@@ -47,6 +47,7 @@ oplora_seed = 0
 - Startup: one SVD per target weight. The default randomized SVD keeps this fast; `oplora_full_svd = true` is exact but slower on large models.
 - Memory: the bases `U_k` (`out x rank`) and `V_k` (`in x rank`) are kept resident per target layer. Per layer this is small, but it scales with the number of target layers and `oplora_rank`, so budget for it on very large models.
 - The randomized SVD leaves a tiny residual, so orthogonality is approximate rather than exact; use `oplora_full_svd = true` if you want the exact bases.
+- The projection is computed in float32 but written back in the LoRA dtype. With `bfloat16` LoRA weights the leftover overlap is at bf16 rounding level rather than float32 noise, which is expected and harmless.
 - On resume the bases are rebuilt from the (unchanged) base weights, so nothing OPLoRA-specific needs to be checkpointed.
 
 ## Verifying

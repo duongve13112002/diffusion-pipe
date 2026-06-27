@@ -76,13 +76,17 @@ def _full_bases(weight, rank):
 
 
 def _randomized_bases(weight, rank, generator, niter=2, oversample=8):
+    # Randomized SVD with subspace iteration (Halko, Martinsson, Tropp 2011).
+    # Re-orthonormalizing with QR between power iterations keeps it numerically
+    # stable on slowly-decaying spectra, where a plain (W W^T)^q product would
+    # lose the smaller of the top-k directions to rounding.
     out_features, in_features = weight.shape
     sketch_width = min(rank + oversample, out_features, in_features)
     omega = torch.randn(in_features, sketch_width, generator=generator, device=weight.device, dtype=weight.dtype)
-    y = weight @ omega
+    q, _ = torch.linalg.qr(weight @ omega)
     for _ in range(niter):
-        y = weight @ (weight.transpose(0, 1) @ y)
-    q, _ = torch.linalg.qr(y)
+        z, _ = torch.linalg.qr(weight.transpose(0, 1) @ q)
+        q, _ = torch.linalg.qr(weight @ z)
     b = q.transpose(0, 1) @ weight
     u_small, _, vh = torch.linalg.svd(b, full_matrices=False)
     u = q @ u_small
@@ -128,9 +132,11 @@ class OPLoRAProjector:
         return len(self._entries)
 
     def describe(self):
+        # With pipeline parallelism each rank only owns part of the model, so this
+        # count is for the calling rank's stage, not the whole model.
         mode = 'full' if self.full_svd else 'randomized'
         extra = f', skipped {self.num_skipped} non-2D modules' if self.num_skipped else ''
-        return f'OPLoRA enabled: projecting {len(self._entries)} LoRA modules with rank={self.rank} ({mode} SVD){extra}'
+        return f'OPLoRA enabled: projecting {len(self._entries)} LoRA modules on this rank with rank={self.rank} ({mode} SVD){extra}'
 
     @classmethod
     def build(cls, root, rank, full_svd=False, base_seed=0, compute_device=None):

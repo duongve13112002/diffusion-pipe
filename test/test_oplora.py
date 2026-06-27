@@ -9,7 +9,12 @@ import pytest
 import torch
 from torch import nn
 
-from utils.oplora import OPLoRAProjector, apply_oplora_config_defaults
+from utils.oplora import (
+    OPLoRAProjector,
+    apply_oplora_config_defaults,
+    _full_bases,
+    _randomized_bases,
+)
 
 
 class FakeLoraLayer(nn.Module):
@@ -93,6 +98,31 @@ class TestProjectionMath:
         layer = FakeLoraLayer(out_features=8, in_features=6, r=4, seed=3)
         with pytest.raises(ValueError, match='larger than the smallest dimension'):
             OPLoRAProjector.build(layer, rank=10, compute_device=torch.device('cpu'))
+
+
+class TestRandomizedSvdAccuracy:
+    def test_randomized_top_k_subspace_matches_full_svd(self):
+        # A clearly decaying spectrum so the top-k subspace is well separated; the
+        # randomized SVD should recover essentially the same subspace as full SVD.
+        torch.manual_seed(0)
+        out_features, in_features, k = 64, 48, 6
+        m = min(out_features, in_features)
+        u = torch.linalg.qr(torch.randn(out_features, m))[0]
+        v = torch.linalg.qr(torch.randn(in_features, m))[0]
+        s = torch.logspace(0, -3, m)
+        weight = (u * s) @ v.transpose(0, 1)
+
+        u_full, v_full = _full_bases(weight, k)
+        generator = torch.Generator().manual_seed(42)
+        u_rand, v_rand = _randomized_bases(weight, k, generator)
+
+        def subspace_gap(a, b):
+            # Frobenius distance between the projectors onto each subspace; this is
+            # invariant to the sign and ordering of the individual singular vectors.
+            return (a @ a.transpose(0, 1) - b @ b.transpose(0, 1)).norm().item()
+
+        assert subspace_gap(u_full, u_rand) < 5e-2
+        assert subspace_gap(v_full, v_rand) < 5e-2
 
 
 class TestDataParallelDeterminism:
