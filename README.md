@@ -11,8 +11,11 @@ Models supported: SDXL, Flux, LTX-Video, HunyuanVideo (t2v), Cosmos, Lumina Imag
 - Efficient multi-process, multi-GPU pre-caching of latents and text embeddings
 - Seemlessly supports both image and video models in a unified way
 - Easily add new models by implementing a single subclass
+- Optional OPLoRA (orthogonal projection LoRA) to reduce catastrophic forgetting when training LoRAs
 
 ## Recent changes
+- 2026-06-27
+  - Add OPLoRA (orthogonal projection LoRA) to reduce catastrophic forgetting during LoRA training. Enable it with `oplora = true` and `oplora_rank` in the `[adapter]` table. See [docs/oplora.md](./docs/oplora.md).
 - 2026-06-24
   - Support Krea 2.
 - 2026-06-07
