@@ -120,9 +120,18 @@ A small standalone script `tools/test_oplora_gpu.py` (or a documented short conf
 - `README.md`: one line under features / recent changes.
 - `requirements.txt`: only if a new dependency is required (not expected; SVD is already available via torch and the existing projector utilities).
 
-## 11. Open questions and risks
+## 11. Audit results
 
-- Exact peft attribute names and whether multiple adapters can ever be active here (the repo uses a single `default` adapter). Confirm before coding.
-- Whether any target module is a packed projection that needs splitting before SVD (per-model check).
-- Performance on the largest models: storing `U_k`/`V_k` per target layer scales with layer count and rank. Measure on the GPU box and document the cost, mirroring the reference's note.
-- Interaction with `gradient_release` (per-param optimizer hook in [train.py:741](../../train.py)): the step still completes before the post-`train_batch` projection, so it should compose, but verify.
+Resolved during implementation and a second audit:
+
+- peft attribute names confirmed against peft 0.19.1: a LoRA layer exposes `base_layer.weight` (out, in), `lora_A['default'].weight` (rank, in) and `lora_B['default'].weight` (out, rank); the repo uses a single `default` adapter. Verified live.
+- Discovery is universal. Every model builds its adapter with `peft.get_peft_model` (or, for SDXL, diffusers `add_adapter`, which injects the same peft layers), targeting only `nn.Linear` inside the `adapter_target_modules` blocks. `to_layers` wraps each block (`self.block = block`), which registers it as a submodule, so the LoRA layers are reachable via `model_engine.module.named_modules()`. Any trained LoRA parameter is in `pipeline_model.parameters()`, hence its module is discoverable, so the projector cannot miss a trained layer. A CPU test (`TestPipelineNesting`) reproduces the wrapper-plus-module-list nesting to confirm this.
+- Non-Linear adapters (a 4D Conv weight, possible on some models) are skipped by the `ndim != 2` guard rather than mis-projected, and counted in the startup log.
+- No packed/split-qkv issue in this repo: peft wraps each `nn.Linear` independently, so a fused qkv `Linear` is projected exactly via the SVD of its full weight. The split-qkv caveat in `anti-forgetting.md` is about a different (kohya) LoRA implementation.
+- Multi-device: build is per rank from `model_engine.module` (pipeline-sharded), projection is rank-local, and the randomized SVD is seeded from a stable per-layer key so data-parallel replicas build identical bases. ZeRO is not used (stage 0); a guard rejects ZeRO-partitioned params.
+- The SVD now runs on each LoRA parameter's own device by default, instead of the global current CUDA device, so it is correct per rank without relying on global device state.
+- `gradient_release` composes: the optimizer step finishes inside `train_batch`, and the projection runs after `train_batch` returns.
+
+Still needs hardware the dev machine does not have:
+
+- A real multi-GPU run (pipeline, data-parallel, and hybrid) to confirm the end-to-end DeepSpeed integration and to measure the `U_k`/`V_k` memory and SVD startup cost on a large model. Use `tools/test_oplora_gpu.py` and a short LoRA run with `oplora = true`.

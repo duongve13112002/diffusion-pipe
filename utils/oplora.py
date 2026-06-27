@@ -140,10 +140,11 @@ class OPLoRAProjector:
 
     @classmethod
     def build(cls, root, rank, full_svd=False, base_seed=0, compute_device=None):
+        # compute_device overrides where the SVD runs. When it is None the SVD runs on
+        # each LoRA parameter's own device, which is the correct GPU for this rank under
+        # pipeline parallelism and avoids relying on the global current CUDA device.
         if rank < 1:
             raise ValueError(f'oplora_rank must be >= 1, got {rank}')
-        if compute_device is None:
-            compute_device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
 
         entries = []
         skipped = 0
@@ -170,8 +171,9 @@ class OPLoRAProjector:
                         'OPLoRA does not support ZeRO-partitioned parameters. Run with ZeRO stage 0 '
                         '(the default for pipeline-parallel training in this repo).'
                     )
+                device = compute_device if compute_device is not None else up_param.device
                 seed = _stable_seed(base_seed, f'{name}.{adapter_name}')
-                u_k, v_k = _compute_bases(base_weight, rank, full_svd, seed, compute_device)
+                u_k, v_k = _compute_bases(base_weight, rank, full_svd, seed, device)
                 entries.append(_Entry(
                     f'{name}.{adapter_name}',
                     up_param,

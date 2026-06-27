@@ -84,7 +84,9 @@ class TestProjectionMath:
         base = layer.base_layer.weight.detach().clone()
         u_k, s_k, v_k = _bases_from_full_svd(base, k)
 
-        projector = OPLoRAProjector.build(layer, rank=k, full_svd=True, compute_device=torch.device('cpu'))
+        # No compute_device: exercises the default path that runs the SVD on each
+        # LoRA parameter's own device (CPU here).
+        projector = OPLoRAProjector.build(layer, rank=k, full_svd=True)
         projector.project()
 
         up = layer.lora_B['default'].weight.detach()
@@ -155,6 +157,59 @@ class TestDataParallelDeterminism:
         proj_b.project()
 
         assert not torch.allclose(layer_a.lora_B['default'].weight, layer_b.lora_B['default'].weight)
+
+
+class TestPipelineNesting:
+    """Mirrors how to_layers wraps blocks, to confirm the projector finds LoRA
+    layers through wrappers and a module list, and skips non-target Linears."""
+
+    def test_build_discovers_lora_through_wrappers(self):
+        peft = pytest.importorskip('peft')
+
+        class Block(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.attn = nn.Linear(16, 16, bias=False)
+                self.mlp = nn.Linear(16, 32, bias=False)
+
+            def forward(self, x):
+                return self.mlp(torch.relu(self.attn(x)))
+
+        class Model(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.blocks = nn.ModuleList([Block(), Block()])
+                self.head = nn.Linear(32, 8, bias=False)
+
+            def forward(self, x):
+                for block in self.blocks:
+                    x = block(x)
+                return self.head(x)
+
+        class Wrapper(nn.Module):
+            def __init__(self, block):
+                super().__init__()
+                self.block = block
+
+            def forward(self, x):
+                return self.block(x)
+
+        cfg = peft.LoraConfig(r=4, lora_alpha=4, target_modules=['attn', 'mlp'], lora_dropout=0.0, bias='none')
+        model = peft.get_peft_model(Model(), cfg)
+        wrapped_model = model.base_model.model
+
+        # Same nesting depth as a pipeline: ModuleList of wrappers, each holding a block.
+        pipeline_like = nn.ModuleList([Wrapper(block) for block in wrapped_model.blocks])
+
+        projector = OPLoRAProjector.build(pipeline_like, rank=4, full_svd=True, compute_device=torch.device('cpu'))
+        # 2 blocks x (attn, mlp) = 4 LoRA layers; head is outside target_modules and excluded.
+        assert len(projector) == 4
+
+        for linear in (wrapped_model.blocks[0].attn, wrapped_model.blocks[0].mlp):
+            with torch.no_grad():
+                linear.lora_B['default'].weight.copy_(torch.randn_like(linear.lora_B['default'].weight))
+        projector.project()
+        assert projector.max_residual() < 1e-4
 
 
 class TestPeftSmoke:
