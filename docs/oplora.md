@@ -38,9 +38,20 @@ oplora_seed = 0
 ```
 
 - `oplora` (bool, default `false`): enable the projection.
-- `oplora_rank` (int, required when `oplora = true`): size of the protected top-k singular subspace per base weight. It is independent of the LoRA `rank`. Larger preserves more base knowledge but leaves the adapter less room to learn. It must not exceed the smallest dimension of any target weight.
+- `oplora_rank` (int, required when `oplora = true`): size of the protected top-k singular subspace per base weight. It is independent of the LoRA `rank` (see the section below). Larger preserves more base knowledge but leaves the adapter less room to learn. It must not exceed the smallest dimension of any target weight.
 - `oplora_full_svd` (bool, default `false`): use exact full SVD instead of the default fast randomized SVD when building the bases. Full SVD is slower at startup but exact.
 - `oplora_seed` (int, default `0`): seed for the randomized SVD. It is kept deterministic so that data-parallel replicas build identical bases and stay consistent. You normally do not need to change it.
+
+## `oplora_rank` is not the LoRA `rank`
+
+Do not assume `oplora_rank` should equal the LoRA `rank`. They are two different things on two different axes, and they do not need to match.
+
+- LoRA `rank` is the rank of the trainable adapter `delta_W = B A`. It sets how much capacity the adapter has to learn the new task. Typical values are 16 to 64.
+- `oplora_rank` is how many of the frozen base weight's strongest singular directions to protect. A base weight of shape `(out, in)` has up to `min(out, in)` singular values (often several thousand in a diffusion transformer), and `oplora_rank` selects the top-k of those to keep unchanged.
+
+So one number is the size of the update, the other is the size of the protected subspace of the base weight. The OPLoRA paper uses an `oplora_rank` of 16 or 128, chosen independently of the adapter rank.
+
+Rule of thumb: start at `oplora_rank = 16`. Raise it (32 to 128) if the base model is forgetting too much; lower it if the adapter cannot learn the new task. Setting it equal to the LoRA `rank` is fine as a convenience, but it is not required and is not a default.
 
 ## Cost and notes
 

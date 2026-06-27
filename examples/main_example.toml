@@ -146,8 +146,11 @@ dtype = 'bfloat16'
 # LoRA update onto the orthogonal complement of each base weight's top-k singular subspace,
 # so the base model's dominant directions stay unchanged. LoRA only. See docs/oplora.md.
 #oplora = true
-# Size of the protected top-k subspace per base weight. Larger preserves more base knowledge
-# but leaves the adapter less room to learn the new task. Required when oplora = true.
+# Size of the protected top-k subspace per base weight. Required when oplora = true.
+# NOTE: this is NOT the LoRA rank above. The LoRA rank is the size of the trainable adapter;
+# oplora_rank is how many of the base weight's strongest singular directions to protect.
+# They do not need to match. The paper uses 16 or 128. Larger preserves more base knowledge
+# but leaves the adapter less room to learn the new task. See docs/oplora.md.
 #oplora_rank = 16
 # Use exact full SVD instead of the default fast randomized SVD when building the bases.
 #oplora_full_svd = false
