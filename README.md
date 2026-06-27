@@ -16,6 +16,7 @@ Models supported: SDXL, Flux, LTX-Video, HunyuanVideo (t2v), Cosmos, Lumina Imag
 ## Recent changes
 - 2026-06-27
   - Add OPLoRA (orthogonal projection LoRA) to reduce catastrophic forgetting during LoRA training. Enable it with `oplora = true` and `oplora_rank` in the `[adapter]` table. See [docs/oplora.md](./docs/oplora.md).
+  - Add the `cosine_with_restarts` LR scheduler (set `lr_scheduler = 'cosine_with_restarts'`, optionally `lr_scheduler_num_cycles`).
 - 2026-06-24
   - Support Krea 2.
 - 2026-06-07

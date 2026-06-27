@@ -31,6 +31,7 @@ from utils.patches import apply_patches
 from utils.unsloth_utils import unsloth_checkpoint
 from utils.pipeline import ManualPipelineModule
 from utils.oplora import OPLoRAProjector, apply_oplora_config_defaults
+from utils.lr_schedule import create_lr_scheduler
 
 # needed for broadcasting Queue in dataset.py
 mp.current_process().authkey = b'afsaskgfdjh4'
@@ -844,18 +845,13 @@ if __name__ == '__main__':
     steps_per_epoch = len(train_dataloader) // model_engine.gradient_accumulation_steps()
 
     scheduler_type = config.get('lr_scheduler', 'constant')
-    if scheduler_type == 'constant':
-        lr_scheduler = torch.optim.lr_scheduler.ConstantLR(optimizer, factor=1.0)
-    elif scheduler_type == 'linear':
-        lr_scheduler = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=1.0, end_factor=0.0, total_iters=config['epochs'] * steps_per_epoch)
-    elif scheduler_type == 'cosine':
-        lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=config['epochs'] * steps_per_epoch, eta_min=1e-6)
-    else:
-        raise NotImplementedError(f'Unknown lr_scheduler: {scheduler_type}')
-    if config['warmup_steps'] > 0:
-        warmup_steps = config['warmup_steps']
-        warmup_scheduler = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=1/warmup_steps, total_iters=warmup_steps)
-        lr_scheduler = torch.optim.lr_scheduler.SequentialLR(optimizer, schedulers=[warmup_scheduler, lr_scheduler], milestones=[warmup_steps])
+    lr_scheduler = create_lr_scheduler(
+        optimizer,
+        scheduler_type,
+        total_steps=config['epochs'] * steps_per_epoch,
+        warmup_steps=config['warmup_steps'],
+        num_cycles=config.get('lr_scheduler_num_cycles', 1),
+    )
     model_engine.lr_scheduler = lr_scheduler
 
     step = 1
