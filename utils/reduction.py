@@ -10,7 +10,17 @@ from multiprocess.util import register_after_fork
 from typing import Union
 
 import torch
-from torch._namedtensor_internals import check_serializing_named_tensor
+
+
+def check_serializing_named_tensor(tensor):
+    # Inlined from torch._namedtensor_internals, which is a private module: torch 2.13
+    # removed this helper and the import broke. The check itself is stable, so keeping a
+    # local copy is safer than importing a private symbol that can disappear again.
+    if tensor.has_names():
+        raise RuntimeError(
+            "NYI: Named tensors don't support serialization. Please drop "
+            "names via `tensor = tensor.rename(None)` before serialization."
+        )
 
 
 try:

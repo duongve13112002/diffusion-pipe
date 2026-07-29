@@ -17,8 +17,9 @@ the other ComfyUI runtime deps), so run it on a machine where training works:
 Exit code is non-zero if any check fails, so it can be wired into CI or a pre-update
 hook. Run it after every ``git submodule update`` that touches ComfyUI. The same re-audit policy
 applies to every other submodule too (each backs its own models); see CLAUDE.md and
-docs/note/submodule-signature-audit.md for the submodule->model map and the manual procedure
-used for the non-ComfyUI submodules.
+docs/note/upstream-api-drift-audit.md for the submodule->model map and the manual procedure
+used for the non-ComfyUI submodules. The same note covers pip dependencies that we copy or
+subclass (torch, bitsandbytes), guarded by tools/check_vendored_apis.py.
 
 When a check legitimately needs to change because ComfyUI changed on purpose, update
 both the model code and the corresponding check here in the same commit.

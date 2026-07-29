@@ -1,6 +1,6 @@
-# Auditing submodule-backed models after a submodule update
+# Auditing code that depends on upstream internals
 
-- Date: 2026-06-29
+- Date: 2026-06-29, extended 2026-07-29
 - Prompt: A real training run of Ideogram4 crashed with
   `TypeError: Ideogram4EmbedScalar.forward() missing 1 required positional argument: 'dtype'`
   after the ComfyUI submodule was bumped. The crash was not in our code per se — it was a
@@ -8,6 +8,12 @@
   active example: **every** submodule in `submodules/` is a third-party library that one or more
   models import from and call directly, so the same drift can come from any of them. This note
   records why the bug class exists and the procedure to re-audit after **any** submodule pin changes.
+- Extension (2026-07-29): the same bug class hit twice more, this time from **pip dependencies**
+  rather than submodules — bitsandbytes 0.50 broke `optimizers/adamw_8bit.py` with
+  `KeyError: 'percentile_clipping'`, and torch 2.13 broke `utils/reduction.py` by removing
+  `torch._namedtensor_internals.check_serializing_named_tensor`. The trigger is not "a submodule
+  moved", it is "we copied or subclassed someone else's internals and they changed". This note now
+  covers both.
 
 ## Why this class of bug exists
 
@@ -59,7 +65,37 @@ Re-derive this map (don't trust it blindly) with:
 grep -rnE "sys\.path.*submodules/|^(from|import) .*comfy" models/ utils/ train.py
 ```
 
-## Procedure (run on every submodule pin change)
+## Which pip dependency backs which file
+
+Submodules are the obvious case because they are pinned in-tree, but `requirements.txt` is
+mostly unpinned, so a plain `pip install -U` moves these the same way. Only the files below
+copy or subclass a dependency's **internals**; everything else uses public APIs and is not part
+of this audit.
+
+| Dependency | Dependent code | What it borrows |
+| --- | --- | --- |
+| `torch` | `utils/reduction.py` | A copy of `torch/multiprocessing/reductions.py` with `multiprocessing` swapped for the third-party `multiprocess` library, so HF Datasets workers can pass CUDA tensors over queues. Reaches into private symbols (`torch._utils._rebuild_tensor`, `torch._storage_classes`, `torch._nested_view_from_buffer_copy`, ...). |
+| `torch` | `utils/patches.py` | `torch._inductor.runtime.triton_heuristics`, plus it registers the reductions above. |
+| `bitsandbytes` | `optimizers/adamw_8bit.py` | A re-implementation of `Optimizer2State.update_step` that adds Kahan summation, so it depends on the exact keys of `get_config()` and on the positional order of `functional.optimizer_update_32bit` / `optimizer_update_8bit_blockwise`. |
+
+Re-derive this map with:
+
+```
+grep -rnE "^from torch\._|^import torch\._|Copied from|bitsandbytes\.optim\." models/ utils/ optimizers/ train.py
+```
+
+The automated guard for these is:
+
+```
+python tools/check_vendored_apis.py
+```
+
+It checks every private torch symbol `utils/reduction.py` needs, that the module still imports,
+and the bitsandbytes surface `adamw_8bit.py` re-implements (including the positional order of the
+two update kernels). The bitsandbytes half is skipped rather than failed when it is not installed,
+so the torch half still runs on the CPU-only dev box.
+
+## Procedure (run on every submodule pin change or dependency upgrade)
 
 1. Find which submodule commits changed: `git submodule status` and `git diff <old>..<new>` on the
    submodule gitlink. Only audit models that depend on a changed submodule.
@@ -113,3 +149,36 @@ grep -rnE "sys\.path.*submodules/|^(from|import) .*comfy" models/ utils/ train.p
 - The non-ComfyUI submodules were not changed in this update, so their models (chroma, cosmos,
   hidream, hunyuan_image, hunyuan_video, ltx_video, lumina_2, omnigen2) were not re-audited here;
   audit them when their submodule pin moves.
+
+## Result of the 2026-07-29 audit (bitsandbytes 0.50.0, torch 2.13.0)
+
+Two crashes were reported from a training box that had upgraded both dependencies.
+
+**bitsandbytes 0.50.0** — the reported crash was `KeyError: 'percentile_clipping'` at
+`optimizers/adamw_8bit.py:30`. Diffing our `update_step` against 0.50.0's showed the single
+reported error was hiding three more breakages right behind it:
+
+- `get_config()` no longer emits `percentile_clipping` (the reported crash).
+- `get_config()` no longer emits `block_wise` either, so the next two branches would `KeyError`.
+- `functional.percentile_clipping` was removed outright.
+- `functional.optimizer_update_8bit` (the non-blockwise 8-bit kernel) was removed; 0.50 keeps
+  only the blockwise path, and `AdamW8bit.__init__` no longer accepts either keyword.
+
+The positional order of `optimizer_update_32bit` and `optimizer_update_8bit_blockwise` did
+**not** change, so the Kahan summation itself was unaffected. The fix reads both keys with
+`config.get(...)` and defaults (`percentile_clipping=100`, `block_wise=True`), which reproduces
+0.50's behaviour on 0.50 and keeps 0.49.x working, since `requirements.txt` leaves bitsandbytes
+unpinned and other users may still be on the old release.
+
+**torch 2.13.0** — `utils/reduction.py` failed at import because
+`torch._namedtensor_internals.check_serializing_named_tensor` was removed. The helper is five
+lines and its semantics are stable, so it was inlined into `utils/reduction.py` rather than
+re-imported from another private location. The file depends on 14 other private torch symbols;
+`tools/check_vendored_apis.py` now enumerates all of them so the next removal is caught before
+a training run hits it. Those symbols were verified present on torch 2.12.1; they still need one
+run of the guard on the 2.13 box to confirm nothing else went missing.
+
+**Lesson worth keeping:** in both the ComfyUI case and this one, the single error message the
+user saw was one of several divergences. Fixing only the line in the traceback leaves the rest to
+surface one training run at a time, so always diff the whole contact surface, not just the crash
+site.
