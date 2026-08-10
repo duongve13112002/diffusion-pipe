@@ -11,6 +11,7 @@ Models supported: SDXL, Flux, LTX-Video, HunyuanVideo (t2v), Cosmos, Lumina Imag
 - Efficient multi-process, multi-GPU pre-caching of latents and text embeddings
 - Seemlessly supports both image and video models in a unified way
 - Easily add new models by implementing a single subclass
+- Optional OPLoRA (orthogonal projection LoRA) to reduce catastrophic forgetting when training LoRAs
 
 ## Recent changes
 - 2026-08-08
@@ -20,6 +21,9 @@ Models supported: SDXL, Flux, LTX-Video, HunyuanVideo (t2v), Cosmos, Lumina Imag
   - Modify dataset code to support audio from videos.
   - Allow training LoRAs directly on quantized models. This should theoretically work with any ComfyUI-based model (Z-Image and later, excluding Anima).
   - Simplified some latent caching code. If training Z-Image, Flux2, or Ernie-Image, make sure to `--regenerate_cache` because latent scaling is now done in the caching phase and not in the model.
+- 2026-06-27
+  - Add OPLoRA (orthogonal projection LoRA) to reduce catastrophic forgetting during LoRA training. Enable it with `oplora = true` and `oplora_rank` in the `[adapter]` table. See [docs/oplora.md](./docs/oplora.md).
+  - Add the `cosine_with_restarts` LR scheduler (set `lr_scheduler = 'cosine_with_restarts'`, optionally `lr_scheduler_num_cycles`).
 - 2026-06-24
   - Support Krea 2.
 - 2026-06-07

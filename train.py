@@ -30,6 +30,8 @@ from utils.isolate_rng import isolate_rng
 from utils.patches import apply_patches
 from utils.unsloth_utils import unsloth_checkpoint
 from utils.pipeline import ManualPipelineModule
+from utils.oplora import OPLoRAProjector, apply_oplora_config_defaults
+from utils.lr_schedule import create_lr_scheduler
 
 # needed for broadcasting Queue in dataset.py
 mp.current_process().authkey = b'afsaskgfdjh4'
@@ -131,6 +133,12 @@ def set_config_defaults(config):
             adapter_config.setdefault('rank_dropout', 0.0)
         else:
             raise NotImplementedError(f'Adapter type {adapter_type} is not implemented')
+
+        # OPLoRA projects each LoRA update onto the orthogonal complement of the base
+        # weight's top-k singular subspace, so the base model's dominant directions are
+        # preserved. Validation and defaults live in utils.oplora so they can be
+        # unit-tested without importing the training stack.
+        apply_oplora_config_defaults(adapter_config)
 
     config.setdefault('logging_steps', 1)
     config.setdefault('eval_datasets', [])
@@ -847,18 +855,13 @@ if __name__ == '__main__':
     steps_per_epoch = len(train_dataloader) // model_engine.gradient_accumulation_steps()
 
     scheduler_type = config.get('lr_scheduler', 'constant')
-    if scheduler_type == 'constant':
-        lr_scheduler = torch.optim.lr_scheduler.ConstantLR(optimizer, factor=1.0)
-    elif scheduler_type == 'linear':
-        lr_scheduler = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=1.0, end_factor=0.0, total_iters=config['epochs'] * steps_per_epoch)
-    elif scheduler_type == 'cosine':
-        lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=config['epochs'] * steps_per_epoch, eta_min=1e-6)
-    else:
-        raise NotImplementedError(f'Unknown lr_scheduler: {scheduler_type}')
-    if config['warmup_steps'] > 0:
-        warmup_steps = config['warmup_steps']
-        warmup_scheduler = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=1/warmup_steps, total_iters=warmup_steps)
-        lr_scheduler = torch.optim.lr_scheduler.SequentialLR(optimizer, schedulers=[warmup_scheduler, lr_scheduler], milestones=[warmup_steps])
+    lr_scheduler = create_lr_scheduler(
+        optimizer,
+        scheduler_type,
+        total_steps=config['epochs'] * steps_per_epoch,
+        warmup_steps=config['warmup_steps'],
+        num_cycles=config.get('lr_scheduler_num_cycles', 1),
+    )
     model_engine.lr_scheduler = lr_scheduler
 
     step = 1
@@ -900,6 +903,17 @@ if __name__ == '__main__':
         for name, eval_data in eval_data_map.items()
     }
 
+    oplora_projector = None
+    if is_adapter and config['adapter']['oplora']:
+        oplora_projector = OPLoRAProjector.build(
+            model_engine.module,
+            rank=config['adapter']['oplora_rank'],
+            full_svd=config['adapter']['oplora_full_svd'],
+            base_seed=config['adapter']['oplora_seed'],
+        )
+        if is_main_process():
+            print(oplora_projector.describe())
+
     epoch = train_dataloader.epoch
     tb_writer = SummaryWriter(log_dir=run_dir) if is_main_process() else None
     saver = utils.saver.Saver(args, config, is_adapter, run_dir, model, train_dataloader, model_engine, pipeline_model)
@@ -916,6 +930,8 @@ if __name__ == '__main__':
         model_engine.reset_activation_shape()
         iterator = get_data_iterator_for_step(train_dataloader, model_engine)
         loss = model_engine.train_batch(iterator).item()
+        if oplora_projector is not None:
+            oplora_projector.project()
         epoch_loss += loss
         num_steps += 1
         train_dataloader.sync_epoch()

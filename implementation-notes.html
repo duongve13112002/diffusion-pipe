@@ -1,0 +1,131 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>diffusion-pipe implementation notes</title>
+<style>
+  body { font-family: system-ui, -apple-system, "Segoe UI", sans-serif; line-height: 1.6;
+         max-width: 60rem; margin: 0 auto; padding: 2rem 1.25rem; color: #1c1c1e; }
+  h1 { font-size: 1.6rem; }
+  h2 { font-size: 1.25rem; margin-top: 2.5rem; border-bottom: 1px solid #d8d8dc; padding-bottom: .3rem; }
+  h3 { font-size: 1.05rem; margin-top: 1.75rem; }
+  code { background: #f2f2f4; padding: .1rem .3rem; border-radius: 3px; font-size: .9em; }
+  table { border-collapse: collapse; width: 100%; margin: 1rem 0; }
+  th, td { border: 1px solid #d8d8dc; padding: .5rem .6rem; text-align: left; vertical-align: top; }
+  th { background: #f2f2f4; }
+  .meta { color: #5a5a60; font-size: .9rem; }
+  .flag { background: #fff6e5; border-left: 4px solid #e8a33d; padding: .75rem 1rem; margin: 1rem 0; }
+  @media (prefers-color-scheme: dark) {
+    body { background: #16161a; color: #e8e8ea; }
+    h2 { border-bottom-color: #34343a; }
+    code { background: #26262c; }
+    th, td { border-color: #34343a; }
+    th { background: #26262c; }
+    .meta { color: #a0a0a8; }
+    .flag { background: #2e2618; border-left-color: #e8a33d; }
+  }
+</style>
+</head>
+<body>
+
+<h1>Implementation notes</h1>
+<p class="meta">A running log of decisions taken outside the spec, forced changes, tradeoffs, and
+anything else the maintainer needs to know. Newest entry first.</p>
+
+<h2>2026-07-29 — bitsandbytes 0.50 and torch 2.13 upstream drift</h2>
+
+<p><strong>Reported problem.</strong> Two crashes from the training box:
+<code>KeyError: 'percentile_clipping'</code> at <code>optimizers/adamw_8bit.py:30</code>, and a failed
+import of <code>check_serializing_named_tensor</code> from <code>torch._namedtensor_internals</code>
+on torch 2.13.0.</p>
+
+<h3>What the audit actually found</h3>
+
+<p>The reported <code>KeyError</code> was one of four breakages, not one. Verified by extracting the
+bitsandbytes 0.50.0 wheel and reading the source rather than guessing:</p>
+
+<table>
+  <tr><th>Removed in bitsandbytes 0.50.0</th><th>Where it broke</th></tr>
+  <tr><td><code>get_config()</code> key <code>percentile_clipping</code></td><td><code>adamw_8bit.py:30</code> (the reported crash)</td></tr>
+  <tr><td><code>get_config()</code> key <code>block_wise</code></td><td><code>adamw_8bit.py:72</code> and <code>:99</code> — the next two <code>KeyError</code>s</td></tr>
+  <tr><td><code>functional.percentile_clipping</code></td><td><code>adamw_8bit.py:31</code></td></tr>
+  <tr><td><code>functional.optimizer_update_8bit</code> (non-blockwise)</td><td><code>adamw_8bit.py:73</code></td></tr>
+</table>
+
+<p>The positional order of <code>optimizer_update_32bit</code> and
+<code>optimizer_update_8bit_blockwise</code> did <em>not</em> change, so the Kahan summation logic
+itself needed no edit. That was checked argument by argument against the 0.50.0 source.</p>
+
+<h3>Decisions made that were not in the request</h3>
+
+<ul>
+  <li><strong>Kept the non-blockwise 8-bit branch instead of deleting it.</strong> The chosen approach
+    was "support both 0.49.x and 0.50.x", so the branch stays reachable for users still on 0.49 where
+    <code>F.optimizer_update_8bit</code> exists. On 0.50 the <code>block_wise</code> default of
+    <code>True</code> means it is never entered, so the missing function is never touched.</li>
+  <li><strong>Second <code>elif</code> reduced to a bare dtype check.</strong>
+    <code>elif state["state1"].dtype == torch.uint8 and config["block_wise"]</code> became
+    <code>elif state["state1"].dtype == torch.uint8</code>. It is logically equivalent once the
+    preceding branch handles the non-blockwise case, and it avoids a second defensive
+    <code>config.get()</code> for no benefit.</li>
+  <li><strong>Inlined the torch helper rather than a <code>try</code>/<code>except</code> import.</strong>
+    <code>check_serializing_named_tensor</code> is five lines with stable semantics. Importing it from
+    a private module is what broke; a fallback import would leave the same fragility in place, so
+    <code>utils/reduction.py</code> now defines it locally.</li>
+  <li><strong>No pin added to <code>requirements.txt</code>.</strong> The version-adaptive fix works on
+    both releases, and the project deliberately keeps dependencies unpinned.</li>
+  <li><strong>Renamed the audit note.</strong>
+    <code>docs/note/submodule-signature-audit.md</code> became
+    <code>docs/note/upstream-api-drift-audit.md</code> because the rule now covers pip dependencies as
+    well as submodules, and the old filename would have been misleading. Done with <code>git mv</code>
+    to keep history; all three referring files were updated.</li>
+  <li><strong>Guard script skips bitsandbytes instead of failing it.</strong> In
+    <code>tools/check_vendored_apis.py</code>, a missing bitsandbytes is reported as
+    <code>[SKIP]</code>, so the torch half of the audit still runs (and still exits zero) on the
+    CPU-only dev box where bitsandbytes is not part of the normal setup.</li>
+</ul>
+
+<h3>Tradeoffs weighed</h3>
+
+<ul>
+  <li><strong>Version-adaptive vs. following 0.50 exactly.</strong> Mirroring 0.50 would be cleaner and
+    would delete two dead branches, but it breaks anyone on 0.49.x, and <code>requirements.txt</code>
+    leaves bitsandbytes unpinned so that is a real population. Cost of the chosen path: two branches
+    that are unreachable on modern bitsandbytes, kept alive by <code>config.get()</code> defaults.</li>
+  <li><strong>Inlining vs. re-vendoring <code>utils/reduction.py</code> from torch 2.13.</strong>
+    Re-vendoring would resync the whole file, but it is a large diff that needs real
+    multi-process GPU testing to trust, and only one symbol was reported broken. Inlining is a
+    five-line change; the guard script covers the risk that other symbols went missing too.</li>
+  <li><strong>Test realism.</strong> The tests build <code>AdamW8bitKahan</code> via
+    <code>__new__</code> and stub <code>bitsandbytes.functional</code>, because the real update
+    kernels need CUDA. That means they verify the config handling and the branch routing —
+    the parts that actually broke — but not the numerics of the kernels themselves.</li>
+</ul>
+
+<h3>Things the maintainer needs to know</h3>
+
+<div class="flag">
+  <p><strong>Not verifiable on the dev box.</strong> This machine runs torch 2.12.1+cpu, so the torch
+  2.13 removal could not be reproduced locally. <code>utils/reduction.py</code> depends on 14 other
+  private torch symbols beyond the one that broke; all 14 were confirmed present on 2.12.1 but not on
+  2.13. Please run <code>python tools/check_vendored_apis.py</code> on the 2.13 training box and
+  report any <code>FAIL</code> lines.</p>
+</div>
+
+<ul>
+  <li><strong>The dev venv changed.</strong> <code>multiprocess</code> and
+    <code>bitsandbytes==0.50.0</code> were installed into <code>.venv</code> so the fixes could be
+    verified rather than assumed. bitsandbytes 0.50.0 ships a CPU-capable <code>win_amd64</code> wheel
+    and imports without a GPU, which is what made the audit checkable locally.</li>
+  <li><strong>Tests.</strong> <code>test/test_adamw_8bit.py</code> (5 cases) covers the new and old
+    config shapes, both 8-bit paths, and the Kahan compensation. Confirmed to reproduce the original
+    <code>KeyError: 'percentile_clipping'</code> when the fix is reverted. Full suite: 31 passed.</li>
+  <li><strong>Left out of the commit.</strong> An unrelated in-progress research note,
+    <code>docs/note/lumina2-vs-sd-scripts-training.md</code> and its index line, was already
+    uncommitted in the working tree. It was deliberately not included so this change stays atomic;
+    it is still sitting in the working tree.</li>
+</ul>
+
+</body>
+</html>

@@ -26,13 +26,18 @@ pipeline_stages = 1
 gradient_accumulation_steps = 1
 # Grad norm clipping.
 gradient_clipping = 1.0
-# Learning rate warmup.
+# Learning rate warmup, counted in optimizer (global) steps. One step is one optimizer update
+# after gradient accumulation, so this is independent of gradient_accumulation_steps and of the
+# number of GPUs (data parallel). The LR schedule below is counted in the same units.
 warmup_steps = 100
 # Force the learning rate to be this value, regardless of what the optimizer or anything else says.
 # Can be used to change learning rate even when resuming from checkpoint.
 #force_constant_lr = 1e-5
-# Can be 'constant' or 'linear'. If unset, will default to 'constant', i.e. no LR scheduler.
-#lr_scheduler = 'linear'
+# LR schedule: 'constant', 'linear', 'cosine', or 'cosine_with_restarts'. If unset, defaults to 'constant'.
+#lr_scheduler = 'cosine_with_restarts'
+# Only used by 'cosine_with_restarts': how many cosine cycles to run over the whole training.
+# 1 is a plain cosine decay; higher values add that many warm restarts. Defaults to 1.
+#lr_scheduler_num_cycles = 4
 
 # Block swapping is supported for Wan, HunyuanVideo, Flux, and Chroma. This value controls the number
 # of blocks kept offloaded to RAM. Increasing it lowers VRAM use, but has a performance penalty. The
@@ -142,6 +147,21 @@ dtype = 'bfloat16'
 #fuse_adapters = [
 #    {path = '/data2/imagegen_models/loras/some_lora.safetensors', weight = 1.0}
 #]
+# OPLoRA (orthogonal projection LoRA) reduces catastrophic forgetting by projecting every
+# LoRA update onto the orthogonal complement of each base weight's top-k singular subspace,
+# so the base model's dominant directions stay unchanged. LoRA only. See docs/oplora.md.
+#oplora = true
+# Size of the protected top-k subspace per base weight. Required when oplora = true.
+# NOTE: this is NOT the LoRA rank above. The LoRA rank is the size of the trainable adapter;
+# oplora_rank is how many of the base weight's strongest singular directions to protect.
+# They do not need to match. The paper uses 16 or 128. Larger preserves more base knowledge
+# but leaves the adapter less room to learn the new task. See docs/oplora.md.
+#oplora_rank = 16
+# Use exact full SVD instead of the default fast randomized SVD when building the bases.
+#oplora_full_svd = false
+# Seed for the randomized SVD. Kept deterministic so data-parallel replicas build identical
+# bases; you normally do not need to change it.
+#oplora_seed = 0
 
 # LoKr is supported. Setting very high rank makes it do full-matrix LoKr rather than low-rank decomposition.
 # [adapter]
