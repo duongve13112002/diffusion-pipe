@@ -383,9 +383,6 @@ if __name__ == '__main__':
     elif model_type == 'krea2':
         from models import krea2
         model = krea2.Krea2Pipeline(config)
-    elif model_type == 'minimax_h3':
-        from models import minimax_h3
-        model = minimax_h3.MinimaxH3Pipeline(config)
     else:
         raise NotImplementedError(f'Model type {model_type} is not implemented')
 
@@ -525,14 +522,8 @@ if __name__ == '__main__':
     if args.cache_only:
         quit()
 
-    # Free up as much RAM as we can.
-    del dataset_manager
-    if config['model'].get('cache_text_embeddings', True):
-        # Only ComfyUI-based models, and only if we are caching text embeddings (which most models require).
-        model.free_vae_and_te()
-
     if args.test_sample:
-        model.prepare_sample_test('a golden retriever running through a grassy field', cfg=1)
+        model.prepare_sample_test('a golden retriever running through a grassy field', cfg=5)
 
     model.load_diffusion_model()
 
@@ -619,7 +610,6 @@ if __name__ == '__main__':
         partition_method=partition_method,
         manual_partition_split=partition_split,
         loss_fn=model.get_loss_fn(),
-        dynamic_shape=True,
         **additional_pipeline_module_kwargs
     )
     model.pipeline_model = pipeline_model

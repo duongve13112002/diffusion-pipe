@@ -184,9 +184,7 @@ class ChromaPipeline(BasePipeline):
 
     def get_call_vae_fn(self, vae):
         def fn(tensor):
-            tensor = tensor.to(vae.device, vae.dtype)
-            tensor = tensor*2 - 1
-            latents = vae.encode(tensor).latent_dist.sample()
+            latents = vae.encode(tensor.to(vae.device, vae.dtype)).latent_dist.sample()
             if hasattr(vae.config, 'shift_factor') and vae.config.shift_factor is not None:
                 latents = latents - vae.config.shift_factor
             latents = latents * vae.config.scaling_factor

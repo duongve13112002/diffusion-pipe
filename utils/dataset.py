@@ -915,7 +915,6 @@ class DirectoryDataset:
             cache_file_prefix=f'uncond_text_embeddings_{i}_',
             regenerate_cache=regenerate_cache,
         )
-        self.uncond_dict = uncond_text_embeddings_ds[0]
         for size_bucket_ds in self.get_size_bucket_datasets():
             size_bucket_ds.uncond_text_embeddings.append(uncond_text_embeddings_ds)
 
@@ -1009,7 +1008,7 @@ class Dataset:
             features = [example[key] for example in examples]
             if torch.is_tensor(features[0]):
                 shape = features[0].shape
-                if all(torch.is_tensor(f) and f.shape == shape for f in features):
+                if all(f.shape == shape for f in features):
                     # if we can form a single batched tensor, do it
                     features = torch.stack(features)
             ret[key] = features
@@ -1043,8 +1042,6 @@ class Dataset:
     def cache_text_embeddings(self, map_fn, i, regenerate_cache=False, caching_batch_size=1):
         for ds in self.directory_datasets:
             ds.cache_text_embeddings(map_fn, i, regenerate_cache=regenerate_cache, caching_batch_size=caching_batch_size)
-        # some techniques need access to the uncond
-        self.model.uncond_dict = self.directory_datasets[0].uncond_dict
 
 
 def _cache_fn(datasets, queue, preprocess_media_file_fn, num_text_encoders, regenerate_cache, trust_cache, caching_batch_size):
@@ -1095,23 +1092,18 @@ def _cache_fn(datasets, queue, preprocess_media_file_fn, num_text_encoders, rege
         for i in range(0, len(tensors_and_masks), caching_batch_size):
             tensor = torch.stack([t[0] for t in tensors_and_masks[i:i+caching_batch_size]])
             c_tensor = torch.stack([t[0] for t in control_tensors_and_masks[i:i+caching_batch_size]]) if is_edit_dataset else None
-            audio_list = [t[1] for t in tensors_and_masks[i:i+caching_batch_size]]  # needs to be list because any example's audio could be None
             if rank not in pipes:
                 pipes[rank] = mp.Pipe(duplex=False)
             parent_conn, child_conn = pipes[rank]
-            queue.put((0, tensor, c_tensor, audio_list, child_conn))
+            queue.put((0, tensor, c_tensor, child_conn))
             result = parent_conn.recv()  # dict
             for k, v in result.items():
                 results[k].append(v)
-        # concatenate the batches
+        # concatenate the list of tensors at each key into one batched tensor
         for k, v in results.items():
-            if isinstance(v[0], list):
-                # some features could be lists: [[audio1, audio2], [audio3, None]]
-                results[k] = sum(v, [])
-            else:
-                results[k] = torch.cat(v)
+            results[k] = torch.cat(v)
         results['image_spec'] = image_specs
-        results['mask'] = [t[-1] for t in tensors_and_masks]
+        results['mask'] = [t[1] for t in tensors_and_masks]
         results['caption'] = captions
         return results
 
@@ -1144,7 +1136,6 @@ class DatasetManager:
         self.text_encoders = self.model.get_text_encoders()
         self.submodels = [self.vae] + list(self.text_encoders)
         self.call_vae_fn = self.model.get_call_vae_fn(self.vae)
-        self.vae_supports_audio = 'audio' in signature(self.call_vae_fn).parameters
         self.call_text_encoder_fns = [self.model.get_call_text_encoder_fn(text_encoder) for text_encoder in self.text_encoders]
         self.te_fn_requires_control_file = [
             len(signature(fn).parameters) == 3
@@ -1209,8 +1200,6 @@ class DatasetManager:
                     model.to('cpu')
                 else:
                     model.to('meta')
-            # TODO: this keeps weights in RAM, which can OOM for very large text encoders. Not a big deal since you can
-            # just relaunch the training script, since the data is now cached. But would be good to make it work in one pass.
             mm.unload_all_models()  # Comfy managed models
 
         dist.barrier()
@@ -1239,15 +1228,12 @@ class DatasetManager:
             # ComfyUI model in a wrapper class that delays loading until the model is needed.
             self.submodels[id].load_model_if_needed()
         if id == 0:
-            tensor, control_tensor, audio_list, pipe = task[1:]
-            kwargs = {}
-            if self.vae_supports_audio:
-                kwargs['audio'] = audio_list
+            tensor, control_tensor, pipe = task[1:]
             if control_tensor is not None:
                 # edit dataset
-                results = self.call_vae_fn(tensor, control_tensor, **kwargs)
+                results = self.call_vae_fn(tensor, control_tensor)
             else:
-                results = self.call_vae_fn(tensor, **kwargs)
+                results = self.call_vae_fn(tensor)
         elif id > 0:
             caption, is_video, control_file, pipe = task[1:]
             args = [caption, is_video]
@@ -1263,7 +1249,7 @@ class DatasetManager:
         cpu_results = {}
         for k, v in results.items():
             if isinstance(v, (list, tuple)):
-                cpu_results[k] = [x.to('cpu') if torch.is_tensor(x) else x for x in v]
+                cpu_results[k] = [x.to('cpu') for x in v]
             else:
                 cpu_results[k] = v.to('cpu')
         pipe.send(cpu_results)
@@ -1371,14 +1357,12 @@ class PipelineDataLoader:
     def _pull_batches_from_dataloader(self):
         for batch in self.dataloader:
             features, label = self.model.prepare_inputs(batch, timestep_quantile=self.eval_quantile)
-            *target_list, mask = label
+            target, mask = label
             # The target depends on the noise, so we must broadcast it from the first stage to the last.
             # NOTE: I had to patch the pipeline parallel TrainSchedule so that the LoadMicroBatch commands
             # would line up on the first and last stage so that this doesn't deadlock.
-            broadcasted_targets = []
-            for t in target_list:
-                broadcasted_targets.append(self._broadcast_target(t))
-            label = (*broadcasted_targets, mask)
+            target = self._broadcast_target(target)
+            label = (target, mask)
             self.num_batches_pulled += 1
             for micro_batch in split_batch((features, label), self.gradient_accumulation_steps):
                 yield micro_batch

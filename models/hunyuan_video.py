@@ -358,9 +358,7 @@ class HunyuanVideoPipeline(BasePipeline):
 
     def get_call_vae_fn(self, vae):
         def fn(tensor):
-            tensor = tensor.to(vae.device, vae.dtype)
-            tensor = tensor*2 - 1
-            return {'latents': vae_encode(tensor, vae)}
+            return {'latents': vae_encode(tensor.to(vae.device, vae.dtype), vae)}
         return fn
 
     def get_call_text_encoder_fn(self, text_encoder):

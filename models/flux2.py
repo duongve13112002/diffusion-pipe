@@ -50,8 +50,6 @@ class Flux2Pipeline(ComfyPipeline):
         else:
             raise RuntimeError(f'Unknown Flux2 model version with model_dim={model_dim}')
 
-        self.latent_format = comfy.latent_formats.Flux2()
-
         self.offloader_double = ModelOffloader('dummy', [], 0, 0, True, torch.device('cuda'), False, debug=False)
         self.offloader_single = ModelOffloader('dummy', [], 0, 0, True, torch.device('cuda'), False, debug=False)
 
@@ -129,6 +127,7 @@ class Flux2Pipeline(ComfyPipeline):
 
     def prepare_inputs(self, inputs, timestep_quantile=None):
         latents = inputs['latents'].float()
+        latents = self.model_patcher.model.process_latent_in(latents)
         mask = inputs['mask']
 
         conds = self.get_conds(inputs)

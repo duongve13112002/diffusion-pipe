@@ -80,9 +80,7 @@ KEEP_IN_HIGH_PRECISION = ['time_text_embed', 'context_embedder', 'x_embedder']
 
 
 def vae_encode(vae, image):
-    image = image.to(vae.device, vae.dtype)
-    image = image*2 - 1
-    latents = vae.encode(image).latent_dist.sample()
+    latents = vae.encode(image.to(vae.device, vae.dtype)).latent_dist.sample()
     if hasattr(vae.config, 'shift_factor') and vae.config.shift_factor is not None:
         latents = latents - vae.config.shift_factor
     latents = latents * vae.config.scaling_factor

@@ -97,10 +97,8 @@ class LTXVideoPipeline(BasePipeline):
 
     def get_call_vae_fn(self, vae):
         def fn(tensor):
-            tensor = tensor.to(dtype=vae.dtype, device=vae.device)
-            tensor = tensor*2 - 1
             latents = vae_encode(
-                tensor,
+                tensor.to(dtype=vae.dtype, device=vae.device),
                 vae,
                 vae_per_channel_normalize=True,
             )
