@@ -170,9 +170,32 @@ class TestCrossAttentionInvariance:
             out_permuted = attn(query, context=context[:, permutation])
 
         torch.testing.assert_close(out, out_permuted, atol=1e-5, rtol=1e-5)
-        # And the naive position-wise comparison is NOT invariant, which is the trap this
-        # objective avoids.
-        assert not torch.allclose(context, context[:, permutation])
+
+    def test_output_magnitude_depends_on_padded_length(self):
+        """The property permutation invariance does NOT give you, and the reason the auxiliary
+        distillation term normalises by the padded length rather than the real token count.
+
+        Padded rows project to k = 0 (k_proj has no bias, RMSNorm(0) = 0), so each contributes
+        exp(0) = 1 to the softmax denominator and nothing to the numerator. The same real
+        content therefore yields a smaller output as padding grows -- and teacher and student
+        tokenizers give different real-token counts for the same caption.
+        """
+        modeling = pytest.importorskip('models.cosmos_predict2_modeling')
+        torch.manual_seed(0)
+        attn = modeling.Attention(query_dim=32, context_dim=MODEL_DIM, n_heads=4, head_dim=8, backend='torch')
+        attn.eval()
+        query = torch.randn(1, 5, 32)
+        real = torch.randn(1, 8, MODEL_DIM)
+
+        norms = []
+        for total in (16, 64, 512):
+            context = torch.zeros(1, total, MODEL_DIM)
+            context[:, :8] = real
+            with torch.no_grad():
+                norms.append(attn(query, context=context).norm().item())
+
+        assert norms[0] > norms[1] > norms[2], f'expected dilution with padding, got {norms}'
+        assert norms[0] / norms[2] > 5, 'the effect is large, not a rounding detail'
 
 
 class TestMiniTrainDitWiring:
@@ -566,15 +589,48 @@ class TestTextEncoderCacheKey:
 
 
 class TestExistingModelFingerprintsUnchanged:
-    """The cache change must not invalidate caches for wan / anima / cosmos_predict2."""
+    """The cache change must not invalidate caches for wan / anima / cosmos_predict2.
 
-    def test_empty_key_preserves_the_original_fingerprint(self):
+    Asserted against the arguments _cache_text_embeddings actually passes, not against the
+    hashing library's determinism -- the claim is about this repo's conditional, so that is
+    what gets exercised.
+    """
+
+    @staticmethod
+    def captured_fingerprint_args(text_encoder_key):
         dataset = pytest.importorskip('utils.dataset')
-        from datasets.fingerprint import Hasher
-        # _cache_text_embeddings passes [i] when there is no key, exactly as before.
-        assert Hasher.hash([0]) == Hasher.hash([0])
-        assert Hasher.hash([0]) != Hasher.hash([0, 'some-text-encoder'])
-        assert hasattr(dataset, 'enumerate_captions')
+        captured = {}
+
+        def fake_map_and_cache(ds, map_fn, cache_dir, cache_file_prefix='', new_fingerprint_args=None, **kwargs):
+            captured['args'] = new_fingerprint_args
+            captured['prefix'] = cache_file_prefix
+            return []
+
+        original = dataset._map_and_cache
+        dataset._map_and_cache = fake_map_and_cache
+        try:
+            fake_metadata = type('D', (), {
+                'map': lambda self, *a, **k: self,
+                'column_names': [],
+            })()
+            try:
+                dataset._cache_text_embeddings(
+                    fake_metadata, map_fn=None, i=0, cache_dir='/tmp',
+                    regenerate_cache=False, caching_batch_size=1,
+                    text_encoder_key=text_encoder_key,
+                )
+            except Exception:
+                pass  # only the captured arguments matter
+        finally:
+            dataset._map_and_cache = original
+        return captured.get('args')
+
+    def test_no_key_passes_the_original_arguments(self):
+        """Models supplying no key must produce byte-identical fingerprint input to before."""
+        assert self.captured_fingerprint_args('') == [0]
+
+    def test_a_key_is_appended_when_present(self):
+        assert self.captured_fingerprint_args('qwen35-base|-1|512') == [0, 'qwen35-base|-1|512']
 
 
 class TestBaseLrIsRefinerOnly:
@@ -697,3 +753,86 @@ class TestContextRefinerPathAcceptsFullCheckpoint:
         assert set(result) == set(refiner.state_dict()), 'net. prefix must be stripped'
         assert dit_config['n_refiner_layers'] == 2
         assert dit_config['cap_feat_dim'] == CAP_FEAT_DIM
+
+
+class TestCaptionEnumerationMatchesTraining:
+    """The cases the first version of enumerate_captions got wrong.
+
+    A mismatch here means distillation trains on captions the diffusion stages never see, which
+    is the exact drift this helper exists to prevent.
+    """
+
+    @staticmethod
+    def enumerate_captions(*args, **kwargs):
+        dataset = pytest.importorskip('utils.dataset')
+        return dataset.enumerate_captions(*args, **kwargs)
+
+    @staticmethod
+    def write(tmp_path, files):
+        import json
+        for name, content in files.items():
+            path = tmp_path / name
+            path.write_text(json.dumps(content) if name.endswith('.json') else content)
+        return {'directory': [{'path': str(tmp_path)}]}
+
+    def test_captions_json_disables_the_txt_fallback(self, tmp_path):
+        """DirectoryDataset kills the .txt fallback for the WHOLE directory once a
+        captions.json exists (`if has_captions_json or not os.path.exists(...)`), so an image
+        missing from the json is dropped rather than falling back to its .txt."""
+        config = self.write(tmp_path, {
+            'a.jpg': 'x', 'b.jpg': 'x',
+            'b.txt': 'this must NOT be picked up',
+            'captions.json': {'a.jpg': ['from json']},
+        })
+        assert self.enumerate_captions(config) == ['from json']
+
+    def test_tar_members_are_keyed_by_full_path(self, tmp_path):
+        """add_captions() only takes the basename when tar_file is None; a tar member is
+        looked up by its full path inside the archive."""
+        import tarfile
+        member_dir = tmp_path / 'src'
+        member_dir.mkdir()
+        for name in ('a.jpg', 'b.jpg'):
+            (member_dir / name).write_text('x')
+        with tarfile.TarFile(tmp_path / 'shard.tar', 'w') as tar:
+            for name in ('a.jpg', 'b.jpg'):
+                tar.add(member_dir / name, arcname=f'sub/{name}')
+        for name in ('a.jpg', 'b.jpg'):
+            (member_dir / name).unlink()
+        member_dir.rmdir()
+
+        config = self.write(tmp_path, {'captions.json': {'sub/a.jpg': ['tar A'], 'sub/b.jpg': ['tar B']}})
+        assert sorted(self.enumerate_captions(config)) == ['tar A', 'tar B']
+
+    def test_missing_json_entry_is_skipped_not_guessed(self, tmp_path):
+        config = self.write(tmp_path, {
+            'a.jpg': 'x', 'b.jpg': 'x',
+            'captions.json': {'a.jpg': ['only this one']},
+        })
+        assert self.enumerate_captions(config) == ['only this one']
+
+    def test_multiple_captions_per_image(self, tmp_path):
+        config = self.write(tmp_path, {
+            'a.jpg': 'x',
+            'captions.json': {'a.jpg': ['first', 'second', 'third']},
+        })
+        assert self.enumerate_captions(config) == ['first', 'second', 'third']
+
+    def test_fractional_num_repeats(self, tmp_path):
+        """SizeBucketDataset accepts any num_repeats > 0 and takes int(len * num_repeats)."""
+        config = self.write(tmp_path, {f'{i}.jpg': 'x' for i in range(4)})
+        for i in range(4):
+            (tmp_path / f'{i}.txt').write_text(f'caption {i}')
+        config['directory'][0]['num_repeats'] = 0.5
+        assert len(self.enumerate_captions(config, apply_num_repeats=True)) == 2
+        config['directory'][0]['num_repeats'] = 2
+        assert len(self.enumerate_captions(config, apply_num_repeats=True)) == 8
+
+    def test_custom_shuffle_delimiter(self, tmp_path):
+        config = self.write(tmp_path, {'a.jpg': 'x', 'a.txt': 'one;two;three'})
+        config['cache_shuffle_num'] = 3
+        config['cache_shuffle_delimiter'] = ';'
+        captions = self.enumerate_captions(config)
+        assert len(captions) == 3
+        for caption in captions:
+            assert sorted(caption.split(';')) == ['one', 'three', 'two']

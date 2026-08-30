@@ -30,8 +30,16 @@ import toml
 import torch
 from PIL import Image
 
-from models import cosmos_predict2
 from utils.common import DTYPE_MAP
+
+# models.cosmos_predict2 is imported lazily, inside build_pipeline, and that is load-bearing.
+# Every pipeline layer is decorated `@torch.autocast('cuda', dtype=AUTOCAST_DTYPE)`, and the
+# decorator captures utils.common.AUTOCAST_DTYPE at import time. train.py sets that global
+# before it imports the model module; importing at the top here would capture the default of
+# None, which torch.autocast resolves to float16 -- silently running a bfloat16 model under
+# fp16 autocast on CUDA, where the 65504 ceiling makes overflow to inf/NaN a live risk. A
+# CPU test suite cannot catch it, because autocast('cuda') is inert there.
+cosmos_predict2 = None
 
 
 def parse_args():
@@ -55,8 +63,9 @@ def parse_args():
 
 def build_pipeline(config_path, device, dtype_override):
     """Load through the training pipeline so the loading rules are shared, not duplicated."""
+    global cosmos_predict2
     config = toml.load(config_path)
-    model_config = config['model']
+    model_config = dict(config['model'])  # never mutate the caller's parsed config
     if model_config.get('type') != 'anima_refiner':
         raise RuntimeError(f"Expected type = 'anima_refiner' in {config_path}, got {model_config.get('type')!r}")
     if dtype_override:
@@ -67,6 +76,12 @@ def build_pipeline(config_path, device, dtype_override):
     model_config.pop('transformer_dtype', None)
     # Text embeddings are computed here, never read from a training cache.
     model_config['cache_text_embeddings'] = False
+
+    # Must happen before models.cosmos_predict2 is imported: see the note at the top.
+    import utils.common
+    utils.common.AUTOCAST_DTYPE = model_config['dtype']
+    from models import cosmos_predict2 as _cosmos_predict2
+    cosmos_predict2 = _cosmos_predict2
 
     pipeline = cosmos_predict2.CosmosPredict2Pipeline({'model': model_config})
     pipeline.load_diffusion_model()
@@ -114,7 +129,9 @@ def sample(pipeline, layers, embeds, mask, uncond, uncond_mask, args, device, dt
     timesteps = shifted_timesteps(args.steps, args.shift)
 
     def velocity(latents, t_value, text, text_mask):
-        t = torch.full((latents.shape[0], 1), t_value, device=device, dtype=torch.float32)
+        # t must share the model dtype. On CUDA the layers' autocast hides a mismatch; on
+        # CPU autocast('cuda') is inert and the first matmul raises.
+        t = torch.full((latents.shape[0], 1), t_value, device=device, dtype=dtype)
         inputs = (latents.to(dtype), t, text.to(dtype), text_mask)
         for layer in layers:
             inputs = layer(inputs)

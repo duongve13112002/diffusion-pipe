@@ -161,6 +161,89 @@ the first renamed to say plainly that it is a source-level guard rather than a b
 <code>utils/dataset.py</code>, <code>utils/oplora.py</code>, <code>models/base.py</code> and
 <code>train.py</code> to confirm no pre-existing model reaches new behaviour.</p>
 
+<h3>What a second, harder QA pass found</h3>
+
+<p>A stronger reviewer was then pointed at the same range. It found eleven further defects — none
+of them overlapping the first pass — and one false positive. Every one below was reproduced before
+being fixed.</p>
+
+<table>
+  <tr><th>Defect</th><th>Why it survived</th></tr>
+
+  <tr><td><code>tools/sample_anima_refiner.py</code> imported <code>models.cosmos_predict2</code>
+      at module scope, before it set <code>utils.common.AUTOCAST_DTYPE</code>. The model module
+      binds that value at import time, so it was <code>None</code> — and
+      <code>torch.autocast('cuda', dtype=None)</code> does not error, it silently resolves to
+      <code>float16</code>. A bf16 model would have sampled in fp16.</td>
+      <td>The bug is an import-order coupling, invisible in either file read alone. Measured:
+      <code>torch.autocast('cuda', dtype=None).fast_dtype</code> is <code>torch.float16</code>.
+      The import is now deferred until after the dtype is set.</td></tr>
+
+  <tr><td><code>enumerate_captions()</code> fell back to a sidecar <code>.txt</code> for images
+      missing from <code>captions.json</code>. <code>DirectoryDataset</code> disables the
+      <code>.txt</code> path for the entire directory once a <code>captions.json</code> exists.
+      Distillation would train on captions the DiT never sees.</td>
+      <td>"Mirrors the repo's resolution rules" was asserted, not diffed. The two produced
+      <code>['from json', 'from txt fallback']</code> against <code>['from json']</code>.</td></tr>
+
+  <tr><td>For tar datasets, captions were keyed by member <em>basename</em> while the dataset keys
+      by full member path. Every lookup missed: zero captions, silently.</td>
+      <td>Tested only on a flat directory, where basename and path coincide. Reproduced as
+      <code>[]</code>; now keyed by <code>(tar_file, member_path)</code>.</td></tr>
+
+  <tr><td>The distillation auxiliary loss used a mask-normalised mean while the primary term is
+      measured through an attention softmax. Padding changes the softmax denominator but not a
+      masked mean, so the two terms disagreed about what a "position" is.</td>
+      <td>A plausible-looking helper. Replaced with <code>padded_mean(x, mask, length)</code>,
+      which normalises by the same padded length the attention does.</td></tr>
+
+  <tr><td>LoRA targeted <code>RefinerBlock</code>, so <code>cap_embedder</code> — which hangs off
+      <code>ContextRefiner</code>, not off any block — was never adapted. The one projection that
+      has to move for a new text encoder to land was frozen in every adapter run.</td>
+      <td><code>get_target_modules</code> matches a class name and then walks only that module's
+      own <code>nn.Linear</code>s. Target changed to <code>ContextRefiner</code>; a test now
+      asserts a <code>cap_embedder</code> LoRA parameter exists.</td></tr>
+
+  <tr><td><code>train_context_refiner</code> wrote its refiner beside the adapter in the same save
+      directory. Two <code>.safetensors</code> in one directory makes
+      <code>load_adapter_weights</code> raise on resume.</td>
+      <td>Only ever exercised as a fresh run. The refiner now goes to a
+      <code>context_refiner/</code> subdirectory.</td></tr>
+
+  <tr><td>Docs said <code>n_refiner_layers</code> is "ignored" when the checkpoint carries a
+      refiner. The code raises on a conflict — deliberately, after the silent-weight-drop bug
+      earlier on this branch.</td>
+      <td>The doc was written before that fix and never revisited. Docs corrected, and the key
+      removed from the configs that point at refiner-bearing checkpoints.</td></tr>
+
+  <tr><td>A blanket rename of the Unsloth references also rewrote the README line that
+      <em>documents the Unsloth option itself</em>.</td>
+      <td>Self-inflicted, by <code>sed</code> over a whole file instead of a located line.
+      Reverted.</td></tr>
+
+  <tr><td><code>--device cpu</code> in the sampler was broken twice over: an unconditional
+      <code>.to('cuda')</code> on the VAE statistics, and a float32 timestep fed to a bf16
+      model.</td>
+      <td>The CPU path was added for testability and then never run end to end on CPU. Both
+      fixed; it now runs.</td></tr>
+
+  <tr><td>A fractional <code>num_repeats</code> crashed caption enumeration, and a
+      <code>config['probe']</code> subscript assumed an optional key was present.</td>
+      <td>Two ordinary omissions. Repeats now expand as
+      <code>int(len(captions) * num_repeats)</code> with wraparound indexing.</td></tr>
+</table>
+
+<p>The twelfth finding — that <code>implementation-notes.html</code> is a stray artifact this
+branch introduced — is <strong>wrong</strong>. The file predates the branch (commit
+<code>a0efffa</code>) and is the document you are reading. Recorded here rather than quietly
+dropped, because a QA pass being right eleven times out of twelve is exactly the pattern that
+makes the twelfth easy to accept without checking.</p>
+
+<p>What the two passes have in common is worth naming: not one of these fourteen defects was a
+wrong algorithm. They were an import order, a prefix, a mask, a dict key, a class name, a
+directory layout, and a doc that had drifted from its code. All of them sit in the seams between
+two pieces that were each individually correct.</p>
+
 <h3>Not verified</h3>
 
 <div class="flag">

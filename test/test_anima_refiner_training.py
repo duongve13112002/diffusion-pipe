@@ -346,7 +346,7 @@ class TestAdapterConfiguration:
                 self.transformer = transformer
                 self.use_context_refiner = True
                 self.model_config = {'dtype': torch.float32}
-                self.adapter_target_modules = ['Block', 'RefinerBlock']
+                self.adapter_target_modules = ['Block', 'ContextRefiner']
 
         stub = Stub(dit)
         adapter_config = {'type': 'lora', 'rank': 4, 'alpha': 4, 'dropout': 0.0, 'dtype': torch.float32}
@@ -374,8 +374,13 @@ class TestAdapterConfiguration:
         dit = build_dit()
         stub = self.configure(dit, train_context_refiner=False)
         counts = self.counts(dit)
-        assert 'RefinerBlock' in stub.adapter_target_modules
+        assert 'ContextRefiner' in stub.adapter_target_modules
         assert counts['lora_on_refiner'] > 0
+        # cap_embedder is the 2048->1024 projection absorbing the whole distribution gap and
+        # the largest tensor in the refiner. Targeting RefinerBlock instead would silently
+        # leave it frozen while this assertion's weaker sibling above still passed.
+        adapted = [n for n, p in dit.named_parameters() if p.requires_grad]
+        assert any('cap_embedder' in n and 'lora_' in n for n in adapted), 'cap_embedder must be adapted'
         assert counts['dense_refiner'] == 0, 'base weights must stay frozen under peft'
         assert counts['lora_on_dit'] > 0
 
@@ -384,7 +389,7 @@ class TestAdapterConfiguration:
         dit = build_dit()
         stub = self.configure(dit, train_context_refiner=True)
         counts = self.counts(dit)
-        assert 'RefinerBlock' not in stub.adapter_target_modules
+        assert 'ContextRefiner' not in stub.adapter_target_modules
         assert counts['lora_on_refiner'] == 0
         assert counts['dense_refiner'] > 0
         assert counts['lora_on_dit'] > 0, 'the DiT must still get its adapter'

@@ -37,7 +37,8 @@ dtype = 'bfloat16'
 transformer_dtype = 'float8_e5m2'  # e4m3fn does NOT work well on this model family
 
 llm_hidden_layer = -1
-n_refiner_layers = 6
+# n_refiner_layers is omitted: transformer_path already carries a refiner, and its layer
+# count is read from those weights. Setting it here would raise if the two disagree.
 max_text_length = 512
 # Needed if transformer_path does not already contain trained refiner weights.
 #context_refiner_path = '/data/output/anima_refiner_distill/context_refiner.safetensors'

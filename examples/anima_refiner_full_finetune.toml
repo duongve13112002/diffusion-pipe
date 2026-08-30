@@ -40,7 +40,8 @@ llm_path = '/data2/imagegen_models/Qwen3.5-2B-Base'
 dtype = 'bfloat16'
 
 llm_hidden_layer = -1
-n_refiner_layers = 6
+# n_refiner_layers is omitted: transformer_path already carries a refiner, and its layer
+# count is read from those weights. Setting it here would raise if the two disagree.
 max_text_length = 512
 
 # Per-group learning rates still apply. Everything defaults to base_lr; these let you keep the

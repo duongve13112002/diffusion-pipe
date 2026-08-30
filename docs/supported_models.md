@@ -580,7 +580,7 @@ llm_path = '/data2/imagegen_models/Qwen3.5-2B-Base'
 dtype = 'bfloat16'
 
 llm_hidden_layer = -1   # which hidden_states index feeds the refiner
-n_refiner_layers = 6    # ignored once the checkpoint carries a trained refiner
+n_refiner_layers = 6    # only for a FRESH refiner; omit once the checkpoint carries one
 max_text_length = 512
 
 # refiner_only: train just the refiner, freeze the DiT.

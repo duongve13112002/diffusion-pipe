@@ -119,31 +119,41 @@ def enumerate_captions(dataset_config, apply_num_repeats=False):
                 caption_data = json.load(f)
 
         files = sorted(path.glob('*'))
-        media_files = []
+        # (tar_file_or_None, path_within_or_on_disk), mirroring DirectoryDataset's image_spec.
+        # The distinction matters for captions.json lookups: DirectoryDataset keys a plain file
+        # by basename but a tar member by its full path inside the archive.
+        media_specs = []
         for file in files:
             if not file.is_file() or file.suffix in NON_MEDIA_SUFFIXES:
                 continue
             if file.suffix == '.tar':
                 with tarfile.TarFile(file) as tar_f:
-                    media_files.extend(Path(name) for name in tar_f.getnames())
+                    media_specs.extend((file, Path(name)) for name in tar_f.getnames())
             else:
-                media_files.append(file)
+                media_specs.append((None, file))
 
-        if not media_files and caption_data is None:
+        if not media_specs and caption_data is None:
             # Text-only directory: take the caption files themselves as the unit of work.
-            media_files = [f for f in files if f.is_file() and f.suffix == '.txt']
+            media_specs = [(None, f) for f in files if f.is_file() and f.suffix == '.txt']
 
         directory_captions = []
-        for media_file in media_files:
+        for tar_file, media_file in media_specs:
             item = None
             if caption_data is not None:
-                item = caption_data.get(media_file.name, None)
+                key = str(media_file) if tar_file is not None else media_file.name
+                item = caption_data.get(key, None)
                 if item is None:
-                    logger.warning(f'{media_file.name} has no entry in {CAPTIONS_JSON_FILE}')
+                    logger.warning(f'{key} has no entry in {CAPTIONS_JSON_FILE}')
                 else:
                     assert isinstance(item, list), f'{CAPTIONS_JSON_FILE} must contain lists of captions'
-            if item is None:
-                caption_file = media_file if media_file.suffix == '.txt' else media_file.with_suffix('.txt')
+            elif media_file.suffix == '.txt':
+                item = [media_file.read_text().strip()]
+            else:
+                # DirectoryDataset disables the .txt fallback for the WHOLE directory as soon as
+                # a captions.json exists (`if has_captions_json or not os.path.exists(...)`).
+                # Keeping the fallback here would feed distillation captions the diffusion
+                # stages never see, which is the drift this helper exists to prevent.
+                caption_file = media_file.with_suffix('.txt')
                 if caption_file.exists():
                     item = [caption_file.read_text().strip()]
             if item is None:
@@ -153,7 +163,11 @@ def enumerate_captions(dataset_config, apply_num_repeats=False):
                 item = ['']
             directory_captions.extend(shuffle_captions(item, shuffle_num, delimiter, caption_prefix))
 
-        captions.extend(directory_captions * num_repeats)
+        # num_repeats may be fractional -- SizeBucketDataset accepts any value > 0 and takes
+        # int(len * num_repeats), so mirror that rather than assuming an integer.
+        if directory_captions:
+            total = int(len(directory_captions) * num_repeats)
+            captions.extend(directory_captions[i % len(directory_captions)] for i in range(total))
 
     return captions
 

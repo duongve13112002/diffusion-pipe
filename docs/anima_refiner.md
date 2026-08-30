@@ -284,10 +284,14 @@ Keep `cross_attn_lr` roughly 10x below `refiner_lr`. Structural knowledge lives 
 
 ## LoRA and LoKr
 
-LoRA targets `Block` and `RefinerBlock`. A low-rank update needs something to build on, so
+LoRA targets `Block` and `ContextRefiner` -- the latter rather than `RefinerBlock`, because
+`get_target_modules` only walks the matched module's own Linears, and `cap_embedder` hangs
+off `ContextRefiner`. A low-rank update needs something to build on, so
 either point `context_refiner_path` at a trained refiner, or set `train_context_refiner = true`
 in `[adapter]`, which excludes the refiner from the adapter, trains it densely alongside, and
-saves it as `context_refiner.safetensors`.
+saves it as `context_refiner/context_refiner.safetensors` -- in a subdirectory, because
+`load_adapter_weights` globs `*.safetensors` in the save dir and raises on more than one
+match, so a second file beside the adapter would break `init_from_existing`.
 
 Block swapping requires an `[adapter]` block (`train.py` asserts this), so it is available for
 LoRA and LoKr but not for the frozen-DiT modes or a full fine tune. Use `pipeline_stages`
@@ -343,7 +347,7 @@ Every key below is read only when `type = 'anima_refiner'`.
 | `llm_config_path` | `configs/qwen3_5_2b_base` | config/tokenizer dir when `llm_path` is a file |
 | `llm_repo_id` | — | Hub repo to fetch config/tokenizer from instead |
 | `llm_hidden_layer` | `None` (last) | index into `hidden_states` |
-| `n_refiner_layers` | `6` | refiner blocks; **ignored** when the weights already say |
+| `n_refiner_layers` | `6` | refiner blocks. Used only when building a fresh refiner; **omit it** when the checkpoint carries one, because a value that disagrees with the weights raises |
 | `max_text_length` | `512` | padded token length |
 | `context_refiner_path` | — | separate refiner file; overrides the checkpoint's, with a warning |
 | `cache_text_embeddings` | `true` | cache to disk, or run the encoder inline |

@@ -296,8 +296,12 @@ class CosmosPredict2Pipeline(BasePipeline):
             self.max_text_length = self.model_config.get('max_text_length', 512)
             self.llm_hidden_layer = self.model_config.get('llm_hidden_layer', None)
             # 'TransformerBlock' would match the LLMAdapter blocks, which this architecture
-            # doesn't build. RefinerBlock takes its place as the LoRA/LoKr target.
-            self.adapter_target_modules = ['Block', 'RefinerBlock']
+            # doesn't build. ContextRefiner takes its place -- and it, not RefinerBlock, because
+            # get_target_modules walks the matched module's own Linears: cap_embedder and
+            # norm_out hang off ContextRefiner, so targeting RefinerBlock would leave
+            # cap_embedder unadapted. That is the single 2048->1024 projection absorbing the
+            # whole LLM-to-DiT distribution gap, and the largest tensor in the refiner.
+            self.adapter_target_modules = ['Block', 'ContextRefiner']
             # The refiner is new, so it has no pretrained singular directions for OPLoRA to
             # protect. Two of its six Linear layers per block are zero-initialised as well,
             # where the "top-k subspace" is an arbitrary basis and projecting against it would
@@ -310,9 +314,12 @@ class CosmosPredict2Pipeline(BasePipeline):
             device='cpu',
             dtype=dtype,
         )
-        # These need to be on the device the VAE will be moved to during caching.
-        self.vae.mean = self.vae.mean.to('cuda')
-        self.vae.std = self.vae.std.to('cuda')
+        # These need to be on the device the VAE will be moved to during caching. Guarded so a
+        # CPU-only box can still construct the pipeline (tools/sample_anima_refiner.py offers
+        # --device cpu); on a GPU box this is unchanged.
+        if torch.cuda.is_available():
+            self.vae.mean = self.vae.mean.to('cuda')
+            self.vae.std = self.vae.std.to('cuda')
         self.vae.scale = [self.vae.mean, 1.0 / self.vae.std]
 
         self.is_generic_llm = False
@@ -594,7 +601,7 @@ class CosmosPredict2Pipeline(BasePipeline):
         # context_refiner_path.
         self.train_context_refiner = self.use_context_refiner and adapter_config.get('train_context_refiner', False)
         if self.train_context_refiner:
-            self.adapter_target_modules = [m for m in self.adapter_target_modules if m != 'RefinerBlock']
+            self.adapter_target_modules = [m for m in self.adapter_target_modules if m != 'ContextRefiner']
 
         super().configure_adapter(adapter_config)
 
@@ -617,7 +624,12 @@ class CosmosPredict2Pipeline(BasePipeline):
                 k = k[k.index('context_refiner.') + len('context_refiner.'):].replace('.base_layer', '')
                 refiner_state_dict[k] = v
         if refiner_state_dict:
-            safetensors.torch.save_file(refiner_state_dict, save_dir / 'context_refiner.safetensors', metadata={'format': 'pt'})
+            # A subdirectory, because load_adapter_weights() globs '*.safetensors' in the
+            # save dir and raises on more than one match -- a second file beside the
+            # adapter would break init_from_existing for this run's own output.
+            refiner_dir = save_dir / 'context_refiner'
+            refiner_dir.mkdir(parents=True, exist_ok=True)
+            safetensors.torch.save_file(refiner_state_dict, refiner_dir / 'context_refiner.safetensors', metadata={'format': 'pt'})
         # ComfyUI format.
         peft_state_dict = {'diffusion_model.'+k: v for k, v in peft_state_dict.items()}
         safetensors.torch.save_file(peft_state_dict, save_dir / 'adapter_model.safetensors', metadata={'format': 'pt'})

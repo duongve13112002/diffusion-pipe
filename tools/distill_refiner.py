@@ -118,7 +118,7 @@ def build_teacher(config, dtype, device):
     llm_adapter = dit.llm_adapter
     # Probe through a spread of blocks rather than all of them: adjacent blocks give highly
     # correlated signal, so a subset covers the same ground for less compute.
-    num_probe_blocks = config['probe'].get('num_blocks', 8)
+    num_probe_blocks = config.get('probe', {}).get('num_blocks', 8)
     num_probe_blocks = min(num_probe_blocks, len(dit.blocks))
     stride = max(1, len(dit.blocks) // num_probe_blocks)
     block_indices = list(range(0, len(dit.blocks), stride))[:num_probe_blocks]
@@ -219,9 +219,22 @@ def encode(text_encoder, input_ids, attn_mask, hidden_layer):
     return out
 
 
-def masked_mean(x, mask):
+def padded_mean(x, mask, length):
+    """Sum over real tokens divided by the PADDED length, not by the number of real tokens.
+
+    This has to match how the probe-attention term behaves. Padded context rows project to
+    k = 0 (k_proj has no bias and RMSNorm(0) = 0), so every padded position still contributes
+    exp(0) = 1 to the attention softmax denominator while contributing nothing to the
+    numerator. At max_text_length = 512 with a 20-token caption, ~490 pad terms dominate that
+    denominator, which makes the cross-attention output a strong function of the token COUNT.
+
+    Teacher and student tokenize the same caption into different numbers of real tokens, so a
+    mean over real tokens (the obvious choice) and the attention term pull in different
+    directions and cannot both be satisfied. Dividing by the shared padded length keeps the two
+    terms consistent.
+    """
     mask = mask.unsqueeze(-1).to(x.dtype)
-    return (x * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1.0)
+    return (x * mask).sum(dim=1) / length
 
 
 def main():
@@ -263,7 +276,7 @@ def main():
     # any query set works as a measuring stick; a fixed one keeps the objective stationary
     # across steps. Matching the output for many random queries is a strong proxy for matching
     # the key/value content itself, without ever comparing individual token positions.
-    num_queries = config['probe'].get('num_queries', 64)
+    num_queries = config.get('probe', {}).get('num_queries', 64)
     generator = torch.Generator(device='cpu').manual_seed(seed)
     probe = torch.randn(1, num_queries, model_channels, generator=generator).to(device=device, dtype=dtype)
 
@@ -328,8 +341,8 @@ def main():
         # early on while the probe-attention term is still dominated by noise.
         if pooled_weight > 0:
             pooled_loss = F.mse_loss(
-                masked_mean(student_feats.float(), s_mask),
-                masked_mean(teacher_feats.float(), t5_mask),
+                padded_mean(student_feats.float(), s_mask, max_text_length),
+                padded_mean(teacher_feats.float(), t5_mask, max_text_length),
             )
             loss = loss + pooled_weight * pooled_loss
 

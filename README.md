@@ -149,7 +149,7 @@ The [wan_14b_min_vram.toml](./examples/wan_14b_min_vram.toml) example file has a
   - ```PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True NCCL_P2P_DISABLE="1" NCCL_IB_DISABLE="1" deepspeed --num_gpus=1 train.py --deepspeed --config /home/you/path/to/config.toml```
   - I've seen this help a lot when training on video with multiple aspect ratio buckets.
   - On my system, sometimes this causes random CUDA failures. If training gets through a few steps though, it will train indefinitely without failures. Very weird.
-- Use unsloth activation checkpointing: ```activation_checkpointing = true```
+- Use unsloth activation checkpointing: ```activation_checkpointing = 'unsloth'```
 
 ## Parallelism
 This code uses hybrid data- and pipeline-parallelism. Set the ```--num_gpus``` flag appropriately for your setup. Set ```pipeline_stages``` in the config file to control the degree of pipeline parallelism. Then the data parallelism degree will automatically be set to use all GPUs (number of GPUs must be divisible by pipeline_stages). For example, with 4 GPUs and pipeline_stages=2, you will run two instances of the model, each divided across two GPUs.
