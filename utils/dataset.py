@@ -81,6 +81,83 @@ def seed_from_hash(item):
     return int(hashlib.md5(str.encode(str(item))).hexdigest(), 16) % int(1e9)
 
 
+# Extensions DirectoryDataset skips when enumerating media files.
+NON_MEDIA_SUFFIXES = ('.txt', '.npz', '.json', '.parquet', '.bak', '.db')
+
+
+def enumerate_captions(dataset_config, apply_num_repeats=False):
+    """Return every caption in a dataset config, without opening any media file.
+
+    This mirrors the caption resolution DirectoryDataset does (captions.json first, then a
+    matching .txt, then skip_empty_caption) and applies the same caption_prefix and tag
+    shuffling, so callers see the caption distribution training will see. It exists for tools
+    that need captions but not images -- tools/distill_refiner.py trains only the text frontend
+    and never touches the VAE or the DiT's image path.
+
+    As an accommodation for that use case, a directory holding only caption files with no
+    media alongside them is accepted: DirectoryDataset would assert, but for a text-only tool
+    the images are genuinely not needed.
+    """
+    captions = []
+    for directory_config in dataset_config['directory']:
+        def setting(key, default):
+            return directory_config.get(key, dataset_config.get(key, default))
+
+        path = Path(directory_config['path'])
+        caption_prefix = setting('caption_prefix', '')
+        shuffle_num = setting('cache_shuffle_num', 0)
+        if setting('shuffle_tags', False) and shuffle_num == 0:
+            shuffle_num = 1  # backwards compatibility, same as DirectoryDataset
+        delimiter = setting('cache_shuffle_delimiter', ', ')
+        skip_empty_caption = setting('skip_empty_caption', True)
+        num_repeats = setting('num_repeats', 1) if apply_num_repeats else 1
+
+        caption_data = None
+        captions_json = path / CAPTIONS_JSON_FILE
+        if captions_json.exists():
+            with open(captions_json) as f:
+                caption_data = json.load(f)
+
+        files = sorted(path.glob('*'))
+        media_files = []
+        for file in files:
+            if not file.is_file() or file.suffix in NON_MEDIA_SUFFIXES:
+                continue
+            if file.suffix == '.tar':
+                with tarfile.TarFile(file) as tar_f:
+                    media_files.extend(Path(name) for name in tar_f.getnames())
+            else:
+                media_files.append(file)
+
+        if not media_files and caption_data is None:
+            # Text-only directory: take the caption files themselves as the unit of work.
+            media_files = [f for f in files if f.is_file() and f.suffix == '.txt']
+
+        directory_captions = []
+        for media_file in media_files:
+            item = None
+            if caption_data is not None:
+                item = caption_data.get(media_file.name, None)
+                if item is None:
+                    logger.warning(f'{media_file.name} has no entry in {CAPTIONS_JSON_FILE}')
+                else:
+                    assert isinstance(item, list), f'{CAPTIONS_JSON_FILE} must contain lists of captions'
+            if item is None:
+                caption_file = media_file if media_file.suffix == '.txt' else media_file.with_suffix('.txt')
+                if caption_file.exists():
+                    item = [caption_file.read_text().strip()]
+            if item is None:
+                if skip_empty_caption:
+                    logger.warning(f'Could not find caption for {media_file}. Skipping.')
+                    continue
+                item = ['']
+            directory_captions.extend(shuffle_captions(item, shuffle_num, delimiter, caption_prefix))
+
+        captions.extend(directory_captions * num_repeats)
+
+    return captions
+
+
 def _map_and_cache(dataset, map_fn, cache_dir, cache_file_prefix='', new_fingerprint_args=None, regenerate_cache=False, caching_batch_size=1):
     new_fingerprint_args = [] if new_fingerprint_args is None else new_fingerprint_args
     new_fingerprint_args.append(dataset._fingerprint)

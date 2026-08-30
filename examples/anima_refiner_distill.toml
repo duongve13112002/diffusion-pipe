@@ -11,8 +11,19 @@
 # LLMAdapter and a handful of the DiT's cross-attention modules.
 
 [distill]
-# One caption per line, or a directory of .txt caption files (rglob'd).
-captions = '/data/anime_dataset/captions.txt'
+# The ordinary dataset.toml, the same one every other training mode uses. Captions are read
+# through the same rules training uses -- captions.json or matching .txt, caption_prefix, tag
+# shuffling -- so this stage sees exactly the caption distribution training will see. Images
+# are never opened: only the text frontend trains here.
+dataset = 'examples/dataset.toml'
+# Set true to honour num_repeats from the dataset config. Off by default: repeats exist to
+# rebalance how often images are sampled, which does not mean much for captions alone.
+#apply_num_repeats = false
+
+# Fallback when there is no dataset.toml to hand: a file with one caption per line, or a
+# directory of .txt files. Ignored when 'dataset' is set.
+#captions = '/data/anime_dataset/captions.txt'
+
 output_dir = '/data/output/anima_refiner_distill'
 
 steps = 20000

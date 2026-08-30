@@ -53,20 +53,36 @@ from models.cosmos_predict2 import get_dit_config
 from models.cosmos_predict2_modeling import MiniTrainDIT
 from models.text_refiner import ContextRefiner
 from utils.common import iterate_safetensors, load_state_dict
+from utils.dataset import enumerate_captions
 
 MAX_TEXT_LENGTH_DEFAULT = 512
 
 
-def load_captions(spec):
-    """Read captions from a file with one caption per line, or a directory of .txt files."""
-    path = Path(spec)
+def load_captions(config):
+    """Get the captions to distil on, preferring the ordinary dataset.toml flow.
+
+    `dataset` points at the same dataset.toml every other training mode uses, so the captions
+    seen here are exactly the ones training will see -- same directories, same captions.json /
+    .txt resolution, same caption_prefix and tag shuffling. Images are never opened: this stage
+    trains only the text frontend.
+
+    `captions` is a fallback for when there is no dataset.toml to hand: either a file with one
+    caption per line, or a directory of .txt files.
+    """
+    distill_config = config['distill']
+    if 'dataset' in distill_config:
+        dataset_config = toml.load(distill_config['dataset'])
+        return enumerate_captions(dataset_config, apply_num_repeats=distill_config.get('apply_num_repeats', False))
+
+    if 'captions' not in distill_config:
+        raise RuntimeError("set either 'dataset' (a dataset.toml) or 'captions' under [distill]")
+
+    path = Path(distill_config['captions'])
     if path.is_dir():
-        captions = []
-        for txt in sorted(path.rglob('*.txt')):
-            text = txt.read_text(encoding='utf-8').strip()
-            if text:
-                captions.append(text)
-        return captions
+        return [
+            text for txt in sorted(path.rglob('*.txt'))
+            if (text := txt.read_text(encoding='utf-8').strip())
+        ]
     return [line.strip() for line in path.read_text(encoding='utf-8').splitlines() if line.strip()]
 
 
@@ -191,9 +207,9 @@ def main():
     torch.manual_seed(seed)
     random.seed(seed)
 
-    captions = load_captions(config['distill']['captions'])
+    captions = load_captions(config)
     if not captions:
-        raise RuntimeError(f"No captions found at {config['distill']['captions']}")
+        raise RuntimeError('No captions found. Check the dataset / captions path under [distill].')
     print(f'Loaded {len(captions)} captions')
 
     print('Building teacher...')

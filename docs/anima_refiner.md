@@ -81,6 +81,23 @@ Captions only. No images, no VAE, no diffusion, roughly 6GB of VRAM. It teaches 
 refiner to reproduce what Anima's existing `llm_adapter` already emits, which is by definition
 what the frozen DiT knows how to read.
 
+Captions come from the ordinary `dataset.toml` — the same file every other mode uses:
+
+```toml
+[distill]
+dataset = 'examples/dataset.toml'
+```
+
+They are resolved by the same rules `DirectoryDataset` applies (`captions.json` first, then a
+matching `.txt`, then `skip_empty_caption`) with the same `caption_prefix` and tag shuffling,
+so this stage sees the caption distribution training will see. Images are enumerated but never
+opened. `num_repeats` is ignored unless `apply_num_repeats = true`: repeats exist to rebalance
+how often *images* are sampled, which means little for captions on their own. A directory
+holding only `.txt` files and no media works too, since nothing here needs images.
+
+For a dataset that has no `dataset.toml`, `captions` takes a file with one caption per line or
+a directory of `.txt` files instead.
+
 **Why the loss is measured at the cross-attention output.** The obvious objective, a
 position-wise MSE between teacher and student features, does not work. Both sides are
 `(B, L, 1024)` so the shapes match and the code runs — but the teacher's positions are indexed

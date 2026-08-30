@@ -360,3 +360,82 @@ class TestAdapterSaving:
         assert set(written['adapter_model.safetensors']) == {
             'diffusion_model.blocks.0.cross_attn.k_proj.lora_A.weight'
         }
+
+
+class TestCaptionEnumeration:
+    """tools/distill_refiner.py reads captions through the ordinary dataset.toml flow.
+
+    It must resolve captions the same way DirectoryDataset does, so the distillation stage
+    sees the caption distribution training will see -- while never opening an image.
+    """
+
+    @staticmethod
+    def enumerate_captions(*args, **kwargs):
+        dataset = pytest.importorskip('utils.dataset')
+        return dataset.enumerate_captions(*args, **kwargs)
+
+    @staticmethod
+    def make_dir(tmp_path, files):
+        for name, content in files.items():
+            (tmp_path / name).write_text(content)
+        return {'directory': [{'path': str(tmp_path)}]}
+
+    def test_reads_txt_captions_next_to_images(self, tmp_path):
+        config = self.make_dir(tmp_path, {
+            'a.jpg': 'x', 'a.txt': '1girl, solo',
+            'b.jpg': 'x', 'b.txt': 'landscape',
+        })
+        assert sorted(self.enumerate_captions(config)) == ['1girl, solo', 'landscape']
+
+    def test_captions_json_takes_priority(self, tmp_path):
+        config = self.make_dir(tmp_path, {
+            'a.jpg': 'x', 'a.txt': 'from txt',
+            'captions.json': '{"a.jpg": ["from json"]}',
+        })
+        assert self.enumerate_captions(config) == ['from json']
+
+    def test_caption_prefix_is_applied(self, tmp_path):
+        config = self.make_dir(tmp_path, {'a.jpg': 'x', 'a.txt': '1girl'})
+        config['caption_prefix'] = 'anime, '
+        assert self.enumerate_captions(config) == ['anime, 1girl']
+
+    def test_skip_empty_caption(self, tmp_path):
+        config = self.make_dir(tmp_path, {'a.jpg': 'x', 'b.jpg': 'x', 'b.txt': 'has one'})
+        assert self.enumerate_captions(config) == ['has one']
+
+        config['skip_empty_caption'] = False
+        assert sorted(self.enumerate_captions(config)) == ['', 'has one']
+
+    def test_tag_shuffling_multiplies_captions(self, tmp_path):
+        config = self.make_dir(tmp_path, {'a.jpg': 'x', 'a.txt': 'one, two, three'})
+        config['cache_shuffle_num'] = 4
+        captions = self.enumerate_captions(config)
+        assert len(captions) == 4
+        for caption in captions:
+            assert sorted(caption.split(', ')) == ['one', 'three', 'two']
+
+    def test_num_repeats_is_opt_in(self, tmp_path):
+        config = self.make_dir(tmp_path, {'a.jpg': 'x', 'a.txt': 'c'})
+        config['directory'][0]['num_repeats'] = 3
+        assert self.enumerate_captions(config) == ['c']
+        assert self.enumerate_captions(config, apply_num_repeats=True) == ['c', 'c', 'c']
+
+    def test_text_only_directory_is_accepted(self, tmp_path):
+        """Distillation needs no images, so a folder of bare .txt files still works."""
+        config = self.make_dir(tmp_path, {'a.txt': 'first', 'b.txt': 'second'})
+        assert sorted(self.enumerate_captions(config)) == ['first', 'second']
+
+    def test_multiple_directories_are_concatenated(self, tmp_path):
+        d1, d2 = tmp_path / 'one', tmp_path / 'two'
+        d1.mkdir(); d2.mkdir()
+        (d1 / 'a.jpg').write_text('x'); (d1 / 'a.txt').write_text('from one')
+        (d2 / 'b.jpg').write_text('x'); (d2 / 'b.txt').write_text('from two')
+        config = {'directory': [{'path': str(d1)}, {'path': str(d2)}]}
+        assert sorted(self.enumerate_captions(config)) == ['from one', 'from two']
+
+    def test_non_media_files_are_not_treated_as_images(self, tmp_path):
+        config = self.make_dir(tmp_path, {
+            'a.jpg': 'x', 'a.txt': 'real',
+            'notes.bak': 'x', 'cache.db': 'x', 'meta.parquet': 'x', 'z.npz': 'x',
+        })
+        assert self.enumerate_captions(config) == ['real']
