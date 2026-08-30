@@ -33,6 +33,116 @@
 <p class="meta">A running log of decisions taken outside the spec, forced changes, tradeoffs, and
 anything else the maintainer needs to know. Newest entry first.</p>
 
+<h2>2026-08-30 — Anima Refiner: replacing Anima's LLMAdapter text frontend</h2>
+
+<p><strong>Request.</strong> Add an architecture that swaps Anima's <code>LLMAdapter</code> for the
+<code>cap_embedder</code> + bidirectional refiner blocks that Lumina 2 and Z-Image use, so any
+Transformers LLM (target: Qwen3.5-2B-Base) can drive the DiT. New model type
+<code>anima_refiner</code>; <code>cosmos_predict2</code> and <code>anima</code> must be untouched.</p>
+
+<h3>Why the adapter exists at all</h3>
+
+<p>Worth recording, because it explains the whole design. In ComfyUI Anima is literally
+<code>class Anima(MiniTrainDIT)</code> — a Cosmos-Predict2 DiT whose only addition is the adapter.
+Cosmos-Predict2 feeds old-T5 encoder output straight into cross-attention with no adapter, so the
+adapter is a retrofit letting a Qwen3 LLM drive a T5-native DiT.</p>
+
+<p>The mismatch it papers over is <em>not</em> dimensional: old T5-XXL has
+<code>d_model = 1024</code> and Qwen3-0.6B has <code>hidden_size = 1024</code>. They already agree.
+A six-layer cross-attention module with a 32128-entry embedding table was built anyway, which is
+the evidence that the gap is representational — bidirectional encoder vs causal decoder, span
+corruption vs next-token, sentencepiece vs BPE.</p>
+
+<h3>Findings that changed the design</h3>
+
+<table>
+  <tr><th>Finding</th><th>Consequence</th></tr>
+  <tr><td>Qwen3.5 interleaves linear and full attention (<code>full_attention_interval = 4</code>), full-attention layers at 3/7/11/15/19/23</td>
+      <td><code>hidden_states[-2]</code>, Lumina 2's convention, lands after a <em>linear</em>-attention layer. Default is <code>-1</code> here.</td></tr>
+  <tr><td>Linear-attention layers are recurrences with no attention matrix</td>
+      <td>They cannot be made bidirectional by flipping a mask, so the refiner's bidirectional blocks are load-bearing, not decoration.</td></tr>
+  <tr><td><code>Qwen3.5-2B</code> and <code>Qwen3.5-2B-Base</code> have byte-identical <code>config.json</code></td>
+      <td>No architecture change needed for Base; only the tokenizer differs (<code>eos</code> <code>&lt;|endoftext|&gt;</code> vs <code>&lt;|im_end|&gt;</code>). Verified by fetching both.</td></tr>
+  <tr><td>Teacher and student features are indexed by <em>different</em> tokenizers</td>
+      <td>A position-wise distillation MSE runs without error while comparing unrelated slots. The loss is measured at the cross-attention output instead, which is a weighted sum over text positions and therefore invariant to indexing.</td></tr>
+</table>
+
+<h3>Mistakes made in the first version, and what fixed them</h3>
+
+<p>Recorded honestly, because four of them were regressions in code shared with other models.</p>
+
+<div class="flag">
+<p><strong>Shape derived from config instead of from the weights.</strong>
+<code>load_diffusion_model</code> loads with <code>if name not in state_dict: continue</code>, so a
+checkpoint holding more refiner layers than <code>n_refiner_layers</code> asked for silently lost
+the surplus. Measured: a 4-layer refiner loaded under the default of 6 dropped 24 tensors with no
+warning. Now the layer count and input dimension come from the weights, and a config that
+contradicts them raises.</p>
+</div>
+
+<div class="flag">
+<p><strong><code>cache_name</code> discarded the VAE latents.</strong> A config key was added to
+invalidate stale text embeddings when the text encoder changed. It worked by changing the
+pipeline's <code>name</code>, which is the root of the whole cache tree — so switching text encoder
+also threw away latents, by far the more expensive half, for a component that had not changed.
+Replaced by a text-encoder identity mixed into the <em>text embedding</em> fingerprint only.
+<code>anima_refiner</code> now also shares <code>anima</code>'s cache directory deliberately, so
+latents cached by an anima run are reused as is.</p>
+</div>
+
+<p>Three smaller leaks into shared code, all now gated on the model type: <code>base_lr</code> and
+<code>max_text_length</code> were read unconditionally, giving <code>anima</code> and
+<code>cosmos_predict2</code> config keys nobody asked for; and the vision-language branch of the
+<code>llm_path</code> directory loader changed how <code>anima</code> would load a VLM.</p>
+
+<p>One near-miss caught during implementation rather than after: the text-encoder identity was
+first appended to <code>new_fingerprint_args</code> unconditionally.
+<code>Hasher.hash([i])</code> and <code>Hasher.hash([i, ''])</code> differ, so that would have
+invalidated the text embedding cache of <em>every</em> model in the repo. Extra fingerprint args
+are now only appended when non-empty, and the old fingerprint was verified byte-for-byte.</p>
+
+<h3>Decisions made that were not in the request</h3>
+
+<ul>
+  <li><strong>OPLoRA excludes the refiner.</strong> OPLoRA projects a low-rank update away from the
+  top-k singular subspace of the pretrained base weight. A newly built refiner has no pretrained
+  weights to protect, and two of its six Linear layers per block are zero-initialised — where, as
+  measured, the SVD does not fail or produce NaN but returns an <em>arbitrary</em> orthonormal
+  basis. Projecting against that costs the adapter <code>rank</code> directions for nothing.
+  Implemented as a per-model <code>oplora_exclude_names</code>, empty everywhere else.</li>
+
+  <li><strong>Distillation reads <code>dataset.toml</code>.</strong> It originally took a bespoke
+  caption format while every other mode used the repo's. Now it goes through
+  <code>utils.dataset.enumerate_captions()</code>, which mirrors <code>DirectoryDataset</code>'s
+  resolution rules exactly. Images are enumerated to find their captions but never opened.</li>
+
+  <li><strong><code>context_refiner_path</code> wins over the checkpoint, loudly.</strong> Both
+  orderings are defensible; silence is not, so it warns naming both files every time.</li>
+
+  <li><strong>Stage numbering removed.</strong> <code>stage1</code>/<code>stage2</code> implied a
+  pipeline the code does not enforce — every mode loads identically and can run in any order. The
+  configs are named for what they train instead.</li>
+</ul>
+
+<h3>Not verified</h3>
+
+<div class="flag">
+<p>Development happened on a CPU-only box with no model weights. Everything is covered by CPU
+tests — including a real optimisation loop over the layer stack <code>to_layers()</code> builds,
+and sampling checked against a synthetic velocity field where the exact answer is known — but
+<strong>no training run, no multi-GPU run and no image was ever produced</strong>. Multi-GPU is
+covered indirectly by asserting the invariants pipeline parallelism depends on: constant tensor
+shapes across micro batches, and every layer boundary being a valid split point. Real DeepSpeed
+execution still needs <code>deepspeed --num_gpus=2 --module test.debug_deepspeed_init</code>.</p>
+</div>
+
+<p>Also unproven: sampling quality. <code>tools/sample_anima_refiner.py</code> is verified for
+integration math and shape handling, not for producing good images.</p>
+
+<p>See <a href="docs/anima_refiner.md">docs/anima_refiner.md</a> for the architecture and
+<a href="docs/anima_refiner_lessons.md">docs/anima_refiner_lessons.md</a> for the rules these
+mistakes turned into.</p>
+
 <h2>2026-07-29 — bitsandbytes 0.50 and torch 2.13 upstream drift</h2>
 
 <p><strong>Reported problem.</strong> Two crashes from the training box:

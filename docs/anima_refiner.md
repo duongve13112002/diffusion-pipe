@@ -81,6 +81,7 @@ There are two save formats, and `context_refiner.safetensors` is produced by onl
 | Mode | Produces | Where the refiner lives |
 |---|---|---|
 | `distill` | `context_refiner.safetensors` | that file (refiner **only**) |
+| `distill` with `save_full_model = true` | both, plus `model.safetensors` | inside it, under `net.context_refiner.*` |
 | `refiner_only` / `refiner_crossattn` / full fine tune | `model.safetensors` | inside it, under `net.context_refiner.*` |
 | LoRA / LoKr | `adapter_model.safetensors` | inside it, as adapter tensors |
 | LoRA / LoKr with `train_context_refiner = true` | both, plus `context_refiner.safetensors` | the separate file |
@@ -191,6 +192,13 @@ This is automatic. There is nothing to configure and no cache name to keep track
 other than `anima_refiner` supply no such identity, so their cache fingerprints are exactly
 what they were before.
 
+`anima_refiner` also shares `anima`'s cache directory on purpose. The directory name selects
+the whole tree, latents included, and the two use the same VAE — a separate name would
+discard latents that are still valid. So **latents cached by an `anima` run are reused as
+is**. The one caveat: latents are not fingerprinted by VAE, so pointing `anima_refiner` at a
+*different* VAE than the run that filled the cache would silently reuse the wrong ones. Pass
+`--regenerate_cache` when changing VAE.
+
 At `max_text_length = 512`, 3M images cache to roughly 6TB of text embeddings in bf16 at 2048
 dims. Set `cache_text_embeddings = false` to run the text encoder inside the training loop
 instead: no disk cost, about 4.5GB more VRAM, slower steps.
@@ -213,7 +221,15 @@ what the frozen DiT knows how to read.
 The teacher is always a **stock Anima checkpoint** — it is the only thing that has an
 `llm_adapter`. It is entirely separate from the model being trained, which is what lets you
 come back and distil again later: point `student.resume_from` at any refiner you already have,
-including one inside a full checkpoint saved by another mode.
+including one inside a full `model.safetensors` saved by another mode. When resuming, the
+refiner's layer count comes from those weights, not from `n_refiner_layers`, matching how the
+training pipeline resolves it.
+
+By default this writes `context_refiner.safetensors`, the refiner alone. Set
+`save_full_model = true` to also write a complete `model.safetensors` — the teacher's DiT
+with the refiner attached and `llm_adapter` dropped — so distillation produces the same kind
+of artefact every other mode does. The DiT weights are untouched, so it is exactly equivalent
+to pairing the Anima checkpoint with `context_refiner_path`.
 
 Captions come from the ordinary `dataset.toml`, resolved by the same rules `DirectoryDataset`
 applies (`captions.json` first, then a matching `.txt`, then `skip_empty_caption`) with the
@@ -277,11 +293,43 @@ Block swapping requires an `[adapter]` block (`train.py` asserts this), so it is
 LoRA and LoKr but not for the frozen-DiT modes or a full fine tune. Use `pipeline_stages`
 across GPUs there instead.
 
+## OPLoRA
+
+OPLoRA works as before, on the DiT's LoRA layers. The refiner is excluded from it: OPLoRA
+projects a low-rank update away from the top-k singular subspace of the **pretrained** base
+weight, and a newly built refiner has no pretrained weights to protect. Two of its six Linear
+layers per block are zero-initialised as well, where that subspace is whatever arbitrary
+orthonormal basis the SVD happens to return — projecting against it would cost the adapter
+`rank` directions for nothing. This does not fail loudly, which is why it is worth stating.
+
+The exclusion is per-model (`oplora_exclude_names`), empty for every other model, so nothing
+else changes.
+
 ## Activation checkpointing
 
 `activation_checkpointing = true` uses `torch.utils.checkpoint` with `use_reentrant=False`.
 Unsloth is used only when `activation_checkpointing = 'unsloth'` is written explicitly; there
 is no automatic fallback to it. All the example configs here use `true`.
+
+## Sampling
+
+```
+python -m tools.sample_anima_refiner \
+    --config examples/anima_refiner_refiner_only.toml \
+    --prompt '1girl, solo, blue eyes' \
+    --steps 30 --cfg 5 --output out.png
+```
+
+ComfyUI's `Anima` class has no `context_refiner`, so a model trained here cannot be sampled
+there yet. This script fills the gap. It reads the `[model]` table of a training config and
+loads through `CosmosPredict2Pipeline` — the same class and the same checkpoint-resolution
+rules training uses — then runs the layer stack `to_layers()` builds. There is no second copy
+of the loading logic to drift out of sync.
+
+Sampling is rectified-flow Euler, inverting what `prepare_inputs()` constructs: training
+builds `noisy = (1-t)*clean + t*noise` with target `noise - clean`, so the model predicts a
+velocity that is integrated from `t=1` down to `t=0`. `--shift` applies the same
+reparametrisation the training timestep sampling uses, defaulting to the config's `shift`.
 
 ## Config reference
 

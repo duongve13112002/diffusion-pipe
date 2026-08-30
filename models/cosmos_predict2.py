@@ -297,6 +297,11 @@ class CosmosPredict2Pipeline(BasePipeline):
             # 'TransformerBlock' would match the LLMAdapter blocks, which this architecture
             # doesn't build. RefinerBlock takes its place as the LoRA/LoKr target.
             self.adapter_target_modules = ['Block', 'RefinerBlock']
+            # The refiner is new, so it has no pretrained singular directions for OPLoRA to
+            # protect. Two of its six Linear layers per block are zero-initialised as well,
+            # where the "top-k subspace" is an arbitrary basis and projecting against it would
+            # cost the adapter rank directions for nothing.
+            self.oplora_exclude_names = ('context_refiner',)
 
         # This isn't a nn.Module.
         self.vae = WanVAE(
@@ -382,8 +387,17 @@ class CosmosPredict2Pipeline(BasePipeline):
                 self.tokenizer.pad_token = self.tokenizer.eos_token
             self.text_encoder.config.use_cache = False
             self.is_generic_llm = True
-            # text encoder is different from Cosmos, use a different cache dir
-            self.name = 'anima_refiner' if self.use_context_refiner else 'anima'
+            # text encoder is different from Cosmos, use a different cache dir.
+            #
+            # anima_refiner deliberately shares this name with anima. The name selects the whole
+            # cache tree, latents included, and the two use the same VAE -- so a separate name
+            # would throw away latents that are still perfectly valid, which is the expensive
+            # half to recompute. What actually differs between them is the text encoder, and
+            # that is handled precisely by text_encoder_cache_key() feeding the text embedding
+            # fingerprint. Note the consequence: pointing anima_refiner at a *different* VAE
+            # than the anima run that filled this cache would reuse the wrong latents, because
+            # latents are not fingerprinted by VAE. Pass --regenerate_cache when changing VAE.
+            self.name = 'anima'
         else:
             raise RuntimeError('Missing text encoder path')
 

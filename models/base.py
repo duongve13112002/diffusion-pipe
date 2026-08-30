@@ -220,6 +220,11 @@ class CommonPipeline:
     spatial_compression = 8
     channels = 16
     is_video_vae = False
+    # Substrings of module names OPLoRA must leave alone. OPLoRA protects a pretrained
+    # weight's dominant singular directions, which is meaningless for a module that has no
+    # pretrained weights to protect. Empty for every model that trains adapters purely on
+    # pretrained layers.
+    oplora_exclude_names = ()
 
     def __init__(self, *args, **kwargs):
         # sampling only

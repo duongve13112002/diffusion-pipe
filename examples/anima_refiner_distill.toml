@@ -25,6 +25,11 @@ dataset = 'examples/dataset.toml'
 #captions = '/data/anime_dataset/captions.txt'
 
 output_dir = '/data/output/anima_refiner_distill'
+# Also write a complete anima_refiner checkpoint (the teacher's DiT with the trained
+# refiner attached, llm_adapter dropped) so this mode produces the same kind of artefact
+# the others do: one file that is a whole model, usable directly as transformer_path.
+# Equivalent to pairing the Anima checkpoint with context_refiner_path by hand.
+#save_full_model = true
 
 steps = 20000
 batch_size = 16
@@ -58,10 +63,13 @@ llm_path = '/data2/imagegen_models/Qwen3.5-2B-Base'
 # and hidden_states[i] is the output of layer i-1, so -1 lands right after a full-attention
 # layer while -2 would land after a linear-attention one.
 llm_hidden_layer = -1
+# Ignored when resume_from is set: the layer count then comes from the weights.
 n_refiner_layers = 6
-model_dim = 1024
-# Resume a partially distilled refiner.
-#resume_from = '/data/output/anima_refiner_distill/context_refiner.safetensors'
+# Resume a refiner from anywhere: a bare context_refiner.safetensors, or a full
+# model.safetensors saved by refiner_only / refiner_crossattn / a full fine tune. The
+# teacher stays the stock Anima checkpoint either way, which is what makes distillation
+# reachable again from a model trained by any other mode.
+#resume_from = '/data/output/anima_refiner_refiner_crossattn/<run>/model.safetensors'
 
 [probe]
 # Fixed random queries pushed through the DiT's frozen cross-attention. The loss is measured

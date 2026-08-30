@@ -910,6 +910,7 @@ if __name__ == '__main__':
             rank=config['adapter']['oplora_rank'],
             full_svd=config['adapter']['oplora_full_svd'],
             base_seed=config['adapter']['oplora_seed'],
+            exclude_names=model.oplora_exclude_names,
         )
         if is_main_process():
             print(oplora_projector.describe())

@@ -147,7 +147,12 @@ def build_teacher(config, dtype, device):
     stride = max(1, len(dit.blocks) // num_probe_blocks)
     block_indices = list(range(0, len(dit.blocks), stride))[:num_probe_blocks]
     cross_attns = nn.ModuleList([dit.blocks[i].cross_attn for i in block_indices])
+    # Two different dimensions, easy to confuse: model_channels is the image side, which
+    # the probe queries live in, while crossattn_emb_channels is the text side the refiner
+    # must output. Passing the former as the refiner's model_dim would build a refiner
+    # twice the required width and fail at the first cross-attention.
     model_channels = dit_config['model_channels']
+    crossattn_emb_channels = dit_config['crossattn_emb_channels']
 
     # Everything else in the DiT is dead weight for this stage.
     dit.blocks = None
@@ -157,11 +162,19 @@ def build_teacher(config, dtype, device):
     text_encoder.to(device).eval().requires_grad_(False)
     llm_adapter.to(device).eval().requires_grad_(False)
     cross_attns.to(device).eval().requires_grad_(False)
-    return tokenizer, text_encoder, llm_adapter, cross_attns, model_channels
+    return tokenizer, text_encoder, llm_adapter, cross_attns, model_channels, crossattn_emb_channels
 
 
-def build_student(config, dtype, device):
-    """Source LLM plus a fresh (or resumed) ContextRefiner."""
+def build_student(config, dtype, device, model_dim):
+    """Source LLM plus a fresh (or resumed) ContextRefiner.
+
+    model_dim comes from the teacher DiT's crossattn_emb_channels rather than the config:
+    the refiner's output feeds that cross-attention, so the DiT is the authority on the size.
+
+    When resuming, the layer count is taken FROM THE RESUMED WEIGHTS for the same reason the
+    training pipeline derives it from the checkpoint -- a config that disagrees with the
+    weights is a mistake, not an instruction.
+    """
     llm_path = config['student']['llm_path']
     tokenizer = AutoTokenizer.from_pretrained(llm_path, local_files_only=True)
     llm_config = transformers.AutoConfig.from_pretrained(llm_path, local_files_only=True)
@@ -182,15 +195,38 @@ def build_student(config, dtype, device):
     text_encoder.config.use_cache = False
     text_encoder.to(device).eval().requires_grad_(False)
 
+    resume = config['student'].get('resume_from', None)
+    resumed_state_dict = extract_refiner_state_dict(resume) if resume else None
+
+    num_layers = config['student'].get('n_refiner_layers', 6)
+    if resumed_state_dict is not None:
+        derived_layers = 1 + max(
+            (int(k.split('.')[1]) for k in resumed_state_dict if k.startswith('blocks.')), default=-1
+        )
+        derived_cap_feat_dim = resumed_state_dict['cap_embedder.1.weight'].shape[1]
+        if config['student'].get('n_refiner_layers', None) not in (None, derived_layers):
+            raise RuntimeError(
+                f"n_refiner_layers={config['student']['n_refiner_layers']} in the config, but "
+                f'{resume} holds {derived_layers} layers. Remove n_refiner_layers to use what '
+                'the weights carry.'
+            )
+        if derived_cap_feat_dim != cap_feat_dim:
+            raise RuntimeError(
+                f'{resume} expects a text encoder with hidden size {derived_cap_feat_dim}, but '
+                f'llm_path provides {cap_feat_dim}. These weights were trained against a '
+                'different text encoder.'
+            )
+        num_layers = derived_layers
+
     refiner = ContextRefiner(
         cap_feat_dim=cap_feat_dim,
-        model_dim=config['student'].get('model_dim', 1024),
-        num_layers=config['student'].get('n_refiner_layers', 6),
+        model_dim=model_dim,
+        num_layers=num_layers,
     )
     refiner.init_weights()
-    if resume := config['student'].get('resume_from', None):
-        refiner.load_state_dict(extract_refiner_state_dict(resume))
-        print(f'Resumed refiner weights from {resume}')
+    if resumed_state_dict is not None:
+        refiner.load_state_dict(resumed_state_dict)
+        print(f'Resumed refiner weights from {resume} ({num_layers} layers)')
     # Trained in fp32 for stable optimisation; it is small enough that this is cheap.
     refiner.to(device=device, dtype=torch.float32).train()
     return tokenizer, text_encoder, refiner, cap_feat_dim
@@ -241,10 +277,10 @@ def main():
         vocab_file='configs/t5_old/spiece.model',
         tokenizer_file='configs/t5_old/tokenizer.json',
     )
-    teacher_tok, teacher_llm, llm_adapter, cross_attns, model_channels = build_teacher(config, dtype, device)
+    teacher_tok, teacher_llm, llm_adapter, cross_attns, model_channels, crossattn_emb_channels = build_teacher(config, dtype, device)
 
     print('Building student...')
-    student_tok, student_llm, refiner, cap_feat_dim = build_student(config, dtype, device)
+    student_tok, student_llm, refiner, cap_feat_dim = build_student(config, dtype, device, crossattn_emb_channels)
     print(f'Student LLM hidden size: {cap_feat_dim}')
 
     # Fixed probe queries. The cross-attention modules are frozen and shared by both paths, so
@@ -341,6 +377,33 @@ def main():
 
     save_refiner(refiner, output_dir / 'context_refiner.safetensors', dtype)
     print(f'Done. Point context_refiner_path at {output_dir / "context_refiner.safetensors"}')
+
+    if config['distill'].get('save_full_model', False):
+        path = output_dir / 'model.safetensors'
+        save_full_model(config['teacher']['transformer_path'], refiner, path, dtype)
+        print(f'Also wrote a full anima_refiner checkpoint to {path}. Use it as transformer_path.')
+
+
+def save_full_model(teacher_transformer_path, refiner, path, dtype):
+    """Write a complete anima_refiner checkpoint: the teacher's DiT with the refiner attached.
+
+    The DiT weights are unchanged, so this is exactly equivalent to passing the Anima
+    checkpoint as transformer_path alongside context_refiner_path. It exists so distillation
+    produces the same kind of artefact every other mode does -- a single file that is a whole
+    model -- instead of a component that has to be paired up by hand.
+
+    llm_adapter is dropped: this architecture does not build it, and leaving it in would be
+    dead weight in every future checkpoint.
+    """
+    state_dict = {}
+    for k, v in load_state_dict(teacher_transformer_path).items():
+        name = k[len('net.'):] if k.startswith('net.') else k
+        if name.startswith('llm_adapter.'):
+            continue
+        state_dict['net.' + name] = v.to(dtype).cpu().contiguous()
+    for k, v in refiner.state_dict().items():
+        state_dict['net.context_refiner.' + k] = v.detach().to(dtype).cpu().contiguous()
+    safetensors.torch.save_file(state_dict, str(path), metadata={'format': 'pt'})
 
 
 def save_refiner(refiner, path, dtype):

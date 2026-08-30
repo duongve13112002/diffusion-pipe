@@ -55,8 +55,10 @@ def _stable_seed(base_seed, key):
     return (base_seed ^ int.from_bytes(digest[:8], 'big')) & 0xFFFFFFFFFFFFFFFF
 
 
-def _iter_lora_layers(root):
+def _iter_lora_layers(root, exclude_names=()):
     for name, module in root.named_modules():
+        if any(excluded in name for excluded in exclude_names):
+            continue
         if hasattr(module, 'base_layer') and hasattr(module, 'lora_A') and hasattr(module, 'lora_B'):
             yield name, module
 
@@ -122,10 +124,11 @@ class _Entry:
 class OPLoRAProjector:
     """Builds and applies the OPLoRA projection for every LoRA layer under a module."""
 
-    def __init__(self, entries, rank, full_svd, num_skipped):
+    def __init__(self, entries, rank, full_svd, num_skipped, num_excluded=0):
         self._entries = entries
         self.rank = rank
         self.full_svd = full_svd
+        self.num_excluded = num_excluded
         self.num_skipped = num_skipped
 
     def __len__(self):
@@ -136,19 +139,30 @@ class OPLoRAProjector:
         # count is for the calling rank's stage, not the whole model.
         mode = 'full' if self.full_svd else 'randomized'
         extra = f', skipped {self.num_skipped} non-2D modules' if self.num_skipped else ''
+        if self.num_excluded:
+            extra += f', excluded {self.num_excluded} modules with no pretrained weights to protect'
         return f'OPLoRA enabled: projecting {len(self._entries)} LoRA modules on this rank with rank={self.rank} ({mode} SVD){extra}'
 
     @classmethod
-    def build(cls, root, rank, full_svd=False, base_seed=0, compute_device=None):
+    def build(cls, root, rank, full_svd=False, base_seed=0, compute_device=None, exclude_names=()):
         # compute_device overrides where the SVD runs. When it is None the SVD runs on
         # each LoRA parameter's own device, which is the correct GPU for this rank under
         # pipeline parallelism and avoids relying on the global current CUDA device.
         if rank < 1:
             raise ValueError(f'oplora_rank must be >= 1, got {rank}')
 
+        # exclude_names holds substrings of module names to leave alone. OPLoRA protects a
+        # pretrained weight's dominant singular directions, so it is meaningless for a module
+        # that has no pretrained weights -- and actively harmful for one initialised to zero,
+        # where the "top-k singular subspace" is whatever arbitrary orthonormal basis the SVD
+        # happens to return, costing the adapter rank directions for nothing.
         entries = []
         skipped = 0
-        for name, layer in _iter_lora_layers(root):
+        excluded = sum(
+            1 for name, _ in _iter_lora_layers(root)
+            if any(excluded_name in name for excluded_name in exclude_names)
+        )
+        for name, layer in _iter_lora_layers(root, exclude_names):
             base_weight = layer.base_layer.weight
             if base_weight.ndim != 2:
                 # configure_adapter only targets nn.Linear, so this is a guard
@@ -182,7 +196,7 @@ class OPLoRAProjector:
                     v_k.to(down_param.device),
                 ))
 
-        return cls(entries, rank, full_svd, skipped)
+        return cls(entries, rank, full_svd, skipped, excluded)
 
     @torch.no_grad()
     def project(self):
