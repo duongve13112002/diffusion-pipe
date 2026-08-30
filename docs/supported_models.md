@@ -576,15 +576,14 @@ type = 'anima_refiner'
 transformer_path = '/data2/imagegen_models/comfyui-models/anima-preview.safetensors'
 vae_path = '/data2/imagegen_models/comfyui-models/qwen_image_vae.safetensors'
 # A full Transformers folder, or a single safetensors file (see llm_config_path / llm_repo_id).
-llm_path = '/data2/imagegen_models/Qwen3.5-2B'
+llm_path = '/data2/imagegen_models/Qwen3.5-2B-Base'
 dtype = 'bfloat16'
 
 llm_hidden_layer = -1   # which hidden_states index feeds the refiner
-n_refiner_layers = 6
+n_refiner_layers = 6    # ignored once the checkpoint carries a trained refiner
 max_text_length = 512
-cache_name = 'anima_refiner_qwen35_2b_L-1'   # CHANGE when switching text encoders
 
-# Stage 1: train only the refiner, freeze the DiT.
+# refiner_only: train just the refiner, freeze the DiT.
 base_lr = 0
 self_attn_lr = 0
 cross_attn_lr = 0
@@ -593,19 +592,32 @@ mod_lr = 0
 refiner_lr = 1e-4
 ```
 
-Read [docs/anima_refiner.md](anima_refiner.md) before training this. The staging matters: the
-refiner has to adapt to a frozen DiT first, because unfreezing while it still emits noise is
-what causes forgetting. There are example configs for every mode in `examples/`
-(`anima_refiner_distill`, `_stage1`, `_stage2`, `_lora`, `_lokr`, `_full_finetune`).
+Read [docs/anima_refiner.md](anima_refiner.md) before training this. Example configs for every
+mode live in `examples/`: `anima_refiner_distill`, `_refiner_only`, `_refiner_crossattn`,
+`_lora`, `_lokr`, `_full_finetune`. They are configurations, not a fixed pipeline — each loads
+the model the same way, so they run in any order and any one's output feeds any other. Ordering
+still matters for results: training the refiner against a frozen DiT before opening the
+cross-attention is what avoids forgetting.
 
-Two settings are easy to get wrong:
-- `llm_hidden_layer`. Lumina 2 uses `hidden_states[-2]`, but Qwen3.5 interleaves linear and
-  full attention, and for it `-2` lands after a *linear*-attention layer while `-1` lands after
-  a full-attention one.
-- `cache_name`. Nothing detects a stale text embedding cache. Changing the text encoder,
-  hidden layer or `max_text_length` requires changing this too.
+**Checkpoint loading.** Whatever weights you point at are the weights used; nothing is
+re-initialised from Anima when real weights exist. When `transformer_path` already contains a
+refiner, its layer count and input dimension are derived from those weights, and a config that
+disagrees raises rather than silently dropping layers. `context_refiner_path` overrides the
+refiner inside the checkpoint, with a warning naming both files.
 
-An optional distillation stage warm-starts the refiner from Anima's existing adapter using
+**Use the Base model, not Instruct** — `Qwen/Qwen3.5-2B-Base`, matching how Anima uses
+Qwen3-0.6B-Base. Their `config.json` is byte-identical so the architecture is the same; the
+tokenizers differ.
+
+`llm_hidden_layer` is easy to get wrong. Lumina 2 uses `hidden_states[-2]`, but Qwen3.5
+interleaves linear and full attention, and for it `-2` lands after a *linear*-attention layer
+while `-1` lands after a full-attention one.
+
+Text embeddings are fingerprinted separately from latents and the fingerprint includes the text
+encoder's identity, so switching text encoders re-caches only the embeddings and leaves latents
+alone. There is nothing to configure for this.
+
+An optional distillation mode warm-starts the refiner from Anima's existing adapter using
 captions only, no images:
 ```
 python -m tools.distill_refiner --config examples/anima_refiner_distill.toml

@@ -200,42 +200,6 @@
       "rstrip": false,
       "single_word": false,
       "special": false
-    },
-    {
-      "id": 248066,
-      "content": "<tool_response>",
-      "lstrip": false,
-      "normalized": false,
-      "rstrip": false,
-      "single_word": false,
-      "special": false
-    },
-    {
-      "id": 248067,
-      "content": "</tool_response>",
-      "lstrip": false,
-      "normalized": false,
-      "rstrip": false,
-      "single_word": false,
-      "special": false
-    },
-    {
-      "id": 248068,
-      "content": "<think>",
-      "lstrip": false,
-      "normalized": false,
-      "rstrip": false,
-      "single_word": false,
-      "special": false
-    },
-    {
-      "id": 248069,
-      "content": "</think>",
-      "lstrip": false,
-      "normalized": false,
-      "rstrip": false,
-      "single_word": false,
-      "special": false
     }
   ],
   "normalizer": {
@@ -280,7 +244,6 @@
     "end_of_word_suffix": "",
     "fuse_unk": false,
     "byte_fallback": false,
-    "ignore_merges": false,
     "vocab": {
       "!": 0,
       "\"": 1,

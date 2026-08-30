@@ -186,8 +186,8 @@ def _compute_text_embeddings(text_encoder, input_ids, attn_mask, is_generic_llm=
     return encoded_text
 
 
-# Shipped with the repo so a bare Qwen3.5-2B safetensors file works with no extra downloads.
-DEFAULT_LLM_CONFIG_PATH = 'configs/qwen3_5_2b'
+# Shipped with the repo so a bare Qwen3.5-2B-Base safetensors file works with no extra downloads.
+DEFAULT_LLM_CONFIG_PATH = 'configs/qwen3_5_2b_base'
 # Tried in order when mapping checkpoint keys onto the bare text model. A file exported from
 # the full VLM keeps the wrapper prefixes; one exported from the text tower alone has none.
 _LLM_KEY_PREFIXES = ('model.language_model.', 'language_model.', 'model.', '')
@@ -199,7 +199,7 @@ def _load_llm_from_single_file(llm_path, model_config, dtype):
     Three ways to supply the architecture and tokenizer, in priority order:
       1. llm_config_path pointing at a local directory,
       2. llm_repo_id, which Transformers downloads and caches,
-      3. the bundled configs/qwen3_5_2b.
+      3. the bundled configs/qwen3_5_2b_base.
     """
     config_path = model_config.get('llm_config_path', None)
     repo_id = model_config.get('llm_repo_id', None)
@@ -284,11 +284,16 @@ class CosmosPredict2Pipeline(BasePipeline):
         # The anima_refiner architecture swaps Anima's LLMAdapter (T5 token queries cross
         # attending into the LLM) for the Lumina 2 / Z-Image text frontend (cap_embedder plus
         # bidirectional refiner blocks). See docs/anima_refiner.md.
-        self.use_context_refiner = self.model_config['type'] == 'anima_refiner'
-        self.max_text_length = self.model_config.get('max_text_length', 512)
-        self.llm_hidden_layer = self.model_config.get('llm_hidden_layer', None)
+        #
+        # Every option this architecture adds is read only when it is active, so cosmos_predict2
+        # and anima keep exactly the config surface they had before.
+        self.use_context_refiner = self.model_config.get('type', None) == 'anima_refiner'
+        self.max_text_length = 512
+        self.llm_hidden_layer = None
         self.cap_feat_dim = None
         if self.use_context_refiner:
+            self.max_text_length = self.model_config.get('max_text_length', 512)
+            self.llm_hidden_layer = self.model_config.get('llm_hidden_layer', None)
             # 'TransformerBlock' would match the LLMAdapter blocks, which this architecture
             # doesn't build. RefinerBlock takes its place as the LoRA/LoKr target.
             self.adapter_target_modules = ['Block', 'RefinerBlock']
@@ -339,11 +344,12 @@ class CosmosPredict2Pipeline(BasePipeline):
                 # generic Transformers LLM
                 self.tokenizer = AutoTokenizer.from_pretrained(llm_path, local_files_only=True)
                 llm_config = transformers.AutoConfig.from_pretrained(llm_path, local_files_only=True)
-                if hasattr(llm_config, 'text_config'):
-                    # Vision-language model, e.g. Qwen3.5-2B, whose architecture is
+                if self.use_context_refiner and hasattr(llm_config, 'text_config'):
+                    # Vision-language model, e.g. Qwen3.5-2B-Base, whose architecture is
                     # Qwen3_5ForConditionalGeneration with a .model.language_model text tower.
                     # Only the language tower is used; dropping the vision tower saves its
-                    # weights from ever being held in memory.
+                    # weights from ever being held in memory. Gated on the refiner so that
+                    # anima's existing behaviour for this branch is untouched.
                     full_model = transformers.AutoModelForImageTextToText.from_pretrained(
                         llm_path, dtype=dtype, local_files_only=True
                     )
@@ -353,10 +359,10 @@ class CosmosPredict2Pipeline(BasePipeline):
                 else:
                     text_encoder = AutoModelForCausalLM.from_pretrained(llm_path, dtype=dtype, local_files_only=True)
                     self.text_encoder = text_encoder.model
-                    self.cap_feat_dim = llm_config.hidden_size
+                    self.cap_feat_dim = getattr(llm_config, 'hidden_size', None)
             elif self.use_context_refiner:
                 # Single safetensors file. The architecture and tokenizer come from a config
-                # directory instead: configs/qwen3_5_2b ships with the repo, and any other
+                # directory instead: configs/qwen3_5_2b_base ships with the repo, and any other
                 # local directory or Hugging Face repo id works via llm_config_path /
                 # llm_repo_id.
                 self.tokenizer, self.text_encoder, self.cap_feat_dim = _load_llm_from_single_file(
@@ -381,17 +387,102 @@ class CosmosPredict2Pipeline(BasePipeline):
         else:
             raise RuntimeError('Missing text encoder path')
 
-        if self.use_context_refiner:
-            if not self.is_generic_llm:
-                raise RuntimeError("anima_refiner requires llm_path (a Transformers LLM), not t5_path")
-            # Cached text embeddings are keyed on this name. Anything that changes what the
-            # text encoder produces -- a different LLM, a different llm_hidden_layer, a
-            # different max_text_length -- invalidates the cache, and nothing detects that
-            # automatically. Set cache_name explicitly when switching between text encoders,
-            # otherwise stale embeddings are silently reused.
-            self.name = self.model_config.get('cache_name', 'anima_refiner')
+        if self.use_context_refiner and not self.is_generic_llm:
+            raise RuntimeError("anima_refiner requires llm_path (a Transformers LLM), not t5_path")
 
         self.text_encoder.requires_grad_(False)
+
+    def text_encoder_cache_key(self, i):
+        """Identity of text encoder `i`, mixed into the text embedding cache fingerprint.
+
+        Latents and text embeddings share a cache directory but are fingerprinted separately,
+        so swapping the text encoder invalidates only the text embeddings. Latents stay put --
+        they are by far the more expensive half to recompute, and the VAE has not changed.
+
+        Anything that alters what the encoder emits belongs in here.
+        """
+        if not self.use_context_refiner:
+            return ''
+        return '|'.join(str(x) for x in (
+            self.model_config.get('llm_path', ''),
+            self.model_config.get('llm_config_path', ''),
+            self.model_config.get('llm_repo_id', ''),
+            self.llm_hidden_layer,
+            self.max_text_length,
+            self.cap_feat_dim,
+        ))
+
+    def _resolve_context_refiner(self, state_dict, dit_config, dtype):
+        """Decide where the refiner's weights and shape come from, and fill in dit_config.
+
+        Three sources, in this order:
+          1. context_refiner_path -- an explicit refiner file, which WINS over the copy inside
+             the checkpoint. Warned about loudly, because silently overriding trained weights
+             is the easiest way to continue training from the wrong starting point.
+          2. context_refiner.* inside transformer_path -- a model saved by a previous run.
+          3. Nothing -- build a fresh refiner (a stock Anima checkpoint).
+
+        In cases 1 and 2 the shape is derived FROM THE WEIGHTS, never from the config. The
+        loading loop skips names absent from the state dict, so a checkpoint holding more
+        refiner layers than the config asks for would quietly lose the surplus; deriving the
+        shape removes that failure mode entirely, and a config that contradicts the weights is
+        an error rather than a silent reshape.
+
+        Returns the refiner state dict to load, None when the main loop already covers it, or
+        the string 'init' meaning build fresh.
+        """
+        from_path = None
+        if path := self.model_config.get('context_refiner_path', None):
+            from_path = {
+                k[len('context_refiner.'):] if k.startswith('context_refiner.') else k: v.to(dtype)
+                for k, v in load_state_dict(path).items()
+            }
+        in_checkpoint = {
+            k[len('context_refiner.'):]: v
+            for k, v in state_dict.items() if k.startswith('context_refiner.')
+        }
+
+        if from_path is not None and in_checkpoint and is_main_process():
+            print(
+                '\nWARNING: context_refiner_path overrides the context_refiner already present '
+                'in transformer_path.\n'
+                f"  checkpoint  : {self.model_config['transformer_path']}\n"
+                f"  overridden by: {self.model_config['context_refiner_path']}\n"
+                '  Remove context_refiner_path to train on from the refiner inside the '
+                'checkpoint.\n'
+            )
+
+        weights = from_path if from_path is not None else (in_checkpoint or None)
+        if weights is None:
+            dit_config['cap_feat_dim'] = self.cap_feat_dim
+            dit_config['n_refiner_layers'] = self.model_config.get('n_refiner_layers', 6)
+            return 'init'
+
+        derived_layers = 1 + max(
+            (int(k.split('.')[1]) for k in weights if k.startswith('blocks.')), default=-1
+        )
+        derived_cap_feat_dim = weights['cap_embedder.1.weight'].shape[1]
+
+        for key, derived in (('n_refiner_layers', derived_layers), ('cap_feat_dim', derived_cap_feat_dim)):
+            configured = self.model_config.get(key, None)
+            if configured is not None and configured != derived:
+                raise RuntimeError(
+                    f'{key}={configured} in the config, but the refiner weights have '
+                    f'{key}={derived}. Remove {key} from the config to use the value the '
+                    'weights carry, or point at weights that match.'
+                )
+        if derived_cap_feat_dim != self.cap_feat_dim:
+            raise RuntimeError(
+                f'The refiner weights expect a text encoder with hidden size '
+                f'{derived_cap_feat_dim}, but llm_path provides {self.cap_feat_dim}. These '
+                'refiner weights were trained against a different text encoder.'
+            )
+        dit_config['cap_feat_dim'] = derived_cap_feat_dim
+        dit_config['n_refiner_layers'] = derived_layers
+
+        # from_path weights are loaded separately; ones already in the checkpoint are picked up
+        # by the main named_parameters loop.
+        return from_path
 
     def load_diffusion_model(self):
         dtype = self.model_config['dtype']
@@ -412,21 +503,7 @@ class CosmosPredict2Pipeline(BasePipeline):
         if self.use_context_refiner:
             # The refiner replaces the llm_adapter entirely, so never build both.
             self.use_llm_adapter = False
-            dit_config['cap_feat_dim'] = self.cap_feat_dim
-            dit_config['n_refiner_layers'] = self.model_config.get('n_refiner_layers', 6)
-            if 'context_refiner_path' in self.model_config:
-                # Trained refiner weights, e.g. the output of tools/distill_refiner.py.
-                context_refiner_state_dict = {
-                    k[len('context_refiner.'):] if k.startswith('context_refiner.') else k: v.to(dtype)
-                    for k, v in load_state_dict(self.model_config['context_refiner_path']).items()
-                }
-            elif any(k.startswith('context_refiner.') for k in state_dict):
-                # Refiner already lives in the checkpoint (a model saved by a previous run).
-                context_refiner_state_dict = None
-            else:
-                # First run against a stock Anima checkpoint: no refiner weights exist yet, so
-                # it gets built fresh. Sentinel distinguishes this from "load from checkpoint".
-                context_refiner_state_dict = 'init'
+            context_refiner_state_dict = self._resolve_context_refiner(state_dict, dit_config, dtype)
         elif 'llm_adapter_path' in self.model_config:
             self.use_llm_adapter = True
             dit_config['use_llm_adapter'] = True
@@ -692,9 +769,12 @@ class CosmosPredict2Pipeline(BasePipeline):
             else:
                 base_params.append(p)
 
-        # base_lr is overridable so a stage that only trains the refiner can freeze everything
-        # else by setting base_lr = 0 without also zeroing the optimizer's own lr.
-        base_lr = self.model_config.get('base_lr', self.config['optimizer'].get('lr', None))
+        # anima_refiner alone can override base_lr, so that a stage training only the refiner
+        # freezes everything else with base_lr = 0 without zeroing the optimizer's own lr.
+        # cosmos_predict2 and anima keep the original behaviour.
+        base_lr = self.config['optimizer'].get('lr', None)
+        if self.use_context_refiner:
+            base_lr = self.model_config.get('base_lr', base_lr)
         self_attn_lr = self.model_config.get('self_attn_lr', base_lr)
         cross_attn_lr = self.model_config.get('cross_attn_lr', base_lr)
         mlp_lr = self.model_config.get('mlp_lr', base_lr)

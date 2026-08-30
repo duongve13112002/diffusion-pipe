@@ -86,7 +86,7 @@ class ContextRefiner(nn.Module):
     source LLM's hidden states and the space the DiT cross-attention expects.
 
     Args:
-        cap_feat_dim: hidden size of the source LLM (e.g. 2048 for Qwen3.5-2B).
+        cap_feat_dim: hidden size of the source LLM (e.g. 2048 for Qwen3.5-2B-Base).
         model_dim: dimension the DiT cross-attention consumes (crossattn_emb_channels, 1024).
         num_layers: number of refiner blocks. Higher than Lumina's default of 2 because here
             the DiT is typically frozen, so the refiner carries the whole distribution gap.

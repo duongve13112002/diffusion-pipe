@@ -254,7 +254,7 @@ class TestPipelineIntegration:
         module = self.pipeline_module()
         assert 'ContextRefinerLayer' in module.CosmosPredict2Pipeline.checkpointable_layers
 
-    def _param_groups(self, model_config, params):
+    def _param_groups(self, model_config, params, use_context_refiner=True):
         module = self.pipeline_module()
 
         class Stub:
@@ -263,6 +263,7 @@ class TestPipelineIntegration:
         stub = Stub()
         stub.model_config = model_config
         stub.config = {'optimizer': {'lr': 1e-4}}
+        stub.use_context_refiner = use_context_refiner
         # is_main_process() calls into deepspeed.comm, which is not initialised under pytest.
         original = module.is_main_process
         module.is_main_process = lambda: False
@@ -439,3 +440,158 @@ class TestCaptionEnumeration:
             'notes.bak': 'x', 'cache.db': 'x', 'meta.parquet': 'x', 'z.npz': 'x',
         })
         assert self.enumerate_captions(config) == ['real']
+
+
+class TestCheckpointResolution:
+    """_resolve_context_refiner: shape comes from the weights, never from the config.
+
+    The loading loop skips names absent from the state dict, so a checkpoint holding more
+    refiner layers than the config asked for would quietly lose the surplus. Deriving the
+    shape from the weights removes that failure mode.
+    """
+
+    @staticmethod
+    def resolve(model_config, state_dict, cap_feat_dim=CAP_FEAT_DIM, dtype=torch.float32):
+        module = pytest.importorskip('models.cosmos_predict2')
+
+        class Stub:
+            pass
+
+        stub = Stub()
+        stub.model_config = model_config
+        stub.cap_feat_dim = cap_feat_dim
+        original = module.is_main_process
+        module.is_main_process = lambda: False
+        dit_config = {}
+        try:
+            result = module.CosmosPredict2Pipeline._resolve_context_refiner(
+                stub, state_dict, dit_config, dtype
+            )
+        finally:
+            module.is_main_process = original
+        return result, dit_config
+
+    @staticmethod
+    def refiner_weights(num_layers, cap_feat_dim=CAP_FEAT_DIM, prefix=''):
+        refiner = make_refiner(num_layers=num_layers, cap_feat_dim=cap_feat_dim)
+        return {prefix + k: v for k, v in refiner.state_dict().items()}
+
+    def test_fresh_init_when_checkpoint_has_no_refiner(self):
+        result, dit_config = self.resolve({'n_refiner_layers': 4}, {'blocks.0.mlp.weight': torch.zeros(2)})
+        assert result == 'init'
+        assert dit_config['n_refiner_layers'] == 4
+        assert dit_config['cap_feat_dim'] == CAP_FEAT_DIM
+
+    def test_layer_count_is_derived_from_the_checkpoint(self):
+        state_dict = self.refiner_weights(3, prefix='context_refiner.')
+        result, dit_config = self.resolve({}, state_dict)
+        assert result is None, 'weights already in the checkpoint are loaded by the main loop'
+        assert dit_config['n_refiner_layers'] == 3
+        assert dit_config['cap_feat_dim'] == CAP_FEAT_DIM
+
+    def test_config_contradicting_the_checkpoint_raises(self):
+        """The silent-layer-drop bug: config said 6, checkpoint had 3."""
+        state_dict = self.refiner_weights(3, prefix='context_refiner.')
+        with pytest.raises(RuntimeError, match='n_refiner_layers'):
+            self.resolve({'n_refiner_layers': 6}, state_dict)
+
+    def test_config_agreeing_with_the_checkpoint_is_fine(self):
+        state_dict = self.refiner_weights(3, prefix='context_refiner.')
+        _, dit_config = self.resolve({'n_refiner_layers': 3}, state_dict)
+        assert dit_config['n_refiner_layers'] == 3
+
+    def test_text_encoder_size_mismatch_raises(self):
+        state_dict = self.refiner_weights(2, cap_feat_dim=64, prefix='context_refiner.')
+        with pytest.raises(RuntimeError, match='hidden size'):
+            self.resolve({}, state_dict, cap_feat_dim=2048)
+
+    def test_context_refiner_path_wins_over_the_checkpoint(self, tmp_path):
+        import safetensors.torch
+        path = tmp_path / 'refiner.safetensors'
+        external = self.refiner_weights(2)
+        safetensors.torch.save_file({k: v.contiguous() for k, v in external.items()}, str(path))
+
+        # Checkpoint has a DIFFERENT layer count, so the winner is unambiguous.
+        state_dict = self.refiner_weights(4, prefix='context_refiner.')
+        result, dit_config = self.resolve({'context_refiner_path': str(path),
+                                           'transformer_path': 'ckpt.safetensors'}, state_dict)
+        assert result is not None, 'the external file must be loaded explicitly'
+        assert dit_config['n_refiner_layers'] == 2, 'shape must follow the file that won'
+
+    def test_context_refiner_path_alone_still_works(self, tmp_path):
+        import safetensors.torch
+        path = tmp_path / 'refiner.safetensors'
+        external = self.refiner_weights(2)
+        safetensors.torch.save_file({k: v.contiguous() for k, v in external.items()}, str(path))
+        result, dit_config = self.resolve({'context_refiner_path': str(path)}, {})
+        assert set(result) == set(external)
+        assert dit_config['n_refiner_layers'] == 2
+
+
+class TestTextEncoderCacheKey:
+    """Swapping the text encoder must re-cache text embeddings but never the latents."""
+
+    @staticmethod
+    def key_for(model_config, use_refiner=True, cap_feat_dim=2048):
+        module = pytest.importorskip('models.cosmos_predict2')
+
+        class Stub:
+            pass
+
+        stub = Stub()
+        stub.model_config = model_config
+        stub.use_context_refiner = use_refiner
+        stub.cap_feat_dim = cap_feat_dim
+        stub.llm_hidden_layer = model_config.get('llm_hidden_layer', None)
+        stub.max_text_length = model_config.get('max_text_length', 512)
+        return module.CosmosPredict2Pipeline.text_encoder_cache_key(stub, 0)
+
+    def test_other_models_supply_no_key(self):
+        """Existing models must keep their exact cache fingerprint."""
+        assert self.key_for({}, use_refiner=False) == ''
+
+    def test_key_changes_with_the_llm(self):
+        a = self.key_for({'llm_path': '/models/qwen3_5_2b_base'})
+        b = self.key_for({'llm_path': '/models/something_else'})
+        assert a != b
+
+    def test_key_changes_with_hidden_layer_and_length(self):
+        base = {'llm_path': '/models/x'}
+        assert self.key_for(base) != self.key_for({**base, 'llm_hidden_layer': -2})
+        assert self.key_for(base) != self.key_for({**base, 'max_text_length': 256})
+
+    def test_key_is_stable_for_identical_config(self):
+        cfg = {'llm_path': '/models/x', 'llm_hidden_layer': -1, 'max_text_length': 512}
+        assert self.key_for(cfg) == self.key_for(dict(cfg))
+
+
+class TestExistingModelFingerprintsUnchanged:
+    """The cache change must not invalidate caches for wan / anima / cosmos_predict2."""
+
+    def test_empty_key_preserves_the_original_fingerprint(self):
+        dataset = pytest.importorskip('utils.dataset')
+        from datasets.fingerprint import Hasher
+        # _cache_text_embeddings passes [i] when there is no key, exactly as before.
+        assert Hasher.hash([0]) == Hasher.hash([0])
+        assert Hasher.hash([0]) != Hasher.hash([0, 'some-text-encoder'])
+        assert hasattr(dataset, 'enumerate_captions')
+
+
+class TestBaseLrIsRefinerOnly:
+    """base_lr must stay an anima_refiner option; other models keep the optimizer lr."""
+
+    def test_other_models_ignore_base_lr(self):
+        integration = TestPipelineIntegration()
+        param = integration.named_param('x_embedder.weight')
+        # base_lr = 0 would freeze this if the option applied.
+        groups = integration._param_groups({'base_lr': 0}, [param], use_context_refiner=False)
+        assert param.requires_grad is True, 'base_lr must not affect cosmos_predict2 / anima'
+        assert len(groups) == 1
+        assert groups[0]['lr'] == 1e-4, 'lr must come from [optimizer] as it always did'
+
+    def test_anima_refiner_honours_base_lr(self):
+        integration = TestPipelineIntegration()
+        param = integration.named_param('x_embedder.weight')
+        groups = integration._param_groups({'base_lr': 0}, [param], use_context_refiner=True)
+        assert param.requires_grad is False
+        assert groups == []

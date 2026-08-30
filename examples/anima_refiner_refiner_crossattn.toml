@@ -1,0 +1,65 @@
+# refiner_crossattn: the refiner plus the cross-attention key/value projections.
+#
+# Not a stage that must follow another one. Every anima_refiner config loads the model the
+# same way, so this runs against any checkpoint that has a refiner -- including one you come
+# back to after a full fine tune. What matters is the state of the refiner, not which config
+# produced it: run this once the refiner has converged, because its point is to let the DiT
+# read information the previous text frontend never carried, and gradients arriving at
+# cross-attention while the refiner is still noisy are what cause forgetting.
+#
+# Only k_proj/v_proj really matter here -- they project the TEXT side, which is what changed.
+# q_proj and output_proj work on the image side. get_param_groups matches '.cross_attn', so
+# cross_attn_lr covers all four; see docs/anima_refiner.md to restrict it to k/v.
+
+output_dir = '/data/output/anima_refiner_refiner_crossattn'
+dataset = 'examples/dataset.toml'
+
+epochs = 1
+micro_batch_size_per_gpu = 4
+pipeline_stages = 1
+gradient_accumulation_steps = 1
+gradient_clipping = 1
+warmup_steps = 200
+
+eval_every_n_steps = 500
+eval_before_first_step = true
+eval_micro_batch_size_per_gpu = 4
+eval_gradient_accumulation_steps = 1
+
+save_every_n_steps = 2000
+checkpoint_every_n_minutes = 120
+activation_checkpointing = true
+partition_method = 'parameters'
+save_dtype = 'bfloat16'
+caching_batch_size = 8
+steps_per_print = 10
+
+[model]
+type = 'anima_refiner'
+# Point at the model stage 1 saved: it already contains the trained context_refiner.
+# Any checkpoint that carries a trained refiner. The layer count and input dimension are
+# read from the weights, so n_refiner_layers is not needed here.
+transformer_path = '/data/output/anima_refiner_refiner_only/<run>/model.safetensors'
+vae_path = '/data2/imagegen_models/comfyui-models/qwen_image_vae.safetensors'
+llm_path = '/data2/imagegen_models/Qwen3.5-2B-Base'
+dtype = 'bfloat16'
+
+llm_hidden_layer = -1
+max_text_length = 512
+
+# Everything structural stays frozen; only the text interface moves.
+base_lr = 0
+self_attn_lr = 0
+mlp_lr = 0
+mod_lr = 0
+cross_attn_lr = 1e-5   # roughly 10x below the refiner, to limit drift
+refiner_lr = 1e-4
+
+timestep_sample_method = 'logit_normal'
+
+[optimizer]
+type = 'adamw_optimi'
+lr = 1e-4
+betas = [0.9, 0.99]
+weight_decay = 0.01
+eps = 1e-8

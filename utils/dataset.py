@@ -251,7 +251,7 @@ class TextEmbeddingDataset:
         return self.te_dataset[self.image_spec_to_te_idx[image_spec][caption_number]]
 
 
-def _cache_text_embeddings(metadata_dataset, map_fn, i, cache_dir, regenerate_cache, caching_batch_size):
+def _cache_text_embeddings(metadata_dataset, map_fn, i, cache_dir, regenerate_cache, caching_batch_size, text_encoder_key=''):
 
     def flatten_captions(example):
         result = {key: [] for key in example}
@@ -270,7 +270,11 @@ def _cache_text_embeddings(metadata_dataset, map_fn, i, cache_dir, regenerate_ca
         map_fn,
         cache_dir,
         cache_file_prefix=f'text_embeddings_{i}_',
-        new_fingerprint_args=[i],
+        # text_encoder_key identifies which text encoder produced these embeddings, and is
+        # deliberately only in THIS fingerprint: latents are cached separately, so swapping
+        # the text encoder must not invalidate them. Models that supply no key keep their
+        # original fingerprint exactly, so existing caches stay valid.
+        new_fingerprint_args=[i, text_encoder_key] if text_encoder_key else [i],
         regenerate_cache=regenerate_cache,
         caching_batch_size=caching_batch_size,
     )
@@ -374,9 +378,9 @@ class SizeBucketDataset:
 
         self.iteration_order = datasets.load_from_disk(str(iteration_order_cache_dir))
 
-    def cache_text_embeddings(self, map_fn, i, regenerate_cache=False, caching_batch_size=1):
+    def cache_text_embeddings(self, map_fn, i, regenerate_cache=False, caching_batch_size=1, text_encoder_key=''):
         print(f'caching text embeddings: {self.size_bucket}')
-        te_dataset = _cache_text_embeddings(self.metadata_dataset, map_fn, i, self.cache_dir, regenerate_cache, caching_batch_size)
+        te_dataset = _cache_text_embeddings(self.metadata_dataset, map_fn, i, self.cache_dir, regenerate_cache, caching_batch_size, text_encoder_key)
         self.text_embedding_datasets.append(te_dataset)
 
     def add_text_embedding_dataset(self, te_dataset):
@@ -514,9 +518,9 @@ class ARBucketDataset:
         for ds in self.size_buckets:
             ds.cache_latents(map_fn, regenerate_cache=regenerate_cache, trust_cache=trust_cache, caching_batch_size=caching_batch_size)
 
-    def cache_text_embeddings(self, map_fn, i, regenerate_cache=False, caching_batch_size=1):
+    def cache_text_embeddings(self, map_fn, i, regenerate_cache=False, caching_batch_size=1, text_encoder_key=''):
         print(f'caching text embeddings: {self.ar_frames}')
-        te_dataset = _cache_text_embeddings(self.metadata_dataset, map_fn, i, self.cache_dir, regenerate_cache, caching_batch_size)
+        te_dataset = _cache_text_embeddings(self.metadata_dataset, map_fn, i, self.cache_dir, regenerate_cache, caching_batch_size, text_encoder_key)
         for size_bucket_dataset in self.size_buckets:
             size_bucket_dataset.add_text_embedding_dataset(te_dataset)
 
@@ -978,11 +982,11 @@ class DirectoryDataset:
         for ds in datasets:
             ds.cache_latents(map_fn, regenerate_cache=regenerate_cache, trust_cache=trust_cache, caching_batch_size=caching_batch_size)
 
-    def cache_text_embeddings(self, map_fn, i, regenerate_cache=False, caching_batch_size=1):
+    def cache_text_embeddings(self, map_fn, i, regenerate_cache=False, caching_batch_size=1, text_encoder_key=''):
         print(f'caching text embeddings: {self.path}')
         datasets_list = self.size_bucket_datasets if self.use_size_buckets else self.ar_bucket_datasets
         for ds in datasets_list:
-            ds.cache_text_embeddings(map_fn, i, regenerate_cache=regenerate_cache, caching_batch_size=caching_batch_size)
+            ds.cache_text_embeddings(map_fn, i, regenerate_cache=regenerate_cache, caching_batch_size=caching_batch_size, text_encoder_key=text_encoder_key)
         # TODO: do this separately for is_video True and False for models that support it?
         empty_caption_ds = datasets.Dataset.from_dict({'caption': [''], 'is_video': [False], 'image_spec': [(None, None)]})
         uncond_text_embeddings_ds = _map_and_cache(
@@ -990,6 +994,10 @@ class DirectoryDataset:
             map_fn,
             cache_dir=self.cache_dir,
             cache_file_prefix=f'uncond_text_embeddings_{i}_',
+            # Same reasoning as the conditional embeddings above: this is text encoder
+            # output, so it must follow the text encoder rather than the latents. Left at
+            # None without a key, preserving the original fingerprint.
+            new_fingerprint_args=[text_encoder_key] if text_encoder_key else None,
             regenerate_cache=regenerate_cache,
         )
         self.uncond_dict = uncond_text_embeddings_ds[0]
@@ -1118,8 +1126,9 @@ class Dataset:
             ds.cache_latents(map_fn, regenerate_cache=regenerate_cache, trust_cache=trust_cache, caching_batch_size=caching_batch_size)
 
     def cache_text_embeddings(self, map_fn, i, regenerate_cache=False, caching_batch_size=1):
+        text_encoder_key = getattr(self.model, 'text_encoder_cache_key', lambda _i: '')(i)
         for ds in self.directory_datasets:
-            ds.cache_text_embeddings(map_fn, i, regenerate_cache=regenerate_cache, caching_batch_size=caching_batch_size)
+            ds.cache_text_embeddings(map_fn, i, regenerate_cache=regenerate_cache, caching_batch_size=caching_batch_size, text_encoder_key=text_encoder_key)
         # some techniques need access to the uncond
         self.model.uncond_dict = self.directory_datasets[0].uncond_dict
 

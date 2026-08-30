@@ -21,7 +21,7 @@ eval_micro_batch_size_per_gpu = 4
 eval_gradient_accumulation_steps = 1
 
 save_every_n_epochs = 2
-activation_checkpointing = 'unsloth'
+activation_checkpointing = true
 partition_method = 'parameters'
 save_dtype = 'bfloat16'
 caching_batch_size = 8
@@ -30,16 +30,15 @@ blocks_to_swap = 20  # block swapping requires an [adapter] block, so it works h
 
 [model]
 type = 'anima_refiner'
-transformer_path = '/data/output/anima_refiner_stage2/<run>/model.safetensors'
+transformer_path = '/data/output/anima_refiner_refiner_crossattn/<run>/model.safetensors'
 vae_path = '/data2/imagegen_models/comfyui-models/qwen_image_vae.safetensors'
-llm_path = '/data2/imagegen_models/Qwen3.5-2B'
+llm_path = '/data2/imagegen_models/Qwen3.5-2B-Base'
 dtype = 'bfloat16'
 transformer_dtype = 'float8_e5m2'  # e4m3fn does NOT work well on this model family
 
 llm_hidden_layer = -1
 n_refiner_layers = 6
 max_text_length = 512
-cache_name = 'anima_refiner_qwen35_2b_L-1'
 # Needed if transformer_path does not already contain trained refiner weights.
 #context_refiner_path = '/data/output/anima_refiner_distill/context_refiner.safetensors'
 

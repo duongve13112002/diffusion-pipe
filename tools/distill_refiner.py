@@ -86,6 +86,30 @@ def load_captions(config):
     return [line.strip() for line in path.read_text(encoding='utf-8').splitlines() if line.strip()]
 
 
+def extract_refiner_state_dict(path):
+    """Pull refiner weights out of either a bare refiner file or a full model checkpoint.
+
+    This is what makes distillation re-runnable at any point: a model saved by refiner_only,
+    refiner_crossattn or a full fine tune keys its refiner as `net.context_refiner.*`, and
+    that has to be loadable back into a bare ContextRefiner so the same refiner can be taken
+    back to the distillation objective.
+    """
+    state_dict = load_state_dict(path)
+    refiner = {}
+    for k, v in state_dict.items():
+        if k.startswith('net.'):
+            k = k[len('net.'):]
+        if k.startswith('context_refiner.'):
+            k = k[len('context_refiner.'):]
+        elif any(key.startswith(('context_refiner.', 'net.context_refiner.')) for key in state_dict):
+            # A full checkpoint: keep only the refiner half of it.
+            continue
+        refiner[k] = v
+    if not refiner:
+        raise RuntimeError(f'No context_refiner weights found in {path}')
+    return refiner
+
+
 def build_teacher(config, dtype, device):
     """Qwen3-0.6B plus the LLMAdapter and cross-attention modules from an Anima checkpoint."""
     llm_path = config['teacher']['llm_path']
@@ -165,7 +189,7 @@ def build_student(config, dtype, device):
     )
     refiner.init_weights()
     if resume := config['student'].get('resume_from', None):
-        refiner.load_state_dict(load_state_dict(resume))
+        refiner.load_state_dict(extract_refiner_state_dict(resume))
         print(f'Resumed refiner weights from {resume}')
     # Trained in fp32 for stable optimisation; it is small enough that this is cheap.
     refiner.to(device=device, dtype=torch.float32).train()

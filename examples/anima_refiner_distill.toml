@@ -5,9 +5,9 @@
 #
 # This is NOT a diffusion training run and does not use train.py. It needs captions only --
 # no images, no VAE, no DiT forward pass -- and gets the refiner into roughly the space the
-# frozen DiT can read. Follow it with anima_refiner_stage1.toml.
+# frozen DiT can read. Follow it with anima_refiner_refiner_only.toml.
 #
-# Roughly 6GB of VRAM: Qwen3-0.6B (teacher source) + Qwen3.5-2B (student source) + the
+# Roughly 6GB of VRAM: Qwen3-0.6B (teacher source) + Qwen3.5-2B-Base (student source) + the
 # LLMAdapter and a handful of the DiT's cross-attention modules.
 
 [distill]
@@ -52,9 +52,9 @@ transformer_path = '/data2/imagegen_models/comfyui-models/anima-preview.safetens
 
 [student]
 # Either a full Transformers folder, or a single safetensors file (see llm_config_path in
-# examples/anima_refiner_stage1.toml).
-llm_path = '/data2/imagegen_models/Qwen3.5-2B'
-# Which hidden state to take. For Qwen3.5-2B, full-attention layers sit at 3/7/11/15/19/23,
+# examples/anima_refiner_refiner_only.toml).
+llm_path = '/data2/imagegen_models/Qwen3.5-2B-Base'
+# Which hidden state to take. For Qwen3.5-2B-Base, full-attention layers sit at 3/7/11/15/19/23,
 # and hidden_states[i] is the output of layer i-1, so -1 lands right after a full-attention
 # layer while -2 would land after a linear-attention one.
 llm_hidden_layer = -1
