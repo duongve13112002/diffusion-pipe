@@ -595,3 +595,105 @@ class TestBaseLrIsRefinerOnly:
         groups = integration._param_groups({'base_lr': 0}, [param], use_context_refiner=True)
         assert param.requires_grad is False
         assert groups == []
+
+
+class TestFullyMaskedRow:
+    """An empty caption tokenizes to an all-padding row -- the uncond embedding CFG needs.
+
+    A row with no unmasked key makes the attention softmax degenerate. The CPU math backend
+    returns zeros, but the fused CUDA backends can return NaN, and NaN * 0 is still NaN, so
+    zeroing the padded output afterwards would not contain it. Such rows are allowed to attend
+    freely instead; their output is discarded either way.
+    """
+
+    @staticmethod
+    def refiner_with_live_residuals(num_layers=2):
+        refiner = make_refiner(num_layers=num_layers)
+        # Zero-init residuals would hide any attention misbehaviour entirely.
+        for block in refiner.blocks:
+            nn.init.normal_(block.attn.o_proj.weight, std=0.05)
+            nn.init.normal_(block.mlp[2].weight, std=0.05)
+        return refiner
+
+    def test_empty_caption_row_is_finite(self):
+        refiner = self.refiner_with_live_residuals()
+        hidden = torch.randn(2, 16, CAP_FEAT_DIM)
+        mask = torch.ones(2, 16, dtype=torch.long)
+        mask[0] = 0  # fully padded, exactly what an empty caption produces
+        out = refiner(hidden, mask)
+        assert torch.isfinite(out).all(), 'a fully masked row must not produce NaN or inf'
+        assert out[0].abs().max() == 0, 'its output is still zeroed'
+
+    def test_unmasked_rows_are_unaffected_by_the_guard(self):
+        """Letting an empty row attend freely must not alter any other row in the batch."""
+        refiner = self.refiner_with_live_residuals()
+        hidden = torch.randn(2, 16, CAP_FEAT_DIM)
+        with_empty = torch.ones(2, 16, dtype=torch.long)
+        with_empty[0] = 0
+        all_valid = torch.ones(2, 16, dtype=torch.long)
+        torch.testing.assert_close(refiner(hidden, with_empty)[1], refiner(hidden, all_valid)[1])
+
+    def test_all_rows_empty_is_finite(self):
+        refiner = self.refiner_with_live_residuals()
+        out = refiner(torch.randn(2, 8, CAP_FEAT_DIM), torch.zeros(2, 8, dtype=torch.long))
+        assert torch.isfinite(out).all()
+        assert out.abs().max() == 0
+
+
+class TestExtractRefinerStateDict:
+    """One helper, used by both the training pipeline and the distillation tool.
+
+    Refiner weights arrive in three shapes and every one has to work wherever a refiner is
+    accepted; having each call site reimplement the stripping is what let context_refiner_path
+    crash on a full checkpoint.
+    """
+
+    @staticmethod
+    def bare():
+        refiner = make_refiner(num_layers=2)
+        return refiner.state_dict()
+
+    def test_bare_refiner_passes_through(self):
+        from models.text_refiner import extract_refiner_state_dict
+        bare = self.bare()
+        assert set(extract_refiner_state_dict(dict(bare))) == set(bare)
+
+    def test_full_checkpoint_with_net_prefix(self):
+        from models.text_refiner import extract_refiner_state_dict
+        bare = self.bare()
+        full = {'net.context_refiner.' + k: v for k, v in bare.items()}
+        full['net.blocks.0.self_attn.q_proj.weight'] = torch.zeros(2, 2)
+        full['net.x_embedder.proj.1.weight'] = torch.zeros(2, 2)
+        assert set(extract_refiner_state_dict(full)) == set(bare)
+
+    def test_checkpoint_already_stripped_of_net(self):
+        from models.text_refiner import extract_refiner_state_dict
+        bare = self.bare()
+        assert set(extract_refiner_state_dict({'context_refiner.' + k: v for k, v in bare.items()})) == set(bare)
+
+    def test_no_refiner_raises_instead_of_returning_junk(self):
+        from models.text_refiner import extract_refiner_state_dict
+        with pytest.raises(RuntimeError, match='No context_refiner weights found'):
+            extract_refiner_state_dict({'net.blocks.0.mlp.weight': torch.zeros(2, 2)})
+
+
+class TestContextRefinerPathAcceptsFullCheckpoint:
+    """context_refiner_path may point at a full model.safetensors, not just a bare refiner."""
+
+    def test_full_checkpoint_resolves(self, tmp_path):
+        import safetensors.torch
+        module = pytest.importorskip('models.cosmos_predict2')
+
+        refiner = make_refiner(num_layers=2)
+        full = {'net.context_refiner.' + k: v.contiguous() for k, v in refiner.state_dict().items()}
+        full['net.blocks.0.self_attn.q_proj.weight'] = torch.zeros(4, 4)
+        path = tmp_path / 'model.safetensors'
+        safetensors.torch.save_file(full, str(path))
+
+        resolution = TestCheckpointResolution()
+        result, dit_config = resolution.resolve(
+            {'context_refiner_path': str(path), 'transformer_path': 'ckpt.safetensors'}, {}
+        )
+        assert set(result) == set(refiner.state_dict()), 'net. prefix must be stripped'
+        assert dit_config['n_refiner_layers'] == 2
+        assert dit_config['cap_feat_dim'] == CAP_FEAT_DIM

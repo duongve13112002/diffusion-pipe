@@ -236,16 +236,19 @@ class TestCacheSharingWithAnima:
     the text embedding fingerprint.
     """
 
-    @staticmethod
-    def cache_name_for(model_config):
-        """Reproduces the one assignment in __init__ without loading any weights."""
+    def test_source_does_not_reintroduce_a_separate_cache_name(self):
+        """A source-level guard, not a behaviour test -- be clear about which this is.
+
+        The assignment lives inside __init__ behind a text-encoder load, so reaching it needs
+        real weights this suite does not ship. Grepping the source at least catches someone
+        reintroducing a separate cache name, which would silently discard every cached latent.
+        The behaviour that IS testable -- that text embeddings stay separated -- is covered
+        below.
+        """
         module = pytest.importorskip('models.cosmos_predict2')
         source = open(module.__file__).read()
-        assert "self.name = 'anima'" in source, 'anima_refiner must not use its own cache tree'
-        return 'anima'
-
-    def test_both_use_the_same_cache_tree(self):
-        assert self.cache_name_for({'type': 'anima'}) == self.cache_name_for({'type': 'anima_refiner'})
+        assert "self.name = 'anima'" in source
+        assert "'anima_refiner' if self.use_context_refiner" not in source
 
     def test_text_encoder_key_separates_the_embeddings(self):
         module = pytest.importorskip('models.cosmos_predict2')
@@ -283,8 +286,8 @@ class TestDistillResumeRegression:
 
     def test_full_checkpoint_resume_extracts_the_refiner(self, tmp_path):
         import safetensors.torch
-        from tools.distill_refiner import extract_refiner_state_dict
-        from models.text_refiner import ContextRefiner
+        from models.text_refiner import ContextRefiner, extract_refiner_state_dict
+        from utils.common import load_state_dict
 
         refiner = ContextRefiner(cap_feat_dim=64, model_dim=32, num_layers=2, num_heads=4)
         refiner.init_weights()
@@ -293,21 +296,29 @@ class TestDistillResumeRegression:
         path = tmp_path / 'model.safetensors'
         safetensors.torch.save_file(full, str(path))
 
-        extracted = extract_refiner_state_dict(str(path))
+        extracted = extract_refiner_state_dict(load_state_dict(str(path)))
         assert set(extracted) == set(refiner.state_dict())
         assert not any(k.startswith(('net.', 'context_refiner.')) for k in extracted)
 
     def test_bare_refiner_file_still_works(self, tmp_path):
-        from tools.distill_refiner import extract_refiner_state_dict
+        from models.text_refiner import extract_refiner_state_dict
         path = self.write_refiner(tmp_path, num_layers=2)
-        assert extract_refiner_state_dict(str(path))
+        from utils.common import load_state_dict
+        assert extract_refiner_state_dict(load_state_dict(str(path)))
 
     def test_checkpoint_without_a_refiner_raises(self, tmp_path):
+        """A checkpoint with no refiner must fail here, not pass unrelated tensors onward.
+
+        The earlier version returned every non-refiner weight as if it were the refiner, so the
+        failure surfaced later as an opaque KeyError or shape mismatch inside load_state_dict.
+        """
         import safetensors.torch
-        from tools.distill_refiner import extract_refiner_state_dict
+        from models.text_refiner import extract_refiner_state_dict
+        from utils.common import load_state_dict
         path = tmp_path / 'no_refiner.safetensors'
-        safetensors.torch.save_file({'net.blocks.0.mlp.weight': torch.zeros(2, 2)}, str(path))
-        # Nothing matches, so every key survives the filter and load_state_dict would fail
-        # later with a confusing error. Better to be explicit here.
-        extracted = extract_refiner_state_dict(str(path))
-        assert 'blocks.0.mlp.weight' in extracted
+        safetensors.torch.save_file({
+            'net.blocks.0.mlp.weight': torch.zeros(2, 2),
+            'net.x_embedder.proj.1.weight': torch.zeros(4, 4),
+        }, str(path))
+        with pytest.raises(RuntimeError, match='No context_refiner weights found'):
+            extract_refiner_state_dict(load_state_dict(str(path)))

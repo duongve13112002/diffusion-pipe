@@ -124,6 +124,43 @@ are now only appended when non-empty, and the old fingerprint was verified byte-
   configs are named for what they train instead.</li>
 </ul>
 
+<h3>What an independent QA pass found</h3>
+
+<p>A separate reviewer was pointed at the whole branch after it was written. Three real defects,
+all confirmed by reproduction before being fixed:</p>
+
+<table>
+  <tr><th>Defect</th><th>Why it survived the author's own review</th></tr>
+  <tr><td><code>context_refiner_path</code> stripped <code>context_refiner.</code> but not
+      <code>net.</code>, so pointing it at a full <code>model.safetensors</code> — the format
+      this repo's own <code>save_model</code> writes — raised <code>KeyError</code>.</td>
+      <td>The distillation tool had a correct stripper; the pipeline had its own inline copy
+      that handled one prefix fewer. Two implementations of the same idea, only one of them
+      right.</td></tr>
+  <tr><td><code>extract_refiner_state_dict</code> returned every unrelated DiT tensor as if it
+      were the refiner when the file contained no refiner at all, so its own
+      <code>if not refiner: raise</code> guard never fired.</td>
+      <td>The filter that narrows a full checkpoint only activated when a refiner key was
+      present, which is precisely the case that does not need narrowing.</td></tr>
+  <tr><td>An empty caption tokenizes to an <strong>all-padding</strong> row, and that is the
+      unconditional embedding every CFG run uses. A row with no unmasked key makes the attention
+      softmax degenerate.</td>
+      <td>Measured on CPU it returns zeros, so nothing looked wrong. The fused CUDA backends can
+      return NaN, and <code>NaN * 0</code> is still NaN, so zeroing the padded output would not
+      have contained it — it would have poisoned the gradients. Untestable here; guarded
+      defensively by letting such rows attend freely, since their output is discarded anyway.</td></tr>
+</table>
+
+<p>Two of the branch's own tests were also called out and deserved it: one asserted a literal
+string was present in a source file and returned a constant, testing nothing; another was named
+<code>test_checkpoint_without_a_refiner_raises</code> while asserting that it did <em>not</em>
+raise, effectively documenting the second defect above as intended behaviour. Both are fixed —
+the first renamed to say plainly that it is a source-level guard rather than a behaviour test.</p>
+
+<p>The reviewer found no surviving regression in shared code, having traced every changed line in
+<code>utils/dataset.py</code>, <code>utils/oplora.py</code>, <code>models/base.py</code> and
+<code>train.py</code> to confirm no pre-existing model reaches new behaviour.</p>
+
 <h3>Not verified</h3>
 
 <div class="flag">

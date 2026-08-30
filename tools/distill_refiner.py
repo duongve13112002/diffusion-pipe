@@ -51,7 +51,7 @@ from transformers import AutoTokenizer, T5TokenizerFast
 
 from models.cosmos_predict2 import get_dit_config
 from models.cosmos_predict2_modeling import MiniTrainDIT
-from models.text_refiner import ContextRefiner
+from models.text_refiner import ContextRefiner, extract_refiner_state_dict
 from utils.common import iterate_safetensors, load_state_dict
 from utils.dataset import enumerate_captions
 
@@ -84,30 +84,6 @@ def load_captions(config):
             if (text := txt.read_text(encoding='utf-8').strip())
         ]
     return [line.strip() for line in path.read_text(encoding='utf-8').splitlines() if line.strip()]
-
-
-def extract_refiner_state_dict(path):
-    """Pull refiner weights out of either a bare refiner file or a full model checkpoint.
-
-    This is what makes distillation re-runnable at any point: a model saved by refiner_only,
-    refiner_crossattn or a full fine tune keys its refiner as `net.context_refiner.*`, and
-    that has to be loadable back into a bare ContextRefiner so the same refiner can be taken
-    back to the distillation objective.
-    """
-    state_dict = load_state_dict(path)
-    refiner = {}
-    for k, v in state_dict.items():
-        if k.startswith('net.'):
-            k = k[len('net.'):]
-        if k.startswith('context_refiner.'):
-            k = k[len('context_refiner.'):]
-        elif any(key.startswith(('context_refiner.', 'net.context_refiner.')) for key in state_dict):
-            # A full checkpoint: keep only the refiner half of it.
-            continue
-        refiner[k] = v
-    if not refiner:
-        raise RuntimeError(f'No context_refiner weights found in {path}')
-    return refiner
 
 
 def build_teacher(config, dtype, device):
@@ -196,7 +172,7 @@ def build_student(config, dtype, device, model_dim):
     text_encoder.to(device).eval().requires_grad_(False)
 
     resume = config['student'].get('resume_from', None)
-    resumed_state_dict = extract_refiner_state_dict(resume) if resume else None
+    resumed_state_dict = extract_refiner_state_dict(load_state_dict(resume)) if resume else None
 
     num_layers = config['student'].get('n_refiner_layers', 6)
     if resumed_state_dict is not None:

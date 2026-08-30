@@ -24,6 +24,7 @@ from accelerate.utils import set_module_tensor_to_device
 
 from models.base import BasePipeline, PreprocessMediaFile, make_contiguous
 from models.cosmos_predict2_modeling import MiniTrainDIT
+from models.text_refiner import extract_refiner_state_dict
 from utils.common import load_state_dict, AUTOCAST_DTYPE, is_main_process, iterate_safetensors
 from utils.offloading import ModelOffloader
 from models.wan.vae2_1 import WanVAE_
@@ -447,10 +448,11 @@ class CosmosPredict2Pipeline(BasePipeline):
         """
         from_path = None
         if path := self.model_config.get('context_refiner_path', None):
-            from_path = {
-                k[len('context_refiner.'):] if k.startswith('context_refiner.') else k: v.to(dtype)
-                for k, v in load_state_dict(path).items()
-            }
+            # Accepts a bare refiner file or a full checkpoint. Pointing this at a
+            # model.safetensors is a reasonable thing to do, and it keys its refiner as
+            # net.context_refiner.*, so the same extraction the distillation tool uses applies
+            # here too.
+            from_path = {k: v.to(dtype) for k, v in extract_refiner_state_dict(load_state_dict(path)).items()}
         in_checkpoint = {
             k[len('context_refiner.'):]: v
             for k, v in state_dict.items() if k.startswith('context_refiner.')

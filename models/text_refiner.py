@@ -32,6 +32,40 @@ from torch import nn
 from models.llm_adapter import RMSNorm, Attention, RotaryEmbedding
 
 
+# Signature key of a bare refiner state dict, used to tell one apart from a full checkpoint.
+_REFINER_MARKER = 'cap_embedder.1.weight'
+
+
+def extract_refiner_state_dict(state_dict):
+    """Pull refiner weights out of any of the three shapes they are stored in.
+
+    Refiner weights reach the loader as a bare file from distillation, as
+    `net.context_refiner.*` inside a full model checkpoint, or as `context_refiner.*` after the
+    caller has already stripped `net.`. All three have to work wherever a refiner is accepted,
+    so this lives in one place rather than being reimplemented per call site.
+
+    Raises when the input holds no refiner at all, rather than passing unrelated tensors on to
+    fail later with an opaque KeyError or shape mismatch.
+    """
+    stripped = {
+        (k[len('net.'):] if k.startswith('net.') else k): v
+        for k, v in state_dict.items()
+    }
+    refiner = {
+        k[len('context_refiner.'):]: v
+        for k, v in stripped.items() if k.startswith('context_refiner.')
+    }
+    if refiner:
+        return refiner
+    if _REFINER_MARKER in stripped:
+        # Already a bare refiner state dict.
+        return stripped
+    raise RuntimeError(
+        'No context_refiner weights found. Expected either a refiner file (keys like '
+        f'{_REFINER_MARKER!r}) or a checkpoint containing context_refiner.* entries.'
+    )
+
+
 class RefinerBlock(nn.Module):
     """Bidirectional self-attention + MLP.
 
@@ -131,6 +165,14 @@ class ContextRefiner(nn.Module):
             sdpa_mask = attention_mask
             if sdpa_mask.ndim == 2:
                 sdpa_mask = sdpa_mask.unsqueeze(1).unsqueeze(1)
+            # An empty caption tokenizes to an all-padding row, and that is not a corner case:
+            # it is exactly the unconditional embedding every CFG run needs. A row with no
+            # unmasked key makes the attention softmax degenerate; the CPU math backend returns
+            # zeros, but the fused CUDA backends can return NaN, and NaN * 0 is still NaN, so
+            # zeroing the padded output afterwards would not contain it -- it would poison the
+            # gradients instead. Let such a row attend freely; its output is discarded anyway.
+            empty_rows = ~sdpa_mask.any(dim=-1, keepdim=True)
+            sdpa_mask = sdpa_mask | empty_rows
 
         x = self.cap_embedder(hidden_states)
 
