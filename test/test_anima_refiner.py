@@ -1,0 +1,362 @@
+"""Tests for the anima_refiner text frontend (models/text_refiner.py and its wiring).
+
+These run on CPU without DeepSpeed or GPU, and never download model weights. The heavier
+integration tests skip themselves when their imports are unavailable.
+"""
+
+import pytest
+import torch
+from torch import nn
+
+from models.text_refiner import ContextRefiner, RefinerBlock
+
+
+CAP_FEAT_DIM = 128
+MODEL_DIM = 64
+
+
+def make_refiner(num_layers=2, cap_feat_dim=CAP_FEAT_DIM, model_dim=MODEL_DIM, seed=0):
+    torch.manual_seed(seed)
+    refiner = ContextRefiner(
+        cap_feat_dim=cap_feat_dim, model_dim=model_dim, num_layers=num_layers, num_heads=4
+    )
+    refiner.init_weights()
+    refiner.eval()
+    return refiner
+
+
+def make_batch(batch=2, length=12, cap_feat_dim=CAP_FEAT_DIM, valid=8, seed=1):
+    torch.manual_seed(seed)
+    hidden = torch.randn(batch, length, cap_feat_dim)
+    mask = torch.ones(batch, length, dtype=torch.long)
+    mask[-1, valid:] = 0
+    return hidden, mask
+
+
+class TestContextRefiner:
+    def test_output_shape(self):
+        refiner = make_refiner()
+        hidden, mask = make_batch()
+        out = refiner(hidden, mask)
+        assert out.shape == (hidden.shape[0], hidden.shape[1], MODEL_DIM)
+
+    def test_runs_without_mask(self):
+        refiner = make_refiner()
+        hidden, _ = make_batch()
+        assert refiner(hidden).shape == (hidden.shape[0], hidden.shape[1], MODEL_DIM)
+
+    def test_identity_at_init(self):
+        """Zero-init residual branches mean the refiner starts as a plain linear projection.
+
+        This is what makes a fresh refiner a stable starting point in front of a frozen DiT.
+        """
+        refiner = make_refiner(num_layers=4)
+        hidden, mask = make_batch()
+        out = refiner(hidden, mask)
+        expected = refiner.norm_out(refiner.cap_embedder(hidden)) * mask.unsqueeze(-1)
+        torch.testing.assert_close(out, expected)
+
+    def test_padded_positions_are_zeroed(self):
+        refiner = make_refiner()
+        hidden, mask = make_batch(valid=8)
+        out = refiner(hidden, mask)
+        assert out[-1, 8:].abs().max() == 0
+
+    def test_padding_does_not_leak_into_real_tokens(self):
+        """Changing masked-out input must not move the output at unmasked positions."""
+        refiner = make_refiner()
+        hidden, mask = make_batch(valid=8)
+        other = hidden.clone()
+        torch.manual_seed(99)
+        other[-1, 8:] = torch.randn_like(other[-1, 8:])
+        out_a = refiner(hidden, mask)
+        out_b = refiner(other, mask)
+        torch.testing.assert_close(out_a[-1, :8], out_b[-1, :8])
+
+    def test_attention_is_bidirectional(self):
+        """A later token must be able to influence an earlier one.
+
+        This is the property the refiner exists to restore: causal LLMs (and hybrid
+        linear-attention models like Qwen3.5) only give each position left context, while the
+        DiT cross-attention was trained on bidirectional T5 encoder output.
+        """
+        refiner = make_refiner(num_layers=2)
+        # Non-zero residual branches, otherwise the identity init hides all mixing.
+        for block in refiner.blocks:
+            nn.init.normal_(block.attn.o_proj.weight, std=0.05)
+            nn.init.normal_(block.mlp[2].weight, std=0.05)
+
+        hidden, mask = make_batch(batch=1, length=8, valid=8)
+        out_a = refiner(hidden, mask)
+        perturbed = hidden.clone()
+        perturbed[0, 7] += 10.0  # change the LAST token only
+        out_b = refiner(perturbed, mask)
+
+        first_token_delta = (out_a[0, 0] - out_b[0, 0]).abs().max()
+        assert first_token_delta > 1e-4, 'later tokens must influence earlier ones'
+
+    def test_state_dict_round_trip(self):
+        refiner = make_refiner(seed=0)
+        reloaded = make_refiner(seed=7)
+        hidden, mask = make_batch()
+
+        # Perturb so the two are genuinely different before loading.
+        with torch.no_grad():
+            for p in refiner.parameters():
+                p.add_(torch.randn_like(p) * 0.01)
+
+        assert not torch.allclose(refiner(hidden, mask), reloaded(hidden, mask))
+        reloaded.load_state_dict(refiner.state_dict())
+        torch.testing.assert_close(refiner(hidden, mask), reloaded(hidden, mask))
+
+    def test_rotary_buffer_is_not_persistent(self):
+        """inv_freq must stay out of the state dict so saved refiners load cleanly."""
+        refiner = make_refiner()
+        assert not any('inv_freq' in k for k in refiner.state_dict())
+
+    def test_gradients_flow_through_zero_init(self):
+        """Zero-initialised weights must still receive gradient, or the blocks never train."""
+        refiner = make_refiner(num_layers=2)
+        refiner.train()
+        hidden, mask = make_batch()
+        refiner(hidden, mask).square().mean().backward()
+        for i, block in enumerate(refiner.blocks):
+            assert block.attn.o_proj.weight.grad is not None
+            assert block.attn.o_proj.weight.grad.abs().max() > 0, f'block {i} o_proj got no gradient'
+            assert block.mlp[2].weight.grad.abs().max() > 0, f'block {i} mlp got no gradient'
+
+    def test_param_names_are_stable(self):
+        """get_param_groups and KEEP_IN_HIGH_PRECISION match on these substrings."""
+        refiner = make_refiner()
+        names = set(refiner.state_dict())
+        assert 'cap_embedder.1.weight' in names
+        assert 'cap_embedder.1.bias' in names
+        assert 'norm_out.weight' in names
+        assert any(n.startswith('blocks.0.attn.') for n in names)
+
+
+class TestRefinerBlock:
+    def test_zero_init_is_identity(self):
+        torch.manual_seed(0)
+        block = RefinerBlock(MODEL_DIM, num_heads=4)
+        block.init_weights()
+        block.eval()
+        x = torch.randn(2, 6, MODEL_DIM)
+        torch.testing.assert_close(block(x), x)
+
+
+class TestCrossAttentionInvariance:
+    """The distillation objective in tools/distill_refiner.py rests on this property.
+
+    Teacher features are indexed by T5 tokens and student features by the source LLM's
+    tokens, so a position-wise loss compares unrelated slots. Cross-attention output is a
+    weighted sum over text positions and does not depend on their order, which is why the
+    distillation loss is measured there instead.
+    """
+
+    def test_cross_attention_output_is_permutation_invariant(self):
+        modeling = pytest.importorskip('models.cosmos_predict2_modeling')
+        torch.manual_seed(0)
+        attn = modeling.Attention(
+            query_dim=32, context_dim=MODEL_DIM, n_heads=4, head_dim=8, backend='torch'
+        )
+        attn.eval()
+        query = torch.randn(1, 5, 32)
+        context = torch.randn(1, 10, MODEL_DIM)
+        permutation = torch.randperm(10)
+
+        with torch.no_grad():
+            out = attn(query, context=context)
+            out_permuted = attn(query, context=context[:, permutation])
+
+        torch.testing.assert_close(out, out_permuted, atol=1e-5, rtol=1e-5)
+        # And the naive position-wise comparison is NOT invariant, which is the trap this
+        # objective avoids.
+        assert not torch.allclose(context, context[:, permutation])
+
+
+class TestMiniTrainDitWiring:
+    @staticmethod
+    def build(**overrides):
+        modeling = pytest.importorskip('models.cosmos_predict2_modeling')
+        kwargs = dict(
+            max_img_h=64, max_img_w=64, max_frames=8, in_channels=17, out_channels=16,
+            patch_spatial=2, patch_temporal=1, model_channels=128, concat_padding_mask=True,
+            crossattn_emb_channels=1024, pos_emb_cls='rope3d', pos_emb_learnable=True,
+            num_blocks=2, num_heads=4, use_adaln_lora=True, adaln_lora_dim=32,
+        )
+        kwargs.update(overrides)
+        return modeling.MiniTrainDIT(**kwargs)
+
+    def test_refiner_built_when_cap_feat_dim_given(self):
+        model = self.build(cap_feat_dim=2048, n_refiner_layers=2)
+        assert model.use_context_refiner
+        assert not model.use_llm_adapter
+        assert model.context_refiner.cap_embedder[1].in_features == 2048
+        assert model.context_refiner.cap_embedder[1].out_features == 1024
+        assert len(model.context_refiner.blocks) == 2
+
+    def test_llm_adapter_path_unchanged(self):
+        """Existing anima / cosmos_predict2 training must not be affected."""
+        model = self.build(use_llm_adapter=True)
+        assert model.use_llm_adapter
+        assert not model.use_context_refiner
+        assert not hasattr(model, 'context_refiner')
+
+    def test_neither_by_default(self):
+        model = self.build()
+        assert not model.use_llm_adapter
+        assert not model.use_context_refiner
+
+    def test_refiner_and_llm_adapter_are_mutually_exclusive(self):
+        with pytest.raises(AssertionError):
+            self.build(cap_feat_dim=2048, use_llm_adapter=True)
+
+    def test_refiner_params_are_named_for_matching(self):
+        model = self.build(cap_feat_dim=2048, n_refiner_layers=1)
+        names = [n for n, _ in model.named_parameters() if 'context_refiner' in n]
+        assert names, 'refiner parameters must contain "context_refiner" for param grouping'
+        assert all(n.startswith('context_refiner.') for n in names)
+
+
+class TestPipelineIntegration:
+    """Wiring inside models/cosmos_predict2.py. Skipped when its heavy imports are missing."""
+
+    @staticmethod
+    def pipeline_module():
+        return pytest.importorskip('models.cosmos_predict2')
+
+    def test_context_refiner_layer_tuple_arity(self):
+        """ContextRefinerLayer must consume InitialLayer's 7-tuple and emit TransformerLayer's 6."""
+        module = self.pipeline_module()
+        refiner = make_refiner(model_dim=MODEL_DIM)
+        layer = module.ContextRefinerLayer(refiner)
+
+        hidden, mask = make_batch()
+        inputs = (
+            torch.randn(2, 1, 4, 4, 8),   # x_B_T_H_W_D
+            torch.randn(2, 1, 8),         # t_embedding
+            hidden,                       # crossattn_emb (pre-refiner)
+            mask,                         # attn_mask
+            torch.randn(4, 1, 1, 8),      # rope
+            torch.randn(2, 1, 24),        # adaln_lora
+            torch.randn(2, 1),            # timesteps
+        )
+        outputs = layer(inputs)
+        assert len(outputs) == 6, 'must drop attn_mask before the transformer blocks'
+        assert outputs[2].shape == (2, hidden.shape[1], MODEL_DIM)
+
+    def test_keep_in_high_precision_covers_refiner(self):
+        module = self.pipeline_module()
+        assert 'context_refiner' in module.KEEP_IN_HIGH_PRECISION
+
+    def test_checkpointable_layers_covers_refiner(self):
+        module = self.pipeline_module()
+        assert 'ContextRefinerLayer' in module.CosmosPredict2Pipeline.checkpointable_layers
+
+    def _param_groups(self, model_config, params):
+        module = self.pipeline_module()
+
+        class Stub:
+            pass
+
+        stub = Stub()
+        stub.model_config = model_config
+        stub.config = {'optimizer': {'lr': 1e-4}}
+        # is_main_process() calls into deepspeed.comm, which is not initialised under pytest.
+        original = module.is_main_process
+        module.is_main_process = lambda: False
+        try:
+            return module.CosmosPredict2Pipeline.get_param_groups(stub, params)
+        finally:
+            module.is_main_process = original
+
+    @staticmethod
+    def named_param(name, requires_grad=True):
+        p = nn.Parameter(torch.zeros(2), requires_grad=requires_grad)
+        p.original_name = name
+        return p
+
+    def test_refiner_params_get_their_own_group(self):
+        refiner_mlp = self.named_param('context_refiner.blocks.0.mlp.0.weight')
+        refiner_attn = self.named_param('context_refiner.blocks.0.attn.q_proj.weight')
+        dit_cross = self.named_param('blocks.0.cross_attn.k_proj.weight')
+        groups = self._param_groups({'refiner_lr': 5e-4, 'cross_attn_lr': 1e-6}, [refiner_mlp, refiner_attn, dit_cross])
+
+        by_lr = {g['lr']: g['params'] for g in groups}
+        assert set(by_lr[5e-4]) == {refiner_mlp, refiner_attn}, (
+            'refiner params must not fall through into the DiT mlp/attn groups'
+        )
+        assert by_lr[1e-6] == [dit_cross]
+
+    def test_refiner_lr_zero_freezes_refiner(self):
+        refiner_param = self.named_param('context_refiner.norm_out.weight')
+        groups = self._param_groups({'refiner_lr': 0}, [refiner_param])
+        assert refiner_param.requires_grad is False
+        assert groups == []
+
+    def test_base_lr_override_freezes_everything_else(self):
+        """Stage 1: base_lr = 0 freezes the DiT while the refiner still trains."""
+        base = self.named_param('x_embedder.weight')
+        self_attn = self.named_param('blocks.0.self_attn.q_proj.weight')
+        refiner = self.named_param('context_refiner.cap_embedder.1.weight')
+        groups = self._param_groups({'base_lr': 0, 'refiner_lr': 1e-4}, [base, self_attn, refiner])
+
+        assert base.requires_grad is False
+        assert self_attn.requires_grad is False
+        assert refiner.requires_grad is True
+        assert len(groups) == 1
+        assert groups[0]['params'] == [refiner]
+        assert groups[0]['lr'] == 1e-4
+
+
+class TestAdapterSaving:
+    """save_adapter must not confuse LoRA tensors with densely trained refiner weights."""
+
+    @staticmethod
+    def call_save_adapter(train_context_refiner, peft_state_dict, tmp_path):
+        module = pytest.importorskip('models.cosmos_predict2')
+
+        class Stub:
+            train_context_refiner = None
+            saved = {}
+
+            def __init__(self):
+                self.peft_config = type('C', (), {'save_pretrained': lambda s, d: None})()
+
+        stub = Stub()
+        stub.train_context_refiner = train_context_refiner
+        written = {}
+
+        import safetensors.torch
+        original = safetensors.torch.save_file
+        safetensors.torch.save_file = lambda sd, path, metadata=None: written.__setitem__(
+            str(path).rsplit('/', 1)[-1], dict(sd)
+        )
+        try:
+            module.CosmosPredict2Pipeline.save_adapter(stub, tmp_path, peft_state_dict)
+        finally:
+            safetensors.torch.save_file = original
+        return written
+
+    def test_lora_tensors_on_the_refiner_stay_in_the_adapter(self, tmp_path):
+        """When the refiner is a LoRA target its names contain 'context_refiner' too."""
+        state = {
+            'context_refiner.blocks.0.attn.q_proj.lora_A.weight': torch.zeros(2),
+            'blocks.0.cross_attn.k_proj.lora_A.weight': torch.zeros(2),
+        }
+        written = self.call_save_adapter(False, dict(state), tmp_path)
+        assert 'context_refiner.safetensors' not in written
+        assert len(written['adapter_model.safetensors']) == 2
+
+    def test_dense_refiner_weights_are_split_out(self, tmp_path):
+        state = {
+            'context_refiner.cap_embedder.1.weight': torch.zeros(2),
+            'blocks.0.cross_attn.k_proj.lora_A.weight': torch.zeros(2),
+        }
+        written = self.call_save_adapter(True, dict(state), tmp_path)
+        # Saved under names context_refiner_path can load directly.
+        assert set(written['context_refiner.safetensors']) == {'cap_embedder.1.weight'}
+        assert set(written['adapter_model.safetensors']) == {
+            'diffusion_model.blocks.0.cross_attn.k_proj.lora_A.weight'
+        }

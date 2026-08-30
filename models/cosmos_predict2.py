@@ -29,7 +29,7 @@ from utils.offloading import ModelOffloader
 from models.wan.vae2_1 import WanVAE_
 
 
-KEEP_IN_HIGH_PRECISION = ['x_embedder', 't_embedder', 't_embedding_norm', 'final_layer']
+KEEP_IN_HIGH_PRECISION = ['x_embedder', 't_embedder', 't_embedding_norm', 'final_layer', 'context_refiner']
 
 MULTISCALE_LOSS_THRESHOLDS = [size * 0.9 for size in [1024]]
 MULTISCALE_LOSS_THRESHOLDS.sort()
@@ -154,30 +154,120 @@ def get_dit_config(state_dict, key_prefix=''):
     return dit_config
 
 
-def _tokenize(tokenizer, prompts):
+def _tokenize(tokenizer, prompts, max_length=512):
+    # padding='max_length' is required, not just convenient: pipeline parallelism needs every
+    # micro batch to produce identically shaped tensors. Both lumina_2.py and z_image.py carry
+    # the same note where they disable dynamic padding.
     return tokenizer(
         prompts,
         return_tensors="pt",
         truncation=True,
         padding="max_length",
-        max_length=512,
+        max_length=max_length,
     )
 
-def _compute_text_embeddings(text_encoder, input_ids, attn_mask, is_generic_llm=False):
+def _compute_text_embeddings(text_encoder, input_ids, attn_mask, is_generic_llm=False, hidden_layer=None):
     input_ids = input_ids.to(text_encoder.device)
     attn_mask = attn_mask.to(text_encoder.device)
 
-    outputs = text_encoder(input_ids=input_ids, attention_mask=attn_mask)
-    encoded_text = outputs.last_hidden_state
+    if hidden_layer is None:
+        outputs = text_encoder(input_ids=input_ids, attention_mask=attn_mask)
+        encoded_text = outputs.last_hidden_state
+    else:
+        # hidden_states[i] is the output of layer i-1 and hidden_states[0] is the embedding
+        # output, so hidden_states[-1] == last_hidden_state. Which index is best is model
+        # specific: for hybrid attention models (Qwen3.5 interleaves linear and full attention)
+        # prefer one that lands right after a full attention layer.
+        outputs = text_encoder(input_ids=input_ids, attention_mask=attn_mask, output_hidden_states=True)
+        encoded_text = outputs.hidden_states[hidden_layer].clone()
+
     encoded_text[~attn_mask.bool()] = 0
 
     return encoded_text
 
 
+# Shipped with the repo so a bare Qwen3.5-2B safetensors file works with no extra downloads.
+DEFAULT_LLM_CONFIG_PATH = 'configs/qwen3_5_2b'
+# Tried in order when mapping checkpoint keys onto the bare text model. A file exported from
+# the full VLM keeps the wrapper prefixes; one exported from the text tower alone has none.
+_LLM_KEY_PREFIXES = ('model.language_model.', 'language_model.', 'model.', '')
+
+
+def _load_llm_from_single_file(llm_path, model_config, dtype):
+    """Build a text encoder from a single safetensors file plus a separate config directory.
+
+    Three ways to supply the architecture and tokenizer, in priority order:
+      1. llm_config_path pointing at a local directory,
+      2. llm_repo_id, which Transformers downloads and caches,
+      3. the bundled configs/qwen3_5_2b.
+    """
+    config_path = model_config.get('llm_config_path', None)
+    repo_id = model_config.get('llm_repo_id', None)
+    if config_path is None:
+        if repo_id is not None:
+            config_path = repo_id
+        elif os.path.isdir(DEFAULT_LLM_CONFIG_PATH):
+            config_path = DEFAULT_LLM_CONFIG_PATH
+        else:
+            raise RuntimeError(
+                f'llm_path is a single file and {DEFAULT_LLM_CONFIG_PATH} is missing. Set '
+                'llm_config_path to a local Transformers config directory, or llm_repo_id to '
+                'a Hugging Face repo to download it from.'
+            )
+    elif not os.path.isdir(config_path):
+        raise RuntimeError(f'llm_config_path {config_path} is not a directory')
+
+    local_only = os.path.isdir(config_path)
+    tokenizer = AutoTokenizer.from_pretrained(config_path, local_files_only=local_only)
+    llm_config = transformers.AutoConfig.from_pretrained(config_path, local_files_only=local_only)
+    # Vision-language configs nest the language tower's settings under text_config. Building
+    # from that directly means the vision tower is never allocated at all.
+    text_config = getattr(llm_config, 'text_config', llm_config)
+
+    with init_empty_weights():
+        text_encoder = transformers.AutoModel.from_config(text_config)
+
+    # state_dict() is the right expectation set: it holds parameters and persistent buffers,
+    # which is exactly what a checkpoint stores. named_buffers() would additionally demand
+    # non-persistent ones such as rotary_emb.inv_freq, which are computed at init and appear
+    # in no checkpoint.
+    expected = set(text_encoder.state_dict())
+    loaded = set()
+    for key, tensor in iterate_safetensors(llm_path):
+        for prefix in _LLM_KEY_PREFIXES:
+            if key.startswith(prefix) and key[len(prefix):] in expected:
+                target = key[len(prefix):]
+                set_module_tensor_to_device(text_encoder, target, device='cpu', dtype=dtype, value=tensor)
+                loaded.add(target)
+                break
+
+    missing = expected - loaded
+    if missing == {'embed_tokens.weight'} and getattr(text_config, 'tie_word_embeddings', False):
+        # Tied-embedding exports sometimes store the shared matrix only under lm_head.
+        for key, tensor in iterate_safetensors(llm_path):
+            if key.endswith('lm_head.weight'):
+                set_module_tensor_to_device(text_encoder, 'embed_tokens.weight', device='cpu', dtype=dtype, value=tensor)
+                missing = set()
+                break
+
+    if missing:
+        raise RuntimeError(
+            f'{len(missing)} tensors in the text encoder were not found in {llm_path}, for '
+            f'example: {sorted(missing)[:5]}. Check that llm_config_path matches the '
+            'checkpoint, or pass the full Transformers model directory as llm_path instead.'
+        )
+
+    # Non-persistent buffers (rotary_emb.inv_freq and friends) are deliberately left alone:
+    # accelerate's init_empty_weights does not put buffers on the meta device, so the module's
+    # own __init__ has already computed them correctly. Filling them with empty tensors here
+    # would silently corrupt the positional embeddings.
+    return tokenizer, text_encoder, text_config.hidden_size
+
+
 class CosmosPredict2Pipeline(BasePipeline):
     name = 'cosmos_predict2'
     framerate = 16
-    checkpointable_layers = ['TransformerLayer']
+    checkpointable_layers = ['TransformerLayer', 'ContextRefinerLayer']
     adapter_target_modules = [
         'Block',
         'TransformerBlock',  # LLM adapter
@@ -190,6 +280,18 @@ class CosmosPredict2Pipeline(BasePipeline):
         dtype = self.model_config['dtype']
         self.cache_text_embeddings = self.model_config.get('cache_text_embeddings', True)
         self.multiscale_loss_weight = self.model_config.get('multiscale_loss_weight', None)
+
+        # The anima_refiner architecture swaps Anima's LLMAdapter (T5 token queries cross
+        # attending into the LLM) for the Lumina 2 / Z-Image text frontend (cap_embedder plus
+        # bidirectional refiner blocks). See docs/anima_refiner.md.
+        self.use_context_refiner = self.model_config['type'] == 'anima_refiner'
+        self.max_text_length = self.model_config.get('max_text_length', 512)
+        self.llm_hidden_layer = self.model_config.get('llm_hidden_layer', None)
+        self.cap_feat_dim = None
+        if self.use_context_refiner:
+            # 'TransformerBlock' would match the LLMAdapter blocks, which this architecture
+            # doesn't build. RefinerBlock takes its place as the LoRA/LoKr target.
+            self.adapter_target_modules = ['Block', 'RefinerBlock']
 
         # This isn't a nn.Module.
         self.vae = WanVAE(
@@ -236,7 +338,30 @@ class CosmosPredict2Pipeline(BasePipeline):
             if os.path.isdir(llm_path):
                 # generic Transformers LLM
                 self.tokenizer = AutoTokenizer.from_pretrained(llm_path, local_files_only=True)
-                text_encoder = AutoModelForCausalLM.from_pretrained(llm_path, dtype=dtype, local_files_only=True)
+                llm_config = transformers.AutoConfig.from_pretrained(llm_path, local_files_only=True)
+                if hasattr(llm_config, 'text_config'):
+                    # Vision-language model, e.g. Qwen3.5-2B, whose architecture is
+                    # Qwen3_5ForConditionalGeneration with a .model.language_model text tower.
+                    # Only the language tower is used; dropping the vision tower saves its
+                    # weights from ever being held in memory.
+                    full_model = transformers.AutoModelForImageTextToText.from_pretrained(
+                        llm_path, dtype=dtype, local_files_only=True
+                    )
+                    self.text_encoder = full_model.model.language_model
+                    del full_model
+                    self.cap_feat_dim = llm_config.text_config.hidden_size
+                else:
+                    text_encoder = AutoModelForCausalLM.from_pretrained(llm_path, dtype=dtype, local_files_only=True)
+                    self.text_encoder = text_encoder.model
+                    self.cap_feat_dim = llm_config.hidden_size
+            elif self.use_context_refiner:
+                # Single safetensors file. The architecture and tokenizer come from a config
+                # directory instead: configs/qwen3_5_2b ships with the repo, and any other
+                # local directory or Hugging Face repo id works via llm_config_path /
+                # llm_repo_id.
+                self.tokenizer, self.text_encoder, self.cap_feat_dim = _load_llm_from_single_file(
+                    llm_path, self.model_config, dtype
+                )
             else:
                 # assume Qwen3-0.6b (Anima)
                 self.tokenizer = AutoTokenizer.from_pretrained('configs/qwen3_06b', local_files_only=True)
@@ -245,15 +370,26 @@ class CosmosPredict2Pipeline(BasePipeline):
                     text_encoder = transformers.Qwen3ForCausalLM(llm_config)
                 for key, tensor in iterate_safetensors(llm_path):
                     set_module_tensor_to_device(text_encoder, key, device='cpu', dtype=dtype, value=tensor)
-            self.text_encoder = text_encoder.model
+                self.text_encoder = text_encoder.model
+                self.cap_feat_dim = llm_config.hidden_size
             if self.tokenizer.pad_token is None:
                 self.tokenizer.pad_token = self.tokenizer.eos_token
             self.text_encoder.config.use_cache = False
             self.is_generic_llm = True
             # text encoder is different from Cosmos, use a different cache dir
-            self.name = 'anima'
+            self.name = 'anima_refiner' if self.use_context_refiner else 'anima'
         else:
             raise RuntimeError('Missing text encoder path')
+
+        if self.use_context_refiner:
+            if not self.is_generic_llm:
+                raise RuntimeError("anima_refiner requires llm_path (a Transformers LLM), not t5_path")
+            # Cached text embeddings are keyed on this name. Anything that changes what the
+            # text encoder produces -- a different LLM, a different llm_hidden_layer, a
+            # different max_text_length -- invalidates the cache, and nothing detects that
+            # automatically. Set cache_name explicitly when switching between text encoders,
+            # otherwise stale embeddings are silently reused.
+            self.name = self.model_config.get('cache_name', 'anima_refiner')
 
         self.text_encoder.requires_grad_(False)
 
@@ -272,7 +408,26 @@ class CosmosPredict2Pipeline(BasePipeline):
 
         dit_config = get_dit_config(state_dict)
 
-        if 'llm_adapter_path' in self.model_config:
+        context_refiner_state_dict = None
+        if self.use_context_refiner:
+            # The refiner replaces the llm_adapter entirely, so never build both.
+            self.use_llm_adapter = False
+            dit_config['cap_feat_dim'] = self.cap_feat_dim
+            dit_config['n_refiner_layers'] = self.model_config.get('n_refiner_layers', 6)
+            if 'context_refiner_path' in self.model_config:
+                # Trained refiner weights, e.g. the output of tools/distill_refiner.py.
+                context_refiner_state_dict = {
+                    k[len('context_refiner.'):] if k.startswith('context_refiner.') else k: v.to(dtype)
+                    for k, v in load_state_dict(self.model_config['context_refiner_path']).items()
+                }
+            elif any(k.startswith('context_refiner.') for k in state_dict):
+                # Refiner already lives in the checkpoint (a model saved by a previous run).
+                context_refiner_state_dict = None
+            else:
+                # First run against a stock Anima checkpoint: no refiner weights exist yet, so
+                # it gets built fresh. Sentinel distinguishes this from "load from checkpoint".
+                context_refiner_state_dict = 'init'
+        elif 'llm_adapter_path' in self.model_config:
             self.use_llm_adapter = True
             dit_config['use_llm_adapter'] = True
             llm_adapter_state_dict = {
@@ -300,6 +455,30 @@ class CosmosPredict2Pipeline(BasePipeline):
                 dtype_to_use = dtype if (any(keyword in name for keyword in KEEP_IN_HIGH_PRECISION) or p.ndim == 1) else transformer_dtype
                 set_module_tensor_to_device(llm_adapter, name, device='cpu', dtype=dtype_to_use, value=llm_adapter_state_dict[name])
 
+        if self.use_context_refiner and context_refiner_state_dict is not None:
+            # init_empty_weights() leaves every parameter on the meta device, and the loop
+            # above only materialises names present in the checkpoint. A stock Anima
+            # checkpoint has no context_refiner.* keys, so without this the refiner would stay
+            # on meta and blow up on the first forward pass.
+            refiner = transformer.context_refiner
+            fresh = context_refiner_state_dict == 'init'
+            for name, p in refiner.named_parameters():
+                # When fresh, this placeholder only gets the parameter off the meta device;
+                # init_weights() below overwrites it. Buffers are deliberately left alone:
+                # init_empty_weights keeps them real, already computed by __init__, and filling
+                # them with empty tensors would corrupt the rotary embeddings.
+                value = torch.empty(p.shape, dtype=dtype) if fresh else context_refiner_state_dict[name]
+                set_module_tensor_to_device(refiner, name, device='cpu', dtype=dtype, value=value)
+            if fresh:
+                refiner.init_weights()
+                if is_main_process():
+                    print(
+                        f'Initialised a fresh ContextRefiner (cap_feat_dim={self.cap_feat_dim}, '
+                        f'{dit_config["n_refiner_layers"]} layers). It has no trained weights yet: run '
+                        'tools/distill_refiner.py, or train it with the DiT frozen, before expecting '
+                        'usable samples.'
+                    )
+
         self.transformer = transformer
         self.transformer.train()
         for name, p in self.transformer.named_parameters():
@@ -314,8 +493,38 @@ class CosmosPredict2Pipeline(BasePipeline):
         else:
             return []
 
+    def configure_adapter(self, adapter_config):
+        # A freshly initialised refiner has nothing for a low-rank update to build on, so when
+        # train_context_refiner is set the refiner is trained densely instead and kept out of
+        # the adapter entirely. That also keeps its parameter names clean (no PEFT base_layer
+        # indirection), so the weights this run saves load straight back via
+        # context_refiner_path.
+        self.train_context_refiner = self.use_context_refiner and adapter_config.get('train_context_refiner', False)
+        if self.train_context_refiner:
+            self.adapter_target_modules = [m for m in self.adapter_target_modules if m != 'RefinerBlock']
+
+        super().configure_adapter(adapter_config)
+
+        if self.train_context_refiner:
+            for name, p in self.transformer.named_parameters():
+                if 'context_refiner' in name:
+                    p.requires_grad_(True)
+                    p.data = p.data.to(self.model_config['dtype'])
+
     def save_adapter(self, save_dir, peft_state_dict):
         self.peft_config.save_pretrained(save_dir)
+        # Densely trained refiner weights are not part of the adapter. Write them to their own
+        # file, in the layout context_refiner_path expects. Only when train_context_refiner is
+        # set: otherwise the refiner is a LoRA/LoKr target, and its adapter tensors also carry
+        # 'context_refiner' in their names and belong in adapter_model.safetensors.
+        refiner_state_dict = {}
+        if getattr(self, 'train_context_refiner', False):
+            for k in [k for k in peft_state_dict if 'context_refiner' in k]:
+                v = peft_state_dict.pop(k)
+                k = k[k.index('context_refiner.') + len('context_refiner.'):].replace('.base_layer', '')
+                refiner_state_dict[k] = v
+        if refiner_state_dict:
+            safetensors.torch.save_file(refiner_state_dict, save_dir / 'context_refiner.safetensors', metadata={'format': 'pt'})
         # ComfyUI format.
         peft_state_dict = {'diffusion_model.'+k: v for k, v in peft_state_dict.items()}
         safetensors.torch.save_file(peft_state_dict, save_dir / 'adapter_model.safetensors', metadata={'format': 'pt'})
@@ -342,9 +551,17 @@ class CosmosPredict2Pipeline(BasePipeline):
     def get_call_text_encoder_fn(self, text_encoder):
         def fn(captions, is_video):
             # args are lists
-            batch_encoding = _tokenize(self.tokenizer, captions)
-            t5_batch_encoding = _tokenize(self.t5_tokenizer, captions)
-            encoded_text = _compute_text_embeddings(self.text_encoder, batch_encoding.input_ids, batch_encoding.attention_mask)
+            batch_encoding = _tokenize(self.tokenizer, captions, self.max_text_length)
+            encoded_text = _compute_text_embeddings(
+                self.text_encoder,
+                batch_encoding.input_ids,
+                batch_encoding.attention_mask,
+                hidden_layer=self.llm_hidden_layer,
+            )
+            if self.use_context_refiner:
+                # No T5 tokenization: the refiner consumes the LLM's own token sequence.
+                return {'prompt_embeds': encoded_text, 'attn_mask': batch_encoding.attention_mask}
+            t5_batch_encoding = _tokenize(self.t5_tokenizer, captions, self.max_text_length)
             return {'prompt_embeds': encoded_text, 'attn_mask': batch_encoding.attention_mask, 't5_input_ids': t5_batch_encoding.input_ids, 't5_attn_mask': t5_batch_encoding.attention_mask}
         return fn
 
@@ -360,12 +577,16 @@ class CosmosPredict2Pipeline(BasePipeline):
         mask = inputs['mask']
 
         if self.cache_text_embeddings:
-            prompt_embeds_or_batch_encoding = (inputs['prompt_embeds'], inputs['attn_mask'], inputs['t5_input_ids'], inputs['t5_attn_mask'])
+            prompt_embeds_or_batch_encoding = (inputs['prompt_embeds'], inputs['attn_mask'])
+            if not self.use_context_refiner:
+                prompt_embeds_or_batch_encoding += (inputs['t5_input_ids'], inputs['t5_attn_mask'])
         else:
             captions = inputs['caption']
-            batch_encoding = _tokenize(self.tokenizer, captions)
-            t5_batch_encoding = _tokenize(self.t5_tokenizer, captions)
-            prompt_embeds_or_batch_encoding = (batch_encoding.input_ids, batch_encoding.attention_mask, t5_batch_encoding.input_ids, t5_batch_encoding.attention_mask)
+            batch_encoding = _tokenize(self.tokenizer, captions, self.max_text_length)
+            prompt_embeds_or_batch_encoding = (batch_encoding.input_ids, batch_encoding.attention_mask)
+            if not self.use_context_refiner:
+                t5_batch_encoding = _tokenize(self.t5_tokenizer, captions, self.max_text_length)
+                prompt_embeds_or_batch_encoding += (t5_batch_encoding.input_ids, t5_batch_encoding.attention_mask)
 
         bs, channels, num_frames, h, w = latents.shape
 
@@ -411,9 +632,12 @@ class CosmosPredict2Pipeline(BasePipeline):
         transformer = self.transformer
         text_encoder = None if self.cache_text_embeddings else self.text_encoder
         layers = [
-            InitialLayer(transformer, text_encoder, self.is_generic_llm),
-            LLMAdapterLayer(transformer.llm_adapter if self.use_llm_adapter else None),
+            InitialLayer(transformer, text_encoder, self.is_generic_llm, self.use_context_refiner, self.llm_hidden_layer),
         ]
+        if self.use_context_refiner:
+            layers.append(ContextRefinerLayer(transformer.context_refiner))
+        else:
+            layers.append(LLMAdapterLayer(transformer.llm_adapter if self.use_llm_adapter else None))
         for i, block in enumerate(transformer.blocks):
             layers.append(TransformerLayer(block, i, self.offloader))
         layers.append(FinalLayer(transformer))
@@ -448,9 +672,14 @@ class CosmosPredict2Pipeline(BasePipeline):
 
     def get_param_groups(self, parameters):
         base_params, self_attn_params, cross_attn_params, mlp_params, mod_params, llm_adapter_params = [], [], [], [], [], []
+        refiner_params = []
         for p in parameters:
             name = p.original_name
-            if 'llm_adapter' in name:
+            if 'context_refiner' in name:
+                # Must come first: the refiner's own blocks contain .attn and .mlp submodules
+                # that would otherwise be swept into the DiT's parameter groups.
+                refiner_params.append(p)
+            elif 'llm_adapter' in name:
                 llm_adapter_params.append(p)
             elif '.self_attn' in name:
                 self_attn_params.append(p)
@@ -463,24 +692,28 @@ class CosmosPredict2Pipeline(BasePipeline):
             else:
                 base_params.append(p)
 
-        base_lr = self.config['optimizer'].get('lr', None)
+        # base_lr is overridable so a stage that only trains the refiner can freeze everything
+        # else by setting base_lr = 0 without also zeroing the optimizer's own lr.
+        base_lr = self.model_config.get('base_lr', self.config['optimizer'].get('lr', None))
         self_attn_lr = self.model_config.get('self_attn_lr', base_lr)
         cross_attn_lr = self.model_config.get('cross_attn_lr', base_lr)
         mlp_lr = self.model_config.get('mlp_lr', base_lr)
         mod_lr = self.model_config.get('mod_lr', base_lr)
         llm_adapter_lr = self.model_config.get('llm_adapter_lr', base_lr)
+        refiner_lr = self.model_config.get('refiner_lr', base_lr)
 
         if is_main_process():
-            print(f'Using base_lr={base_lr}, self_attn_lr={self_attn_lr}, cross_attn_lr={cross_attn_lr}, mlp_lr={mlp_lr}, mod_lr={mod_lr}, llm_adapter_lr={llm_adapter_lr}')
+            print(f'Using base_lr={base_lr}, self_attn_lr={self_attn_lr}, cross_attn_lr={cross_attn_lr}, mlp_lr={mlp_lr}, mod_lr={mod_lr}, llm_adapter_lr={llm_adapter_lr}, refiner_lr={refiner_lr}')
             print(f'Num base params: {len(base_params)}')
             print(f'Num self_attn params: {len(self_attn_params)}')
             print(f'Num cross_attn params: {len(cross_attn_params)}')
             print(f'Num mlp params: {len(mlp_params)}')
             print(f'Num mod params: {len(mod_params)}')
             print(f'Num llm_adapter params: {len(llm_adapter_params)}')
+            print(f'Num context_refiner params: {len(refiner_params)}')
 
         param_groups = []
-        for lr, params in [(base_lr, base_params), (self_attn_lr, self_attn_params), (cross_attn_lr, cross_attn_params), (mlp_lr, mlp_params), (mod_lr, mod_params), (llm_adapter_lr, llm_adapter_params)]:
+        for lr, params in [(base_lr, base_params), (self_attn_lr, self_attn_params), (cross_attn_lr, cross_attn_params), (mlp_lr, mlp_params), (mod_lr, mod_params), (llm_adapter_lr, llm_adapter_params), (refiner_lr, refiner_params)]:
             if lr == 0:
                 for p in params:
                     p.requires_grad_(False)
@@ -531,7 +764,7 @@ class CosmosPredict2Pipeline(BasePipeline):
 
 
 class InitialLayer(nn.Module):
-    def __init__(self, model, text_encoder, is_generic_llm):
+    def __init__(self, model, text_encoder, is_generic_llm, use_context_refiner=False, llm_hidden_layer=None):
         super().__init__()
         self.x_embedder = model.x_embedder
         self.pos_embedder = model.pos_embedder
@@ -542,17 +775,31 @@ class InitialLayer(nn.Module):
         self.text_encoder = text_encoder
         self.model = [model]
         self.is_generic_llm = is_generic_llm
+        self.use_context_refiner = use_context_refiner
+        self.llm_hidden_layer = llm_hidden_layer
 
     @torch.autocast('cuda', dtype=AUTOCAST_DTYPE)
     def forward(self, inputs):
         x_B_C_T_H_W, timesteps_B_T, *prompt_embeds_or_batch_encoding = inputs
 
+        # The refiner architecture has no T5 tokenization, so it carries two text tensors
+        # instead of four.
+        t5_input_ids = t5_attn_mask = None
         if torch.is_floating_point(prompt_embeds_or_batch_encoding[0]):
-            crossattn_emb, attn_mask, t5_input_ids, t5_attn_mask = prompt_embeds_or_batch_encoding
+            if self.use_context_refiner:
+                crossattn_emb, attn_mask = prompt_embeds_or_batch_encoding
+            else:
+                crossattn_emb, attn_mask, t5_input_ids, t5_attn_mask = prompt_embeds_or_batch_encoding
         else:
             with torch.no_grad():
-                input_ids, attn_mask, t5_input_ids, t5_attn_mask = prompt_embeds_or_batch_encoding
-                crossattn_emb = _compute_text_embeddings(self.text_encoder, input_ids, attn_mask, is_generic_llm=self.is_generic_llm)
+                if self.use_context_refiner:
+                    input_ids, attn_mask = prompt_embeds_or_batch_encoding
+                else:
+                    input_ids, attn_mask, t5_input_ids, t5_attn_mask = prompt_embeds_or_batch_encoding
+                crossattn_emb = _compute_text_embeddings(
+                    self.text_encoder, input_ids, attn_mask,
+                    is_generic_llm=self.is_generic_llm, hidden_layer=self.llm_hidden_layer,
+                )
 
         padding_mask = torch.zeros(x_B_C_T_H_W.shape[0], 1, x_B_C_T_H_W.shape[3], x_B_C_T_H_W.shape[4], dtype=x_B_C_T_H_W.dtype, device=x_B_C_T_H_W.device)
         x_B_T_H_W_D, rope_emb_L_1_1_D, extra_pos_emb_B_T_H_W_D_or_T_H_W_B_D = self.model[0].prepare_embedded_sequence(
@@ -568,11 +815,33 @@ class InitialLayer(nn.Module):
         t_embedding_B_T_D, adaln_lora_B_T_3D = self.t_embedder(timesteps_B_T)
         t_embedding_B_T_D = self.t_embedding_norm(t_embedding_B_T_D)
 
-        outputs =  make_contiguous(x_B_T_H_W_D, t_embedding_B_T_D, crossattn_emb, t5_input_ids, attn_mask, t5_attn_mask, rope_emb_L_1_1_D, adaln_lora_B_T_3D, timesteps_B_T)
+        if self.use_context_refiner:
+            outputs = make_contiguous(x_B_T_H_W_D, t_embedding_B_T_D, crossattn_emb, attn_mask, rope_emb_L_1_1_D, adaln_lora_B_T_3D, timesteps_B_T)
+        else:
+            outputs = make_contiguous(x_B_T_H_W_D, t_embedding_B_T_D, crossattn_emb, t5_input_ids, attn_mask, t5_attn_mask, rope_emb_L_1_1_D, adaln_lora_B_T_3D, timesteps_B_T)
         for tensor in outputs:
             if torch.is_floating_point(tensor):
                 tensor.requires_grad_(True)
         return outputs
+
+
+class ContextRefinerLayer(nn.Module):
+    """Runs the ContextRefiner and drops the attention mask from the pipeline tuple.
+
+    Mirrors LLMAdapterLayer's place in the layer stack: it sits between InitialLayer and the
+    transformer blocks and converts text-encoder output into the crossattn_emb the blocks
+    consume.
+    """
+
+    def __init__(self, context_refiner):
+        super().__init__()
+        self.context_refiner = context_refiner
+
+    @torch.autocast('cuda', dtype=AUTOCAST_DTYPE)
+    def forward(self, inputs):
+        x_B_T_H_W_D, t_embedding_B_T_D, crossattn_emb, attn_mask, rope_emb_L_1_1_D, adaln_lora_B_T_3D, timesteps_B_T = inputs
+        crossattn_emb = self.context_refiner(crossattn_emb, attn_mask)
+        return make_contiguous(x_B_T_H_W_D, t_embedding_B_T_D, crossattn_emb, rope_emb_L_1_1_D, adaln_lora_B_T_3D, timesteps_B_T)
 
 
 class LLMAdapterLayer(nn.Module):

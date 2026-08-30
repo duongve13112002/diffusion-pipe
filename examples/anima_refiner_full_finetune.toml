@@ -1,0 +1,63 @@
+# Full fine tune of anima_refiner: every DiT parameter trains.
+#
+# This is the most expensive option and the easiest way to damage what the base model already
+# knows. Reach for it only after stage 2 has shown the new text encoder actually buys
+# something, and keep a fixed set of validation prompts to watch for style drift -- forgetting
+# usually shows up in samples before it shows up in the loss.
+#
+# There is no [adapter] block, which means full fine tune mode. That also means block swapping
+# is unavailable (train.py requires an adapter for it), so plan VRAM accordingly: use
+# pipeline_stages across GPUs instead.
+
+output_dir = '/data/output/anima_refiner_full'
+dataset = 'examples/dataset.toml'
+
+epochs = 5
+micro_batch_size_per_gpu = 1
+pipeline_stages = 2          # split the model across 2 GPUs
+gradient_accumulation_steps = 4
+gradient_clipping = 1
+warmup_steps = 200
+
+eval_every_n_steps = 500
+eval_before_first_step = true
+eval_micro_batch_size_per_gpu = 1
+eval_gradient_accumulation_steps = 1
+
+save_every_n_steps = 1000
+checkpoint_every_n_minutes = 120
+activation_checkpointing = 'unsloth'
+partition_method = 'parameters'
+save_dtype = 'bfloat16'
+caching_batch_size = 8
+steps_per_print = 10
+
+[model]
+type = 'anima_refiner'
+transformer_path = '/data/output/anima_refiner_stage2/<run>/model.safetensors'
+vae_path = '/data2/imagegen_models/comfyui-models/qwen_image_vae.safetensors'
+llm_path = '/data2/imagegen_models/Qwen3.5-2B'
+dtype = 'bfloat16'
+
+llm_hidden_layer = -1
+n_refiner_layers = 6
+max_text_length = 512
+cache_name = 'anima_refiner_qwen35_2b_L-1'
+
+# Per-group learning rates still apply. Everything defaults to base_lr; these let you keep the
+# structural parts moving more slowly than the text interface, which is usually what you want
+# even in a full fine tune.
+#self_attn_lr = 5e-6
+#mlp_lr = 5e-6
+#cross_attn_lr = 1e-5
+#refiner_lr = 5e-5
+
+timestep_sample_method = 'logit_normal'
+
+[optimizer]
+# Full fine tune of a 2B model needs a memory-efficient optimizer on smaller cards.
+type = 'adamw8bitkahan'
+lr = 5e-6
+betas = [0.9, 0.99]
+weight_decay = 0.01
+eps = 1e-8

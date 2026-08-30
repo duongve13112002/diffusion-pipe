@@ -1,7 +1,7 @@
 # diffusion-pipe
 A pipeline parallel training script for diffusion models.
 
-Models supported: SDXL, Flux, LTX-Video, HunyuanVideo (t2v), Cosmos, Lumina Image 2.0, Wan2.1 (t2v and i2v), Chroma, HiDream, Stable Diffusion 3, Cosmos-Predict2, OmniGen2, Flux Kontext, Wan2.2, Qwen-Image, Qwen-Image-Edit, HunyuanImage-2.1, AuraFlow, Z-Image, HunyuanVideo-1.5, Flux 2 (Dev and Klein), Anima, Ernie-Image, LTX 2.3, Ideogram4, Krea 2, MiniMax H3.
+Models supported: SDXL, Flux, LTX-Video, HunyuanVideo (t2v), Cosmos, Lumina Image 2.0, Wan2.1 (t2v and i2v), Chroma, HiDream, Stable Diffusion 3, Cosmos-Predict2, OmniGen2, Flux Kontext, Wan2.2, Qwen-Image, Qwen-Image-Edit, HunyuanImage-2.1, AuraFlow, Z-Image, HunyuanVideo-1.5, Flux 2 (Dev and Klein), Anima, Anima Refiner, Ernie-Image, LTX 2.3, Ideogram4, Krea 2, MiniMax H3.
 
 ## Features
 - Pipeline parallelism, for training models larger than can fit on a single GPU
@@ -14,6 +14,9 @@ Models supported: SDXL, Flux, LTX-Video, HunyuanVideo (t2v), Cosmos, Lumina Imag
 - Optional OPLoRA (orthogonal projection LoRA) to reduce catastrophic forgetting when training LoRAs
 
 ## Recent changes
+- 2026-08-30
+  - Support Anima Refiner (`type = 'anima_refiner'`): Anima with its LLMAdapter replaced by the Lumina 2 / Z-Image text frontend (`cap_embedder` plus bidirectional refiner blocks). Drops the T5 tokenizer and its embedding table, and lets any Transformers LLM be the text encoder. See [docs/anima_refiner.md](./docs/anima_refiner.md) and the `examples/anima_refiner_*.toml` configs.
+  - Add `tools/distill_refiner.py` to warm-start a refiner from Anima's existing adapter using captions only.
 - 2026-08-08
   - Add CFG-augmented training for MiniMax H3. You need to enable it, see the example TOML file. You probably always want to use either this, or a training adapter.
 - 2026-08-06

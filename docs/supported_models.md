@@ -24,6 +24,7 @@
 |HunyuanVideo-1.5|✅    |✅              |✅                |
 |Flux 2          |✅    |✅              |✅                |
 |Anima           |✅    |✅              |✅                |
+|Anima Refiner   |✅    |✅              |✅                |
 |LTX 2.3         |✅    |❌              |✅                |
 |Ideogram4       |✅    |✅              |✅                |
 |Krea 2          |✅    |✅              |✅                |
@@ -560,6 +561,58 @@ Notes:
   - If you have a larger dataset or a lot of brand-new concepts, you can try training the llm_adapter and see if it helps.
 
 Anima LoRAs are saved in ComfyUI format.
+
+
+## Anima Refiner
+Anima with its text frontend replaced: the `LLMAdapter` (T5 token queries cross-attending into
+the LLM) gives way to a `ContextRefiner`, the `cap_embedder` + bidirectional refiner blocks
+that Lumina 2 and Z-Image use. That drops the T5 tokenizer, its 32128-entry embedding table,
+and the second tokenization pass over every caption, and it lets any Transformers LLM act as
+the text encoder.
+
+```
+[model]
+type = 'anima_refiner'
+transformer_path = '/data2/imagegen_models/comfyui-models/anima-preview.safetensors'
+vae_path = '/data2/imagegen_models/comfyui-models/qwen_image_vae.safetensors'
+# A full Transformers folder, or a single safetensors file (see llm_config_path / llm_repo_id).
+llm_path = '/data2/imagegen_models/Qwen3.5-2B'
+dtype = 'bfloat16'
+
+llm_hidden_layer = -1   # which hidden_states index feeds the refiner
+n_refiner_layers = 6
+max_text_length = 512
+cache_name = 'anima_refiner_qwen35_2b_L-1'   # CHANGE when switching text encoders
+
+# Stage 1: train only the refiner, freeze the DiT.
+base_lr = 0
+self_attn_lr = 0
+cross_attn_lr = 0
+mlp_lr = 0
+mod_lr = 0
+refiner_lr = 1e-4
+```
+
+Read [docs/anima_refiner.md](anima_refiner.md) before training this. The staging matters: the
+refiner has to adapt to a frozen DiT first, because unfreezing while it still emits noise is
+what causes forgetting. There are example configs for every mode in `examples/`
+(`anima_refiner_distill`, `_stage1`, `_stage2`, `_lora`, `_lokr`, `_full_finetune`).
+
+Two settings are easy to get wrong:
+- `llm_hidden_layer`. Lumina 2 uses `hidden_states[-2]`, but Qwen3.5 interleaves linear and
+  full attention, and for it `-2` lands after a *linear*-attention layer while `-1` lands after
+  a full-attention one.
+- `cache_name`. Nothing detects a stale text embedding cache. Changing the text encoder,
+  hidden layer or `max_text_length` requires changing this too.
+
+An optional distillation stage warm-starts the refiner from Anima's existing adapter using
+captions only, no images:
+```
+python -m tools.distill_refiner --config examples/anima_refiner_distill.toml
+```
+
+Anima Refiner LoRAs are saved in ComfyUI format. A densely trained refiner is saved alongside
+them as `context_refiner.safetensors`, ready to load via `context_refiner_path`.
 
 
 ## Ernie-Image

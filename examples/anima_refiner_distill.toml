@@ -1,0 +1,63 @@
+# Stage 1 (optional but recommended): distil a ContextRefiner from Anima's LLMAdapter.
+#
+# Run with:
+#   python -m tools.distill_refiner --config examples/anima_refiner_distill.toml
+#
+# This is NOT a diffusion training run and does not use train.py. It needs captions only --
+# no images, no VAE, no DiT forward pass -- and gets the refiner into roughly the space the
+# frozen DiT can read. Follow it with anima_refiner_stage1.toml.
+#
+# Roughly 6GB of VRAM: Qwen3-0.6B (teacher source) + Qwen3.5-2B (student source) + the
+# LLMAdapter and a handful of the DiT's cross-attention modules.
+
+[distill]
+# One caption per line, or a directory of .txt caption files (rglob'd).
+captions = '/data/anime_dataset/captions.txt'
+output_dir = '/data/output/anima_refiner_distill'
+
+steps = 20000
+batch_size = 16
+lr = 1e-4
+warmup_steps = 500
+betas = [0.9, 0.99]
+weight_decay = 0.01
+max_grad_norm = 1.0
+max_text_length = 512
+dtype = 'bfloat16'
+seed = 42
+
+save_every = 2000
+log_every = 50
+# Weight on the auxiliary masked-mean term. Also permutation invariant, and it gives a useful
+# gradient early on while the probe-attention term is still noisy. Set to 0 to disable.
+pooled_loss_weight = 0.1
+
+[teacher]
+# Anima's Qwen3-0.6B text encoder (ComfyUI single-file format).
+llm_path = '/data2/imagegen_models/comfyui-models/qwen_3_06b_base.safetensors'
+# Must be a trained Anima checkpoint: it supplies both the LLMAdapter (the teacher) and the
+# frozen cross-attention modules the loss is measured through.
+transformer_path = '/data2/imagegen_models/comfyui-models/anima-preview.safetensors'
+
+[student]
+# Either a full Transformers folder, or a single safetensors file (see llm_config_path in
+# examples/anima_refiner_stage1.toml).
+llm_path = '/data2/imagegen_models/Qwen3.5-2B'
+# Which hidden state to take. For Qwen3.5-2B, full-attention layers sit at 3/7/11/15/19/23,
+# and hidden_states[i] is the output of layer i-1, so -1 lands right after a full-attention
+# layer while -2 would land after a linear-attention one.
+llm_hidden_layer = -1
+n_refiner_layers = 6
+model_dim = 1024
+# Resume a partially distilled refiner.
+#resume_from = '/data/output/anima_refiner_distill/context_refiner.safetensors'
+
+[probe]
+# Fixed random queries pushed through the DiT's frozen cross-attention. The loss is measured
+# on the output, which is a weighted sum over text positions and therefore does not depend on
+# how that text is tokenised -- teacher (T5 indexed) and student (LLM indexed) sequences can
+# be compared even though position i means different things on each side.
+num_queries = 64
+# Adjacent DiT blocks give highly correlated signal, so a spread of them covers the same
+# ground for less compute.
+num_blocks = 8

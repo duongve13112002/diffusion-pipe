@@ -25,6 +25,7 @@ from torch.distributed import get_process_group_ranks
 from torchvision import transforms
 
 from .llm_adapter import LLMAdapter
+from .text_refiner import ContextRefiner
 
 
 def _rotate_half(x: torch.Tensor, interleaved: bool) -> torch.Tensor:
@@ -1211,6 +1212,8 @@ class MiniTrainDIT(nn.Module):
         extra_t_extrapolation_ratio: float = 1.0,
         rope_enable_fps_modulation: bool = True,
         use_llm_adapter=False,
+        cap_feat_dim=None,
+        n_refiner_layers=6,
     ) -> None:
         atten_backend = 'torch'
 
@@ -1260,6 +1263,17 @@ class MiniTrainDIT(nn.Module):
                 model_dim=1024,
                 num_layers=6,
                 self_attn=True,
+            )
+
+        # anima_refiner: Lumina/Z-Image style text frontend. Mutually exclusive with the
+        # llm_adapter above -- the pipeline never sets both.
+        self.use_context_refiner = cap_feat_dim is not None
+        if self.use_context_refiner:
+            assert not self.use_llm_adapter, 'cap_feat_dim and use_llm_adapter are mutually exclusive'
+            self.context_refiner = ContextRefiner(
+                cap_feat_dim=cap_feat_dim,
+                model_dim=crossattn_emb_channels,
+                num_layers=n_refiner_layers,
             )
 
         self.blocks = nn.ModuleList(

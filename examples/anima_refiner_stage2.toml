@@ -1,0 +1,66 @@
+# Stage 2: refiner plus the cross-attention key/value projections.
+#
+# Stage 1 leaves the DiT unable to use anything the new text encoder knows that the old one
+# did not -- its cross-attention only understands the vocabulary the previous frontend spoke.
+# Opening k_proj and v_proj is what lets it pick up the new information. Run this only AFTER
+# stage 1 has converged: the point of the ordering is that the refiner's output is already
+# close to what the DiT expects, so these gradients stay small.
+#
+# Only k_proj/v_proj matter here. They project the TEXT side, which is what changed. q_proj
+# and output_proj work on the image side and are left frozen.
+#
+# NOTE: get_param_groups matches '.cross_attn', so cross_attn_lr covers q_proj and output_proj
+# as well. To restrict it to k/v only, see docs/anima_refiner.md.
+
+output_dir = '/data/output/anima_refiner_stage2'
+dataset = 'examples/dataset.toml'
+
+epochs = 1
+micro_batch_size_per_gpu = 4
+pipeline_stages = 1
+gradient_accumulation_steps = 1
+gradient_clipping = 1
+warmup_steps = 200
+
+eval_every_n_steps = 500
+eval_before_first_step = true
+eval_micro_batch_size_per_gpu = 4
+eval_gradient_accumulation_steps = 1
+
+save_every_n_steps = 2000
+checkpoint_every_n_minutes = 120
+activation_checkpointing = 'unsloth'
+partition_method = 'parameters'
+save_dtype = 'bfloat16'
+caching_batch_size = 8
+steps_per_print = 10
+
+[model]
+type = 'anima_refiner'
+# Point at the model stage 1 saved: it already contains the trained context_refiner.
+transformer_path = '/data/output/anima_refiner_stage1/<run>/model.safetensors'
+vae_path = '/data2/imagegen_models/comfyui-models/qwen_image_vae.safetensors'
+llm_path = '/data2/imagegen_models/Qwen3.5-2B'
+dtype = 'bfloat16'
+
+llm_hidden_layer = -1
+n_refiner_layers = 6
+max_text_length = 512
+cache_name = 'anima_refiner_qwen35_2b_L-1'   # same as stage 1, so the cache is reused
+
+# Everything structural stays frozen; only the text interface moves.
+base_lr = 0
+self_attn_lr = 0
+mlp_lr = 0
+mod_lr = 0
+cross_attn_lr = 1e-5   # roughly 10x below the refiner, to limit drift
+refiner_lr = 1e-4
+
+timestep_sample_method = 'logit_normal'
+
+[optimizer]
+type = 'adamw_optimi'
+lr = 1e-4
+betas = [0.9, 0.99]
+weight_decay = 0.01
+eps = 1e-8

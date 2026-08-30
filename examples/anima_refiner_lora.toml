@@ -1,0 +1,63 @@
+# LoRA on top of a TRAINED anima_refiner model.
+#
+# Important: a LoRA is a low-rank update to existing weights, so it has nothing to build on if
+# the refiner is still freshly initialised. Either point context_refiner_path at a trained
+# refiner (normal case), or set train_context_refiner in [adapter] to train it densely
+# alongside the LoRA.
+
+output_dir = '/data/output/anima_refiner_lora'
+dataset = 'examples/dataset.toml'
+
+epochs = 100
+micro_batch_size_per_gpu = 4
+pipeline_stages = 1
+gradient_accumulation_steps = 1
+gradient_clipping = 1
+warmup_steps = 100
+
+eval_every_n_epochs = 1
+eval_before_first_step = true
+eval_micro_batch_size_per_gpu = 4
+eval_gradient_accumulation_steps = 1
+
+save_every_n_epochs = 2
+activation_checkpointing = 'unsloth'
+partition_method = 'parameters'
+save_dtype = 'bfloat16'
+caching_batch_size = 8
+steps_per_print = 10
+blocks_to_swap = 20  # block swapping requires an [adapter] block, so it works here
+
+[model]
+type = 'anima_refiner'
+transformer_path = '/data/output/anima_refiner_stage2/<run>/model.safetensors'
+vae_path = '/data2/imagegen_models/comfyui-models/qwen_image_vae.safetensors'
+llm_path = '/data2/imagegen_models/Qwen3.5-2B'
+dtype = 'bfloat16'
+transformer_dtype = 'float8_e5m2'  # e4m3fn does NOT work well on this model family
+
+llm_hidden_layer = -1
+n_refiner_layers = 6
+max_text_length = 512
+cache_name = 'anima_refiner_qwen35_2b_L-1'
+# Needed if transformer_path does not already contain trained refiner weights.
+#context_refiner_path = '/data/output/anima_refiner_distill/context_refiner.safetensors'
+
+timestep_sample_method = 'logit_normal'
+
+[adapter]
+type = 'lora'
+rank = 32
+dtype = 'bfloat16'
+# Targets 'Block' (DiT) and 'RefinerBlock' (text refiner) by default.
+# Set this to train the refiner densely instead of adapting it. It is then excluded from the
+# LoRA targets and saved separately as context_refiner.safetensors, ready for
+# context_refiner_path. Use it when starting from an untrained refiner.
+#train_context_refiner = true
+
+[optimizer]
+type = 'adamw_optimi'
+lr = 1e-4
+betas = [0.9, 0.99]
+weight_decay = 0.01
+eps = 1e-8
