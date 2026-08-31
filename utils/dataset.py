@@ -965,6 +965,11 @@ class DirectoryDataset:
                     self.directory_config['caption_prefix'],
                     self.prefix_tag_caption,
                     self.tag_dropout_rate,
+                    # Seeded per image so the variants are identical on every launch. These
+                    # captions are a column of the metadata dataset, and the LATENT cache is
+                    # keyed by that dataset's fingerprint -- drawing unseeded meant a full VAE
+                    # re-encode of the whole dataset on every run.
+                    seed=seed_from_hash((self.path, image_spec)),
                 )
             if self.control_path:
                 empty_return['control_file'] = []

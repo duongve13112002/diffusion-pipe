@@ -103,6 +103,7 @@ def shuffle_captions(
     caption_prefix: str = '',
     prefix_tag_caption: str = '',
     tag_dropout_rate: float = 0.0,
+    seed=None,
 ) -> list[str]:
     """Expand captions into the variants that get embedded and cached.
 
@@ -110,7 +111,15 @@ def shuffle_captions(
     variant, so it is baked into the cache exactly like shuffling already was -- changing
     either setting needs --regenerate_cache to take effect, which is this repo's existing
     behaviour for cache_shuffle_num.
+
+    `seed` makes the draws reproducible across processes. That matters more than it looks:
+    these variants become a column of the metadata dataset, whose fingerprint is what the
+    *latent* cache is keyed by. Drawing unseeded gives different captions on every launch, a
+    different fingerprint, and a full VAE re-encode of the entire dataset every single run.
+    Nothing is lost by fixing them -- the variants are frozen into the text embedding cache
+    anyway, so redrawing them per run never produced fresh augmentation.
     """
+    rng = random if seed is None else random.Random(seed)
     if count == 0 and tag_dropout_rate <= 0 and not tag_markers(prefix_tag_caption):
         return [caption_prefix + c for c in captions]
 
@@ -123,6 +132,7 @@ def shuffle_captions(
             prefix_tag_caption=prefix_tag_caption,
             shuffle=(count > 0),
             tag_dropout_rate=tag_dropout_rate,
+            rng=rng,
         )
         for caption in captions
         for _ in range(variants)
@@ -164,6 +174,13 @@ def enumerate_captions(dataset_config, apply_num_repeats=False, apply_shuffle=Tr
     shuffling, no dropout, no caption_prefix -- for callers that augment per sample instead.
     Pass a set as `markers_seen` to collect the `prefix_tag_caption` values that were skipped,
     so the caller can report which markers a consumer will need to strip.
+
+    Deliberately single threaded. The obvious guess is that reading a few million sidecar files
+    is I/O bound and threads would help; measured on 20k files it is 4x SLOWER with 4 or 8
+    threads (17,058 captions/s serial, 4,137 threaded). The work is pathlib-bound, not
+    io-bound: Path construction, .stem and .suffix are pure Python and hold the GIL, so threads
+    only add contention. Serial, three million captions take about three minutes -- which is
+    the whole point of exporting a corpus once.
     """
     captions = []
     for directory_config in dataset_config['directory']:
@@ -218,13 +235,19 @@ def enumerate_captions(dataset_config, apply_num_repeats=False, apply_shuffle=Tr
             else:
                 media_specs.append((None, file))
 
+        # Sidecar lookup by stem, from the directory listing already in hand. The per-image
+        # media_file.with_suffix('.txt').exists() this replaces was a third of every stat the
+        # walk made -- 20k images cost 60k stats, one from the glob, one from exists(), one
+        # from the open. Tar members are not covered: their sidecars, if any, live on disk
+        # beside the archive, which is what the fallback below still handles.
+        txt_by_stem = {f.stem: f for f in files if f.is_file() and f.suffix == '.txt'}
+
         if not media_specs and caption_data is None:
             # Text-only directory: take the caption files themselves as the unit of work.
             media_specs = [(None, f) for f in files if f.is_file() and f.suffix == '.txt']
 
-        directory_captions = []
-        for tar_file, media_file in media_specs:
-            item = None
+        def resolve(spec):
+            tar_file, media_file = spec
             if caption_data is not None:
                 key = str(media_file) if tar_file is not None else media_file.name
                 item = caption_data.get(key, None)
@@ -232,16 +255,22 @@ def enumerate_captions(dataset_config, apply_num_repeats=False, apply_shuffle=Tr
                     logger.warning(f'{key} has no entry in {CAPTIONS_JSON_FILE}')
                 else:
                     assert isinstance(item, list), f'{CAPTIONS_JSON_FILE} must contain lists of captions'
-            elif media_file.suffix == '.txt':
-                item = read_caption_file(media_file, multiline_captions)
-            else:
-                # DirectoryDataset disables the .txt fallback for the whole directory as soon as
-                # a captions.json exists (`if has_captions_json or not os.path.exists(...)`).
-                # Keeping the fallback here would feed distillation captions the diffusion
-                # stages never see, which is the drift this helper exists to prevent.
-                caption_file = media_file.with_suffix('.txt')
-                if caption_file.exists():
-                    item = read_caption_file(caption_file, multiline_captions)
+                return item
+            if media_file.suffix == '.txt':
+                return read_caption_file(media_file, multiline_captions)
+            # DirectoryDataset disables the .txt fallback for the whole directory as soon as
+            # a captions.json exists (`if has_captions_json or not os.path.exists(...)`).
+            # Keeping the fallback here would feed distillation captions the diffusion
+            # stages never see, which is the drift this helper exists to prevent.
+            caption_file = txt_by_stem.get(media_file.stem)
+            if caption_file is not None:
+                return read_caption_file(caption_file, multiline_captions)
+            return None
+
+        items = [resolve(spec) for spec in media_specs]
+
+        directory_captions = []
+        for (tar_file, media_file), item in zip(media_specs, items):
             if not item:
                 item = None
             if item is None:

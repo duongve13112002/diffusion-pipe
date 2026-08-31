@@ -381,3 +381,64 @@ class TestCaptionCacheFingerprint:
         # separates the two iteration_order directories, appended after that suffix.
         assert a.caption_cache_suffix == b.caption_cache_suffix
         assert a.directory_config['caption_sampling'] != b.directory_config['caption_sampling']
+
+
+class TestLatentCacheStability:
+    """Caption augmentation must not invalidate the VAE latent cache.
+
+    The captions are a column of metadata_dataset, and the latent cache is keyed by that
+    dataset's fingerprint. Shuffling and dropout used to draw unseeded, so the captions -- and
+    therefore the fingerprint -- differed on every launch, and the whole dataset was re-encoded
+    through the VAE every single run. Nothing was gained by it: the variants are frozen into
+    the text embedding cache anyway.
+    """
+
+    def _captions(self, tmp_path, **overrides):
+        d = tmp_path / 'imgs'
+        d.mkdir(parents=True, exist_ok=True)
+        Image.new('RGB', (64, 64), (128, 128, 128)).save(d / 'a.png')
+        (d / 'a.txt').write_text('red, blue, green, yellow')
+        ds = DirectoryDataset(directory_config(d, **overrides), {'resolutions': [64]},
+                              'anima', skip_dataset_validation=True)
+        ds.cache_metadata(regenerate_cache=True)
+        buckets = ds.size_bucket_datasets if ds.use_size_buckets else ds.ar_bucket_datasets
+        md = buckets[0].metadata_dataset
+        return [c for row in md['caption'] for c in row], md._fingerprint
+
+    @pytest.mark.parametrize('overrides', [
+        {},
+        {'cache_shuffle_num': 4},
+        {'cache_shuffle_num': 4, 'tag_dropout_rate': 0.3},
+        {'tag_dropout_rate': 0.3},
+    ])
+    def test_metadata_is_reproducible(self, tmp_path, overrides):
+        # Same directory, rebuilt twice: exactly what a second training launch does. Two
+        # different directories would differ in the fingerprint's lineage regardless.
+        a_caps, a_fp = self._captions(tmp_path, **overrides)
+        b_caps, b_fp = self._captions(tmp_path, **overrides)
+        assert a_caps == b_caps, f'{overrides} produced different captions on a second build'
+        assert a_fp == b_fp, f'{overrides} moved the fingerprint the latent cache is keyed by'
+
+    def test_the_variants_are_still_different_from_each_other(self, tmp_path):
+        caps, _ = self._captions(tmp_path, cache_shuffle_num=8)
+        assert len(caps) == 8
+        assert len(set(caps)) > 1, 'seeding must not collapse the variants into one'
+
+    def test_dropout_still_drops(self, tmp_path):
+        caps, _ = self._captions(tmp_path, cache_shuffle_num=8, tag_dropout_rate=0.5)
+        lengths = {len(c.split(', ')) for c in caps}
+        assert min(lengths) < 4, f'nothing was dropped from a 4-tag caption: {caps}'
+        assert min(lengths) >= 1, 'a caption was emptied'
+
+    def test_different_images_get_different_draws(self, tmp_path):
+        d = tmp_path / 'imgs'
+        d.mkdir()
+        for name in ('a', 'b', 'c', 'd'):
+            Image.new('RGB', (64, 64), (128, 128, 128)).save(d / f'{name}.png')
+            (d / f'{name}.txt').write_text('red, blue, green, yellow')
+        ds = DirectoryDataset(directory_config(d, cache_shuffle_num=2), {'resolutions': [64]},
+                              'anima', skip_dataset_validation=True)
+        ds.cache_metadata(regenerate_cache=True)
+        buckets = ds.size_bucket_datasets if ds.use_size_buckets else ds.ar_bucket_datasets
+        caps = [c for row in buckets[0].metadata_dataset['caption'] for c in row]
+        assert len(set(caps)) > 1, 'the seed must vary per image, not be one global constant'

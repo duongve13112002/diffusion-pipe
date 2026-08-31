@@ -57,6 +57,7 @@ def main():
     parser.add_argument('--output', required=True, help='Corpus file to write (.jsonl, .csv or .txt).')
     parser.add_argument('--format', choices=FORMATS, default=None, help='Override the format inferred from the extension.')
     parser.add_argument('--dedupe', action='store_true', help='Collapse identical captions, recording how many times each occurred.')
+
     parser.add_argument(
         '--apply-num-repeats', action='store_true',
         help="Bake each directory's num_repeats into the corpus by repeating captions. Off by "
