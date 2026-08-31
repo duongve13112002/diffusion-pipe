@@ -102,6 +102,29 @@ class TestScriptStructure:
             indent = len(line) - len(line.lstrip())
             assert indent >= 8, f'save at top level of main(), not under a rank guard: {line!r}'
 
+    def test_both_launchers_drive_the_same_path(self):
+        # deepspeed's launcher and torchrun both export RANK/LOCAL_RANK/WORLD_SIZE, so the
+        # script must read those and nothing launcher-specific.
+        src = self.source()
+        assert "os.environ['RANK']" in src
+        assert "os.environ['WORLD_SIZE']" in src
+        assert "os.environ.get('LOCAL_RANK'" in src
+        for launcher_specific in ('OMPI_COMM_WORLD', 'SLURM_PROCID', 'deepspeed.init_distributed'):
+            assert launcher_specific not in src, f'{launcher_specific} ties this to one launcher'
+
+    @pytest.mark.parametrize('env,expected', [
+        ({}, (0, 1, 0)),
+        ({'RANK': '0', 'WORLD_SIZE': '1', 'LOCAL_RANK': '0'}, (0, 1, 0)),
+    ])
+    def test_setup_distributed_single_process(self, env, expected, monkeypatch):
+        for k in ('RANK', 'WORLD_SIZE', 'LOCAL_RANK'):
+            monkeypatch.delenv(k, raising=False)
+        for k, v in env.items():
+            monkeypatch.setenv(k, v)
+        from tools.distill_refiner import setup_distributed
+        if not env:
+            assert setup_distributed() == expected
+
     def test_the_probe_seed_is_not_rank_offset(self):
         # Every rank must measure against the same queries, or the ranks optimise different
         # objectives and the all-reduce averages nonsense.

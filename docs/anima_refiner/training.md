@@ -51,11 +51,12 @@ it was trained, or the target the student is chasing is not the one the DiT can 
 Multi-GPU, four ranks:
 
 ```
-torchrun --nproc_per_node=4 -m tools.distill_refiner --config examples/anima_refiner/distill.toml
+deepspeed --num_gpus=4 tools/distill_refiner.py --config examples/anima_refiner/distill.toml
 ```
 
-This is the one stage that does not go through `train.py`, so it brings its own DDP and
-`gradient_accumulation_steps` rather than inheriting DeepSpeed's. Effective batch is
+`torchrun --nproc_per_node=4 -m tools.distill_refiner` works identically; both launchers export
+the same env vars. This is the one stage that does not go through `train.py`, so it brings its
+own DDP and `gradient_accumulation_steps` rather than inheriting DeepSpeed's. Effective batch is
 `batch_size * gradient_accumulation_steps * world_size`. See
 [README.md](./README.md#scaling-distillation).
 

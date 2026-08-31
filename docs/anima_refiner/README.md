@@ -330,12 +330,30 @@ This stage does not go through `train.py`, so it has none of DeepSpeed's machine
 own:
 
 ```
+deepspeed --num_gpus=4 tools/distill_refiner.py --config examples/anima_refiner/distill.toml
 torchrun --nproc_per_node=4 -m tools.distill_refiner --config examples/anima_refiner/distill.toml
 ```
 
-Plain DDP rather than DeepSpeed, because the teacher, both LLMs and the cross-attention probes
-are frozen — only the 77M-parameter refiner needs gradient synchronisation, so there is no
-optimizer state worth sharding and no model too large to fit, which is what ZeRO exists for.
+Either launcher works — both export `RANK`, `LOCAL_RANK` and `WORLD_SIZE`, which is all the
+script reads. Prefer the `deepspeed` one to stay consistent with every other stage.
+
+**The launcher and the parallelism strategy are separate choices.** The launcher can be
+DeepSpeed's; the parallelism here is plain DDP, and that is deliberate. ZeRO shards optimizer
+state and gradients, so what it can save is bounded by what is *trainable*:
+
+| | |
+|---|---|
+| Trainable (the refiner) | 77.64M params |
+| AdamW states + fp32 master + gradients | 1.24 GB total, so **0.93 GB saved per GPU** across four |
+| Frozen and dominating memory: Qwen3.5-2B + Qwen3-0.6B in bf16 | **5.20 GB**, which ZeRO-1/2 cannot touch |
+
+ZeRO-3 could shard those frozen weights too, but it would all-gather them on every forward pass
+to save memory that is not the constraint. DDP is the right strategy for a stage where 97% of
+the resident weights never receive a gradient.
+
+That reasoning is specific to distillation. Every other stage trains the DiT itself, where the
+trainable fraction is large and ZeRO earns its keep — which is why they go through `train.py`
+and DeepSpeed, and this one does not.
 
 `gradient_accumulation_steps` gives an effective batch of
 `batch_size * gradient_accumulation_steps * world_size`. The loss is scaled by `1/N` so the

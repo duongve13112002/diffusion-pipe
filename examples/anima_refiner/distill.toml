@@ -3,12 +3,15 @@
 # Run with:
 #   python -m tools.distill_refiner --config examples/anima_refiner/distill.toml
 #
-# Multi-GPU, 4 ranks:
+# Multi-GPU, 4 ranks. Either launcher works -- both export RANK/LOCAL_RANK/WORLD_SIZE, which is
+# all this script reads. Use the deepspeed one to stay consistent with the other stages:
+#   deepspeed --num_gpus=4 tools/distill_refiner.py --config examples/anima_refiner/distill.toml
 #   torchrun --nproc_per_node=4 -m tools.distill_refiner --config examples/anima_refiner/distill.toml
 #
-# This stage does NOT go through train.py, so it uses plain DDP rather than DeepSpeed. The
-# teacher, both LLMs and the cross-attention probes are frozen; only the 77M-parameter refiner
-# needs gradient synchronisation, so there is no optimizer state worth sharding.
+# Note the launcher is DeepSpeed's but the parallelism is plain DDP, which is deliberate. ZeRO
+# shards optimizer state and gradients; here that is 1.24 GB total for the 77.64M-parameter
+# refiner (0.93 GB saved per GPU across four), while the two frozen LLMs that dominate memory --
+# 5.20 GB in bf16 -- are exactly what ZeRO-1/2 cannot touch. See docs/anima_refiner/README.md.
 #
 # This is not a diffusion training run and does not use train.py. It needs captions only --
 # no images, no VAE, no DiT forward pass -- and gets the refiner into roughly the space the
