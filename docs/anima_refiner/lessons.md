@@ -285,6 +285,69 @@ and never with `str()`.
 suite that had only ever run there — which is the second half of the lesson: a platform you
 never run on is a platform where your tests assert nothing.
 
+## A mock proves the call was made, never that it did anything
+
+Every ZeRO test in `test/test_distill_refiner.py` monkeypatched `deepspeed.initialize` away and
+asserted against a `FakeEngine` that `backward` and `step` were called in the right order, that
+the loss was not rescaled, and that nothing clipped by hand. All of that was true. None of it
+noticed that the engine was applying one optimizer update in four.
+
+DeepSpeed advances `micro_steps` inside `step()`, never inside `backward()`, and derives the
+accumulation boundary from that counter. A loop that calls `backward()` N times and `step()`
+once therefore advances it once per *outer* step, so the boundary lands every Nth outer step.
+Measured with `gradient_accumulation_steps = 4`: one update in six, and an LR schedule that
+never left its peak. The run completes, the progress bar fills, and the artefact is
+under-trained.
+
+A fake engine cannot have this property, because the property lives in the real one.
+
+**Rule:** when the thing you depend on is a state machine, at least one test must drive the real
+one. Mocking is for what a collaborator *receives*; it can say nothing about what it *does*.
+
+## Do not fix a deliberate decision without reading why it was made
+
+A review flagged that `caption_prefix`, `cache_shuffle_num`, `cache_shuffle_delimiter` and
+`skip_empty_caption` change the cached caption text but are absent from `CAPTION_CACHE_SETTINGS`,
+so `--trust_cache` serves stale captions when one of them changes. The finding is correct. Adding
+them to the suffix is not the fix.
+
+`719aede` had already considered them and left them out on purpose: all four predate the suffix
+mechanism, so putting them in it moves the cache path of every install that uses them, throwing
+away the metadata and the latents keyed off it. A test guards that decision by name. Adding them
+turned it red immediately, which is what a test for a deliberate choice is for.
+
+The fix that satisfies both is to record the settings beside the cache and report a mismatch,
+rather than to encode them into the path.
+
+**Rule:** a test that fails on your fix is evidence about the fix, not an obstacle to it. Read
+the commit that introduced the behaviour before changing it.
+
+## Windows separators break in two directions, and grep only finds one
+
+The first pass fixed four places that took a basename by splitting on `'/'`, and concluded the
+class was cleared -- a repo-wide grep for `split('/')` returned nothing further. A fifth instance
+was still there, wearing a different shape: `tar_f.extractfile(str(image_file))`. A tar member
+name always uses forward slashes; `str()` on a `Path` emits backslashes on Windows, and
+`extractfile` matches literally, so every member inside a subdirectory raised `KeyError` during
+caching.
+
+**Rule:** search for the *concept*, not the string. `os.path.basename` for a disk path,
+`PurePath.as_posix()` for an archive member, and audit every `str(Path(...))` that is about to be
+used as a lookup key.
+
+## An encoding that does not raise is worse than one that does
+
+`open(captions_json)` uses the locale encoding. On Windows that is a codepage, and a codepage
+does not reject UTF-8 -- it decodes it into something else. Measured: a caption reading
+`1girl, 日本語, café` came back as `1girl, æ—¥æœ¬èªž, cafÃ©`, with no error anywhere. That text
+is then cached, embedded and trained on.
+
+Two of the three sites in the repo already passed `encoding='utf-8'`; the third did not, which is
+how it survived review.
+
+**Rule:** every `open()` on a text file the user wrote takes an explicit encoding. A missing one
+is not a stylistic omission, it is a silent data corruption on half the platforms you support.
+
 ## Git
 
 Commits carry no Claude attribution: no `Co-Authored-By: Claude ...`, no `Claude-Session:`

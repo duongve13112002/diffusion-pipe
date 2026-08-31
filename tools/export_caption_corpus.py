@@ -66,24 +66,39 @@ def main():
              'applies num_repeats per directory, and flooring it per caption would delete '
              'every caption in a directory with num_repeats < 1.',
     )
+    parser.add_argument(
+        '--no-progress', action='store_true',
+        help='Suppress the progress bar. Worth setting when the output is going to a log file.',
+    )
     args = parser.parse_args()
 
     fmt = format_for(args.output, args.format)
-    if args.format and fmt != format_for(args.output):
+    # format_for raises when it cannot infer from the extension. An explicit --format is
+    # exactly the case where the extension may be unrecognisable, so inferring again to
+    # compare has to tolerate that -- otherwise the branch meant to WARN about a mismatch
+    # aborts the run instead.
+    try:
+        inferred = format_for(args.output)
+    except ValueError:
+        inferred = None
+    if args.format and inferred is not None and fmt != inferred:
         print(
             f'WARNING: writing {fmt} content to {args.output}, whose extension says '
-            f'{format_for(args.output)}. Readers infer the format from the extension, so this '
+            f'{inferred}. Readers infer the format from the extension, so this '
             f'file will not read back correctly unless the format is passed explicitly.'
         )
 
     dataset_config = toml.load(args.dataset)
 
     markers = set()
+    stats = {}
     captions = enumerate_captions(
         dataset_config,
         apply_num_repeats=args.apply_num_repeats,
         apply_shuffle=False,
         markers_seen=markers,
+        progress=not args.no_progress,
+        stats=stats,
     )
     if not captions:
         raise SystemExit(f'No captions found in {args.dataset}.')
@@ -95,6 +110,18 @@ def main():
     written = write_corpus(args.output, entries, fmt)
 
     unique = len({e['caption'] for e in entries})
+    failed = stats.get('skipped', 0) + stats.get('empty', 0)
+    print(
+        f"Media files: {stats.get('resolved', 0) + failed} total, "
+        f"{stats.get('resolved', 0)} with captions, {failed} without"
+    )
+    if stats.get('skipped'):
+        print(f"  {stats['skipped']} skipped entirely (skip_empty_caption is on)")
+    if stats.get('empty'):
+        print(
+            f"  {stats['empty']} given an empty caption and kept -- these WILL be trained on. "
+            'Set skip_empty_caption = true to drop them instead.'
+        )
     print(f'Read {len(captions)} captions ({unique} unique) from {args.dataset}')
     print(f'Wrote {written} {"records" if fmt != "txt" else "lines"} to {args.output} [{fmt}]')
     if args.dedupe and fmt != 'txt':

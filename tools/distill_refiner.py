@@ -222,6 +222,12 @@ def build_teacher(config, dtype, device):
     # Probe through a spread of blocks rather than all of them: adjacent blocks give highly
     # correlated signal, so a subset covers the same ground for less compute.
     num_probe_blocks = config.get('probe', {}).get('num_blocks', 8)
+    if num_probe_blocks < 1:
+        raise RuntimeError(
+            f'[probe] num_blocks must be >= 1, got {num_probe_blocks}. It selects how many of '
+            "the DiT's frozen cross-attention blocks the loss is measured through; zero blocks "
+            'is not a valid objective.'
+        )
     num_probe_blocks = min(num_probe_blocks, len(dit.blocks))
     stride = max(1, len(dit.blocks) // num_probe_blocks)
     block_indices = list(range(0, len(dit.blocks), stride))[:num_probe_blocks]
@@ -630,6 +636,16 @@ class DeepSpeedZeROStrategy:
     internally and engine.step is a no-op except on an accumulation boundary. So this class does
     NOT rescale the loss and does NOT clip by hand -- doing either on top of the engine would
     double-apply it.
+
+    The engine does NOT work out that boundary for itself under this loop, which is the one
+    thing here that has to be driven by hand. DeepSpeed advances micro_steps inside step(), not
+    inside backward(), and derives the boundary from it; a loop that calls backward() N times
+    and step() once therefore advances the counter once per OUTER step, and the boundary lands
+    every Nth outer step instead of every Nth micro batch. The measured effect with N=2 was
+    half the configured optimizer updates, an LR schedule that never finished, and gradients
+    reduced across ranks on only one outer step in two. set_gradient_accumulation_boundary is
+    DeepSpeed's documented remedy for exactly this call shape, and it must be set before each
+    forward/backward, which is why micro_batch_context does it.
     """
 
     name = 'zero'
@@ -664,6 +680,13 @@ class DeepSpeedZeROStrategy:
             )
         self.stage = stage
         self.precision = precision
+        # Size the communication buckets to the model. DeepSpeed defaults both to 5e8
+        # ELEMENTS, which contiguous_gradients turns into a 2 GB fp32 buffer and overlap_comm
+        # into a second one -- several GB spent to save the 0.93 GB the docstring above quotes
+        # as the whole reason for using ZeRO here. A bucket only has to be large enough to
+        # pipeline communication, never larger than the gradients it carries.
+        trainable = sum(p.numel() for p in refiner.parameters() if p.requires_grad)
+        bucket = max(1, min(2 * 10 ** 7, trainable))
         ds_config = {
             'train_micro_batch_size_per_gpu': batch_size,
             'gradient_accumulation_steps': grad_accum,
@@ -672,6 +695,8 @@ class DeepSpeedZeROStrategy:
                 'stage': stage,
                 'contiguous_gradients': True,
                 'overlap_comm': True,
+                'reduce_bucket_size': bucket,
+                'allgather_bucket_size': bucket,
             },
             'zero_allow_untested_optimizer': True,
             'steps_per_print': 10 ** 9,
@@ -692,8 +717,11 @@ class DeepSpeedZeROStrategy:
         self.module = self.engine
 
     def micro_batch_context(self, is_last):
-        # The engine tracks the accumulation boundary itself and only reduces there, so there
-        # is nothing to suppress from out here.
+        # Tell the engine whether this micro batch closes the accumulation window. It has to be
+        # set before the forward, which is what this context manager wraps. Without it the
+        # engine infers the boundary from a counter that only advances in step(), so most
+        # optimizer updates never happen -- see the class docstring.
+        self.engine.set_gradient_accumulation_boundary(is_last)
         return contextlib.nullcontext()
 
     def backward(self, loss):
@@ -837,6 +865,15 @@ def main():
 
     save_every = config['distill'].get('save_every', 2000)
     log_every = config['distill'].get('log_every', 50)
+    for key, value in (('save_every', save_every), ('log_every', log_every)):
+        if value < 1:
+            # Both are used as `(step + 1) % value`. At 0 that is a ZeroDivisionError on rank 0
+            # only, so the other ranks sit at the next barrier until the watchdog kills the job
+            # -- a hang, not an error message.
+            raise RuntimeError(
+                f'[distill] {key} must be >= 1, got {value}. To effectively disable it, set it '
+                'larger than `steps`.'
+            )
     running = 0.0
     progress_bar = tqdm(range(steps), desc='distill', disable=not is_main)
 
@@ -922,7 +959,8 @@ def main():
                 dist.barrier()
 
     if is_main:
-        save_refiner(refiner, output_dir / 'context_refiner.safetensors', dtype)
+        # The loop's `step + 1 == steps` branch already wrote this file; no need to write the
+        # same tensors again, just say where they are.
         print(f'Done. Point context_refiner_path at {output_dir / "context_refiner.safetensors"}')
 
     if is_main and config['distill'].get('save_full_model', False):
@@ -954,12 +992,26 @@ def save_full_model(teacher_transformer_path, refiner, path, dtype):
         state_dict['net.' + name] = v.to(dtype).cpu().contiguous()
     for k, v in refiner.state_dict().items():
         state_dict['net.context_refiner.' + k] = v.detach().to(dtype).cpu().contiguous()
-    safetensors.torch.save_file(state_dict, str(path), metadata={'format': 'pt'})
+    _save_file_atomically(state_dict, path, {'format': 'pt'})
+
+
+def _save_file_atomically(state_dict, path, metadata):
+    """Write beside the target, then rename over it.
+
+    save_every rewrites one fixed filename, so a plain in-place write destroys the last good
+    checkpoint the moment it starts. An interruption there -- Ctrl-C, OOM, preemption -- leaves
+    a truncated file and nothing to fall back on. os.replace is atomic on NTFS and on POSIX, so
+    the target is either the old file or the new one, never half of either.
+    """
+    path = Path(path)
+    tmp = path.with_name(path.name + '.tmp')
+    safetensors.torch.save_file(state_dict, str(tmp), metadata=metadata)
+    os.replace(tmp, path)
 
 
 def save_refiner(refiner, path, dtype):
     state_dict = {k: v.detach().to(dtype).cpu().contiguous() for k, v in refiner.state_dict().items()}
-    safetensors.torch.save_file(state_dict, str(path), metadata={'format': 'pt'})
+    _save_file_atomically(state_dict, path, {'format': 'pt'})
 
 
 if __name__ == '__main__':

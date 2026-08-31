@@ -225,6 +225,19 @@ CAPTION_CACHE_SETTINGS = {
 }
 
 
+# Caption settings that predate CAPTION_CACHE_SETTINGS. They change the cached caption text
+# exactly as much as the ones above, but they are deliberately NOT part of the suffix: they
+# already existed when the suffix was introduced, so putting them in it would move the cache
+# path of every install that uses them. They are recorded alongside the cache instead, and a
+# mismatch is reported rather than silently served.
+LEGACY_CAPTION_SETTINGS = {
+    'caption_prefix': '',
+    'cache_shuffle_num': 0,
+    'cache_shuffle_delimiter': ', ',
+    'skip_empty_caption': True,
+}
+
+
 def caption_cache_suffix(settings):
     non_default = {k: v for k, v in settings.items() if v != CAPTION_CACHE_SETTINGS[k]}
     if not non_default:
@@ -715,7 +728,10 @@ class DirectoryDataset:
         if online_captions:
             captions_json = self.path / CAPTIONS_JSON_FILE
             assert captions_json.exists()
-            with open(captions_json) as f:
+            # encoding='utf-8' is not optional: open() defaults to the locale encoding, which
+            # on Windows is a codepage that decodes UTF-8 captions into mojibake WITHOUT
+            # raising. The corrupted text then reaches the cache and the text encoder.
+            with open(captions_json, encoding='utf-8') as f:
                 self.captions_dict = json.load(f)
         else:
             self.captions_dict = None
@@ -728,6 +744,50 @@ class DirectoryDataset:
                       ' and make sure you understand what this setting does. If you still want to proceed with the current configuration,'
                       ' run the script with the --i_know_what_i_am_doing flag.')
             quit()
+
+    def _legacy_caption_settings(self):
+        return {
+            'caption_prefix': self.directory_config.get('caption_prefix', ''),
+            # The resolved count, so the legacy shuffle_tags spelling compares equal to the
+            # cache_shuffle_num it means.
+            'cache_shuffle_num': self.shuffle,
+            'cache_shuffle_delimiter': self.directory_config.get('cache_shuffle_delimiter', ', '),
+            'skip_empty_caption': self.skip_empty_caption,
+        }
+
+    @property
+    def _caption_settings_file(self):
+        return self.cache_dir / f'metadata/caption_settings{self.caption_cache_suffix}.json'
+
+    def _record_caption_settings(self):
+        path = self._caption_settings_file
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump(self._legacy_caption_settings(), f, sort_keys=True)
+
+    def _warn_if_caption_settings_changed(self):
+        """Report a cache built under different caption settings, rather than serving it.
+
+        Absent file means a cache written before this check existed. Nothing is known about it,
+        so nothing is claimed -- staying quiet is what keeps the upgrade seamless.
+        """
+        path = self._caption_settings_file
+        if not path.exists():
+            return
+        with open(path, encoding='utf-8') as f:
+            previous = json.load(f)
+        current = self._legacy_caption_settings()
+        changed = {k: (previous.get(k, LEGACY_CAPTION_SETTINGS[k]), v)
+                   for k, v in current.items() if previous.get(k, LEGACY_CAPTION_SETTINGS[k]) != v}
+        if not changed:
+            return
+        lines = '\n'.join(f'    {k}: {was!r} -> {now!r}' for k, (was, now) in sorted(changed.items()))
+        logger.warning(
+            f'{self.path}: the cached captions were built with different settings, and '
+            f'--trust_cache is reusing them as they are:\n{lines}\n'
+            '  These settings are baked into the cached caption text, so this run will train on '
+            'the OLD captions. Pass --regenerate_cache to rebuild them, or drop --trust_cache.'
+        )
 
     def cache_metadata(self, regenerate_cache=False, trust_cache=False):
         def check_grouped_metadata():
@@ -754,8 +814,10 @@ class DirectoryDataset:
             # Otherwise, need to compute the ungrouped metadata and then group.
             print('Grouped metadata is not cached. Computing ungrouped metadata and then grouping.')
             unique_grouping_keys = self._group_metadata_and_save_to_disk(regenerate_cache=regenerate_cache, trust_cache=trust_cache)
+            self._record_caption_settings()
         else:
             print('Found grouped metadata cache. Directly loading it.')
+            self._warn_if_caption_settings_changed()
 
         for grouping_key in unique_grouping_keys:
             grouped_cache_dir = self.cache_dir / f'metadata/grouped_metadata_{bucket_suffix(grouping_key)}{self.caption_cache_suffix}'
@@ -878,7 +940,7 @@ class DirectoryDataset:
 
             if captions_json.exists():
                 print('Loading captions JSON')
-                with open(captions_json) as f:
+                with open(captions_json, encoding='utf-8') as f:
                     caption_data = json.load(f)
 
                 def add_captions(example):
@@ -990,7 +1052,10 @@ class DirectoryDataset:
                 if tar_filename not in tarfile_map:
                     tarfile_map[tar_filename] = tarfile.TarFile(tar_filename)
                 tar_f = tarfile_map[tar_filename]
-                filepath_or_file = tar_f.extractfile(str(image_file))
+                # as_posix(), not str(): a tar member name always uses forward slashes and
+                # extractfile matches it literally, so str() on a Path looks up a name with
+                # backslashes on Windows and raises KeyError for any member in a subdirectory.
+                filepath_or_file = tar_f.extractfile(image_file.as_posix())
 
             if image_file.suffix == '.webp':
                 # Make sure this this object stays alive so it doesn't close the file on us.

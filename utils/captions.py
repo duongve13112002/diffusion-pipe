@@ -157,7 +157,8 @@ def read_caption_file(path: Path, multiline_captions: bool = False) -> list[str]
 NON_MEDIA_SUFFIXES = ('.txt', '.npz', '.json', '.parquet', '.bak', '.db')
 
 
-def enumerate_captions(dataset_config, apply_num_repeats=False, apply_shuffle=True, markers_seen=None):
+def enumerate_captions(dataset_config, apply_num_repeats=False, apply_shuffle=True,
+                       markers_seen=None, progress=False, stats=None):
     """Return every caption in a dataset config, without opening any media file.
 
     This mirrors the caption resolution DirectoryDataset does (captions.json first, then a
@@ -175,6 +176,14 @@ def enumerate_captions(dataset_config, apply_num_repeats=False, apply_shuffle=Tr
     Pass a set as `markers_seen` to collect the `prefix_tag_caption` values that were skipped,
     so the caller can report which markers a consumer will need to strip.
 
+    `progress=True` draws a tqdm bar. The total is not known up front -- it only becomes known
+    as each directory is globbed and each tar is opened -- so the bar's total grows as the walk
+    discovers work, rather than pretending to a figure it does not have. Pass a dict as `stats`
+    to receive the counts: `resolved`, `skipped` (no caption found and dropped) and `empty` (no
+    caption found and given '' instead, which happens when skip_empty_caption is false). The
+    two failure kinds are counted apart on purpose: dropping an image and training it against
+    an empty caption are very different outcomes.
+
     Deliberately single threaded. The obvious guess is that reading a few million sidecar files
     is I/O bound and threads would help; measured on 20k files it is 4x SLOWER with 4 or 8
     threads (17,058 captions/s serial, 4,137 threaded). The work is pathlib-bound, not
@@ -182,12 +191,26 @@ def enumerate_captions(dataset_config, apply_num_repeats=False, apply_shuffle=Tr
     only add contention. Serial, three million captions take about three minutes -- which is
     the whole point of exporting a corpus once.
     """
+    counts = {'resolved': 0, 'skipped': 0, 'empty': 0}
+    bar = None
+    if progress:
+        # Imported here rather than at module scope: this module is deliberately importable
+        # without the training stack, and a caption-only caller that wants no bar should pay
+        # nothing for one.
+        from tqdm import tqdm
+        bar = tqdm(total=0, unit='file', desc='Reading captions', dynamic_ncols=True)
+
     captions = []
     for directory_config in dataset_config['directory']:
         def setting(key, default):
             return directory_config.get(key, dataset_config.get(key, default))
 
         path = Path(directory_config['path'])
+        if not path.is_dir():
+            # DirectoryDataset raises for the same input. Without this a typo, or a path in a
+            # format this platform does not understand, contributes zero captions in silence --
+            # and with several [[directory]] entries the bad one leaves no trace at all.
+            raise RuntimeError(f'Invalid path in dataset config: {path}')
         caption_prefix = setting('caption_prefix', '')
         shuffle_num = setting('cache_shuffle_num', 0)
         if setting('shuffle_tags', False) and shuffle_num == 0:
@@ -218,7 +241,10 @@ def enumerate_captions(dataset_config, apply_num_repeats=False, apply_shuffle=Tr
         caption_data = None
         captions_json = path / CAPTIONS_JSON_FILE
         if captions_json.exists():
-            with open(captions_json) as f:
+            # encoding='utf-8' for the same reason read_caption_file passes it: open() would
+            # otherwise use the locale encoding, and on Windows that silently mojibakes a
+            # UTF-8 captions.json instead of failing.
+            with open(captions_json, encoding='utf-8') as f:
                 caption_data = json.load(f)
 
         files = sorted(path.glob('*'))
@@ -241,6 +267,11 @@ def enumerate_captions(dataset_config, apply_num_repeats=False, apply_shuffle=Tr
         # from the open. Tar members are not covered: their sidecars, if any, live on disk
         # beside the archive, which is what the fallback below still handles.
         txt_by_stem = {f.stem: f for f in files if f.is_file() and f.suffix == '.txt'}
+
+        if bar is not None:
+            # The tars are open by now, so this directory's contribution to the total is known.
+            bar.total += len(media_specs)
+            bar.refresh()
 
         if not media_specs and caption_data is None:
             # Text-only directory: take the caption files themselves as the unit of work.
@@ -274,13 +305,23 @@ def enumerate_captions(dataset_config, apply_num_repeats=False, apply_shuffle=Tr
 
         directory_captions = []
         for (tar_file, media_file), item in zip(media_specs, items):
+            if bar is not None:
+                bar.update(1)
             if not item:
                 item = None
             if item is None:
                 if skip_empty_caption:
                     logger.warning(f'Could not find caption for {media_file}. Skipping.')
+                    counts['skipped'] += 1
+                    if bar is not None:
+                        bar.set_postfix(ok=counts['resolved'], failed=counts['skipped'] + counts['empty'])
                     continue
                 item = ['']
+                counts['empty'] += 1
+            else:
+                counts['resolved'] += 1
+            if bar is not None:
+                bar.set_postfix(ok=counts['resolved'], failed=counts['skipped'] + counts['empty'])
             directory_captions.extend(shuffle_captions(
                 item, shuffle_num, delimiter, caption_prefix, prefix_tag_caption, tag_dropout_rate,
             ))
@@ -291,4 +332,8 @@ def enumerate_captions(dataset_config, apply_num_repeats=False, apply_shuffle=Tr
             total = int(len(directory_captions) * num_repeats)
             captions.extend(directory_captions[i % len(directory_captions)] for i in range(total))
 
+    if bar is not None:
+        bar.close()
+    if stats is not None:
+        stats.update(counts)
     return captions

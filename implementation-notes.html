@@ -33,6 +33,118 @@
 <p class="meta">A running log of decisions taken outside the spec, forced changes, tradeoffs, and
 anything else the maintainer needs to know. Newest entry first.</p>
 
+<h2>2026-09-01 &mdash; Three-agent audit: a silent ZeRO bug, a fifth path bug, and one fix that was wrong</h2>
+
+<p><strong>Request.</strong> A full architecture / QA / adversarial audit of the branch from
+<code>fd00a5e</code>, run as three parallel reviewers, then fix what is real. Plus a progress bar
+for <code>tools/export_caption_corpus.py</code>.</p>
+
+<p><strong>How it was run.</strong> Three Opus agents: architecture-and-research, systematic QA,
+and adversarial. All read-only on the working tree &mdash; three agents editing one checkout would
+have corrupted each other, and the user's instruction was to verify before fixing anyway. The
+machine has 8 GB of RAM; two agents running the full suite at once crashed the user's
+application, and an architecture probe sized at production dims (8 attention blocks at 2048)
+exhausted the allocator. The resource rule that actually held was giving exactly ONE agent the
+right to run torch, with a 600 MB budget, and putting the other two on static analysis. A stated
+cap of "two full-suite agents" was a number on paper with nothing enforcing it.</p>
+
+<p><strong>The find that justified the exercise.</strong> ZeRO plus
+<code>gradient_accumulation_steps &gt; 1</code> applied a fraction of the configured optimizer
+steps. DeepSpeed advances <code>micro_steps</code> inside <code>step()</code>, never inside
+<code>backward()</code>, and derives the accumulation boundary from it; the distillation loop
+calls <code>backward()</code> N times then <code>step()</code> once, so the boundary landed every
+Nth outer step. Measured on a real engine at <code>gas = 4</code>: <strong>one optimizer update in
+six</strong>, and the cosine LR never left its peak. The run completes, the progress bar fills,
+and the artefact is under-trained &mdash; the shipped <code>distill.toml</code> sets
+<code>gradient_accumulation_steps = 2</code> one uncommented line from
+<code>distributed_strategy</code>. Two agents found it independently and the orchestrator
+reproduced it a third time before any code changed. Fixed with
+<code>set_gradient_accumulation_boundary</code>, which is DeepSpeed's documented remedy for
+exactly this call shape.</p>
+
+<p><strong>Why no test caught it, and what changed.</strong> Every ZeRO test monkeypatched
+<code>deepspeed.initialize</code> away and asserted against a fake engine that the right calls
+were made in the right order. All of those assertions were true and none of them could see this.
+<code>TestZeROAccumulationBoundaryForReal</code> now drives a real ZeRO-1 engine on CPU: one test
+asserts the unfixed pattern skips updates, one asserts the fix restores them, one asserts the
+strategy is what sets the boundary. Running DeepSpeed on Windows CPU needs
+<code>deepspeed.ops.__compatible_ops__['ShareMemCommBuilder'] = False</code> to skip a JIT-built
+op that wants MSVC &mdash; which also corrects this log's previous entry, where that was recorded
+as a hard blocker.</p>
+
+<p><strong>A fifth instance of the path-separator class.</strong> The previous entry claimed four
+was the complete set, on the strength of a repo-wide grep for <code>split('/')</code>.
+<code>tar_f.extractfile(str(image_file))</code> in <code>utils/dataset.py</code> was still there
+wearing a different shape: a tar member name always uses forward slashes, <code>str()</code> on a
+<code>Path</code> emits backslashes on Windows, and <code>extractfile</code> matches literally, so
+every member inside a subdirectory raised <code>KeyError</code> during caching. Flat tars are
+unaffected, which is why it survived. Search for the concept, not the string.</p>
+
+<p><strong>An encoding bug that does not raise.</strong> <code>open(captions_json)</code> uses the
+locale encoding; on Windows that is a codepage, and a codepage does not reject UTF-8, it decodes
+it into something else. Measured: <code>1girl, [CJK], caf&eacute;</code> came back mojibaked with
+no error, and that text is what gets cached, embedded and trained. Three sites; two already
+passed <code>encoding='utf-8'</code>, which is how the third escaped review.</p>
+
+<p><strong>Decision: one recommended fix was wrong, and the test said so.</strong> Two agents
+independently flagged that <code>caption_prefix</code>, <code>cache_shuffle_num</code>,
+<code>cache_shuffle_delimiter</code> and <code>skip_empty_caption</code> change the cached caption
+text but are missing from <code>CAPTION_CACHE_SETTINGS</code>, so <code>--trust_cache</code>
+serves stale captions when one changes. The finding is correct; adding them to the suffix is not
+the fix. <code>719aede</code> excluded them deliberately &mdash; all four predate the suffix
+mechanism, so putting them in it moves the cache path of every install that uses them, discarding
+the metadata and the latents keyed off it. A test guards that by name and went red immediately.
+Reverted, and replaced with a <code>caption_settings.json</code> recorded beside the cache: a
+mismatch is reported, the path never moves, and a cache written before the check existed is left
+alone.</p>
+
+<p><strong>Progress bar.</strong> The cost is in <code>enumerate_captions</code>, not in the
+exporter, so that is where it went, behind an opt-in <code>progress=</code> parameter so
+<code>tools/distill_refiner.py</code> is unaffected. The total is not known up front &mdash; it
+becomes known only as each directory is globbed and each tar opened &mdash; so the bar's total
+grows rather than pretending to a figure it does not have. Failures are counted apart:
+<code>skipped</code> (dropped) and <code>empty</code> (kept with an empty caption, and therefore
+trained on) are very different outcomes, so the summary names them separately. No new dependency:
+tqdm is already required and already used in <code>utils/dataset.py</code>.</p>
+
+<div class="flag">
+  <p><strong>AV is a hard dependency and cannot be removed.</strong> <code>utils/dataset.py</code>
+  imports <code>comfy_api.latest</code>, which imports <code>_input_impl/video_types.py</code>,
+  which imports <code>av</code> at module scope. <code>train.py</code> imports
+  <code>utils/dataset.py</code>, so every training run needs it before a line executes &mdash;
+  image-only datasets included. It arrived with the video frame-count fix
+  (<code>e14f976</code>/<code>a14e524</code>), not with the audio commit that added the
+  requirements line. It could only become optional by moving the <code>comfy_api</code> import
+  inside the video branch of <code>_metadata_map_fn</code>. Separately,
+  <code>requirements.txt</code> declares <code>av</code> twice (line 16 and line 34); pip
+  intersects the constraints so behaviour is correct, but line 16 should go.</p>
+</div>
+
+<ul>
+  <li><strong>Tests.</strong> 329 passed, 1 skipped, 0 failed, about three minutes. Was 320 before
+    this work; the 9 new tests cover the ZeRO boundary (3), Windows tar and UTF-8 captions (2),
+    and the caption-settings record (4).</li>
+  <li><strong>Also fixed.</strong> ZeRO left DeepSpeed's bucket sizes at their 5e8-element
+    default, allocating gigabytes to save the 0.93 GB the docs quote as its whole justification
+    &mdash; now sized to the model. Distillation checkpoints are written to a temp file and
+    <code>os.replace</code>d, so an interruption during a periodic save no longer destroys the
+    only artefact. <code>log_every</code>, <code>save_every</code> and <code>[probe]
+    num_blocks</code> are validated instead of raising <code>ZeroDivisionError</code> on rank 0
+    and hanging the others at a barrier. <code>--format</code> on the corpus exporter no longer
+    crashes on exactly the case its warning exists for. The sampler refuses
+    <code>flux_shift</code> rather than silently sampling an unshifted schedule.
+    <code>enumerate_captions</code> raises on a missing directory instead of contributing zero
+    captions in silence. Dead <code>args</code>/<code>kwargs</code> removed from
+    <code>train.py</code>; the duplicate final checkpoint write removed.</li>
+  <li><strong>Not fixed, reported.</strong> The architecture review's findings on the distillation
+    objective (it constrains permutation-invariant moments, with a measured irreducible floor and
+    a generalization gap that scales with <code>num_queries / head_dim</code>), the
+    empty-caption/CFG divergence, refiner provenance metadata,
+    <code>init_from_existing</code> dropping a densely-trained refiner, and
+    <code>refiner_only</code> with <code>pipeline_stages &gt; 1</code>. Each needs a design
+    decision or GPU verification rather than a mechanical fix.</li>
+</ul>
+
 <h2>2026-08-31 &mdash; Running the test suite on Windows, and the four path bugs it found</h2>
 
 <p><strong>Request.</strong> Unblock the test suite on the Windows dev box, run the drift audit,

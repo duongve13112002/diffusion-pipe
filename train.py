@@ -678,9 +678,6 @@ if __name__ == '__main__':
             print(f'Computed beta2 = {betas[1]}')
             optim_config['betas'] = betas
 
-        args = []
-        kwargs = {k: v for k, v in optim_config.items() if k not in ['type', 'gradient_release']}
-
         # The name-to-class mapping lives in utils/optimizer_factory so tools/distill_refiner.py
         # can accept the same optimizer names. Everything below here is pipeline-specific and
         # stays put.

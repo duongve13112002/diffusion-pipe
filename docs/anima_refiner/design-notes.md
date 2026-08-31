@@ -171,12 +171,23 @@ No training run, no multi-GPU run, and no image has ever been produced from this
 tests cover a real optimisation loop, and sampling is checked against a synthetic velocity field
 where the exact answer is known, but that is not the same thing.
 
-`deepspeed.initialize` — and therefore the whole ZeRO strategy — has still never executed.
-DeepSpeed 0.18.4 does install and import on Windows CPU: the sdist omits `bin/deepspeed.bat`,
-which `setup.py` lists for win32, so supply that file and build with `--no-build-isolation` and
-`DS_BUILD_OPS=0`. `initialize` then gets as far as JIT-building the `deepspeed_shm_comm` op and
-stops for want of MSVC `cl.exe`. It fails in seconds with that message rather than hanging, so
-whoever picks this up needs Visual Studio Build Tools on Windows, or a Linux box.
+`deepspeed.initialize` now runs here, and finding the bug below is what it was worth. Two
+things stand between a CPU-only Windows box and a live engine, both surmountable. The sdist
+omits `bin/deepspeed.bat`, which its own `setup.py` lists for win32, so unpack the sdist, add
+that file and `bin/ds_report.bat`, then build with `DS_BUILD_OPS=0` and `--no-build-isolation`.
+`initialize` then tries to JIT-build the `deepspeed_shm_comm` op and needs MSVC `cl.exe`, which
+`build_shm_op()` lets you skip:
+
+```python
+deepspeed.ops.__compatible_ops__['ShareMemCommBuilder'] = False   # before initialize
+```
+
+`test/test_distill_refiner.py::TestZeROAccumulationBoundaryForReal` uses that to drive a real
+ZeRO-1 engine on CPU. It is what caught the accumulation-boundary bug, which every mocked test
+in the file had passed straight over.
+
+What is still unverified is what needs real hardware: no multi-rank run, no GPU run, no training
+run, and no image has been produced from this branch.
 
 `blocks_to_swap` with `cache_text_embeddings = false` is asserted against rather than fixed,
 because verifying a device move needs a GPU.

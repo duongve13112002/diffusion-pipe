@@ -163,6 +163,14 @@ def main():
     pipeline, model_config = build_pipeline(args.config, device, args.dtype)
     dtype = model_config['dtype']
     if args.shift is None:
+        # flux_shift is the other schedule prepare_inputs supports. Reading only `shift` meant a
+        # model trained with flux_shift was sampled on an unshifted schedule, silently.
+        if model_config.get('flux_shift', False):
+            raise SystemExit(
+                'This config sets flux_shift, whose schedule depends on the image resolution '
+                'and is not implemented in this sampler. Pass --shift explicitly to sample on a '
+                'fixed shift, and be aware it will not match training exactly.'
+            )
         args.shift = model_config.get('shift', 1.0)
 
     print(f'Encoding prompt through {pipeline.cap_feat_dim}-dim text encoder '

@@ -551,3 +551,105 @@ class TestLatentCachingRunsForReal:
         ds = self._dataset(tmp_path, n_images=3)
         leaves = self._cache(ds, regenerate_cache=True)
         assert sum(len(leaf.latent_dataset) for leaf in leaves) == 3
+
+
+class TestWindowsPathHandling:
+    """Paths that only break where the separator differs from '/'.
+
+    Four instances of this class were fixed once already; these cover the two that were still
+    live afterwards. Both assertions are meaningful on Linux too -- they just cannot fail there.
+    """
+
+    def test_tar_members_in_a_subdirectory_are_extractable(self, tmp_path):
+        # utils/dataset.py extracts by the raw member name. A tar name always uses forward
+        # slashes; str(Path(name)) renders backslashes on Windows and extractfile matches
+        # literally, so every member in a subdirectory raised KeyError during caching.
+        import tarfile
+        src = tmp_path / 'src'
+        src.mkdir()
+        (src / '000001.png').write_bytes(b'\x89PNG\r\n\x1a\n' + b'0' * 32)
+        tar_path = tmp_path / 'shard.tar'
+        with tarfile.TarFile(tar_path, 'w') as tar:
+            tar.add(src / '000001.png', arcname='images/000001.png')
+
+        with tarfile.TarFile(tar_path) as tar:
+            name = tar.getnames()[0]
+            assert name == 'images/000001.png'
+            # as_posix() is what utils/dataset.py now uses.
+            assert tar.extractfile(Path(name).as_posix()) is not None
+
+    def test_captions_json_is_read_as_utf8(self, tmp_path):
+        # open() without an encoding uses the locale codepage. On Windows that does not raise
+        # on UTF-8 input -- it silently produces mojibake, which then gets cached and trained.
+        import json
+        d = tmp_path / 'imgs'
+        d.mkdir()
+        Image.new('RGB', (64, 64), (128, 128, 128)).save(d / 'a.png')
+        caption = '1girl, \u65e5\u672c\u8a9e, caf\u00e9'
+        (d / 'captions.json').write_text(
+            json.dumps({'a.png': [caption]}, ensure_ascii=False), encoding='utf-8')
+
+        ds = DirectoryDataset(directory_config(d), {'resolutions': [64]}, 'anima',
+                              skip_dataset_validation=True)
+        ds.cache_metadata(regenerate_cache=True)
+        buckets = ds.size_bucket_datasets if ds.use_size_buckets else ds.ar_bucket_datasets
+        found = [c for row in buckets[0].metadata_dataset['caption'] for c in row]
+        assert found == [caption], f'caption was corrupted in transit: {found!r}'
+
+
+class TestCaptionSettingsAreRecorded:
+    """The settings that predate the cache suffix are baked into the cached captions.
+
+    They are deliberately not part of the suffix -- that would move the cache path of every
+    install already using them, discarding the latents keyed off it too. So they are recorded
+    beside the cache and a change is reported instead of being served silently.
+    """
+
+    def _dataset(self, tmp_path, **overrides):
+        d = tmp_path / 'imgs'
+        d.mkdir(parents=True, exist_ok=True)
+        Image.new('RGB', (64, 64), (128, 128, 128)).save(d / 'a.png')
+        (d / 'a.txt').write_text('red, blue, green')
+        return DirectoryDataset(directory_config(d, **overrides), {'resolutions': [64]},
+                                'anima', skip_dataset_validation=True)
+
+    def test_the_settings_file_is_written_next_to_the_cache(self, tmp_path):
+        ds = self._dataset(tmp_path, caption_prefix='anime, ')
+        ds.cache_metadata(regenerate_cache=True)
+        assert ds._caption_settings_file.exists()
+        import json
+        recorded = json.loads(ds._caption_settings_file.read_text(encoding='utf-8'))
+        assert recorded['caption_prefix'] == 'anime, '
+
+    def test_changing_a_recorded_setting_warns_when_the_cache_is_trusted(self, tmp_path, caplog):
+        self._dataset(tmp_path, caption_prefix='anime, ').cache_metadata(regenerate_cache=True)
+        gc.collect()
+
+        second = self._dataset(tmp_path, caption_prefix='photo, ')
+        with caplog.at_level('WARNING'):
+            second.cache_metadata(trust_cache=True)
+        assert 'caption_prefix' in caplog.text, (
+            'a run that changed caption_prefix must be told the cached captions are the old ones'
+        )
+
+    def test_an_unchanged_setting_says_nothing(self, tmp_path, caplog):
+        self._dataset(tmp_path, caption_prefix='anime, ').cache_metadata(regenerate_cache=True)
+        gc.collect()
+
+        second = self._dataset(tmp_path, caption_prefix='anime, ')
+        with caplog.at_level('WARNING'):
+            second.cache_metadata(trust_cache=True)
+        assert 'caption_prefix' not in caplog.text
+
+    def test_a_cache_with_no_settings_file_is_left_alone(self, tmp_path, caplog):
+        # An upgrade must be seamless: nothing is known about a cache written before this
+        # check existed, so nothing is claimed about it.
+        ds = self._dataset(tmp_path, caption_prefix='anime, ')
+        ds.cache_metadata(regenerate_cache=True)
+        ds._caption_settings_file.unlink()
+        gc.collect()
+
+        second = self._dataset(tmp_path, caption_prefix='photo, ')
+        with caplog.at_level('WARNING'):
+            second.cache_metadata(trust_cache=True)
+        assert 'caption_prefix' not in caplog.text

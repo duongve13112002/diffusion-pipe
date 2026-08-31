@@ -239,6 +239,12 @@ class TestDistributedStrategySelection:
         calls = []
 
         class FakeEngine:
+            def set_gradient_accumulation_boundary(self, is_boundary):
+                # The strategy drives this per micro batch. DeepSpeed cannot work the boundary
+                # out for itself under a loop that calls backward N times and step once, so a
+                # fake engine that lacks this method no longer matches the real interface.
+                calls.append(f'boundary={is_boundary}')
+
             def backward(self, loss):
                 calls.append('backward')
 
@@ -255,12 +261,16 @@ class TestDistributedStrategySelection:
         monkeypatch.setattr(torch.distributed, 'is_initialized', lambda: True)
         strategy = self._zero(stage=2)
 
-        # No suppression from outside: the engine tracks its own accumulation boundary.
+        # The boundary is driven from out here. The engine derives it from a counter that only
+        # advances inside step(), so under this loop shape -- N backwards, one step -- it would
+        # otherwise reach the boundary once every N outer steps instead of once per outer step.
         with strategy.micro_batch_context(is_last=False):
             strategy.backward(torch.tensor(1.0))
         strategy.zero_grad()  # must be a no-op, or gradients vanish mid-accumulation
         assert strategy.step() == 0.0  # None from the engine becomes 0.0, not a crash
-        assert calls == ['backward', 'step']
+        assert calls == ['boundary=False', 'backward', 'step'], (
+            'the boundary must be set BEFORE the backward it describes'
+        )
 
     def test_zero_does_not_rescale_the_loss_a_second_time(self):
         # DeepSpeed's engine.backward applies 1/gradient_accumulation_steps itself. Dividing
@@ -676,3 +686,127 @@ class TestGradientClipping:
         DeepSpeedZeROStrategy(model, 1, 2, 16, 2, opt, sched, 0.7, precision)
 
         assert DeepSpeedConfig(captured['config']).gradient_clipping == 0.7
+
+
+class TestZeROAccumulationBoundaryForReal:
+    """Drive a real DeepSpeed engine, not a fake one.
+
+    Every other ZeRO test in this file monkeypatches deepspeed.initialize away and asserts that
+    the strategy CALLS backward and step. That is worth checking, but it cannot see whether the
+    engine acts on those calls -- and it did not. DeepSpeed advances micro_steps inside step(),
+    never inside backward(), and derives the accumulation boundary from that counter, so a loop
+    that calls backward() N times and step() once reached the boundary every Nth OUTER step.
+    With gradient_accumulation_steps = 4 only one optimizer update in six actually happened and
+    the LR schedule never annealed, while the run completed and the progress bar filled.
+
+    Nothing about that is visible to a mock, so this test uses the real engine.
+    """
+
+    @staticmethod
+    def _init_engine(gas):
+        import torch.distributed as dist
+        import deepspeed
+        import deepspeed.ops
+
+        # The shm comm op is JIT-compiled and needs a C++ toolchain, which a CPU-only test box
+        # need not have. build_shm_op() checks this registry and returns None when the op is
+        # marked incompatible, which is the supported way to skip it.
+        for name in list(deepspeed.ops.__compatible_ops__):
+            if 'shm' in name.lower():
+                deepspeed.ops.__compatible_ops__[name] = False
+
+        os.environ.setdefault('MASTER_ADDR', '127.0.0.1')
+        os.environ.setdefault('MASTER_PORT', '29577')
+        os.environ.setdefault('RANK', '0')
+        os.environ.setdefault('WORLD_SIZE', '1')
+        os.environ.setdefault('LOCAL_RANK', '0')
+        if not dist.is_initialized():
+            dist.init_process_group(backend='gloo', rank=0, world_size=1)
+
+        torch.manual_seed(0)
+        model = torch.nn.Linear(4, 4, bias=False)
+        torch.nn.init.zeros_(model.weight)
+        opt = torch.optim.AdamW(model.parameters(), lr=0.1)
+        sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda s: 1.0)
+        config = {
+            'train_micro_batch_size_per_gpu': 2,
+            'gradient_accumulation_steps': gas,
+            'gradient_clipping': 1.0,
+            'zero_optimization': {
+                'stage': 1, 'contiguous_gradients': True, 'overlap_comm': True,
+                # Small on purpose: DeepSpeed's 5e8-element default would allocate 2 GB here.
+                'reduce_bucket_size': 4096, 'allgather_bucket_size': 4096,
+            },
+            'zero_allow_untested_optimizer': True,
+            'steps_per_print': 10 ** 9,
+            'wall_clock_breakdown': False,
+        }
+        engine, _, _, _ = deepspeed.initialize(
+            model=model, optimizer=opt, lr_scheduler=sched, config=config,
+            dist_init_required=False,
+        )
+        return engine, model
+
+    def _count_updates(self, gas, outer_steps, set_boundary):
+        engine, model = self._init_engine(gas)
+        torch.manual_seed(1234)
+        previous = model.weight.detach().clone()
+        updates = 0
+        for _ in range(outer_steps):
+            # Exactly the shape of the loop in tools/distill_refiner.py: N backwards, one step.
+            for micro in range(gas):
+                if set_boundary:
+                    engine.set_gradient_accumulation_boundary(micro == gas - 1)
+                loss = ((engine(torch.randn(2, 4)) - 1.0) ** 2).mean()
+                engine.backward(loss)
+            engine.step()
+            if not torch.equal(previous, model.weight.detach()):
+                updates += 1
+            previous = model.weight.detach().clone()
+        return updates
+
+    def test_the_boundary_must_be_set_or_most_updates_are_skipped(self):
+        """The regression itself: without the boundary call the engine skips updates."""
+        pytest.importorskip('deepspeed')
+        gas, outer = 4, 6
+        assert self._count_updates(gas, outer, set_boundary=False) < outer, (
+            'Expected the unfixed call pattern to skip optimizer updates. If this now passes, '
+            'DeepSpeed changed how it derives the accumulation boundary and '
+            'DeepSpeedZeROStrategy.micro_batch_context should be re-checked against it.'
+        )
+
+    def test_setting_the_boundary_gives_one_update_per_outer_step(self):
+        pytest.importorskip('deepspeed')
+        gas, outer = 4, 6
+        assert self._count_updates(gas, outer, set_boundary=True) == outer
+
+    def test_the_strategy_sets_the_boundary_on_every_micro_batch(self, monkeypatch):
+        """The strategy must be the thing that calls it, not just the test."""
+        import deepspeed
+        from tools.distill_refiner import DeepSpeedZeROStrategy, resolve_precision
+
+        calls = []
+
+        class FakeEngine:
+            def set_gradient_accumulation_boundary(self, is_boundary):
+                calls.append(is_boundary)
+
+        monkeypatch.setattr(
+            deepspeed, 'initialize',
+            lambda **kw: (FakeEngine(), kw['optimizer'], None, kw['lr_scheduler']),
+        )
+        monkeypatch.setattr(torch.distributed, 'is_initialized', lambda: True)
+
+        model = torch.nn.Linear(8, 8)
+        opt = torch.optim.AdamW(model.parameters(), lr=1e-4)
+        sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda s: 1.0)
+        strategy = DeepSpeedZeROStrategy(
+            model, 1, 2, 16, 3, opt, sched, 1.0, resolve_precision({'distill': {}}))
+
+        for micro in range(3):
+            with strategy.micro_batch_context(is_last=(micro == 2)):
+                pass
+
+        assert calls == [False, False, True], (
+            f'the boundary must be False until the last micro batch, got {calls}'
+        )
