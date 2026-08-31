@@ -97,14 +97,46 @@ which runs produce it and which do not.
 
 ## Testing on a CPU-only machine
 
-`test/conftest.py` stubs `comfy_aimdo` and forces ComfyUI to CPU, but **only** when the real
-package is missing and CUDA is unavailable, so it does nothing in a real training environment.
-Without it `models/*.py` cannot even be imported off-GPU.
+`test/conftest.py` carries three shims, all conditional: it stubs `comfy_aimdo`, forces ComfyUI to
+CPU, and stubs `deepspeed`. Each one disables itself when the real thing is present, so none of
+them changes anything in a training environment. Without them `models/*.py` cannot even be
+imported off-GPU.
 
-`pytest test/` runs everything on CPU with no downloads. Multi-GPU behaviour is covered
-indirectly by asserting the invariants pipeline parallelism depends on (constant tensor shapes
-across micro batches; every layer boundary being a valid split point). Real DeepSpeed execution
-needs `deepspeed --num_gpus=2 --module test.debug_deepspeed_init`.
+The deepspeed stub is deliberately uneven. `get_rank`, `get_world_size` and `barrier` have an
+unambiguous single-process meaning and are implemented; `send`, `recv`, `broadcast` and
+`all_reduce` raise instead. A test that reaches a collective is testing distributed behaviour a
+shim cannot stand in for, and a plausible return value would let it pass while proving nothing.
+
+`pytest test/` runs everything on CPU with no downloads. Multi-GPU behaviour is covered indirectly
+by asserting the invariants pipeline parallelism depends on (constant tensor shapes across micro
+batches; every layer boundary being a valid split point). Real DeepSpeed execution needs
+`deepspeed --num_gpus=2 --module test.debug_deepspeed_init`.
+
+### Windows needs two more things, because it spawns instead of forking
+
+Both come from the same root: a spawned worker is a brand-new interpreter that inherits nothing
+conftest did, where a forked one inherits everything.
+
+`test/childenv/sitecustomize.py` is what reaches those workers. Python imports `sitecustomize`
+automatically at startup, so conftest puts that directory on `PYTHONPATH` and the children pick up
+the same shims. Order matters inside it: it must claim the `utils` namespace before ComfyUI is
+reachable, because ComfyUI's `utils/` has an `__init__.py` and a regular package ends namespace
+resolution outright — once it wins, `utils.dataset` stops existing. The same file lets
+`tools/check_comfy_signatures.py` run on a CPU box:
+
+```
+PYTHONPATH=test/childenv python tools/check_comfy_signatures.py
+```
+
+`DIFFUSION_PIPE_NUM_PROC=1` is the second. `utils/dataset.py` maps with `min(8, cpu_count())`
+workers, and a spawned one re-imports torch, deepspeed and ComfyUI before it does any work — about
+45 seconds to map a handful of rows. conftest sets it on win32 only, so a Linux run still exercises
+the real multiprocess path.
+
+DeepSpeed itself does install on Windows CPU, which makes the stub inert. The sdist omits
+`bin/deepspeed.bat`, which its own `setup.py` lists for win32, so unpack the sdist, add that file
+and `bin/ds_report.bat`, then `DS_BUILD_OPS=0 pip install . --no-build-isolation`.
+`deepspeed.initialize` still does not run: it JIT-builds an op and needs MSVC `cl.exe`.
 
 ## Check the premise before building on it
 
@@ -229,6 +261,29 @@ else, say so at the point it is missing.
 `shuffle_tags` and `cache_shuffle_num = 1` are documented as the same thing. One gate read the
 value where the back-compat fixup had run and the other where it had not, so the two spellings
 got opposite behaviour. Resolve legacy spellings once, at the point the value is first read.
+
+## Never split a path on '/' to get its basename
+
+Running the suite on Windows for the first time turned up four separate places doing this, and
+they only ever agree with reality on a platform where the two separators are the same character.
+Two were in shipped code, one in a helper on this branch, one in a test:
+
+| Where | What it did |
+| --- | --- |
+| `utils/dataset.py` `add_captions` | `image_file.split('/')[-1]` on a disk path, so every `captions.json` lookup missed and every caption became empty. Pre-existing upstream, not from this branch. |
+| `utils/dataset.py` online-caption path | The same expression, copied from it while fixing something else. |
+| `utils/captions.py` `enumerate_captions` | `str(media_file)` for a tar member, emitting backslashes where a tar name always uses `/`. |
+| `test/test_anima_refiner.py` | `str(path).rsplit('/', 1)[-1]` to key captured writes by filename, so the assertions looked for keys that were full paths. |
+
+Two directions, one confusion. An on-disk path uses the platform separator, so take its basename
+with `os.path.basename`, which splits on `/` everywhere and additionally on `\` on Windows. A
+tar member name always uses `/` regardless of platform, so build it with `PurePath.as_posix()`
+and never with `str()`.
+
+**Rule:** `os.path.basename` for disk paths, `as_posix()` for archive members, and a literal
+`'/'` split for neither. None of these were visible on Linux, and none of them were caught by a
+suite that had only ever run there — which is the second half of the lesson: a platform you
+never run on is a platform where your tests assert nothing.
 
 ## Git
 

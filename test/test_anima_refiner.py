@@ -4,6 +4,7 @@ These run on CPU without DeepSpeed or GPU, and never download model weights. The
 integration tests skip themselves when their imports are unavailable.
 """
 
+import os
 import re
 from pathlib import Path
 
@@ -464,8 +465,10 @@ class TestAdapterSaving:
 
         import safetensors.torch
         original = safetensors.torch.save_file
+        # Keyed by basename via os.path, not a split on '/': save_adapter builds the path with
+        # pathlib, so on Windows it arrives with backslashes and a '/' split returns all of it.
         safetensors.torch.save_file = lambda sd, path, metadata=None: written.__setitem__(
-            str(path).rsplit('/', 1)[-1], dict(sd)
+            os.path.basename(str(path)), dict(sd)
         )
         try:
             module.CosmosPredict2Pipeline.save_adapter(stub, tmp_path, peft_state_dict)

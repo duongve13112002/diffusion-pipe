@@ -146,16 +146,37 @@ the repo had ever constructed a `DirectoryDataset`.
 shared code, ask which test would fail if the change were wrong. If the answer is none, that is
 the test to write.
 
-## What is still unverified
+## What is verified, and what is still not
 
-No training run, no multi-GPU run, no image has ever been produced from this branch. Everything
-is covered by CPU tests, including a real optimisation loop and sampling checked against a
-synthetic velocity field where the exact answer is known, but that is not the same thing.
+Measured 2026-08-31 on Windows 11, Python 3.12.10, torch 2.13.0+cpu, no GPU. The suite is 320
+passed / 1 skipped there.
 
-`utils/cache.py` opens sqlite with `autocommit=`, which needs Python 3.12, so `cache_latents`
-cannot run on a 3.11 box at all — the iteration-order paths are tested through the pure function
-`collapse_to_one_entry_per_image` and through the cache path derivation, not through a real
-caching run.
+### Verified since this section was first written
+
+`cache_latents` now runs for real. `utils/cache.py` opens sqlite with `autocommit=`, which needs
+Python 3.12, so on the 3.11 box this was written for the path could not execute at all, and the
+iteration-order code was only ever reached through the pure helper
+`collapse_to_one_entry_per_image`. `TestLatentCachingRunsForReal` in `test/test_dataset_smoke.py`
+drives the real thing with a stub in place of the VAE — the only genuinely GPU-shaped part —
+covering `_map_and_cache`, the sqlite cache and the iteration-order directory, including that a
+second trusting pass lands on the same directory name.
+
+Both drift guards run and pass here: 34/34 vendored-API checks against torch 2.13.0 and
+bitsandbytes 0.50.0, and 26/26 ComfyUI signature checks. The ComfyUI one needs
+`PYTHONPATH=test/childenv` so the submodule can import without a CUDA device.
+
+### Still unverified, and why
+
+No training run, no multi-GPU run, and no image has ever been produced from this branch. CPU
+tests cover a real optimisation loop, and sampling is checked against a synthetic velocity field
+where the exact answer is known, but that is not the same thing.
+
+`deepspeed.initialize` — and therefore the whole ZeRO strategy — has still never executed.
+DeepSpeed 0.18.4 does install and import on Windows CPU: the sdist omits `bin/deepspeed.bat`,
+which `setup.py` lists for win32, so supply that file and build with `--no-build-isolation` and
+`DS_BUILD_OPS=0`. `initialize` then gets as far as JIT-building the `deepspeed_shm_comm` op and
+stops for want of MSVC `cl.exe`. It fails in seconds with that message rather than hanging, so
+whoever picks this up needs Visual Studio Build Tools on Windows, or a Linux box.
 
 `blocks_to_swap` with `cache_text_embeddings = false` is asserted against rather than fixed,
 because verifying a device move needs a GPU.

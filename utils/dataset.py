@@ -31,7 +31,10 @@ import comfy.model_management as mm
 
 DEBUG = False
 IMAGE_SIZE_ROUND_TO_MULTIPLE = 32
-NUM_PROC = min(8, os.cpu_count())
+# Worker count for the dataset map pools. A forked worker is nearly free, but on a spawn
+# platform each one re-imports torch, deepspeed and ComfyUI, which costs far more than
+# mapping a small dataset. DIFFUSION_PIPE_NUM_PROC overrides the default; 1 maps in-process.
+NUM_PROC = int(os.environ.get('DIFFUSION_PIPE_NUM_PROC', 0)) or min(8, os.cpu_count())
 ROUND_DECIMAL_DIGITS = 3
 
 UNCOND_FRACTION = 0.0
@@ -427,7 +430,10 @@ class SizeBucketDataset:
                 # inside the archive, a plain file by basename. Using the full on-disk path for
                 # both made every lookup miss on an ordinary image directory, so every caption
                 # became ''.
-                key = image_file if tar_file is not None else image_file.split('/')[-1]
+                # os.path.basename, not a split on '/': a tar member always uses forward
+                # slashes, but an on-disk path uses the platform separator, and splitting a
+                # Windows path on '/' returns the whole path and misses every lookup.
+                key = image_file if tar_file is not None else os.path.basename(image_file)
                 if key in self.captions_dict:
                     caption = self.captions_dict[key][caption_number]
                     if self._augment_at_runtime:
@@ -878,7 +884,7 @@ class DirectoryDataset:
                 def add_captions(example):
                     tar_file, image_file = example['image_spec']
                     if tar_file is None:
-                        image_file = image_file.split('/')[-1]
+                        image_file = os.path.basename(image_file)
                     captions = caption_data.get(image_file, None)
                     if captions is None:
                         logger.warning(f'Image file {image_file} does not have an entry in captions.json')
@@ -916,7 +922,8 @@ class DirectoryDataset:
             load_from_cache_file=(not regenerate_cache and trust_cache),
             batched=True,
             batch_size=1,
-            num_proc=NUM_PROC,
+            # None, not 1: datasets still starts a worker process for num_proc=1.
+            num_proc=NUM_PROC if NUM_PROC > 1 else None,
             remove_columns=metadata_dataset.column_names,
         )
         return metadata_dataset

@@ -249,7 +249,10 @@ def enumerate_captions(dataset_config, apply_num_repeats=False, apply_shuffle=Tr
         def resolve(spec):
             tar_file, media_file = spec
             if caption_data is not None:
-                key = str(media_file) if tar_file is not None else media_file.name
+                # as_posix(), not str(): a tar member name always uses forward slashes, and
+                # DirectoryDataset keys captions.json by that raw name. str() on a Path would
+                # emit backslashes on Windows and miss every tar lookup.
+                key = media_file.as_posix() if tar_file is not None else media_file.name
                 item = caption_data.get(key, None)
                 if item is None:
                     logger.warning(f'{key} has no entry in {CAPTIONS_JSON_FILE}')

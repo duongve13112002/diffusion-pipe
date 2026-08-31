@@ -10,6 +10,7 @@ The lesson is narrow and worth keeping: an import test proves a module parses, n
 These tests build the real objects against a handful of real (tiny) images.
 """
 
+import gc
 import sys
 from pathlib import Path
 
@@ -403,7 +404,16 @@ class TestLatentCacheStability:
         ds.cache_metadata(regenerate_cache=True)
         buckets = ds.size_bucket_datasets if ds.use_size_buckets else ds.ar_bucket_datasets
         md = buckets[0].metadata_dataset
-        return [c for row in md['caption'] for c in row], md._fingerprint
+        captions = [c for row in md['caption'] for c in row]
+        fingerprint = md._fingerprint
+        # Read everything out, then let the arrow files go. A caller that builds the same
+        # directory twice is standing in for two training launches, and a real second launch is
+        # a fresh process holding no memory maps. Keeping the first build's maps open here is
+        # not just untidy: Windows refuses to reopen a mapped .arrow file for writing, so the
+        # second save_to_disk fails with EINVAL where Linux would have overwritten it.
+        del md, buckets, ds
+        gc.collect()
+        return captions, fingerprint
 
     @pytest.mark.parametrize('overrides', [
         {},
@@ -442,3 +452,102 @@ class TestLatentCacheStability:
         buckets = ds.size_bucket_datasets if ds.use_size_buckets else ds.ar_bucket_datasets
         caps = [c for row in buckets[0].metadata_dataset['caption'] for c in row]
         assert len(set(caps)) > 1, 'the seed must vary per image, not be one global constant'
+
+
+def _stub_latents_map_fn(example, rank):
+    """Stand in for the VAE call, returning one fixed-size latent per media item.
+
+    Deliberately a module-level function, not a closure: the caching pool pickles it, and on a
+    spawn platform a closure over the test's locals is far more fragile than a plain import.
+    """
+    import torch
+
+    latents = []
+    image_specs = []
+    captions = []
+    masks = []
+    for image_spec, caption in zip(example['image_spec'], example['caption']):
+        latents.append(torch.zeros(1, 4, 8, 8))
+        image_specs.append(image_spec)
+        captions.append(caption)
+        masks.append(None)
+    return {
+        'latents': torch.cat(latents),
+        'image_spec': image_specs,
+        'caption': captions,
+        'mask': masks,
+    }
+
+
+class TestLatentCachingRunsForReal:
+    """Run cache_latents end to end, rather than around it.
+
+    Everything else in this file stops at the metadata. The latent cache is the one part that
+    goes through utils/cache.py, whose sqlite connection uses the autocommit= keyword added in
+    Python 3.12 -- so on a 3.11 box this path could not execute at all, and the iteration-order
+    code underneath it was only ever covered through the pure helper
+    collapse_to_one_entry_per_image. These tests close that gap with a stub for the VAE, which
+    is the only genuinely GPU-shaped part of the path.
+    """
+
+    def _dataset(self, tmp_path, n_images=2, **overrides):
+        d = tmp_path / 'imgs'
+        d.mkdir(parents=True, exist_ok=True)
+        for i in range(n_images):
+            Image.new('RGB', (64, 64), (10 * i, 20, 30)).save(d / f'{i}.png')
+            (d / f'{i}.txt').write_text(f'caption number {i}')
+        ds = DirectoryDataset(directory_config(d, **overrides), {'resolutions': [64]},
+                              'anima', skip_dataset_validation=True)
+        ds.cache_metadata(regenerate_cache=True)
+        return ds
+
+    def _cache(self, ds, **kwargs):
+        """Cache latents and return the size-bucket datasets that actually hold them.
+
+        With ar buckets in play the object cache_latents is called on is not the object that
+        ends up owning latent_dataset: ARBucketDataset builds its size buckets inside the call
+        and delegates to them, so the leaves only exist afterwards.
+        """
+        leaves = []
+        for bucket in (ds.size_bucket_datasets if ds.use_size_buckets else ds.ar_bucket_datasets):
+            bucket.cache_latents(_stub_latents_map_fn, **kwargs)
+            if hasattr(bucket, 'get_size_bucket_datasets'):
+                leaves.extend(bucket.get_size_bucket_datasets())
+            else:
+                leaves.append(bucket)
+        return leaves
+
+    def test_latents_are_cached_for_every_metadata_row(self, tmp_path):
+        ds = self._dataset(tmp_path)
+        leaves = self._cache(ds, regenerate_cache=True)
+        assert leaves, 'no size bucket dataset was produced'
+        for leaf in leaves:
+            # cache_latents asserts this itself, but asserting it here is what makes a silent
+            # change to that invariant show up as a test failure rather than a training crash.
+            assert len(leaf.latent_dataset) == len(leaf.metadata_dataset)
+
+    def test_the_sqlite_cache_is_actually_written(self, tmp_path):
+        ds = self._dataset(tmp_path)
+        leaves = self._cache(ds, regenerate_cache=True)
+        latents_dir = leaves[0].cache_dir / 'latents'
+        assert latents_dir.exists(), 'cache_latents produced no latents directory'
+        assert any(latents_dir.iterdir()), 'the latents cache directory is empty'
+
+    def test_iteration_order_is_built_and_reused(self, tmp_path):
+        ds = self._dataset(tmp_path)
+        leaves = self._cache(ds, regenerate_cache=True)
+        cache_dir = leaves[0].cache_dir
+        first = sorted(p.name for p in cache_dir.iterdir() if p.name.startswith('iteration_order'))
+        assert first, 'no iteration_order directory was written'
+
+        # A second pass that trusts the cache must not invent a different directory: the name
+        # carries the caption settings, and a second launch has to land on the same one or the
+        # cache is silently rebuilt every run.
+        self._cache(ds, trust_cache=True)
+        again = sorted(p.name for p in cache_dir.iterdir() if p.name.startswith('iteration_order'))
+        assert again == first
+
+    def test_every_image_reaches_the_latent_cache(self, tmp_path):
+        ds = self._dataset(tmp_path, n_images=3)
+        leaves = self._cache(ds, regenerate_cache=True)
+        assert sum(len(leaf.latent_dataset) for leaf in leaves) == 3

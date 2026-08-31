@@ -33,6 +33,119 @@
 <p class="meta">A running log of decisions taken outside the spec, forced changes, tradeoffs, and
 anything else the maintainer needs to know. Newest entry first.</p>
 
+<h2>2026-08-31 &mdash; Running the test suite on Windows, and the four path bugs it found</h2>
+
+<p><strong>Request.</strong> Unblock the test suite on the Windows dev box, run the drift audit,
+squash two same-titled commits, and convert as much of the &ldquo;unverified&rdquo; list as a
+CPU-only machine allows.</p>
+
+<p><strong>Starting point.</strong> Not one test could be collected: <code>test/conftest.py</code>
+imports <code>utils.common</code>, which imports <code>deepspeed</code> at module scope, and the
+venv had no deepspeed. The venv was also only partly provisioned &mdash; imageio, pillow, toml,
+datasets, einops, torchvision, torchaudio, comfy-kitchen and comfy-aimdo were all missing.</p>
+
+<p><strong>DeepSpeed does install on Windows CPU.</strong> This was assumed impossible and is not.
+Two things stand in the way, both surmountable: pip builds the wheel in an isolated environment
+with no torch, and deepspeed&rsquo;s <code>setup.py</code> asserts torch is importable, so it needs
+<code>--no-build-isolation</code>; and on win32 that setup.py lists <code>bin/deepspeed.bat</code>
+and <code>bin/ds_report.bat</code> as scripts while the sdist ships neither, so
+<code>build_scripts</code> dies on a missing file. Create the two <code>.bat</code> wrappers in the
+unpacked sdist, build with <code>DS_BUILD_OPS=0</code>, and 0.18.4 installs and imports fine on the
+CPU accelerator. The conditional stub described below then disables itself.</p>
+
+<p><strong>Decision: implement the single-process deepspeed calls, raise on the collectives.</strong>
+The conftest stub is still there for a box without deepspeed. <code>get_rank</code>,
+<code>get_world_size</code> and <code>barrier</code> have an unambiguous meaning with one process,
+so they are implemented. <code>send</code>, <code>recv</code>, <code>broadcast</code> and
+<code>all_reduce</code> raise with an explanation instead, because a test that reaches one is
+testing distributed behaviour the shim cannot stand in for, and returning a plausible value would
+let it pass while proving nothing. The stub modules also need a real <code>__spec__</code>:
+<code>types.ModuleType</code> leaves it <code>None</code>, and
+<code>importlib.util.find_spec</code> &mdash; which transformers uses to probe for deepspeed
+&mdash; raises <code>ValueError</code> rather than returning <code>None</code> for such an entry.
+transformers additionally requires the package metadata, so it still concludes deepspeed is
+absent, which is the answer we want.</p>
+
+<p><strong>Forced change: spawned children need their own bootstrap.</strong> Hugging Face datasets
+maps with a process pool, and Windows spawns rather than forks, so a worker is a bare interpreter
+that never sees anything conftest did. It could not import <code>utils.dataset</code> at all.
+<code>test/childenv/sitecustomize.py</code> is new: Python imports it automatically at interpreter
+startup, so putting that directory on <code>PYTHONPATH</code> covers the children. It must claim
+the <code>utils</code> namespace <em>before</em> ComfyUI reaches the path &mdash; ComfyUI ships a
+<code>utils/</code> with an <code>__init__.py</code>, making it a regular package that ends
+namespace resolution outright, so once it wins <code>utils.dataset</code> stops existing. The same
+file is what lets <code>tools/check_comfy_signatures.py</code> run on a CPU box, which the docs
+previously listed as needing special conditions.</p>
+
+<p><strong>Forced change: <code>NUM_PROC</code> was hardcoded.</strong>
+<code>min(8, os.cpu_count())</code> is right on Linux, where a forked worker is nearly free. Each
+spawned worker re-imports torch, deepspeed and ComfyUI instead, which is about 45 seconds to map a
+handful of rows &mdash; one test took 49s and the file timed out past ten minutes. It now reads
+<code>DIFFUSION_PIPE_NUM_PROC</code>, and passes <code>num_proc=None</code> rather than 1, because
+datasets still starts a worker for <code>num_proc=1</code>. conftest sets it to 1 on win32 only, so
+a Linux run still exercises the real multiprocess path. That file dropped from timing out to seven
+seconds.</p>
+
+<p><strong>Four instances of the same bug, none visible on Linux.</strong> Splitting a path on a
+literal forward slash to get its basename. <code>add_captions</code> in
+<code>utils/dataset.py</code> did it to an on-disk path, so every <code>captions.json</code> lookup
+missed and every caption came back empty &mdash; that one is pre-existing upstream, present in
+<code>main</code> and at <code>fd00a5e</code>. The online-caption path added in
+<code>a85c535</code> copied the same expression. <code>enumerate_captions</code> in
+<code>utils/captions.py</code> had the mirror image: <code>str(media_file)</code> for a tar member,
+emitting backslashes where a tar name always uses forward slashes. And
+<code>test/test_anima_refiner.py</code> keyed captured writes the same way. Fixed with
+<code>os.path.basename</code> for disk paths and <code>as_posix()</code> for archive members; both
+are no-ops on Linux, so nothing changes there.</p>
+
+<p><strong>One test-side fix, and why it is not cheating.</strong>
+<code>TestLatentCacheStability</code> builds the same directory twice in one process to stand in
+for two training launches. The first build leaves arrow files memory-mapped, and Windows refuses to
+reopen a mapped file for writing, so the second <code>save_to_disk</code> failed with EINVAL. The
+helper now drops its references and collects before returning. A real second launch is a fresh
+process holding no maps, so releasing them is the faithful thing to do, not a workaround.</p>
+
+<p><strong>Drift audit.</strong> Both guards pass: 34/34 vendored-API checks and 26/26 ComfyUI
+signature checks. Two findings in <code>tools/check_vendored_apis.py</code> itself, which was
+crashing before it finished and therefore guarding nothing. It called
+<code>reduction.check_serializing_named_tensor</code>, which <code>utils/reduction.py</code> has
+never defined; torch dropped that call from <code>reduce_tensor</code> and our copy never had it,
+so the two are in step and the check was replaced with a signature comparison against torch for the
+four names we vendor. It also asserted <code>torch.Tensor.has_names</code> exists; torch 2.13
+removed the named-tensor API entirely and the repo uses none of it, so that check is gone. An
+AST-level diff of <code>utils/reduction.py</code> against torch 2.13 found no drift: nothing we
+copied is missing upstream and every shared signature matches. This closes the request left in the
+2026-07-29 entry below, which asked for exactly this run on a 2.13 box.</p>
+
+<div class="flag">
+  <p><strong>The dev venv changed, including torch.</strong> Installing torchvision pulled torch
+  from 2.12.1+cpu to <strong>2.13.0+cpu</strong>. That is a drift-audit trigger in its own right,
+  which is why the audit above was run against 2.13; it also means this box no longer reproduces
+  anything that depended on 2.12. Also installed: deepspeed 0.18.4 (see above), torchaudio,
+  torchvision, imageio[ffmpeg], pillow, toml, datasets, einops, sentencepiece, av, scipy,
+  torch-optimi, pytorch-optimizer, diffusers, protobuf, loguru, omegaconf, iopath, termcolor,
+  hydra-core, easydict, ftfy, wandb, tensorboard, optimum-quanto, comfy-kitchen, comfy-aimdo.</p>
+</div>
+
+<ul>
+  <li><strong>Tests.</strong> 320 passed, 1 skipped, 0 failed in about three minutes. Before this
+    change the suite could not be collected at all.</li>
+  <li><strong>New coverage.</strong> <code>TestLatentCachingRunsForReal</code> runs
+    <code>cache_latents</code> end to end with a stub for the VAE, covering
+    <code>_map_and_cache</code>, the sqlite cache in <code>utils/cache.py</code> and the
+    iteration-order directory. That path was previously unreachable on the dev box, because the
+    sqlite <code>autocommit=</code> keyword needs Python 3.12; this box is 3.12.10.</li>
+  <li><strong>Still not verified.</strong> <code>deepspeed.initialize</code> has still never run.
+    It no longer hangs &mdash; on Windows CPU it fails in seconds while JIT-building the
+    <code>deepspeed_shm_comm</code> op, for want of MSVC <code>cl.exe</code>. Unblocking it needs
+    Visual Studio Build Tools, or a Linux box. No training run, no multi-GPU run and no image yet.</li>
+  <li><strong>History.</strong> <code>967ec73</code> and <code>755d8a9</code> carried the same
+    subject line; they were not duplicates, the second added 84 lines over the first. Squashed into
+    one commit whose tree is byte-identical to the previous branch tip, and force-pushed with
+    <code>--force-with-lease</code>. <code>backup/pre-squash-20260831</code> holds the old history
+    locally.</li>
+</ul>
+
 <h2>2026-08-31 — Distillation: ZeRO option, refiner precision modes, and a crash-on-step-0 bug</h2>
 
 <p><strong>Request.</strong> Add the real-ZeRO option that was offered at the end of the previous

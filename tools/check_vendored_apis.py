@@ -96,8 +96,10 @@ def check_torch(record):
         nested_ok = False
     record('torch.nested._internal.nested_tensor importable', nested_ok)
 
-    # Tensor.has_names backs our inlined check_serializing_named_tensor.
-    record('torch.Tensor.has_names exists', hasattr(torch.Tensor, 'has_names'))
+    # torch 2.13 removed the named-tensor API outright -- has_names, names, rename and
+    # refine_names are all gone. It used to back check_serializing_named_tensor, which torch
+    # dropped from reduce_tensor; utils/reduction.py never called either, so there is nothing
+    # here to keep in step and no check to make.
 
     # The real target: utils/reduction.py must import and register cleanly.
     try:
@@ -110,13 +112,20 @@ def check_torch(record):
            reduction is not None)
     if reduction is not None:
         record('utils.reduction.init_reductions is callable', callable(getattr(reduction, 'init_reductions', None)))
-        unnamed = __import__('torch').empty(2, 2)
-        try:
-            reduction.check_serializing_named_tensor(unnamed)
-            unnamed_ok = True
-        except RuntimeError:
-            unnamed_ok = False
-        record('check_serializing_named_tensor accepts an unnamed tensor', unnamed_ok)
+        # torch used to guard reduce_tensor with check_serializing_named_tensor and dropped it;
+        # 2.13 has no such symbol and neither does our copy, so there is nothing to keep in
+        # step. What matters now is that every name we vendored still exists upstream with the
+        # same signature, which is a comparison against torch rather than a call into ours.
+        import inspect
+        import torch.multiprocessing.reductions as upstream
+        for name in ('reduce_tensor', 'rebuild_tensor', 'reduce_storage', 'reduce_typed_storage'):
+            ours = getattr(reduction, name, None)
+            theirs = getattr(upstream, name, None)
+            if ours is None or theirs is None:
+                record(f'torch.multiprocessing.reductions.{name} still exists', False)
+                continue
+            same = list(inspect.signature(ours).parameters) == list(inspect.signature(theirs).parameters)
+            record(f'{name} signature matches torch', same)
 
 
 def check_bitsandbytes(record):
