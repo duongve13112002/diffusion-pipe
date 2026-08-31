@@ -13,6 +13,7 @@
 import math
 import os.path
 import re
+from pathlib import Path
 
 import torch
 from torch import nn
@@ -169,17 +170,43 @@ def get_dit_config(state_dict, key_prefix=''):
     return dit_config
 
 
-def _tokenize(tokenizer, prompts, max_length=512):
-    # padding='max_length' is required, not just convenient: pipeline parallelism needs every
-    # micro batch to produce identically shaped tensors. Both lumina_2.py and z_image.py carry
-    # the same note where they disable dynamic padding.
-    return tokenizer(
+def _tokenize(tokenizer, prompts, max_length=512, keep_one_real_token=False):
+    """Tokenize to a fixed length.
+
+    padding='max_length' is required, not just convenient: pipeline parallelism needs every
+    micro batch to produce identically shaped tensors. Both lumina_2.py and z_image.py carry
+    the same note where they disable dynamic padding.
+
+    keep_one_real_token exists for the context refiner, and only for it. An empty caption is
+    not a corner case -- it is the unconditional embedding that uncond_fraction and every CFG
+    sample rely on. Qwen pads with its own eos and adds no bos, so an empty string tokenizes to
+    a row whose attention_mask is entirely zero; the refiner then masks its output to zeros,
+    and the DiT cross-attention -- which carries no mask and relies on padded keys being zero
+    -- returns exactly zero for every query. Two consequences: those samples deliver no
+    gradient to the refiner at all, because the output does not depend on any of its
+    parameters, and at sampling time the frozen DiT is handed a context it never saw.
+
+    Old T5, which this DiT was trained against, never produces that row: an empty string still
+    yields </s>, one real token with a real embedding. Marking position 0 real reproduces
+    that. It is applied here rather than at each call site so the caching path, the on-the-fly
+    path and the sampler cannot drift apart -- they all tokenize through this function.
+
+    Off by default because it must not change `anima` or `cosmos_predict2`, which share this
+    helper and whose LLMAdapter consumes a T5 query sequence that already has the property.
+    """
+    batch_encoding = tokenizer(
         prompts,
         return_tensors="pt",
         truncation=True,
         padding="max_length",
         max_length=max_length,
     )
+    if keep_one_real_token:
+        mask = batch_encoding['attention_mask']
+        empty_rows = mask.sum(dim=-1) == 0
+        if empty_rows.any():
+            mask[empty_rows, 0] = 1
+    return batch_encoding
 
 def _compute_text_embeddings(text_encoder, input_ids, attn_mask, is_generic_llm=False, hidden_layer=None):
     input_ids = input_ids.to(text_encoder.device)
@@ -576,6 +603,9 @@ class CosmosPredict2Pipeline(BasePipeline):
             # on meta and blow up on the first forward pass.
             refiner = transformer.context_refiner
             fresh = context_refiner_state_dict == 'init'
+            # Remembered for configure_adapter: a low-rank update on top of a randomly
+            # initialised base is not a model anyone can reconstruct.
+            self._refiner_is_fresh = fresh
             for name, p in refiner.named_parameters():
                 # When fresh, this placeholder only gets the parameter off the meta device.
                 # init_weights() below overwrites every one of them -- it is written to be
@@ -616,6 +646,25 @@ class CosmosPredict2Pipeline(BasePipeline):
         # indirection), so the weights this run saves load straight back via
         # context_refiner_path.
         self.train_context_refiner = self.use_context_refiner and adapter_config.get('train_context_refiner', False)
+
+        if self.use_context_refiner and getattr(self, '_refiner_is_fresh', False) and not self.train_context_refiner:
+            # The base refiner is random, frozen, and never written to any file: save_adapter
+            # stores only the adapter tensors, and the dense branch below is gated on
+            # train_context_refiner. init_weights() draws from the ambient RNG stream, so the
+            # base cannot be reconstructed even in principle and the adapter is unusable
+            # without it. A rank-32 update on random weights could not bridge the LLM-to-DiT
+            # gap anyway, so refusing is also the right advice.
+            raise RuntimeError(
+                'This run would train an adapter on top of a freshly initialised, randomly '
+                'weighted ContextRefiner. That base is frozen and is never saved, and it '
+                'cannot be reproduced, so the adapter this run writes would be unusable.\n'
+                '  Do one of:\n'
+                '    - point transformer_path or context_refiner_path at a trained refiner '
+                '(tools/distill_refiner.py produces one), or\n'
+                '    - set train_context_refiner = true under [adapter] to train the refiner '
+                'densely alongside the adapter, which does save it.'
+            )
+
         if self.train_context_refiner:
             self.adapter_target_modules = [m for m in self.adapter_target_modules if m != 'ContextRefiner']
 
@@ -650,6 +699,44 @@ class CosmosPredict2Pipeline(BasePipeline):
         peft_state_dict = {'diffusion_model.'+k: v for k, v in peft_state_dict.items()}
         safetensors.torch.save_file(peft_state_dict, save_dir / 'adapter_model.safetensors', metadata={'format': 'pt'})
 
+    def load_adapter_weights(self, adapter_path):
+        """Also restore the densely trained refiner, which is not part of the adapter file.
+
+        save_adapter writes it to a subdirectory precisely so that the base implementation's
+        glob for '*.safetensors' does not trip over a second file. The consequence was that
+        nothing read it back: init_from_existing restored the adapter and silently left the
+        refiner at its fresh random initialisation, throwing away 77.6M trained parameters
+        while the loss curve looked like the adapter simply needed more steps.
+        """
+        super().load_adapter_weights(adapter_path)
+
+        refiner_file = Path(adapter_path) / 'context_refiner' / 'context_refiner.safetensors'
+        if not refiner_file.exists():
+            return
+        if is_main_process():
+            print(f'Loading densely trained context_refiner from {refiner_file}')
+
+        # Invert exactly the transformation save_adapter applied, rather than guessing names:
+        # it stripped everything up to 'context_refiner.' and removed PEFT's '.base_layer'
+        # indirection. configure_adapter has already run by now, so that indirection is back.
+        by_saved_key = {}
+        for name, _ in self.transformer.named_parameters():
+            if 'context_refiner.' not in name:
+                continue
+            key = name[name.index('context_refiner.') + len('context_refiner.'):].replace('.base_layer', '')
+            by_saved_key[key] = name
+
+        state_dict = safetensors.torch.load_file(refiner_file)
+        missing = [k for k in state_dict if k not in by_saved_key]
+        if missing:
+            raise RuntimeError(
+                f'{refiner_file} holds refiner weights this model has no parameter for: '
+                f'{missing[:5]}{"..." if len(missing) > 5 else ""}. It was saved from a '
+                'differently shaped refiner.'
+            )
+        self.transformer.load_state_dict(
+            {by_saved_key[k]: v for k, v in state_dict.items()}, strict=False)
+
     def save_model(self, save_dir, state_dict):
         state_dict = {'net.'+k: v for k, v in state_dict.items()}
         safetensors.torch.save_file(state_dict, save_dir / 'model.safetensors', metadata={'format': 'pt'})
@@ -672,7 +759,8 @@ class CosmosPredict2Pipeline(BasePipeline):
     def get_call_text_encoder_fn(self, text_encoder):
         def fn(captions, is_video):
             # args are lists
-            batch_encoding = _tokenize(self.tokenizer, captions, self.max_text_length)
+            batch_encoding = _tokenize(self.tokenizer, captions, self.max_text_length,
+                                       keep_one_real_token=self.use_context_refiner)
             encoded_text = _compute_text_embeddings(
                 self.text_encoder,
                 batch_encoding.input_ids,
@@ -703,7 +791,8 @@ class CosmosPredict2Pipeline(BasePipeline):
                 prompt_embeds_or_batch_encoding += (inputs['t5_input_ids'], inputs['t5_attn_mask'])
         else:
             captions = inputs['caption']
-            batch_encoding = _tokenize(self.tokenizer, captions, self.max_text_length)
+            batch_encoding = _tokenize(self.tokenizer, captions, self.max_text_length,
+                                       keep_one_real_token=self.use_context_refiner)
             prompt_embeds_or_batch_encoding = (batch_encoding.input_ids, batch_encoding.attention_mask)
             if not self.use_context_refiner:
                 t5_batch_encoding = _tokenize(self.t5_tokenizer, captions, self.max_text_length)

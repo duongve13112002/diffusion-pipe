@@ -113,7 +113,17 @@ There are two save formats, and `context_refiner.safetensors` is produced by onl
 | `distill` with `save_full_model = true` | both, plus `model.safetensors` | inside it, under `net.context_refiner.*` |
 | `refiner_only` / `refiner_crossattn` / full fine tune | `model.safetensors` | inside it, under `net.context_refiner.*` |
 | LoRA / LoKr | `adapter_model.safetensors` | inside it, as adapter tensors |
-| LoRA / LoKr with `train_context_refiner = true` | both, plus `context_refiner.safetensors` | the separate file |
+| LoRA / LoKr with `train_context_refiner = true` | both, plus `context_refiner.safetensors` | `context_refiner/` beside the adapter |
+
+A LoRA run needs a refiner that already has real weights. Training an adapter on top of a
+freshly initialised one is refused rather than allowed: that base is frozen, never written to
+any file, and drawn from the ambient RNG stream, so it cannot be reproduced and the adapter
+would be unusable without it. Point `transformer_path` or `context_refiner_path` at a trained
+refiner, or set `train_context_refiner = true` to train it densely alongside the adapter.
+
+`init_from_existing` restores both halves. The refiner lives in a subdirectory because the
+adapter loader refuses a directory holding two `.safetensors` files; it is loaded back
+explicitly, so continuing a `train_context_refiner` run keeps the refiner it trained.
 
 `context_refiner.safetensors` contains **nothing but the refiner** — roughly 77M parameters
 (`cap_embedder`, the refiner blocks, `norm_out`). No DiT, no VAE, no LLM, no optimizer state.

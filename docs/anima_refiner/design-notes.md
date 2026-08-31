@@ -146,6 +146,27 @@ the repo had ever constructed a `DirectoryDataset`.
 shared code, ask which test would fail if the change were wrong. If the answer is none, that is
 the test to write.
 
+## The unconditional embedding
+
+An empty caption is not an edge case here: `uncond_fraction` produces them during training and
+every CFG sample uses one. Qwen pads with its own eos and adds no bos, so `''` tokenizes to a
+row whose attention mask is entirely zero.
+
+That row is degenerate all the way down. `_compute_text_embeddings` zeroes every position, the
+refiner masks its output to zero, and the DiT cross-attention carries no attention mask at all
+-- it relies on padded keys being exactly zero, which they are, because `k_proj` has no bias.
+So the output is identically zero for every query. Two consequences follow: those samples
+deliver **no gradient to the refiner**, because the output does not depend on any of its
+parameters, and at sampling time the frozen DiT is handed a context its original training never
+produced.
+
+Old T5, which this DiT was trained against, never emits that row. An empty string still yields
+`</s>` -- one real token, with a real embedding. `_tokenize(..., keep_one_real_token=True)`
+reproduces that by marking position 0 real, and it is applied in `_tokenize` rather than at each
+call site so the caching path, the on-the-fly path and the sampler cannot drift apart. It is off
+by default, because `anima` and `cosmos_predict2` share that helper and their T5 query sequence
+already has the property.
+
 ## What is verified, and what is still not
 
 Measured 2026-08-31 on Windows 11, Python 3.12.10, torch 2.13.0+cpu, no GPU. The suite is 320

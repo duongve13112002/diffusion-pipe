@@ -949,3 +949,160 @@ class TestCaptionEnumerationMatchesTraining:
         assert len(captions) == 3
         for caption in captions:
             assert sorted(caption.split(';')) == ['one', 'three', 'two']
+
+
+class TestEmptyCaptionKeepsOneRealToken:
+    """An empty caption is the unconditional embedding, not a corner case.
+
+    Qwen pads with its own eos and adds no bos, so '' tokenizes to an all-padding row. The
+    refiner masks its output to zero, and the DiT cross-attention carries no mask -- it relies
+    on padded keys being zero -- so every query gets exactly zero back. Those samples deliver no
+    gradient to the refiner at all, and at sampling time the frozen DiT sees a context its
+    original T5 training never produced: T5 yields </s> for '', one real token.
+    """
+
+    class _FakeTokenizer:
+        """Returns an all-padding row for '', a two-token row otherwise."""
+
+        def __call__(self, prompts, **kwargs):
+            length = kwargs['max_length']
+            mask = torch.zeros(len(prompts), length, dtype=torch.long)
+            for i, prompt in enumerate(prompts):
+                mask[i, :0 if prompt == '' else 2] = 1
+            return {'input_ids': torch.zeros(len(prompts), length, dtype=torch.long),
+                    'attention_mask': mask}
+
+    def test_an_empty_caption_gets_one_real_token(self):
+        from models.cosmos_predict2 import _tokenize
+        out = _tokenize(self._FakeTokenizer(), ['', 'a cat'], 8, keep_one_real_token=True)
+        assert out['attention_mask'][0].tolist() == [1, 0, 0, 0, 0, 0, 0, 0], (
+            'the unconditional row must carry exactly one real token, mirroring T5 </s>'
+        )
+
+    def test_a_normal_caption_is_untouched(self):
+        from models.cosmos_predict2 import _tokenize
+        out = _tokenize(self._FakeTokenizer(), ['a cat'], 8, keep_one_real_token=True)
+        assert out['attention_mask'][0].tolist() == [1, 1, 0, 0, 0, 0, 0, 0]
+
+    def test_the_other_two_model_types_are_unaffected(self):
+        # _tokenize is shared with anima and cosmos_predict2, whose LLMAdapter consumes a T5
+        # query sequence that already has this property. Default off, so they cannot change.
+        from models.cosmos_predict2 import _tokenize
+        out = _tokenize(self._FakeTokenizer(), [''], 8)
+        assert out['attention_mask'].sum().item() == 0
+
+    def test_an_all_padding_row_still_produces_finite_output(self):
+        # The refiner must stay safe for anyone who does feed it one.
+        from models.text_refiner import ContextRefiner
+        refiner = ContextRefiner(cap_feat_dim=16, model_dim=8, num_layers=1, num_heads=2)
+        refiner.init_weights()
+        hidden = torch.randn(2, 4, 16)
+        mask = torch.tensor([[0, 0, 0, 0], [1, 1, 0, 0]])
+        out = refiner(hidden, mask)
+        assert torch.isfinite(out).all()
+        assert torch.equal(out[0], torch.zeros_like(out[0]))
+
+
+class TestFreshRefinerWithAnAdapterIsRefused:
+    """A LoRA on a randomly initialised, frozen, never-saved base is not a model.
+
+    init_weights() draws from the ambient RNG stream, so the base cannot be reconstructed even
+    in principle, and save_adapter writes only the adapter tensors. The run trains happily and
+    produces a file nobody can use.
+    """
+
+    @staticmethod
+    def _pipeline(fresh, train_context_refiner):
+        module = pytest.importorskip('models.cosmos_predict2')
+        # A real instance, built without __init__ so no checkpoint is needed: configure_adapter
+        # calls super(), which needs the object to actually be in the class hierarchy.
+        stub = object.__new__(module.CosmosPredict2Pipeline)
+        stub.use_context_refiner = True
+        stub.adapter_target_modules = ['Block', 'ContextRefiner']
+        stub._refiner_is_fresh = fresh
+        stub.transformer = torch.nn.Linear(2, 2)
+        configure = module.CosmosPredict2Pipeline.configure_adapter
+        return stub, configure, {'train_context_refiner': train_context_refiner}
+
+    def test_a_fresh_refiner_plus_an_adapter_raises(self):
+        stub, configure, adapter_config = self._pipeline(fresh=True, train_context_refiner=False)
+        with pytest.raises(RuntimeError, match='freshly initialised'):
+            configure(stub, adapter_config)
+
+    def test_train_context_refiner_is_the_documented_way_through(self, monkeypatch):
+        from models.base import BasePipeline
+        monkeypatch.setattr(BasePipeline, 'configure_adapter', lambda self, cfg: None)
+        stub, configure, adapter_config = self._pipeline(fresh=True, train_context_refiner=True)
+        configure(stub, adapter_config)   # must not raise
+        assert stub.train_context_refiner is True
+
+    def test_a_trained_refiner_is_allowed(self, monkeypatch):
+        from models.base import BasePipeline
+        monkeypatch.setattr(BasePipeline, 'configure_adapter', lambda self, cfg: None)
+        stub, configure, adapter_config = self._pipeline(fresh=False, train_context_refiner=False)
+        configure(stub, adapter_config)   # must not raise
+
+
+class TestRefinerSurvivesInitFromExisting:
+    """save_adapter writes the dense refiner to a subdirectory; something must read it back.
+
+    The subdirectory is deliberate -- BasePipeline.load_adapter_weights globs '*.safetensors'
+    and raises on more than one match. The consequence was that init_from_existing restored the
+    adapter and left the refiner at its fresh random initialisation, discarding every step of
+    refiner training with nothing said.
+    """
+
+    @staticmethod
+    def _pipeline_with_refiner(monkeypatch):
+        module = pytest.importorskip('models.cosmos_predict2')
+        from models.base import BasePipeline
+        from models.text_refiner import ContextRefiner
+
+        # No adapter_model.safetensors in these fixtures; the base class is covered elsewhere.
+        monkeypatch.setattr(BasePipeline, 'load_adapter_weights', lambda self, path: None)
+        # Production runs this under deepspeed, where is_main_process() has a process group to
+        # ask. There is none here, and the rank only decides whether to print.
+        monkeypatch.setattr(module, 'is_main_process', lambda: True)
+
+        transformer = torch.nn.Module()
+        refiner = ContextRefiner(cap_feat_dim=16, model_dim=8, num_layers=1, num_heads=2)
+        refiner.init_weights()
+        transformer.context_refiner = refiner
+
+        pipeline = object.__new__(module.CosmosPredict2Pipeline)
+        pipeline.transformer = transformer
+        return pipeline, refiner
+
+    def test_the_refiner_file_is_loaded_back(self, tmp_path, monkeypatch):
+        import safetensors.torch
+        pipeline, refiner = self._pipeline_with_refiner(monkeypatch)
+
+        # A distinct set of weights, saved in the layout save_adapter produces.
+        trained = {k: torch.randn_like(v) for k, v in refiner.state_dict().items()}
+        refiner_dir = tmp_path / 'context_refiner'
+        refiner_dir.mkdir()
+        safetensors.torch.save_file(trained, str(refiner_dir / 'context_refiner.safetensors'))
+
+        pipeline.load_adapter_weights(tmp_path)
+
+        for name, value in refiner.state_dict().items():
+            assert torch.equal(value, trained[name]), f'{name} was not restored'
+
+    def test_nothing_happens_when_there_is_no_refiner_file(self, tmp_path, monkeypatch):
+        pipeline, refiner = self._pipeline_with_refiner(monkeypatch)
+        before = {k: v.clone() for k, v in refiner.state_dict().items()}
+        pipeline.load_adapter_weights(tmp_path)   # a plain LoRA run, no refiner subdirectory
+        for name, value in refiner.state_dict().items():
+            assert torch.equal(value, before[name])
+
+    def test_a_mismatched_refiner_file_raises_instead_of_loading_part_of_it(self, tmp_path, monkeypatch):
+        import safetensors.torch
+        pipeline, _ = self._pipeline_with_refiner(monkeypatch)
+        refiner_dir = tmp_path / 'context_refiner'
+        refiner_dir.mkdir()
+        safetensors.torch.save_file(
+            {'blocks.99.attn.q_proj.weight': torch.randn(8, 8)},
+            str(refiner_dir / 'context_refiner.safetensors'))
+
+        with pytest.raises(RuntimeError, match='no parameter for'):
+            pipeline.load_adapter_weights(tmp_path)

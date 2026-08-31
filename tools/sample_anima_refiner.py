@@ -96,7 +96,10 @@ def build_pipeline(config_path, device, dtype_override):
 
 @torch.no_grad()
 def encode_prompt(pipeline, prompts, device):
-    batch_encoding = cosmos_predict2._tokenize(pipeline.tokenizer, prompts, pipeline.max_text_length)
+    # keep_one_real_token: the negative prompt defaults to '', and an all-padding row would
+    # hand the frozen DiT an all-zero context it was never trained on.
+    batch_encoding = cosmos_predict2._tokenize(
+        pipeline.tokenizer, prompts, pipeline.max_text_length, keep_one_real_token=True)
     embeds = cosmos_predict2._compute_text_embeddings(
         pipeline.text_encoder,
         batch_encoding.input_ids,
