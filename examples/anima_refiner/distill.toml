@@ -81,13 +81,56 @@ batch_size = 16
 # text encoders will not fit a larger micro batch; the loss is scaled by 1/N so the gradient
 # matches one batch of that size rather than growing with the number of micro batches.
 gradient_accumulation_steps = 2
+# lr / betas / weight_decay configure the optimizer, and there are two ways to write them:
+# these flat keys, or the [optimizer] table at the bottom of this file. Set EXACTLY ONE --
+# having both raises an error rather than half-merging them.
+#
+# Keep these flat keys for plain AdamW, which is what this stage has always used. Move to
+# [optimizer] to pick a different optimizer (adamw8bit and friends); when you do, move all
+# three of these down there with it.
 lr = 1e-4
-warmup_steps = 500
 betas = [0.9, 0.99]
 weight_decay = 0.01
+
+# Stays here either way: it configures gradient clipping, not the optimizer.
 max_grad_norm = 1.0
+
+warmup_steps = 500
+# From utils/lr_schedule.py, the same scheduler train.py uses: 'constant', 'linear', 'cosine'
+# (default) or 'cosine_with_restarts'. Before this was wired up only cosine existed here.
+#lr_scheduler = 'cosine'
+#lr_scheduler_num_cycles = 1
+# Skip weight decay on 1-d parameters (LayerNorm/RMSNorm gains, biases), which is what train.py
+# does. Off by default so existing runs keep their numbers.
+#no_weight_decay_on_1d = true
 max_text_length = 512
+
+# Parallelism strategy, independent of which launcher started the job: 'ddp' (default),
+# 'zero1' or 'zero2'. DDP is the right default here -- see the note at the top of this file for
+# why 0.93 GB per GPU is all ZeRO can reach at this stage. Switch to 'zero1' when that 0.93 GB
+# is the difference between starting and OOMing: a much larger batch_size, a wider student LLM
+# or a deeper refiner all raise the trainable share and shift the balance. Requires more than
+# one rank (sharding across one shards nothing) and, for zero1/zero2, deepspeed installed.
+# Stage 3 is deliberately not offered: it shards the frozen weights but all-gathers them every
+# forward pass, paying bandwidth for memory that is not the constraint.
+#distributed_strategy = 'zero1'
 dtype = 'bfloat16'
+# NOTE: 'dtype' above applies to the FROZEN modules only -- both LLMs, the LLMAdapter and the
+# cross-attention probes. The trainable refiner is controlled by 'precision' below, and has
+# always been fp32 regardless of what dtype said.
+#
+#   'fp32'        (default) fp32 parameters and compute. Most stable, most memory.
+#   'bf16-mixed'  fp32 parameters, bf16 compute via autocast. Saves activation memory. No loss
+#                 scaler needed -- bf16 has fp32's exponent range.
+#   'fp16-mixed'  fp32 parameters, fp16 compute. For pre-Ampere cards with no bf16. Uses a
+#                 GradScaler under DDP, or DeepSpeed's dynamic loss scaling under ZeRO.
+#   'bf16-full'   bf16 parameters. Halves refiner parameter and optimizer-state memory, at the
+#                 cost of the fp32 master weights. Under ZeRO the engine keeps fp32 masters
+#                 anyway, so this saves less there -- and is numerically better there.
+#
+# 'fp16-full' is deliberately not offered: pure fp16 parameters with no fp32 master copy lose
+# most AdamW updates to underflow at this learning rate.
+#precision = 'bf16-mixed'
 seed = 42
 
 save_every = 2000
@@ -128,3 +171,28 @@ num_queries = 64
 # Adjacent DiT blocks give highly correlated signal, so a spread of them covers the same
 # ground for less compute.
 num_blocks = 8
+
+# Optional, and an ALTERNATIVE to the flat lr / betas / weight_decay under [distill] above --
+# not an addition to them. Uncommenting this table means deleting those three keys up there,
+# or the run stops with an error saying so.
+#
+# Accepts the same names as train.py's [optimizer]: adamw (default), adamw8bit,
+# adamw8bitkahan, adamw_optimi, stableadamw, sgd, automagic, offload, or any pytorch_optimizer
+# class by name. Every key other than 'type' is passed to the optimizer's constructor.
+#
+# Worth a look at this stage specifically. The refiner is 77.64M parameters, so AdamW's two
+# fp32 moments are 592 MB; the 8-bit variants cut that to 148 MB, on a single GPU with no extra
+# ranks. That is more per-GPU saving than ZeRO-1 reaches here, and it does not need a second
+# GPU to reach it.
+#
+# Caveat: 8-bit optimizers are mostly validated on fine-tuning, and this refiner trains from a
+# random init. adamw8bitkahan (optimizers/adamw_8bit.py) uses Kahan summation and is the safer
+# choice if you also set precision = 'bf16-full'.
+#
+# 'genericoptim' and 'gradient_release' are refused here: both need pipeline machinery that
+# only train.py builds.
+#[optimizer]
+#type = 'adamw8bit'
+#lr = 1e-4
+#betas = [0.9, 0.99]
+#weight_decay = 0.01

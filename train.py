@@ -32,6 +32,7 @@ from utils.unsloth_utils import unsloth_checkpoint
 from utils.pipeline import ManualPipelineModule
 from utils.oplora import OPLoRAProjector, apply_oplora_config_defaults
 from utils.lr_schedule import create_lr_scheduler
+from utils.optimizer_factory import resolve_optimizer_class
 
 # needed for broadcasting Queue in dataset.py
 mp.current_process().authkey = b'afsaskgfdjh4'
@@ -680,39 +681,10 @@ if __name__ == '__main__':
         args = []
         kwargs = {k: v for k, v in optim_config.items() if k not in ['type', 'gradient_release']}
 
-        if optim_type_lower == 'adamw':
-            # TODO: fix this. I'm getting "fatal error: cuda_runtime.h: No such file or directory"
-            # when Deepspeed tries to build the fused Adam extension.
-            # klass = deepspeed.ops.adam.FusedAdam
-            klass = torch.optim.AdamW
-        elif optim_type_lower == 'adamw8bit':
-            import bitsandbytes
-            klass = bitsandbytes.optim.AdamW8bit
-        elif optim_type_lower == 'adamw_optimi':
-            import optimi
-            klass = optimi.AdamW
-        elif optim_type_lower == 'stableadamw':
-            import optimi
-            klass = optimi.StableAdamW
-        elif optim_type_lower == 'sgd':
-            klass = torch.optim.SGD
-        elif optim_type_lower == 'adamw8bitkahan':
-            from optimizers import adamw_8bit
-            klass = adamw_8bit.AdamW8bitKahan
-        elif optim_type_lower == 'offload':
-            from torchao.prototype.low_bit_optim import CPUOffloadOptimizer
-            klass = CPUOffloadOptimizer
-            args.append(torch.optim.AdamW)
-            kwargs['fused'] = True
-        elif optim_type_lower == 'automagic':
-            from optimizers import automagic
-            klass = automagic.Automagic
-        elif optim_type_lower == 'genericoptim':
-            from optimizers import generic_optim
-            klass = generic_optim.GenericOptim
-        else:
-            import pytorch_optimizer
-            klass = getattr(pytorch_optimizer, optim_type)
+        # The name-to-class mapping lives in utils/optimizer_factory so tools/distill_refiner.py
+        # can accept the same optimizer names. Everything below here is pipeline-specific and
+        # stays put.
+        klass, args, kwargs = resolve_optimizer_class(optim_config)
 
         if optim_config.get('gradient_release', False):
             # Prevent deepspeed from logging every single param group lr

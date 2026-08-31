@@ -23,10 +23,16 @@ quantity the DiT will consume.
 
 Usage:
     python -m tools.distill_refiner --config examples/anima_refiner/distill.toml
+    deepspeed --num_gpus=4 tools/distill_refiner.py --config examples/anima_refiner/distill.toml
+
+The launcher and the parallelism strategy are separate choices. Either launcher works -- both
+export RANK/LOCAL_RANK/WORLD_SIZE, which is all this script reads -- and the strategy is set by
+`distributed_strategy` under [distill]: 'ddp' (the default) or 'zero1'/'zero2'. See
+build_strategy and docs/anima_refiner/README.md for why DDP is the default here.
 """
 
 import argparse
-import math
+import contextlib
 import os
 import random
 import sys
@@ -51,6 +57,8 @@ from models.cosmos_predict2_modeling import MiniTrainDIT
 from models.text_refiner import ContextRefiner, extract_refiner_state_dict
 from utils.common import iterate_safetensors, load_state_dict
 from utils.caption_corpus import read_corpus
+from utils.lr_schedule import create_lr_scheduler
+from utils.optimizer_factory import resolve_optimizer_class
 from utils.captions import enumerate_captions, preprocess_caption, tag_markers
 
 MAX_TEXT_LENGTH_DEFAULT = 512
@@ -333,12 +341,13 @@ def padded_mean(x, mask, length):
 
 
 def setup_distributed():
-    """Initialise torch.distributed if launched under torchrun, otherwise run single process.
+    """Initialise torch.distributed from the launcher's env vars, otherwise run single process.
 
-    DDP rather than DeepSpeed: the teacher, both LLMs and the cross-attention probes are all
-    frozen, so the only thing needing gradient synchronisation is the refiner -- 77M parameters.
-    There is no optimizer state worth sharding and no model too large to fit, which is what
-    ZeRO exists for.
+    Deliberately launcher-agnostic. Both `deepspeed` and `torchrun` export RANK, LOCAL_RANK and
+    WORLD_SIZE, and those are the only variables read here, so either one drives this script
+    through the same path. Nothing launcher-specific belongs in this function.
+
+    The launcher is a separate choice from the parallelism strategy; see build_strategy.
     """
     if 'RANK' not in os.environ or 'WORLD_SIZE' not in os.environ:
         return 0, 1, 0
@@ -351,6 +360,380 @@ def setup_distributed():
     if torch.cuda.is_available():
         torch.cuda.set_device(local_rank)
     return rank, world_size, local_rank
+
+
+DISTRIBUTED_STRATEGIES = ('ddp', 'zero1', 'zero2')
+
+def build_optimizer(config, refiner, is_main):
+    """Build the optimizer from an [optimizer] table, or from the legacy flat [distill] keys.
+
+    The names come from utils/optimizer_factory, the same table train.py uses, so
+    `type = 'adamw8bit'` means here what it means everywhere else. That matters more at this
+    stage than it looks: the refiner is 77.64M parameters, so AdamW's two fp32 moments are
+    592 MB, and the 8-bit variants cut that to 148 MB -- on a single GPU, with no extra ranks.
+
+    Without an [optimizer] table the behaviour is exactly what it was before this existed:
+    torch.optim.AdamW read from lr / betas / weight_decay under [distill].
+    """
+    distill_config = config['distill']
+    flat_keys = [k for k in ('lr', 'betas', 'weight_decay') if k in distill_config]
+    optim_config = dict(config.get('optimizer', {}))
+
+    if optim_config and flat_keys:
+        # Not merged, because merging silently is worse than either option. An [optimizer] table
+        # holding only `type` would inherit lr but take torch's defaults for betas and
+        # weight_decay -- the user's configured values would vanish with nothing said. Same
+        # rule load_captions applies to its three caption sources: set exactly one.
+        raise RuntimeError(
+            f"[distill] sets {', '.join(flat_keys)} and an [optimizer] table is also present. "
+            'They are alternative ways to configure the same optimizer, so set exactly one: '
+            f"move {', '.join(flat_keys)} into [optimizer], or drop the [optimizer] table. "
+            '(warmup_steps, lr_scheduler and max_grad_norm stay under [distill] either way -- '
+            'they configure the schedule and clipping, not the optimizer.)'
+        )
+
+    if not optim_config:
+        optim_config = {
+            'type': 'adamw',
+            'lr': distill_config.get('lr', 1e-4),
+            'betas': list(distill_config.get('betas', [0.9, 0.99])),
+            'weight_decay': distill_config.get('weight_decay', 0.01),
+        }
+    optim_config.setdefault('type', 'adamw')
+    optim_config.setdefault('lr', 1e-4)
+
+    if optim_config.pop('gradient_release', False):
+        raise RuntimeError(
+            'gradient_release is not available here. It steps the optimizer from a '
+            'post-accumulate-grad hook and requires a data-parallel world size of 1, which is '
+            'incompatible with the DDP and ZeRO strategies this script uses.'
+        )
+    if optim_config['type'].lower() == 'genericoptim':
+        raise RuntimeError(
+            'genericoptim needs a pipeline mpu and per-parameter-group splitting that only '
+            'train.py builds. Use adamw, adamw8bit, adamw8bitkahan, adamw_optimi, stableadamw '
+            'or automagic here.'
+        )
+
+    klass, args, kwargs = resolve_optimizer_class(optim_config)
+
+    quantised = optim_config['type'].lower() in ('adamw8bit', 'adamw8bitkahan')
+    if quantised and str(distill_config.get('distributed_strategy', 'ddp')).lower() != 'ddp' and is_main:
+        print(
+            'WARNING: an 8-bit optimizer under ZeRO is untested. ZeRO replaces the optimizer\'s '
+            'param groups with its own flat fp32 partitions after deepspeed.initialize, and the '
+            'quantisation blocks are then laid out over those partitions rather than over whole '
+            'parameters. It may well be fine; it has not been verified. Note also that the two '
+            'save the same memory in different places, so combining them buys less than the sum '
+            'of their separate figures. Prefer one or the other until this is checked.'
+        )
+
+    # Weight decay on 1-d parameters -- LayerNorm/RMSNorm gains and biases -- shrinks them
+    # toward zero for no benefit. train.py splits them into a no-decay group; this does too
+    # when asked. Off by default so an existing run's numbers do not move underneath it.
+    if distill_config.get('no_weight_decay_on_1d', False) and kwargs.get('weight_decay', 0) > 0:
+        decay = [p for p in refiner.parameters() if p.ndim > 1]
+        no_decay = [p for p in refiner.parameters() if p.ndim == 1]
+        param_groups = [{'params': decay}, {'params': no_decay, 'weight_decay': 0.0}]
+        if is_main:
+            print(f'Weight decay applied to {len(decay)} tensors, skipped on {len(no_decay)} 1-d tensors')
+        return klass(param_groups, *args, **kwargs)
+
+    return klass(refiner.parameters(), *args, **kwargs)
+
+
+def build_lr_scheduler(config, optimizer, steps):
+    """Use the repo's shared scheduler rather than a private cosine.
+
+    utils/lr_schedule is deliberately free of training-stack imports so it can be used outside
+    train.py; this stage hand-rolling its own cosine was duplication, and it limited the choice
+    to cosine when constant, linear and cosine_with_restarts were already sitting there.
+    """
+    return create_lr_scheduler(
+        optimizer,
+        config['distill'].get('lr_scheduler', 'cosine'),
+        total_steps=steps,
+        warmup_steps=config['distill'].get('warmup_steps', 500),
+        num_cycles=config['distill'].get('lr_scheduler_num_cycles', 1),
+    )
+
+
+PRECISIONS = ('fp32', 'bf16-mixed', 'fp16-mixed', 'bf16-full')
+
+
+class Precision:
+    """How the *trainable* refiner is stored and computed. Orthogonal to [distill] dtype.
+
+    Worth separating carefully, because the config already has a `dtype` and it is easy to read
+    it as "the precision this trains in". It is not. `dtype` applies only to the frozen modules
+    -- both LLMs, the LLMAdapter, the cross-attention probes -- while the refiner has always
+    been fp32 regardless. This class is the knob for the refiner itself.
+
+    Three axes, and the reason they are one object rather than three settings: they are not
+    independently valid. fp16 without a loss scaler underflows; a scaler on top of DeepSpeed's
+    own loss scaling double-scales; autocast over bf16 parameters is a no-op that reads as if
+    it were doing something.
+    """
+
+    def __init__(self, name, param_dtype, autocast_dtype, needs_scaler, deepspeed_section, note):
+        self.name = name
+        self.param_dtype = param_dtype
+        self.autocast_dtype = autocast_dtype
+        self.needs_scaler = needs_scaler
+        self.deepspeed_section = deepspeed_section
+        self.note = note
+
+    def autocast(self, device_type):
+        if self.autocast_dtype is None or device_type != 'cuda':
+            # autocast is a CUDA/CPU-specific context and buys nothing on CPU here; keeping it
+            # off there means a CPU smoke run exercises the same numerics it always did.
+            return contextlib.nullcontext()
+        return torch.autocast(device_type, dtype=self.autocast_dtype)
+
+
+def resolve_precision(config):
+    """Map the `precision` setting onto parameter storage, autocast and DeepSpeed config.
+
+    The mapping depends on the strategy, because DeepSpeed will not share the job with
+    torch.amp: under ZeRO the engine owns loss scaling and the fp32 master weights, so the
+    same user-facing name has to be implemented through the engine's config instead of through
+    autocast and a GradScaler. The observable behaviour is the same; the mechanism is not, and
+    pretending otherwise is how double-scaling bugs get written.
+    """
+    name = str(config['distill'].get('precision', 'fp32')).lower()
+    strategy = str(config['distill'].get('distributed_strategy', 'ddp')).lower()
+    zero = strategy.startswith('zero')
+
+    if name == 'fp16-full':
+        raise RuntimeError(
+            "precision='fp16-full' is refused. Pure fp16 parameters with no fp32 master copy "
+            'lose AdamW updates to underflow -- an update smaller than about 6e-8 relative to '
+            'the weight rounds to nothing, and at this learning rate most of them are. Use '
+            "'fp16-mixed' (fp16 compute, fp32 master weights) or 'bf16-full'."
+        )
+    if name not in PRECISIONS:
+        raise RuntimeError(f'precision={name!r} under [distill] is not one of {PRECISIONS}.')
+
+    if name == 'fp32':
+        return Precision(name, torch.float32, None, False, {},
+                         'refiner parameters and compute in fp32')
+
+    if name == 'bf16-mixed':
+        # fp32 parameters, bf16 compute. Saves activation memory, not parameter memory, and
+        # needs no loss scaler: bf16 has fp32's exponent range.
+        return Precision(name, torch.float32, torch.bfloat16, False, {},
+                         'fp32 refiner parameters, bf16 compute via autocast')
+
+    if name == 'bf16-full':
+        if zero:
+            # DeepSpeed's bf16 mode keeps fp32 master weights in the optimizer, so this saves
+            # less parameter memory than the DDP path below -- and is numerically better. The
+            # asymmetry is real; see docs/anima_refiner/README.md.
+            return Precision(name, torch.float32, None, False, {'bf16': {'enabled': True}},
+                             'bf16 refiner compute, fp32 master weights held by the ZeRO engine')
+        return Precision(name, torch.bfloat16, None, False, {},
+                         'refiner parameters and compute in bf16, no master weights')
+
+    # fp16-mixed
+    if zero:
+        # loss_scale 0 selects DeepSpeed's dynamic scaler. A torch.amp GradScaler on top of
+        # this would scale the loss twice.
+        return Precision(name, torch.float32, None, False,
+                         {'fp16': {'enabled': True, 'loss_scale': 0}},
+                         'fp16 refiner compute with DeepSpeed dynamic loss scaling')
+    return Precision(name, torch.float32, torch.float16, True, {},
+                     'fp32 refiner parameters, fp16 compute via autocast + GradScaler')
+
+
+class DDPStrategy:
+    """Plain DistributedDataParallel with a hand-rolled accumulation loop. The default.
+
+    Every rank keeps a full copy of the optimizer state. For this stage that is the right
+    trade: the teacher, both LLMs and the cross-attention probes are frozen, so the only thing
+    carrying optimizer state is the refiner (77.64M params -> 1.24 GB of AdamW state, fp32
+    master weights and gradients, or 0.93 GB per GPU saved across four if it were sharded),
+    while the ~5.20 GB of frozen bf16 LLM weights that actually dominate residency is exactly
+    what ZeRO-1/2 cannot touch. See docs/anima_refiner/README.md for the full arithmetic.
+    """
+
+    name = 'ddp'
+
+    def __init__(self, refiner, world_size, local_rank, device, grad_accum, optimizer, scheduler,
+                 max_grad_norm, precision):
+        self.refiner = refiner
+        self.world_size = world_size
+        self.grad_accum = grad_accum
+        self.optimizer = optimizer
+        self.scheduler = scheduler
+        self.max_grad_norm = max_grad_norm
+        self.precision = precision
+        # Enabled only for fp16-mixed. bf16 needs no scaler (fp32's exponent range) and fp32
+        # obviously not; an always-on scaler would just be a no-op that looks load-bearing.
+        self.scaler = torch.amp.GradScaler('cuda', enabled=precision.needs_scaler)
+        if world_size > 1:
+            self.module = torch.nn.parallel.DistributedDataParallel(
+                refiner,
+                device_ids=[local_rank] if device.type == 'cuda' else None,
+                output_device=local_rank if device.type == 'cuda' else None,
+            )
+        else:
+            self.module = refiner
+
+    def micro_batch_context(self, is_last):
+        """DDP all-reduces on every backward by default. Only the last micro batch pays for
+        that; the others just accumulate into .grad locally."""
+        if self.world_size == 1 or is_last:
+            return contextlib.nullcontext()
+        return self.module.no_sync()
+
+    def backward(self, loss):
+        # Scale so the gradient matches one batch of batch_size * grad_accum, rather than
+        # growing with the number of micro batches. (The ZeRO engine does this internally,
+        # which is why DeepSpeedZeROStrategy.backward must not repeat it.)
+        grad_accum = self.grad_accum
+        self.scaler.scale(loss / grad_accum).backward()
+
+    def step(self):
+        # Unscale before clipping, or max_grad_norm would be compared against a gradient
+        # inflated by the loss scale and would effectively never trigger.
+        if self.scaler.is_enabled():
+            self.scaler.unscale_(self.optimizer)
+        grad_norm = torch.nn.utils.clip_grad_norm_(self.refiner.parameters(), self.max_grad_norm)
+        self.scaler.step(self.optimizer)
+        self.scaler.update()
+        self.scheduler.step()
+        self.optimizer.zero_grad(set_to_none=True)
+        return float(grad_norm)
+
+    def zero_grad(self):
+        self.optimizer.zero_grad(set_to_none=True)
+
+    def last_lr(self):
+        return self.scheduler.get_last_lr()[0]
+
+
+class DeepSpeedZeROStrategy:
+    """Opt-in ZeRO stage 1 or 2 through deepspeed.initialize.
+
+    Off by default, because the arithmetic in DDPStrategy says it buys about 0.93 GB per GPU on
+    four ranks and cannot touch the frozen weights that dominate. It is here for the cases where
+    that 0.93 GB is what stands between a run starting and OOMing: a large `batch_size`, a wider
+    student LLM, or a deeper refiner all raise the trainable share and shift the balance.
+
+    Stage 3 is refused rather than supported. It would shard the frozen weights too, but it
+    all-gathers them on every forward pass -- paying bandwidth to save memory that is not the
+    constraint here -- and it leaves refiner.state_dict() holding shards rather than weights, so
+    the save path would need a gather that exists for no benefit.
+
+    DeepSpeed owns accumulation, clipping and stepping once its config carries
+    gradient_accumulation_steps and gradient_clipping: engine.backward applies the 1/N scaling
+    internally and engine.step is a no-op except on an accumulation boundary. So this class does
+    NOT rescale the loss and does NOT clip by hand -- doing either on top of the engine would
+    double-apply it.
+    """
+
+    name = 'zero'
+
+    def __init__(self, refiner, stage, world_size, batch_size, grad_accum, optimizer, scheduler,
+                 max_grad_norm, precision):
+        import deepspeed
+
+        if stage not in (1, 2):
+            raise RuntimeError(
+                f'distributed_strategy asks for ZeRO stage {stage}; only 1 and 2 are supported '
+                'here. Stage 3 shards the frozen weights and all-gathers them every forward '
+                'pass, which trades bandwidth for memory that is not the bottleneck at this '
+                'stage. See docs/anima_refiner/README.md.'
+            )
+        if world_size < 2 or not dist.is_initialized():
+            # Sharding across one rank shards nothing, so this is always a mistake rather than
+            # a degraded mode. Catch it here: left to DeepSpeed, a missing process group sends
+            # it down its MPI discovery path and it dies on `No module named 'mpi4py'`, which
+            # says nothing about the actual problem.
+            raise RuntimeError(
+                f'distributed_strategy asks for ZeRO but world_size={world_size}. ZeRO shards '
+                'optimizer state across ranks, so on a single process it costs a dependency '
+                'and saves nothing. Launch with `deepspeed --num_gpus=N` (N > 1), or leave '
+                'distributed_strategy at its default of ddp.'
+            )
+        if precision.needs_scaler:
+            raise RuntimeError(
+                'a torch.amp GradScaler cannot drive a DeepSpeed engine, which does its own '
+                'loss scaling. resolve_precision is meant to route fp16-mixed through the '
+                "engine's fp16 config under ZeRO; reaching here means that routing broke."
+            )
+        self.stage = stage
+        self.precision = precision
+        ds_config = {
+            'train_micro_batch_size_per_gpu': batch_size,
+            'gradient_accumulation_steps': grad_accum,
+            'gradient_clipping': max_grad_norm,
+            'zero_optimization': {
+                'stage': stage,
+                'contiguous_gradients': True,
+                'overlap_comm': True,
+            },
+            'zero_allow_untested_optimizer': True,
+            'steps_per_print': 10 ** 9,
+            'wall_clock_breakdown': False,
+            # Empty for fp32 (the default), which is what keeps the engine from casting the
+            # refiner's master weights out from under the optimizer.
+            **precision.deepspeed_section,
+        }
+        # The process group already exists -- setup_distributed built it from the launcher's
+        # env vars, and it is the same group either launcher exports. Reuse it.
+        self.engine, self.optimizer, _, self.scheduler = deepspeed.initialize(
+            model=refiner,
+            optimizer=optimizer,
+            lr_scheduler=scheduler,
+            config=ds_config,
+            dist_init_required=False,
+        )
+        self.module = self.engine
+
+    def micro_batch_context(self, is_last):
+        # The engine tracks the accumulation boundary itself and only reduces there, so there
+        # is nothing to suppress from out here.
+        return contextlib.nullcontext()
+
+    def backward(self, loss):
+        self.engine.backward(loss)
+
+    def step(self):
+        self.engine.step()
+        grad_norm = self.engine.get_global_grad_norm()
+        # None until the first accumulation boundary completes.
+        return float(grad_norm) if grad_norm is not None else 0.0
+
+    def zero_grad(self):
+        # engine.step() zeroes on the boundary; calling it from outside would drop gradients
+        # mid-accumulation.
+        pass
+
+    def last_lr(self):
+        return self.scheduler.get_last_lr()[0]
+
+
+def build_strategy(config, refiner, world_size, local_rank, device, batch_size, grad_accum,
+                   optimizer, scheduler, precision):
+    """Pick the parallelism strategy. DDP unless the config asks for ZeRO.
+
+    This is independent of how the job was launched: `deepspeed --num_gpus=4` can drive DDP and
+    `torchrun --nproc_per_node=4` can drive ZeRO. The launcher supplies the process group; the
+    strategy decides what is sharded inside it.
+    """
+    strategy = config['distill'].get('distributed_strategy', 'ddp').lower()
+    if strategy not in DISTRIBUTED_STRATEGIES:
+        raise RuntimeError(
+            f'distributed_strategy={strategy!r} under [distill] is not one of '
+            f'{DISTRIBUTED_STRATEGIES}.'
+        )
+    max_grad_norm = config['distill'].get('max_grad_norm', 1.0)
+    if strategy == 'ddp':
+        return DDPStrategy(refiner, world_size, local_rank, device, grad_accum, optimizer,
+                           scheduler, max_grad_norm, precision)
+    return DeepSpeedZeROStrategy(refiner, int(strategy[-1]), world_size, batch_size, grad_accum,
+                                 optimizer, scheduler, max_grad_norm, precision)
 
 
 def main():
@@ -419,6 +802,15 @@ def main():
     if is_main:
         print(f'Student LLM hidden size: {cap_feat_dim}')
 
+    # Resolved and applied BEFORE the optimizer is built. AdamW allocates its exp_avg and
+    # exp_avg_sq to match each parameter's dtype at construction time, so casting the refiner
+    # afterwards would leave the optimizer holding state of the wrong dtype.
+    precision = resolve_precision(config)
+    if precision.param_dtype != torch.float32:
+        refiner.to(dtype=precision.param_dtype)
+    if is_main:
+        print(f'Precision: {precision.name} -- {precision.note}')
+
     # Fixed probe queries. The cross-attention modules are frozen and shared by both paths, so
     # any query set works as a measuring stick; a fixed one keeps the objective stationary
     # across steps. Matching the output for many random queries is a strong proxy for matching
@@ -429,40 +821,29 @@ def main():
 
     # The probe seed is deliberately NOT rank-offset: every rank must measure against the same
     # queries, or their gradients describe different objectives.
-    train_module = refiner
-    if world_size > 1:
-        train_module = torch.nn.parallel.DistributedDataParallel(
-            refiner,
-            device_ids=[local_rank] if device.type == 'cuda' else None,
-            output_device=local_rank if device.type == 'cuda' else None,
-        )
 
-    lr = config['distill'].get('lr', 1e-4)
-    optimizer = torch.optim.AdamW(
-        refiner.parameters(),
-        lr=lr,
-        betas=tuple(config['distill'].get('betas', [0.9, 0.99])),
-        weight_decay=config['distill'].get('weight_decay', 0.01),
-    )
-    warmup = config['distill'].get('warmup_steps', 500)
+    optimizer = build_optimizer(config, refiner, is_main)
+    scheduler = build_lr_scheduler(config, optimizer, steps)
+    if is_main:
+        print(f'Optimizer: {type(optimizer).__name__} | '
+              f"lr_scheduler: {config['distill'].get('lr_scheduler', 'cosine')}")
 
-    def lr_lambda(step):
-        if step < warmup:
-            return (step + 1) / warmup
-        progress = (step - warmup) / max(1, steps - warmup)
-        return 0.5 * (1 + math.cos(math.pi * progress))
-
-    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+    # Built after the optimizer and scheduler: ZeRO wraps both, so they have to exist first.
+    strategy = build_strategy(config, refiner, world_size, local_rank, device, batch_size,
+                              grad_accum, optimizer, scheduler, precision)
+    train_module = strategy.module
+    if is_main and strategy.name != 'ddp':
+        print(f'Parallelism: DeepSpeed ZeRO stage {strategy.stage} (optimizer state sharded).')
 
     save_every = config['distill'].get('save_every', 2000)
     log_every = config['distill'].get('log_every', 50)
     running = 0.0
     progress_bar = tqdm(range(steps), desc='distill', disable=not is_main)
 
-    optimizer.zero_grad(set_to_none=True)
+    strategy.zero_grad()
     for step in progress_bar:
         accum_loss = 0.0
-        optimizer.zero_grad(set_to_none=True)
+        strategy.zero_grad()
         for micro in range(grad_accum):
             batch = [
                 preprocess_caption(c, **augment)
@@ -490,11 +871,15 @@ def main():
                     student_llm, s_enc.input_ids.to(device), s_mask, config['student'].get('llm_hidden_layer', None)
                 )
 
-            # DDP all-reduces on every backward by default. Only the last micro batch should
-            # pay for that: the others just accumulate into .grad locally.
-            sync = (world_size == 1) or (micro == grad_accum - 1)
-            with contextlib.nullcontext() if sync else train_module.no_sync():
-                student_feats = train_module(student_hidden.to(torch.float32), s_mask)
+            # Whether this micro batch synchronises gradients is the strategy's business: DDP
+            # suppresses all-reduce until the last one, the ZeRO engine tracks the boundary
+            # itself.
+            with strategy.micro_batch_context(is_last=(micro == grad_accum - 1)):
+                # The input must match the refiner's parameter dtype: under 'bf16-full' the
+                # parameters are bf16 and an fp32 input is a hard dtype error, not a silent
+                # upcast. Autocast, where it is on, then handles the compute dtype.
+                with precision.autocast(device.type):
+                    student_feats = train_module(student_hidden.to(precision.param_dtype), s_mask)
 
                 q = probe.expand(len(batch), -1, -1)
                 loss = 0.0
@@ -514,26 +899,23 @@ def main():
                     )
                     loss = loss + pooled_weight * pooled_loss
 
-                # Scale so the gradient matches one batch of batch_size * grad_accum, rather
-                # than growing with the number of micro batches.
-                (loss / grad_accum).backward()
+                strategy.backward(loss)
             accum_loss += loss.item() / grad_accum
 
-        grad_norm = torch.nn.utils.clip_grad_norm_(refiner.parameters(), config['distill'].get('max_grad_norm', 1.0))
-        optimizer.step()
-        scheduler.step()
+        grad_norm = strategy.step()
 
         running += accum_loss
         if is_main and (step + 1) % log_every == 0:
             progress_bar.set_postfix({
                 'loss': f'{running / log_every:.5f}',
                 'grad': f'{grad_norm:.3f}',
-                'lr': f'{scheduler.get_last_lr()[0]:.2e}',
+                'lr': f'{strategy.last_lr():.2e}',
             })
             running = 0.0
 
         if (step + 1) % save_every == 0 or step + 1 == steps:
-            # Every rank holds the same weights after DDP's all-reduce; only one writes.
+            # Every rank holds the full, identical weights -- DDP all-reduces them, and ZeRO
+            # 1/2 shard optimizer state and gradients but never the parameters. Only one writes.
             if is_main:
                 save_refiner(refiner, output_dir / 'context_refiner.safetensors', dtype)
             if world_size > 1:

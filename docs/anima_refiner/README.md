@@ -355,6 +355,139 @@ That reasoning is specific to distillation. Every other stage trains the DiT its
 trainable fraction is large and ZeRO earns its keep — which is why they go through `train.py`
 and DeepSpeed, and this one does not.
 
+#### When ZeRO is worth it anyway
+
+The 0.93 GB above is a default, not a law. Raise `batch_size` a lot, swap in a wider student
+LLM, or deepen the refiner and the trainable share grows until that figure is what stands
+between a run starting and OOMing. For those cases, set under `[distill]`:
+
+```toml
+distributed_strategy = 'zero1'   # 'ddp' (default) | 'zero1' | 'zero2'
+```
+
+The launcher and the strategy stay independent: `deepspeed --num_gpus=4` can drive DDP and
+`torchrun --nproc_per_node=4` can drive ZeRO. The launcher supplies the process group; the
+strategy decides what is sharded inside it.
+
+Two things the engine takes over once this is on, both of which would be silent bugs if
+duplicated: `engine.backward()` applies the `1/gradient_accumulation_steps` scaling itself, and
+`gradient_clipping` in the DeepSpeed config does the clipping. So the ZeRO path neither rescales
+the loss nor calls `clip_grad_norm_` — doing either on top of the engine halves the effective
+learning rate or clips twice.
+
+Two configurations are refused rather than half-supported:
+
+| | Why |
+| --- | --- |
+| Stage 3 | Shards the parameters, so `refiner.state_dict()` holds shards, not weights, and the save path would need a gather that buys nothing. Plus the all-gather-per-forward cost above. |
+| A single rank | Sharding across one rank shards nothing. Left to DeepSpeed this fails on `No module named 'mpi4py'` from its MPI discovery path, which says nothing about the real problem. |
+
+Checkpointing is unaffected either way: ZeRO 1 and 2 shard optimizer state and gradients but
+never the parameters, so every rank still holds the full refiner and rank 0 writes it as before.
+
+### Precision
+
+`dtype` and `precision` are different settings and the distinction matters. `dtype` has always
+applied to the **frozen** modules — both LLMs, the LLMAdapter, the cross-attention probes — and
+the trainable refiner was fp32 regardless. So a config reading `dtype = 'bfloat16'` was never
+"training in bf16"; it described everything except the thing being trained.
+
+`precision` is the knob for the refiner itself:
+
+| `precision` | Refiner params | Compute | Loss scaler |
+| --- | --- | --- | --- |
+| `fp32` (default) | fp32 | fp32 | — |
+| `bf16-mixed` | fp32 | bf16 (autocast) | not needed |
+| `fp16-mixed` | fp32 | fp16 (autocast) | GradScaler, or DeepSpeed's under ZeRO |
+| `bf16-full` | bf16 | bf16 | not needed |
+
+Measured on identical data, an untouched frozen bf16 cross-attention, and the same seed: the
+gradient reaching the refiner under `bf16-full` has cosine similarity **0.999994** with the
+`fp32` gradient, and parameter storage halves. The bf16 hop through the frozen cross-attention
+that every mode already pays costs about **2.9e-03** relative gradient error on its own.
+
+Three things worth knowing before switching:
+
+- **`bf16-mixed` saves activation memory, not parameter memory.** The parameters stay fp32; only
+  the forward runs in bf16. It is the safe first step.
+- **`bf16-full` gives up the fp32 master weights.** At 77.64M parameters that is the largest
+  saving available, and it is the mode most likely to change results rather than just memory.
+- **`bf16-full` under ZeRO is not the same thing as under DDP.** DeepSpeed's bf16 mode keeps
+  fp32 master weights in the optimizer, so it saves less than the DDP path and is numerically
+  better. The asymmetry is real and deliberate; `resolve_precision` routes the two differently.
+
+`fp16-full` is refused rather than offered. Pure fp16 parameters with no fp32 master copy lose
+AdamW updates to underflow — an update smaller than roughly 6e-8 relative to the weight rounds
+to nothing, and at `lr = 1e-4` most of them are. Use `fp16-mixed`, which keeps fp32 masters.
+
+Under DDP, `fp16-mixed` unscales before `clip_grad_norm_`. Clipping a scaled gradient would
+compare `max_grad_norm` against an inflated norm and effectively never fire.
+
+### Optimizer and LR schedule
+
+This stage used to hardcode `torch.optim.AdamW` and hand-roll its own cosine schedule. Both now
+come from the same places `train.py` gets them: `utils/optimizer_factory.py` (extracted from
+`train.py`, so the name table is written once) and `utils/lr_schedule.py`.
+
+```toml
+[distill]
+lr_scheduler = 'cosine'          # or constant, linear, cosine_with_restarts
+
+[optimizer]
+type = 'adamw8bit'               # every name train.py accepts
+lr = 1e-4
+betas = [0.9, 0.99]
+weight_decay = 0.01
+```
+
+`lr`, `betas` and `weight_decay` can be written either as flat keys under `[distill]` (the
+original form, still the default) or inside `[optimizer]` — **not both**. Setting both raises
+rather than merging, because a merge would be silently lossy: an `[optimizer]` table holding
+only `type` would inherit `lr` but fall back to torch's defaults for `betas` and
+`weight_decay`, discarding whatever was configured under `[distill]` without saying so. This
+is the same "set exactly one" rule the three caption sources already follow.
+
+`warmup_steps`, `lr_scheduler` and `max_grad_norm` stay under `[distill]` in either form: they
+configure the schedule and the clipping, not the optimizer.
+
+**The optimizer choice matters more here than the parallelism choice.** The refiner is 77.64M
+parameters:
+
+| | |
+| --- | --- |
+| AdamW fp32 moments (`exp_avg` + `exp_avg_sq`) | 592 MB |
+| 8-bit moments (`uint8` state + per-block `absmax`) | **148 MB** |
+| ZeRO-1 saving, for comparison | 0.93 GB per GPU, but only across 4 GPUs |
+
+So `type = 'adamw8bit'` frees 444 MB on a **single** GPU, which is more per-GPU than ZeRO-1
+reaches here and needs no second GPU to reach it. If the goal is fitting this stage into less
+VRAM, try the optimizer before the parallelism.
+
+Two honest caveats. 8-bit optimizers are mostly validated on fine-tuning, and this refiner
+trains from a random init — `adamw8bitkahan` uses Kahan summation and is the safer pick,
+especially alongside `precision = 'bf16-full'`. And combining an 8-bit optimizer with ZeRO is
+**unverified**: ZeRO replaces the optimizer's param groups with its own flat fp32 partitions, so
+the quantisation blocks end up laid over partitions rather than whole parameters. The script
+prints a warning for that combination.
+
+`gradient_release` and `genericoptim` are refused. The first requires a data-parallel world size
+of 1, which contradicts both strategies here; the second needs a pipeline mpu that only
+`train.py` constructs.
+
+**One behaviour change to be aware of.** Switching to the shared scheduler is not bit-identical
+to the old hand-rolled cosine. Measured over 20000 steps with 500 warmup: the curves agree
+closely in the middle (0.8% apart at step 5000, 4.6% at step 10000) but the shared one floors at
+`eta_min = 1e-6` while the old one decayed to ~0, and the total area under the LR curve rises
+**3.44%**. Resuming a run across this change means a slightly hotter tail, not a different
+schedule.
+
+Noticed while measuring, and it affects every stage rather than just this one:
+`create_lr_scheduler` passes `T_max=total_steps` to `CosineAnnealingLR` but warmup has already
+consumed `warmup_steps` of them, so with warmup the cosine only advances
+`total_steps - warmup_steps` of its period and never completes its anneal — it ends at 1.15e-6
+rather than at `eta_min`. Left alone here, since changing it would move the schedule for every
+model that goes through `train.py`.
+
 `gradient_accumulation_steps` gives an effective batch of
 `batch_size * gradient_accumulation_steps * world_size`. The loss is scaled by `1/N` so the
 gradient matches one batch of that size rather than growing with the number of micro batches,

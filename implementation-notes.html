@@ -33,6 +33,236 @@
 <p class="meta">A running log of decisions taken outside the spec, forced changes, tradeoffs, and
 anything else the maintainer needs to know. Newest entry first.</p>
 
+<h2>2026-08-31 — Distillation: ZeRO option, refiner precision modes, and a crash-on-step-0 bug</h2>
+
+<p><strong>Request.</strong> Add the real-ZeRO option that was offered at the end of the previous
+round (<code>deepspeed.initialize</code> + ZeRO-1 instead of DDP), then add mixed-precision /
+full-bf16 / fp16 support for the refiner.</p>
+
+<h3>The bug found on the way in</h3>
+
+<div class="flag">
+<p><strong><code>tools/distill_refiner.py</code> could not complete a single training step.</strong>
+It used <code>contextlib.nullcontext()</code> at the <code>no_sync</code> call site and never
+imported <code>contextlib</code>. That expression is evaluated on the last micro batch of every
+step, and unconditionally when <code>world_size == 1</code>, so every run died with a
+<code>NameError</code> at step 0 in every configuration.</p>
+</div>
+
+<p>Why the suite did not catch it: every test in <code>TestScriptStructure</code> reads the file
+as a <em>string</em> and asserts on substrings, so the module was never imported. The distributed
+smoke test does import <code>contextlib</code> — but inside its own re-implementation of the
+accumulation loop, embedded as a string literal in the test file. The test had reimplemented the
+logic it was supposed to be testing, so it stayed green while the real code was broken. A
+<code>255 passed</code> against tests shaped like that says less than it looks like it says.</p>
+
+<p>Fixed, plus a test that imports the module rather than grepping it. The lesson is the
+generalisable part: source-substring assertions are cheap to write and cannot fail for the right
+reason. Several of the existing ones were rewritten to exercise behaviour instead.</p>
+
+<h3>ZeRO: added, but not made the default</h3>
+
+<p>The previous round&rsquo;s arithmetic was correct and is why this is opt-in. ZeRO-1/2 shard
+optimizer state and gradients, so the ceiling on what they can save is the <em>trainable</em>
+share — 77.64M params, 1.24 GB, about 0.93 GB per GPU across four — while the ~5.20 GB of frozen
+bf16 LLM weights that dominate residency is exactly what those stages cannot touch. DDP remains
+the default. <code>distributed_strategy = &#39;zero1&#39;</code> exists for the case where that
+0.93 GB is the difference between starting and OOMing.</p>
+
+<p>Launcher and strategy were separated properly: a <code>DDPStrategy</code> /
+<code>DeepSpeedZeROStrategy</code> pair behind one four-method interface, so the training loop has
+a single shape and <code>deepspeed --num_gpus</code> can drive DDP just as <code>torchrun</code>
+can drive ZeRO.</p>
+
+<h3>Decisions not in the request</h3>
+
+<table>
+<tr><th>Decision</th><th>Why</th></tr>
+<tr><td>ZeRO stage 3 refused, not implemented</td><td>It shards the parameters, so
+<code>refiner.state_dict()</code> would hold shards rather than weights and the save path would
+silently write garbage without a gather. Combined with all-gathering the frozen weights on every
+forward pass to save memory that is not the constraint, there is no configuration where it
+wins here.</td></tr>
+<tr><td>ZeRO on a single rank refused</td><td>Sharding across one rank shards nothing. Left to
+DeepSpeed it does not fail cleanly — it falls into MPI discovery and dies on <code>No module
+named &#39;mpi4py&#39;</code>, which points at nothing relevant. Found by running it.</td></tr>
+<tr><td><code>precision</code> as a separate name from <code>dtype</code></td><td>See below.</td></tr>
+<tr><td><code>fp16-full</code> refused</td><td>Pure fp16 parameters with no fp32 master copy lose
+AdamW updates to underflow. At <code>lr = 1e-4</code> most updates are below the ~6e-8 relative
+resolution of fp16 and round to zero. Offering it would mean offering a mode that trains
+nothing.</td></tr>
+</table>
+
+<h3>The <code>dtype</code> / <code>precision</code> confusion, which is worth stating loudly</h3>
+
+<p><code>[distill] dtype = &#39;bfloat16&#39;</code> has been in the config since this stage was
+written, and it reads like &ldquo;this trains in bf16&rdquo;. It does not, and never did.
+<code>dtype</code> applies only to the <em>frozen</em> modules — both LLMs, the LLMAdapter, the
+cross-attention probes, the probe queries. The trainable refiner is cast to fp32 in
+<code>build_student</code> unconditionally. So the config described the precision of everything
+<em>except</em> the thing being trained.</p>
+
+<p>Rather than overload <code>dtype</code>, the refiner gets its own <code>precision</code>
+setting. Measured on identical data and seeds:</p>
+
+<table>
+<tr><th><code>precision</code></th><th>Refiner params</th><th>Grad dtype</th><th>Autocast</th><th>Scaler</th></tr>
+<tr><td><code>fp32</code> (default)</td><td>float32</td><td>float32</td><td>—</td><td>no</td></tr>
+<tr><td><code>bf16-mixed</code></td><td>float32</td><td>float32</td><td>bfloat16</td><td>no</td></tr>
+<tr><td><code>fp16-mixed</code></td><td>float32</td><td>float32</td><td>float16</td><td>yes (DDP) / engine (ZeRO)</td></tr>
+<tr><td><code>bf16-full</code></td><td>bfloat16</td><td>bfloat16</td><td>—</td><td>no</td></tr>
+</table>
+
+<p>Numbers behind the choice: the gradient reaching the refiner under <code>bf16-full</code> has
+cosine similarity <strong>0.999994</strong> with the fp32 gradient, at half the parameter
+storage. Separately, the bf16 hop through the frozen cross-attention that <em>every</em> mode
+already pays costs about <strong>2.9e-03</strong> relative gradient error — so the existing
+pipeline was already further from pure fp32 than <code>bf16-full</code> moves it.</p>
+
+<h3>Things the maintainer needs to know</h3>
+
+<ul>
+<li><strong>The three precision axes are one object, not three settings.</strong> They are not
+independently valid: fp16 without a scaler underflows, a <code>GradScaler</code> on top of
+DeepSpeed&rsquo;s own loss scaling scales twice, and autocast over bf16 parameters is a no-op
+that reads as if it were doing something. <code>resolve_precision</code> owns the whole
+mapping.</li>
+<li><strong><code>bf16-full</code> means something different under ZeRO than under DDP.</strong>
+DeepSpeed&rsquo;s bf16 mode keeps fp32 master weights in the optimizer, so it saves less than the
+DDP path and is numerically better. The asymmetry is deliberate and documented rather than
+papered over.</li>
+<li><strong>Precision is applied before the optimizer is constructed.</strong> AdamW sizes
+<code>exp_avg</code> and <code>exp_avg_sq</code> to each parameter&rsquo;s dtype at construction,
+so casting afterwards leaves the optimizer holding state of the wrong dtype. There is a test
+asserting <code>exp_avg</code> comes out bf16 under <code>bf16-full</code>.</li>
+<li><strong>Do not add a <code>bf16</code> section to the ZeRO config to &ldquo;match&rdquo;
+<code>dtype</code>.</strong> Under the default <code>fp32</code> precision the DeepSpeed config
+deliberately carries no mixed-precision section; adding one casts the refiner and destroys the
+fp32 master weights the default mode depends on.</li>
+<li><strong>Do not set <code>dtype = &#39;float16&#39;</code>.</strong> Gradients flow back
+through the frozen cross-attention at that dtype, and nothing scales them there.</li>
+</ul>
+
+<h3>Optimizer and LR schedule: reuse instead of reimplementation</h3>
+
+<p>Follow-up question from the maintainer, and a fair one: why does distillation hardcode
+<code>torch.optim.AdamW</code> and hand-roll a cosine schedule when <code>train.py</code> has
+nine optimizers and <code>utils/lr_schedule.py</code> exists? There was no principled reason. It
+was never wired up.</p>
+
+<p><strong>The optimizer turns out to matter more than the parallelism work above.</strong>
+Measured on the actual <code>ContextRefiner</code> (<code>cap_feat_dim=2048</code>,
+<code>model_dim=1024</code>, 6 layers), which is 77.64M parameters — matching the figure already
+in the docs:</p>
+
+<table>
+<tr><th>Optimizer state</th><th>Size</th><th>Needs</th></tr>
+<tr><td>AdamW fp32 <code>exp_avg</code> + <code>exp_avg_sq</code></td><td>592 MB</td><td>—</td></tr>
+<tr><td>8-bit (<code>uint8</code> state + per-block <code>absmax</code>)</td><td><strong>148 MB</strong></td><td>one GPU</td></tr>
+<tr><td>ZeRO-1 saving, for comparison</td><td>0.93 GB/GPU</td><td><strong>four GPUs</strong></td></tr>
+</table>
+
+<p>So a single line of config frees 444 MB per GPU with no second GPU required — more per-GPU
+than the entire ZeRO effort reaches at this stage. Worth recording as a sequencing mistake:
+the ZeRO work was requested and delivered correctly, but if the underlying goal was VRAM, the
+cheaper answer was never surfaced first.</p>
+
+<p><code>utils/optimizer_factory.py</code> extracts only the name-to-class mapping out of
+<code>train.py</code>&rsquo;s <code>get_optimizer</code>. Everything else there — parameter
+groups from the model, the weight-decay split keyed on <code>p.original_name</code>, gradient
+release with its pipeline-engine monkeypatching, the GenericOptim 2-d split — depends on the
+pipeline model and stayed put. <code>train.py</code> now calls the shared function;
+<code>optim_type_lower</code> is still defined for its two later uses.</p>
+
+<div class="flag">
+<p><strong>Behaviour change, stated because it was promised not to happen.</strong> Moving to the
+shared LR scheduler is <em>not</em> bit-identical to the old hand-rolled cosine. Over 20000 steps
+with 500 warmup: 0.8% apart at step 5000, 4.6% at step 10000, and the shared one floors at
+<code>eta_min = 1e-6</code> where the old decayed to ~0. Total area under the LR curve rises
+<strong>3.44%</strong>. The optimizer side <em>does</em> keep exact backward compatibility — with
+no <code>[optimizer]</code> table it rebuilds the same AdamW from the same flat
+<code>[distill]</code> keys — but the scheduler side does not, and calling that "no behaviour
+change" would have been false.</p>
+</div>
+
+<h3>A bug in the shared scheduler, left alone deliberately</h3>
+
+<p><code>create_lr_scheduler</code> passes <code>T_max=total_steps</code> to
+<code>CosineAnnealingLR</code>, but under <code>SequentialLR</code> the warmup has already
+consumed <code>warmup_steps</code> of those. The cosine therefore advances only
+<code>total_steps - warmup_steps</code> of its period and never completes its anneal: with the
+distillation defaults it ends at 1.15e-6 instead of <code>eta_min</code>.</p>
+
+<p>Not fixed. It affects <em>every</em> stage that goes through <code>train.py</code>, not just
+this one, so silently changing the LR schedule of every model in the repo while wiring up a
+distillation feature is the wrong trade. Flagged for a deliberate decision instead.</p>
+
+<h3>Decisions on what not to bring over</h3>
+
+<table>
+<tr><th>Refused</th><th>Why</th></tr>
+<tr><td><code>gradient_release</code></td><td>Steps the optimizer from a post-accumulate-grad
+hook and asserts a data-parallel world size of 1. Directly contradicts both DDP and ZeRO
+here.</td></tr>
+<tr><td><code>genericoptim</code></td><td>Needs a pipeline <code>mpu</code> and the 2-d/other
+parameter split that only <code>train.py</code> constructs.</td></tr>
+<tr><td>No-weight-decay-on-1d defaulted <em>off</em></td><td>Skipping decay on LayerNorm gains and
+biases is correct and is what <code>train.py</code> does, but turning it on by default would move
+the numbers of every existing distillation run. Available as
+<code>no_weight_decay_on_1d = true</code>.</td></tr>
+</table>
+
+<h3>A config flaw the maintainer caught by reading</h3>
+
+<p>First version let <code>lr</code> appear in two places — flat under <code>[distill]</code> and
+inside the new <code>[optimizer]</code> table — and merged them. The merge was silently lossy:
+an <code>[optimizer]</code> table holding only <code>type</code> (exactly what someone switching
+to <code>adamw8bit</code> would write) inherited <code>lr</code> but fell back to torch&rsquo;s
+defaults for <code>betas</code> and <code>weight_decay</code>, discarding the configured values
+with nothing printed. Measured: <code>betas</code> went from the configured
+<code>(0.8, 0.95)</code> to <code>(0.9, 0.999)</code> and <code>weight_decay</code> from
+<code>0.05</code> to <code>0.01</code>.</p>
+
+<p>Now refused rather than merged, following the "set exactly one" rule
+<code>load_captions</code> already applies to its three caption sources in the same file. The
+error names the offending keys. <code>warmup_steps</code>, <code>lr_scheduler</code> and
+<code>max_grad_norm</code> are exempt: they configure the schedule and clipping, not the
+optimizer.</p>
+
+<h3>Not verified</h3>
+
+<p>Stated plainly because the distinction matters more than the pass count.</p>
+
+<p><strong>8-bit optimizer under ZeRO is untested and warns at runtime.</strong> Confirmed by
+running that <code>AdamW8bit</code> state is genuinely quantised (<code>uint8</code>
+<code>state1</code>/<code>state2</code> plus fp32 <code>qmap</code>/<code>absmax</code>) and that
+it steps on CPU. Not confirmed: what happens when <code>deepspeed.initialize</code> replaces the
+optimizer&rsquo;s param groups with its own flat fp32 partitions, leaving the quantisation blocks
+laid over partitions rather than whole parameters. Also worth knowing that the two save memory in
+the same place, so combining them buys well under the sum of their separate figures.</p>
+
+<p><strong>Verified by running:</strong> the DDP path across two real gloo ranks (three optimizer
+steps, grad norm 0.5894 &rarr; 0.5344 &rarr; 0.4902); all four precision modes end-to-end, each
+completing a full accumulate-and-step with finite gradients and weights that actually move; the
+generated DeepSpeed config parsed by DeepSpeed&rsquo;s own <code>DeepSpeedConfig</code>; every
+DeepSpeed API called (<code>get_global_grad_norm</code>, <code>backward</code>,
+<code>step</code>, and all five <code>initialize</code> parameters) confirmed present in 0.19.6.
+229 passed, 18 skipped.</p>
+
+<p><strong>Not verified:</strong> <code>deepspeed.initialize</code> has never actually run. The
+development container has no GPU and DeepSpeed hangs indefinitely on the CPU accelerator, with
+<code>overlap_comm</code> ruled out as the cause. The ZeRO tests use a fake engine, so they prove
+this code calls the right things in the right order — not that the real engine behaves as
+assumed. The load-bearing assumption is that <code>engine.backward()</code> applies the
+<code>1/N</code> accumulation scaling itself; if that is wrong, the effective learning rate is off
+by exactly <code>gradient_accumulation_steps</code> and <em>nothing reports it</em> — the loss
+still falls, just at the wrong rate.</p>
+
+<p>Cheapest check on real hardware: 200 steps at <code>ddp</code> and 200 at <code>zero1</code>,
+same seed, compare the loss curves. Also note that autocast is disabled on CPU by design, so the
+<code>bf16-mixed</code> and <code>fp16-mixed</code> numerics specifically have not been exercised
+either — on CPU they fall through to the fp32 path.</p>
+
 <h2>2026-08-31 — Caption corpus, tag dropout, multiline .txt captions</h2>
 
 <p><strong>Request.</strong> A script that flattens every caption in a <code>dataset.toml</code>
