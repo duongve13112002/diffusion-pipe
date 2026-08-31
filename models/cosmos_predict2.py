@@ -563,8 +563,10 @@ class CosmosPredict2Pipeline(BasePipeline):
             refiner = transformer.context_refiner
             fresh = context_refiner_state_dict == 'init'
             for name, p in refiner.named_parameters():
-                # When fresh, this placeholder only gets the parameter off the meta device;
-                # init_weights() below overwrites it. Buffers are deliberately left alone:
+                # When fresh, this placeholder only gets the parameter off the meta device.
+                # init_weights() below overwrites every one of them -- it is written to be
+                # self-sufficient precisely because __init__'s default init never ran here.
+                # Buffers are deliberately left alone:
                 # init_empty_weights keeps them real, already computed by __init__, and filling
                 # them with empty tensors would corrupt the rotary embeddings.
                 value = torch.empty(p.shape, dtype=dtype) if fresh else context_refiner_state_dict[name]

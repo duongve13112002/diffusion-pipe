@@ -145,6 +145,74 @@ class TestRefinerBlock:
         torch.testing.assert_close(block(x), x)
 
 
+class TestFreshInitFromMetaDevice:
+    """init_weights() must cover every parameter, not just the ones it overrides.
+
+    The pipeline builds the refiner under init_empty_weights(), so parameters arrive on the
+    meta device and are materialised with torch.empty -- whatever the allocator last held.
+    init_weights() is the only thing that runs afterwards. It used to touch 15 of 28
+    parameters and leave the rest holding allocator residue, with values measured up to 1e32.
+    Whether that residue happened to be finite was luck, and it differed between machines.
+    """
+
+    def _materialise_with_garbage(self):
+        from accelerate.utils import set_module_tensor_to_device
+        refiner = ContextRefiner(cap_feat_dim=64, model_dim=32, num_layers=2, num_heads=4)
+        for name, p in refiner.named_parameters():
+            # Deliberately hostile: the real failure was allocator residue, which is sometimes
+            # NaN and sometimes merely enormous. Use both so the test does not depend on luck.
+            value = torch.full(p.shape, float('nan'), dtype=torch.float32)
+            value.view(-1)[::2] = 1e30
+            set_module_tensor_to_device(refiner, name, device='cpu', dtype=torch.float32, value=value)
+        return refiner
+
+    def test_every_parameter_is_initialised(self):
+        refiner = self._materialise_with_garbage()
+        refiner.init_weights()
+        left = [n for n, p in refiner.named_parameters()
+                if not torch.isfinite(p).all() or p.abs().max() > 1e4]
+        assert not left, f'init_weights() left these holding uninitialised memory: {left}'
+
+    def test_forward_and_gradients_are_finite(self):
+        refiner = self._materialise_with_garbage()
+        refiner.init_weights()
+        x = torch.randn(2, 8, 64)
+        mask = torch.ones(2, 8, dtype=torch.long)
+        out = refiner(x, mask)
+        assert torch.isfinite(out).all()
+        out.sum().backward()
+        bad = [n for n, p in refiner.named_parameters()
+               if p.grad is not None and not torch.isfinite(p.grad).all()]
+        assert not bad, f'non-finite gradients on step 1: {bad}'
+
+    def test_it_matches_normal_construction_statistically(self):
+        # Not weight-for-weight -- both draw randomly -- but the scales must agree, which is
+        # what proves reset_parameters() reproduced PyTorch's own defaults.
+        torch.manual_seed(0)
+        normal = ContextRefiner(cap_feat_dim=64, model_dim=32, num_layers=2, num_heads=4)
+        normal.init_weights()
+        garbage = self._materialise_with_garbage()
+        garbage.init_weights()
+        a = dict(normal.named_parameters())
+        b = dict(garbage.named_parameters())
+        assert a.keys() == b.keys()
+        for name in a:
+            sa, sb = a[name].std().item(), b[name].std().item()
+            if sa == 0:
+                assert sb == 0, f'{name}: expected zero-init, got std {sb}'
+            else:
+                assert 0.3 < sb / sa < 3.0, f'{name}: std {sb} vs {sa}'
+
+    def test_the_identity_property_survives(self):
+        # Zeroed residual branches are the point of init_weights; the full init must not undo it.
+        refiner = self._materialise_with_garbage()
+        refiner.init_weights()
+        for block in refiner.blocks:
+            assert torch.all(block.attn.o_proj.weight == 0)
+            assert torch.all(block.mlp[2].weight == 0)
+            assert torch.all(block.mlp[2].bias == 0)
+
+
 class TestCrossAttentionInvariance:
     """The distillation objective in tools/distill_refiner.py rests on this property.
 

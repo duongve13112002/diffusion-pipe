@@ -66,6 +66,20 @@ def extract_refiner_state_dict(state_dict):
     )
 
 
+def reset_parameters(root):
+    """Apply each submodule's own default initialisation, recursively.
+
+    nn.Linear and friends carry reset_parameters(); RMSNorm here does not, and its weight is a
+    scale that defaults to one. Delegating rather than hand-rolling kaiming bounds keeps this
+    identical to what PyTorch would have done in __init__.
+    """
+    for module in root.modules():
+        if isinstance(module, RMSNorm):
+            nn.init.ones_(module.weight)
+        elif callable(getattr(module, 'reset_parameters', None)):
+            module.reset_parameters()
+
+
 class RefinerBlock(nn.Module):
     """Bidirectional self-attention + MLP.
 
@@ -103,6 +117,7 @@ class RefinerBlock(nn.Module):
         return x
 
     def init_weights(self):
+        reset_parameters(self)
         # Zero the output of both residual branches so the block starts as the identity. The
         # refiner then begins life as a plain linear projection of the LLM hidden states,
         # which is a much more stable starting point than random blocks when the DiT it feeds
@@ -141,7 +156,14 @@ class ContextRefiner(nn.Module):
         self.norm_out = RMSNorm(model_dim)
 
     def init_weights(self):
-        nn.init.ones_(self.cap_embedder[0].weight)
+        """Initialise every parameter, without relying on __init__ having run.
+
+        The pipeline builds this module under init_empty_weights(), so its parameters arrive
+        on the meta device and are materialised with torch.empty -- whatever the allocator
+        last held. This method is the only thing that runs afterwards, so it has to cover
+        every parameter, not just the ones whose values differ from the PyTorch defaults.
+        """
+        reset_parameters(self.cap_embedder)
         nn.init.trunc_normal_(self.cap_embedder[1].weight, std=0.02)
         nn.init.zeros_(self.cap_embedder[1].bias)
         nn.init.ones_(self.norm_out.weight)

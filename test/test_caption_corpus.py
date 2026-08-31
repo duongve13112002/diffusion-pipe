@@ -358,9 +358,15 @@ class TestRawEnumerationIsFaithful:
         assert enumerate_captions(config, apply_shuffle=False) == ['Special: red, blue']
 
     def test_the_round_trip_reproduces_what_training_sees(self, tmp_path):
-        import random
+        """Rebuilding from the corpus must land in the same space training samples from.
+
+        Equality of the two sets would be wrong: training draws cache_shuffle_num times, so
+        with few tags it can easily miss an ordering that 200 draws finds. The containment
+        direction that matters is that training never produces something the corpus round trip
+        cannot -- an earlier version asserted equality and failed 12% of runs.
+        """
         config = _make_dataset(
-            tmp_path, {'a': 'Special: red, blue'},
+            tmp_path, {'a': 'Special: red, blue, green'},
             extra_dataset={
                 'caption_prefix': 'anime, ', 'prefix_tag_caption': 'Special: ',
                 'cache_shuffle_num': 4,
@@ -371,12 +377,12 @@ class TestRawEnumerationIsFaithful:
             preprocess_caption(
                 raw[0], caption_prefix='anime, ', prefix_tag_caption='Special: ', shuffle=True,
             )
-            for _ in range(200)
+            for _ in range(500)
         }
         training = set(enumerate_captions(config))
-        assert rebuilt == training, f'{rebuilt} != {training}'
+        assert training <= rebuilt, f'training produced {training - rebuilt}, unreachable from the corpus'
         assert all(c.startswith('anime, ') and 'Special' not in c for c in rebuilt)
-        assert random  # the draws above are seeded by the module-level RNG
+        assert all(sorted(c[len('anime, '):].split(', ')) == ['blue', 'green', 'red'] for c in rebuilt)
 
     def test_markers_seen_reports_every_directory(self, tmp_path):
         d1, d2 = tmp_path / 'one', tmp_path / 'two'
