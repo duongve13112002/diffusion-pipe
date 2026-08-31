@@ -42,11 +42,20 @@ At production size (`cap_feat_dim=2048`, `model_dim=1024`, 6 layers, 16 heads) t
 parameters**: 50.36M in the MLPs (64.9%), 25.17M in attention (32.4%), 2.10M in `cap_embedder`
 (2.7%).
 
-### `num_blocks` — not a refiner setting
+### `num_blocks` — two different things with the same name
 
-`num_blocks` is the **DiT's** depth, and it comes from the checkpoint, not from any config here.
-Anima is the 2048-channel Cosmos-Predict2 variant, so 28 blocks. The only place the number
-surfaces is the `blocks_to_swap` assert (`<= num_blocks - 2`).
+**`dit_config["num_blocks"]`** is the DiT's depth and comes from the checkpoint, never from a
+config here. It used to be hardcoded per `model_channels` (28 for the 2048-channel variant Anima
+is); upstream now derives it by counting `blocks.N.` keys, which also means a refiner in the same
+file cannot confuse it — its blocks are `context_refiner.blocks.N.`, verified as 28 and 6
+counted separately.
+
+**`[probe] num_blocks = 8`** is a distillation setting, and it is the one worth explaining. The
+loss is measured through the DiT's frozen cross-attention, but there is no need to push through
+all 28 of them: adjacent blocks give highly correlated signal, so a spread covers the same ground
+for a fraction of the compute. The script takes 8 blocks evenly strided across the stack. Raise
+it if you suspect later blocks read the text differently from earlier ones; lower it to trade
+signal for speed.
 
 ### `num_queries = 64` (`[probe]`)
 

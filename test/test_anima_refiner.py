@@ -4,11 +4,14 @@ These run on CPU without DeepSpeed or GPU, and never download model weights. The
 integration tests skip themselves when their imports are unavailable.
 """
 
+import re
+from pathlib import Path
+
 import pytest
 import torch
 from torch import nn
 
-from models.text_refiner import ContextRefiner, RefinerBlock
+from models.text_refiner import ContextRefiner, RefinerBlock, extract_refiner_state_dict
 
 
 CAP_FEAT_DIM = 128
@@ -143,6 +146,45 @@ class TestRefinerBlock:
         block.eval()
         x = torch.randn(2, 6, MODEL_DIM)
         torch.testing.assert_close(block(x), x)
+
+
+class TestCheckpointPrefixes:
+    """Every prefix the pipeline strips must also be strippable when finding a refiner.
+
+    CosmosPredict2Pipeline.load_diffusion_model strips 'net.' (original Cosmos2) and
+    'model.diffusion_model.' (native ComfyUI). If extract_refiner_state_dict knows fewer of
+    them, a checkpoint the pipeline loads happily fails when passed as context_refiner_path --
+    and no merge conflict would ever reveal it, because the two lists live in different files.
+    """
+
+    def _sd(self, prefix):
+        return {
+            f'{prefix}context_refiner.cap_embedder.1.weight': torch.zeros(4, 4),
+            f'{prefix}blocks.0.self_attn.q_proj.weight': torch.zeros(4, 4),
+        }
+
+    @pytest.mark.parametrize('prefix', ['', 'net.', 'model.diffusion_model.'])
+    def test_every_pipeline_prefix_is_understood(self, prefix):
+        got = extract_refiner_state_dict(self._sd(prefix))
+        assert sorted(got) == ['cap_embedder.1.weight'], prefix
+        assert not any('blocks.0.self_attn' in k for k in got), 'DiT weights leaked in'
+
+    def test_a_bare_refiner_file_still_works(self):
+        sd = {'cap_embedder.1.weight': torch.zeros(4, 4), 'norm_out.weight': torch.zeros(4)}
+        assert sorted(extract_refiner_state_dict(sd)) == ['cap_embedder.1.weight', 'norm_out.weight']
+
+    def test_the_two_prefix_lists_agree(self):
+        """Read both sources rather than trusting them to have been kept in step."""
+        from models.text_refiner import _CHECKPOINT_PREFIXES
+        source = (Path(__file__).resolve().parent.parent / 'models/cosmos_predict2.py').read_text()
+        pipeline_strips = set(re.findall(r"re\.sub\(r'\^([a-z_\\.]+)'", source))
+        pipeline_strips = {p.replace('\\.', '.') for p in pipeline_strips}
+        known = {p.rstrip('.') + '.' for p in _CHECKPOINT_PREFIXES}
+        missing = {p for p in pipeline_strips if p not in known}
+        assert not missing, (
+            f'load_diffusion_model strips {missing} but extract_refiner_state_dict does not. '
+            f'Add them to _CHECKPOINT_PREFIXES.'
+        )
 
 
 class TestFreshInitFromMetaDevice:

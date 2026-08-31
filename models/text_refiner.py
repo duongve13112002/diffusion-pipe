@@ -35,22 +35,33 @@ from models.llm_adapter import RMSNorm, Attention, RotaryEmbedding
 # Signature key of a bare refiner state dict, used to tell one apart from a full checkpoint.
 _REFINER_MARKER = 'cap_embedder.1.weight'
 
+# Checkpoint prefixes to strip before looking for the refiner. Kept in step with what
+# CosmosPredict2Pipeline.load_diffusion_model strips: 'net.' for the original Cosmos2 layout and
+# 'model.diffusion_model.' for native ComfyUI. A refiner file the pipeline can load must be a
+# refiner file this can read, so the two lists have to agree.
+_CHECKPOINT_PREFIXES = ('net.', 'model.diffusion_model.')
+
+
+def _strip_checkpoint_prefix(key):
+    for prefix in _CHECKPOINT_PREFIXES:
+        if key.startswith(prefix):
+            return key[len(prefix):]
+    return key
+
 
 def extract_refiner_state_dict(state_dict):
-    """Pull refiner weights out of any of the three shapes they are stored in.
+    """Pull refiner weights out of any of the shapes they are stored in.
 
     Refiner weights reach the loader as a bare file from distillation, as
-    `net.context_refiner.*` inside a full model checkpoint, or as `context_refiner.*` after the
-    caller has already stripped `net.`. All three have to work wherever a refiner is accepted,
-    so this lives in one place rather than being reimplemented per call site.
+    `net.context_refiner.*` or `model.diffusion_model.context_refiner.*` inside a full model
+    checkpoint, or as `context_refiner.*` after the caller has already stripped the prefix. All
+    of them have to work wherever a refiner is accepted, so this lives in one place rather than
+    being reimplemented per call site.
 
     Raises when the input holds no refiner at all, rather than passing unrelated tensors on to
     fail later with an opaque KeyError or shape mismatch.
     """
-    stripped = {
-        (k[len('net.'):] if k.startswith('net.') else k): v
-        for k, v in state_dict.items()
-    }
+    stripped = {_strip_checkpoint_prefix(k): v for k, v in state_dict.items()}
     refiner = {
         k[len('context_refiner.'):]: v
         for k, v in stripped.items() if k.startswith('context_refiner.')
