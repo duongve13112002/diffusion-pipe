@@ -1,0 +1,93 @@
+# Distillation with the denoising rollout ON.
+#
+#   python -m tools.distill_refiner --config examples/anima_refiner/distill_rollout.toml
+#
+# This is examples/anima_refiner/distill.toml with the rollout enabled and the batch sized down
+# to pay for it. Read that file first -- it documents every key. This one only explains what
+# differs and why.
+#
+# What the rollout adds: instead of only comparing the teacher's and the student's text features
+# at the DiT's frozen cross-attention with synthetic probe queries, it also walks the frozen DiT
+# from pure noise toward clean and compares what the DiT actually PREDICTS from each. Still no
+# images and no VAE. See docs/anima_refiner/denoising-rollout.md.
+#
+# When to use this instead of distill.toml: when the `spread` figure in the progress bar shows
+# the student's captions collapsing toward each other -- distinct captions producing the same
+# features -- and relational_loss_weight has not stopped it.
+#
+# WHAT IT COSTS. The DiT stays resident, roughly 3.5-4 GB in bf16 for Anima, so this stage goes
+# from about 6 GB to 10-12 GB plus activations. batch_size is halved below to leave room; raise
+# it back if you have the memory.
+
+[distill]
+dataset = 'examples/dataset.toml'
+output_dir = '/data/output/anima_refiner_distill_rollout'
+
+steps = 20000
+# Halved from distill.toml's 16 to pay for the resident DiT and the rollout's activations.
+# The effective batch is batch_size * gradient_accumulation_steps * world_size, so the
+# accumulation below keeps it where distill.toml had it.
+batch_size = 8
+gradient_accumulation_steps = 4
+
+lr = 1e-4
+betas = [0.9, 0.99]
+weight_decay = 0.01
+max_grad_norm = 1.0
+warmup_steps = 500
+
+max_text_length = 512
+dtype = 'bfloat16'
+seed = 42
+
+save_every = 2000
+log_every = 50
+
+pooled_loss_weight = 0.1
+relational_loss_weight = 1.0
+
+[teacher]
+llm_path = '/data2/imagegen_models/comfyui-models/qwen_3_06b_base.safetensors'
+transformer_path = '/data2/imagegen_models/comfyui-models/anima-preview.safetensors'
+
+[student]
+llm_path = '/data2/imagegen_models/Qwen3.5-2B-Base'
+llm_hidden_layer = -1
+n_refiner_layers = 6
+
+[probe]
+# The probe objective stays on. The rollout does not replace it -- the probe is cheap and gives
+# dense signal on the text features directly, while the rollout is expensive and measures the
+# thing that actually matters. They are summed.
+num_blocks = 8
+
+[rollout]
+# The knob that turns the feature on. 0 would discard the DiT and behave exactly like
+# distill.toml. 1.0 puts the rollout term on equal footing with the probe term; lower it to
+# 0.25-0.5 if the rollout dominates the loss and the probe term stops moving.
+loss_weight = 1.0
+
+# Trajectory length. Cheap: the walk is driven by the teacher and runs under no_grad, so it
+# costs inference only. With 8 steps the lowest point visited is t = 0.125; raise this if you
+# want the comparison to reach latents closer to clean.
+steps = 8
+
+# Where the loss is measured along that trajectory, drawn at random each step. THIS is the
+# expensive knob -- cost is linear in it. Measured at 1.0x / 1.9x / 3.7x / 7.6x for 1 / 2 / 4 / 8
+# points. Adjacent trajectory points give correlated signal and the random draw covers the whole
+# path across training steps, so 2 is the knee.
+loss_points = 2
+
+# Pixel resolution the noise latent is sized from. Must be a multiple of 16: the VAE downsamples
+# by 8 and the DiT patches by 2. 256 gives a 32x32 latent and 256 tokens after patching, which is
+# a realistic sequence length at a fraction of the cost of 512.
+resolution = 256
+
+# Classifier-free guidance during the rollout. 0 evaluates only the conditional branch, which is
+# what this file ships with because it halves the DiT forwards.
+#
+# Set it to 3.0 if you specifically care about CFG sampling quality: above 0 the unconditional
+# branch is evaluated on both sides and receives gradient, and that branch is the one an empty
+# caption feeds -- the single input where the refiner path diverges most from the T5-native DiT
+# it has to satisfy. It doubles the rollout's cost.
+guidance_scale = 0.0

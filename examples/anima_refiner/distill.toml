@@ -139,6 +139,19 @@ log_every = 50
 # gradient early on while the probe-attention term is still noisy. Set to 0 to disable.
 pooled_loss_weight = 0.1
 
+# Keeps distinct captions distinct. The probe loss compares one caption at a time, so it
+# constrains where each caption lands but says nothing about how captions sit relative to each
+# other -- and a student that maps every caption to the same feature satisfies it about as well
+# as one that keeps them apart. That is the mode collapse reported for naive text-encoder
+# distillation (Scaling Down Text Encoders of Text-to-Image Diffusion Models, CVPR 2025, where
+# "rat", "cat" and "man" collapse to identical embeddings).
+#
+# This is Relational Knowledge Distillation's distance-wise term: match the teacher's pairwise
+# distance structure within the batch. It costs nothing -- both feature sets are already
+# computed -- and needs no images, so the stage keeps the property that is its whole reason to
+# exist. Set to 0 to disable, and watch 'spread' in the progress bar if you do.
+relational_loss_weight = 1.0
+
 [teacher]
 # Anima's Qwen3-0.6B text encoder (ComfyUI single-file format).
 llm_path = '/data2/imagegen_models/comfyui-models/qwen_3_06b_base.safetensors'
@@ -161,19 +174,6 @@ n_refiner_layers = 6
 # teacher stays the stock Anima checkpoint either way, which is what makes distillation
 # reachable again from a model trained by any other mode.
 #resume_from = '/data/output/anima_refiner_refiner_crossattn/<run>/model.safetensors'
-
-# Keeps distinct captions distinct. The probe loss compares one caption at a time, so it
-# constrains where each caption lands but says nothing about how captions sit relative to each
-# other -- and a student that maps every caption to the same feature satisfies it about as well
-# as one that keeps them apart. That is the mode collapse reported for naive text-encoder
-# distillation (Scaling Down Text Encoders of Text-to-Image Diffusion Models, CVPR 2025, where
-# "rat", "cat" and "man" collapse to identical embeddings).
-#
-# This is Relational Knowledge Distillation's distance-wise term: match the teacher's pairwise
-# distance structure within the batch. It costs nothing -- both feature sets are already
-# computed -- and needs no images, so the stage keeps the property that is its whole reason to
-# exist. Set to 0 to disable, and watch 'spread' in the progress bar if you do.
-relational_loss_weight = 1.0
 
 # Denoising rollout. OFF by default, and off means off: at loss_weight = 0 the DiT is thrown
 # away exactly as it always was, nothing is allocated, and this stage behaves byte for byte
