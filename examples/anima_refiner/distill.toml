@@ -3,6 +3,13 @@
 # Run with:
 #   python -m tools.distill_refiner --config examples/anima_refiner/distill.toml
 #
+# Multi-GPU, 4 ranks:
+#   torchrun --nproc_per_node=4 -m tools.distill_refiner --config examples/anima_refiner/distill.toml
+#
+# This stage does NOT go through train.py, so it uses plain DDP rather than DeepSpeed. The
+# teacher, both LLMs and the cross-attention probes are frozen; only the 77M-parameter refiner
+# needs gradient synchronisation, so there is no optimizer state worth sharding.
+#
 # This is not a diffusion training run and does not use train.py. It needs captions only --
 # no images, no VAE, no DiT forward pass -- and gets the refiner into roughly the space the
 # frozen DiT can read. Follow it with refiner_only.toml.
@@ -63,7 +70,14 @@ output_dir = '/data/output/anima_refiner_distill'
 #save_full_model = true
 
 steps = 20000
+# Captions per micro batch, per rank.
 batch_size = 16
+# Micro batches accumulated before each optimizer step. The effective batch is
+# batch_size * gradient_accumulation_steps * world_size, so the four ranks above with these
+# values give 16 * 2 * 4 = 128 captions per step. Raise this instead of batch_size when the
+# text encoders will not fit a larger micro batch; the loss is scaled by 1/N so the gradient
+# matches one batch of that size rather than growing with the number of micro batches.
+gradient_accumulation_steps = 2
 lr = 1e-4
 warmup_steps = 500
 betas = [0.9, 0.99]

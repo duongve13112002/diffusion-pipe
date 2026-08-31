@@ -324,6 +324,30 @@ with the refiner attached and `llm_adapter` dropped — so distillation produces
 of artefact every other mode does. The DiT weights are untouched, so it is exactly equivalent
 to pairing the Anima checkpoint with `context_refiner_path`.
 
+### Scaling distillation
+
+This stage does not go through `train.py`, so it has none of DeepSpeed's machinery. It has its
+own:
+
+```
+torchrun --nproc_per_node=4 -m tools.distill_refiner --config examples/anima_refiner/distill.toml
+```
+
+Plain DDP rather than DeepSpeed, because the teacher, both LLMs and the cross-attention probes
+are frozen — only the 77M-parameter refiner needs gradient synchronisation, so there is no
+optimizer state worth sharding and no model too large to fit, which is what ZeRO exists for.
+
+`gradient_accumulation_steps` gives an effective batch of
+`batch_size * gradient_accumulation_steps * world_size`. The loss is scaled by `1/N` so the
+gradient matches one batch of that size rather than growing with the number of micro batches,
+and all but the last micro batch runs under `no_sync()` so DDP all-reduces once per optimizer
+step instead of once per micro batch.
+
+Each rank draws different captions (`random.seed(seed + rank)`) while the model seed and the
+probe stay shared — every rank must measure against the same queries, or the ranks optimise
+different objectives and the all-reduce averages nonsense. Only rank 0 logs and writes
+checkpoints.
+
 ### Where the captions come from
 
 Set exactly one of three sources under `[distill]`:
@@ -521,6 +545,8 @@ Every key below is read only when `type = 'anima_refiner'`.
 | `caption_corpus_format` | from extension | `jsonl`, `csv` or `txt` |
 | `captions` | — | bare file of one caption per line, or a directory of `.txt` |
 | `apply_num_repeats` | `false` | honour the dataset's `num_repeats`; `dataset` source only |
+| `batch_size` | `8` | captions per micro batch, per rank |
+| `gradient_accumulation_steps` | `1` | micro batches per optimizer step |
 | `shuffle_tags` / `cache_shuffle_num` | from `dataset.toml` | shuffle tag order, per sample |
 | `cache_shuffle_delimiter` | `', '` | tag separator |
 | `tag_dropout_rate` | from `dataset.toml` | drop each tag with this probability, per sample |

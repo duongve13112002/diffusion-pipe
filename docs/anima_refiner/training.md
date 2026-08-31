@@ -48,6 +48,17 @@ Three paths matter here. The teacher is the whole stock Anima setup, so it needs
 Getting `teacher.llm_path` wrong is the easy mistake: the teacher has to be reproduced exactly as
 it was trained, or the target the student is chasing is not the one the DiT can read.
 
+Multi-GPU, four ranks:
+
+```
+torchrun --nproc_per_node=4 -m tools.distill_refiner --config examples/anima_refiner/distill.toml
+```
+
+This is the one stage that does not go through `train.py`, so it brings its own DDP and
+`gradient_accumulation_steps` rather than inheriting DeepSpeed's. Effective batch is
+`batch_size * gradient_accumulation_steps * world_size`. See
+[README.md](./README.md#scaling-distillation).
+
 Captions only. No images, no VAE, no diffusion. It teaches a freshly
 initialised `ContextRefiner` to reproduce what Anima's `llm_adapter` already emits, which is by
 definition what the frozen DiT knows how to read.
@@ -86,6 +97,12 @@ to strip them.
 NCCL_P2P_DISABLE="1" NCCL_IB_DISABLE="1" deepspeed --num_gpus=1 \
     train.py --deepspeed --config examples/anima_refiner/refiner_only.toml
 ```
+
+Steps 2 onwards go through `train.py`, so they get everything it offers for every model:
+`gradient_accumulation_steps`, `micro_batch_size_per_gpu`, `pipeline_stages` for pipeline
+parallelism, `blocks_to_swap`, eval datasets, `resume_from_checkpoint`, and multi-GPU via
+`--num_gpus`. Nothing about `anima_refiner` opts out of any of it -- the refiner is its own
+entry in `to_layers()`, so pipeline parallelism and block swapping both see it.
 
 Set `transformer_path` to the Anima checkpoint and `context_refiner_path` to the
 `context_refiner.safetensors` from step 1. If step 1 was run with `save_full_model = true`, point

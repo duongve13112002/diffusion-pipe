@@ -37,6 +37,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')
 import safetensors.torch
 import toml
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 import transformers
 from accelerate import init_empty_weights
@@ -331,47 +332,92 @@ def padded_mean(x, mask, length):
     return (x * mask).sum(dim=1) / length
 
 
+def setup_distributed():
+    """Initialise torch.distributed if launched under torchrun, otherwise run single process.
+
+    DDP rather than DeepSpeed: the teacher, both LLMs and the cross-attention probes are all
+    frozen, so the only thing needing gradient synchronisation is the refiner -- 77M parameters.
+    There is no optimizer state worth sharding and no model too large to fit, which is what
+    ZeRO exists for.
+    """
+    if 'RANK' not in os.environ or 'WORLD_SIZE' not in os.environ:
+        return 0, 1, 0
+    rank = int(os.environ['RANK'])
+    world_size = int(os.environ['WORLD_SIZE'])
+    local_rank = int(os.environ.get('LOCAL_RANK', rank))
+    backend = 'nccl' if torch.cuda.is_available() else 'gloo'
+    if not dist.is_initialized():
+        dist.init_process_group(backend=backend, rank=rank, world_size=world_size)
+    if torch.cuda.is_available():
+        torch.cuda.set_device(local_rank)
+    return rank, world_size, local_rank
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('--config', required=True, help='Path to the TOML config.')
     args = parser.parse_args()
     config = toml.load(args.config)
 
-    device = torch.device(config['distill'].get('device', 'cuda' if torch.cuda.is_available() else 'cpu'))
+    rank, world_size, local_rank = setup_distributed()
+    is_main = rank == 0
+
+    configured_device = config['distill'].get('device', None)
+    if configured_device is not None:
+        device = torch.device(configured_device)
+    elif torch.cuda.is_available():
+        device = torch.device('cuda', local_rank)
+    else:
+        device = torch.device('cpu')
     dtype = getattr(torch, config['distill'].get('dtype', 'bfloat16'))
     max_text_length = config['distill'].get('max_text_length', MAX_TEXT_LENGTH_DEFAULT)
     batch_size = config['distill'].get('batch_size', 8)
+    grad_accum = max(1, config['distill'].get('gradient_accumulation_steps', 1))
     steps = config['distill'].get('steps', 20000)
     seed = config['distill'].get('seed', 42)
     pooled_weight = config['distill'].get('pooled_loss_weight', 0.1)
     output_dir = Path(config['distill']['output_dir'])
-    output_dir.mkdir(parents=True, exist_ok=True)
+    if is_main:
+        output_dir.mkdir(parents=True, exist_ok=True)
 
+    # Every rank draws different captions, so the effective batch is
+    # batch_size * gradient_accumulation_steps * world_size. The model seed stays shared, so
+    # the refiner and the probe are identical everywhere; only the data stream differs.
     torch.manual_seed(seed)
-    random.seed(seed)
+    random.seed(seed + rank)
+    if world_size > 1 and is_main:
+        print(
+            f'Distributed: {world_size} ranks. Effective batch = '
+            f'{batch_size} x {grad_accum} accum x {world_size} ranks = '
+            f'{batch_size * grad_accum * world_size} captions per optimizer step.'
+        )
 
     captions = load_captions(config)
     if not captions:
         raise RuntimeError('No captions found. Check the dataset / captions path under [distill].')
-    print(f'Loaded {len(captions)} captions')
+    if is_main:
+        print(f'Loaded {len(captions)} captions')
     augment = caption_augment_config(config)
-    if augment['shuffle'] or augment['tag_dropout_rate'] > 0:
+    if is_main and (augment['shuffle'] or augment['tag_dropout_rate'] > 0):
         print(
             f"Caption augmentation: shuffle={augment['shuffle']} "
             f"tag_dropout_rate={augment['tag_dropout_rate']} "
             f"prefix_tag_caption={augment['prefix_tag_caption']!r}"
         )
 
-    print('Building teacher...')
+    if is_main:
+        print('Building teacher...')
     t5_tokenizer = T5TokenizerFast(
         vocab_file='configs/t5_old/spiece.model',
         tokenizer_file='configs/t5_old/tokenizer.json',
     )
     teacher_tok, teacher_llm, llm_adapter, cross_attns, model_channels, crossattn_emb_channels = build_teacher(config, dtype, device)
 
-    print('Building student...')
+    if is_main:
+        print('Building student...')
     student_tok, student_llm, refiner, cap_feat_dim = build_student(config, dtype, device, crossattn_emb_channels)
-    print(f'Student LLM hidden size: {cap_feat_dim}')
+    if is_main:
+        print(f'Student LLM hidden size: {cap_feat_dim}')
 
     # Fixed probe queries. The cross-attention modules are frozen and shared by both paths, so
     # any query set works as a measuring stick; a fixed one keeps the objective stationary
@@ -380,6 +426,16 @@ def main():
     num_queries = config.get('probe', {}).get('num_queries', 64)
     generator = torch.Generator(device='cpu').manual_seed(seed)
     probe = torch.randn(1, num_queries, model_channels, generator=generator).to(device=device, dtype=dtype)
+
+    # The probe seed is deliberately NOT rank-offset: every rank must measure against the same
+    # queries, or their gradients describe different objectives.
+    train_module = refiner
+    if world_size > 1:
+        train_module = torch.nn.parallel.DistributedDataParallel(
+            refiner,
+            device_ids=[local_rank] if device.type == 'cuda' else None,
+            output_device=local_rank if device.type == 'cuda' else None,
+        )
 
     lr = config['distill'].get('lr', 1e-4)
     optimizer = torch.optim.AdamW(
@@ -401,63 +457,74 @@ def main():
     save_every = config['distill'].get('save_every', 2000)
     log_every = config['distill'].get('log_every', 50)
     running = 0.0
-    progress_bar = tqdm(range(steps), desc='distill')
+    progress_bar = tqdm(range(steps), desc='distill', disable=not is_main)
 
+    optimizer.zero_grad(set_to_none=True)
     for step in progress_bar:
-        batch = [
-            preprocess_caption(c, **augment)
-            for c in random.sample(captions, min(batch_size, len(captions)))
-        ]
-
-        with torch.no_grad():
-            t_enc = teacher_tok(batch, return_tensors='pt', truncation=True, padding='max_length', max_length=max_text_length)
-            t5_enc = t5_tokenizer(batch, return_tensors='pt', truncation=True, padding='max_length', max_length=max_text_length)
-            teacher_hidden = encode(
-                teacher_llm, t_enc.input_ids.to(device), t_enc.attention_mask.to(device), None
-            )
-            teacher_feats = llm_adapter(
-                source_hidden_states=teacher_hidden,
-                target_input_ids=t5_enc.input_ids.to(device),
-                target_attention_mask=t5_enc.attention_mask.to(device),
-                source_attention_mask=t_enc.attention_mask.to(device),
-            )
-            t5_mask = t5_enc.attention_mask.to(device)
-            teacher_feats = teacher_feats * t5_mask.unsqueeze(-1).to(teacher_feats.dtype)
-
-            s_enc = student_tok(batch, return_tensors='pt', truncation=True, padding='max_length', max_length=max_text_length)
-            s_mask = s_enc.attention_mask.to(device)
-            student_hidden = encode(
-                student_llm, s_enc.input_ids.to(device), s_mask, config['student'].get('llm_hidden_layer', None)
-            )
-
-        student_feats = refiner(student_hidden.to(torch.float32), s_mask)
-
-        q = probe.expand(len(batch), -1, -1)
-        loss = 0.0
-        for cross_attn in cross_attns:
-            with torch.no_grad():
-                target = cross_attn(q, context=teacher_feats.to(dtype))
-            pred = cross_attn(q, context=student_feats.to(dtype))
-            loss = loss + F.mse_loss(pred.float(), target.float())
-        loss = loss / len(cross_attns)
-
-        # Auxiliary global term. Also permutation invariant, and it gives a useful gradient
-        # early on while the probe-attention term is still dominated by noise.
-        if pooled_weight > 0:
-            pooled_loss = F.mse_loss(
-                padded_mean(student_feats.float(), s_mask, max_text_length),
-                padded_mean(teacher_feats.float(), t5_mask, max_text_length),
-            )
-            loss = loss + pooled_weight * pooled_loss
-
+        accum_loss = 0.0
         optimizer.zero_grad(set_to_none=True)
-        loss.backward()
+        for micro in range(grad_accum):
+            batch = [
+                preprocess_caption(c, **augment)
+                for c in random.sample(captions, min(batch_size, len(captions)))
+            ]
+
+            with torch.no_grad():
+                t_enc = teacher_tok(batch, return_tensors='pt', truncation=True, padding='max_length', max_length=max_text_length)
+                t5_enc = t5_tokenizer(batch, return_tensors='pt', truncation=True, padding='max_length', max_length=max_text_length)
+                teacher_hidden = encode(
+                    teacher_llm, t_enc.input_ids.to(device), t_enc.attention_mask.to(device), None
+                )
+                teacher_feats = llm_adapter(
+                    source_hidden_states=teacher_hidden,
+                    target_input_ids=t5_enc.input_ids.to(device),
+                    target_attention_mask=t5_enc.attention_mask.to(device),
+                    source_attention_mask=t_enc.attention_mask.to(device),
+                )
+                t5_mask = t5_enc.attention_mask.to(device)
+                teacher_feats = teacher_feats * t5_mask.unsqueeze(-1).to(teacher_feats.dtype)
+
+                s_enc = student_tok(batch, return_tensors='pt', truncation=True, padding='max_length', max_length=max_text_length)
+                s_mask = s_enc.attention_mask.to(device)
+                student_hidden = encode(
+                    student_llm, s_enc.input_ids.to(device), s_mask, config['student'].get('llm_hidden_layer', None)
+                )
+
+            # DDP all-reduces on every backward by default. Only the last micro batch should
+            # pay for that: the others just accumulate into .grad locally.
+            sync = (world_size == 1) or (micro == grad_accum - 1)
+            with contextlib.nullcontext() if sync else train_module.no_sync():
+                student_feats = train_module(student_hidden.to(torch.float32), s_mask)
+
+                q = probe.expand(len(batch), -1, -1)
+                loss = 0.0
+                for cross_attn in cross_attns:
+                    with torch.no_grad():
+                        target = cross_attn(q, context=teacher_feats.to(dtype))
+                    pred = cross_attn(q, context=student_feats.to(dtype))
+                    loss = loss + F.mse_loss(pred.float(), target.float())
+                loss = loss / len(cross_attns)
+
+                # Auxiliary global term. Also permutation invariant, and it gives a useful
+                # gradient early on while the probe-attention term is still dominated by noise.
+                if pooled_weight > 0:
+                    pooled_loss = F.mse_loss(
+                        padded_mean(student_feats.float(), s_mask, max_text_length),
+                        padded_mean(teacher_feats.float(), t5_mask, max_text_length),
+                    )
+                    loss = loss + pooled_weight * pooled_loss
+
+                # Scale so the gradient matches one batch of batch_size * grad_accum, rather
+                # than growing with the number of micro batches.
+                (loss / grad_accum).backward()
+            accum_loss += loss.item() / grad_accum
+
         grad_norm = torch.nn.utils.clip_grad_norm_(refiner.parameters(), config['distill'].get('max_grad_norm', 1.0))
         optimizer.step()
         scheduler.step()
 
-        running += loss.item()
-        if (step + 1) % log_every == 0:
+        running += accum_loss
+        if is_main and (step + 1) % log_every == 0:
             progress_bar.set_postfix({
                 'loss': f'{running / log_every:.5f}',
                 'grad': f'{grad_norm:.3f}',
@@ -466,15 +533,24 @@ def main():
             running = 0.0
 
         if (step + 1) % save_every == 0 or step + 1 == steps:
-            save_refiner(refiner, output_dir / 'context_refiner.safetensors', dtype)
+            # Every rank holds the same weights after DDP's all-reduce; only one writes.
+            if is_main:
+                save_refiner(refiner, output_dir / 'context_refiner.safetensors', dtype)
+            if world_size > 1:
+                dist.barrier()
 
-    save_refiner(refiner, output_dir / 'context_refiner.safetensors', dtype)
-    print(f'Done. Point context_refiner_path at {output_dir / "context_refiner.safetensors"}')
+    if is_main:
+        save_refiner(refiner, output_dir / 'context_refiner.safetensors', dtype)
+        print(f'Done. Point context_refiner_path at {output_dir / "context_refiner.safetensors"}')
 
-    if config['distill'].get('save_full_model', False):
+    if is_main and config['distill'].get('save_full_model', False):
         path = output_dir / 'model.safetensors'
         save_full_model(config['teacher']['transformer_path'], refiner, path, dtype)
         print(f'Also wrote a full anima_refiner checkpoint to {path}. Use it as transformer_path.')
+
+    if world_size > 1:
+        dist.barrier()
+        dist.destroy_process_group()
 
 
 def save_full_model(teacher_transformer_path, refiner, path, dtype):
