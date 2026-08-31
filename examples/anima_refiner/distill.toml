@@ -175,6 +175,43 @@ n_refiner_layers = 6
 # exist. Set to 0 to disable, and watch 'spread' in the progress bar if you do.
 relational_loss_weight = 1.0
 
+# Denoising rollout. OFF by default, and off means off: at loss_weight = 0 the DiT is thrown
+# away exactly as it always was, nothing is allocated, and this stage behaves byte for byte
+# the way it did before this option existed.
+#
+# What it does: run the frozen DiT from pure noise toward clean, driven by the teacher's own
+# prediction, and compare what the DiT predicts from the teacher's text features against what
+# it predicts from the student's, at points along that path.
+#
+# Why it is stronger than [probe]: the probe measures agreement at the cross-attention output
+# for synthetic random queries. This measures agreement at the model's actual prediction, for
+# inputs the model itself produced. It is the remedy the CVPR 2025 text-encoder distillation
+# paper uses for the mode collapse that embedding-space objectives are prone to.
+#
+# Cost: the DiT stays resident, roughly 3.5-4 GB in bf16 for Anima, taking this stage from
+# about 6 GB to 10-12 GB. Turn it on when the `spread` diagnostic in the progress bar shows
+# the student's captions collapsing toward each other despite relational_loss_weight.
+#[rollout]
+# 0 disables the feature entirely. 1.0 is a reasonable starting point when enabling it.
+#loss_weight = 0.0
+# Steps along the trajectory. Cheap: the walk is teacher-driven and runs under no_grad, so it
+# costs inference only. Measured on a reduced-scale replica, 8 steps cost about as much as 3
+# loss points.
+#steps = 8
+# How many of those points the loss is measured at. This is the expensive knob -- cost is
+# linear, measured at 1.0x / 1.9x / 3.7x / 7.6x for 1 / 2 / 4 / 8 points. Adjacent trajectory
+# points give correlated signal, and random sampling covers the whole path across training
+# steps, so 2 is the knee. Same reasoning as [probe] num_blocks.
+#loss_points = 2
+# Pixel resolution the latent is sized from. Must be a multiple of 16: the VAE downsamples by
+# 8 and the DiT patches by 2. 256 gives a 32x32 latent, 256 tokens after patching.
+#resolution = 256
+# Classifier-free guidance during the rollout. 0 disables it and only the conditional branch
+# is evaluated. Above 0 also evaluates the unconditional branch on both sides, which doubles
+# the DiT forwards but covers the branch every CFG sample actually uses -- and that branch is
+# fed by an empty caption, so it is worth covering. The paper samples 2-5.
+#guidance_scale = 0.0
+
 [probe]
 # Fixed random queries pushed through the DiT's frozen cross-attention. The loss is measured
 # on the output, which is a weighted sum over text positions and therefore does not depend on

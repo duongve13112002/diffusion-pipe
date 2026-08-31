@@ -932,3 +932,163 @@ class TestDistillResumeIsComplete:
         assert metadata['llm_path'] == '/models/Qwen3.5-2B-Base'
         assert metadata['llm_hidden_layer'] == '20'
         assert metadata['max_text_length'] == '512'
+
+
+class TestDenoisingRollout:
+    """The rollout produces x_t on a real sampling trajectory, which this stage cannot otherwise get.
+
+    Distillation has no images, so there is no x_0 and therefore no way to build
+    x_t = (1-t)*x_0 + t*noise the way training normally does. The trajectory is what supplies
+    plausible x_t at all.
+
+    It is driven entirely by the teacher: the student never advances it and never sees its own
+    output as input, so there is no error accumulation and none of the exposure-bias behaviour
+    the word "rollout" usually implies. Built against a real MiniTrainDIT, small enough to run
+    on CPU, because the point is that this works with the actual model.
+    """
+
+    DIT_CONFIG = dict(
+        max_img_h=64, max_img_w=64, max_frames=8,
+        in_channels=16, out_channels=16,
+        patch_spatial=2, patch_temporal=1,
+        model_channels=64, num_blocks=2, num_heads=4,
+        crossattn_emb_channels=32,
+        concat_padding_mask=True,
+        pos_emb_cls='rope3d', pos_emb_learnable=True, pos_emb_interpolation='crop',
+        min_fps=1, max_fps=30,
+        use_adaln_lora=True, adaln_lora_dim=16,
+    )
+
+    @classmethod
+    def _dit(cls):
+        from models.cosmos_predict2_modeling import MiniTrainDIT
+        torch.manual_seed(0)
+        return MiniTrainDIT(**cls.DIT_CONFIG).eval().requires_grad_(False)
+
+    @classmethod
+    def _trajectory(cls, dit, steps=4, guidance_scale=0.0, uncond=None):
+        from tools.distill_refiner import teacher_trajectory
+        teacher = torch.randn(2, 8, cls.DIT_CONFIG['crossattn_emb_channels'])
+        shape = (2, cls.DIT_CONFIG['in_channels'], 1, 16, 16)
+        visited = teacher_trajectory(
+            dit, teacher, uncond, shape, steps, guidance_scale,
+            torch.Generator().manual_seed(0), torch.device('cpu'), torch.float32,
+        )
+        return teacher, visited
+
+    def test_the_schedule_runs_from_pure_noise_downward(self):
+        # t = 1 is pure noise and t = 0 is clean, which is the rectified-flow convention this
+        # DiT was trained with -- not DDPM's, where the paper's Eq. 3 lives.
+        _, visited = self._trajectory(self._dit(), steps=4)
+        schedule = [round(float(t[0, 0]), 4) for _, t in visited]
+        assert schedule == [1.0, 0.75, 0.5, 0.25], schedule
+
+    def test_the_trajectory_carries_no_gradient(self):
+        # The whole walk is teacher-driven and frozen. If this ever starts carrying gradient,
+        # the cost of `steps` stops being inference-only and the two knobs stop being
+        # independent.
+        _, visited = self._trajectory(self._dit(), steps=4)
+        assert not any(x.requires_grad for x, _ in visited)
+
+    def test_identical_features_cost_nothing(self):
+        from tools.distill_refiner import rollout_loss
+        import random
+        dit = self._dit()
+        teacher, visited = self._trajectory(dit, steps=4)
+        loss = rollout_loss(dit, visited, teacher, teacher.clone(), None, None, 0.0, 4,
+                            random.Random(0))
+        assert float(loss) == 0.0
+
+    def test_a_different_student_costs_something_and_has_gradient(self):
+        from tools.distill_refiner import rollout_loss
+        import random
+        dit = self._dit()
+        teacher, visited = self._trajectory(dit, steps=4)
+        student = torch.randn_like(teacher).requires_grad_(True)
+        loss = rollout_loss(dit, visited, teacher, student, None, None, 0.0, 2, random.Random(0))
+        loss.backward()
+        assert float(loss) > 0
+        assert student.grad is not None and torch.isfinite(student.grad).all()
+        assert float(student.grad.norm()) > 0, 'the student must receive gradient from the rollout'
+
+    def test_loss_points_bounds_how_many_predictions_are_compared(self):
+        from tools.distill_refiner import rollout_loss
+        import random
+
+        dit = self._dit()
+        teacher, visited = self._trajectory(dit, steps=8)
+        student = torch.randn_like(teacher)
+
+        calls = []
+        original = dit.forward
+
+        def counting(*args, **kwargs):
+            calls.append(1)
+            return original(*args, **kwargs)
+
+        dit.forward = counting
+        rollout_loss(dit, visited, teacher, student, None, None, 0.0, 3, random.Random(0))
+        dit.forward = original
+        # Three points, teacher and student at each.
+        assert len(calls) == 6, len(calls)
+
+    def test_more_points_than_the_trajectory_has_is_not_an_error(self):
+        from tools.distill_refiner import rollout_loss
+        import random
+        dit = self._dit()
+        teacher, visited = self._trajectory(dit, steps=2)
+        student = torch.randn_like(teacher)
+        loss = rollout_loss(dit, visited, teacher, student, None, None, 0.0, 99, random.Random(0))
+        assert torch.isfinite(loss)
+
+    def test_guidance_doubles_the_predictions_and_still_trains(self):
+        from tools.distill_refiner import rollout_loss
+        import random
+        dit = self._dit()
+        uncond = torch.randn(2, 8, self.DIT_CONFIG['crossattn_emb_channels'])
+        teacher, visited = self._trajectory(dit, steps=4, guidance_scale=3.0, uncond=uncond)
+        student = torch.randn_like(teacher).requires_grad_(True)
+        student_uncond = torch.randn_like(uncond).requires_grad_(True)
+
+        loss = rollout_loss(dit, visited, teacher, student, uncond, student_uncond, 3.0, 2,
+                            random.Random(0))
+        loss.backward()
+        assert torch.isfinite(loss)
+        # Both branches must receive gradient: the unconditional one is what every CFG sample
+        # uses, and it is the branch an empty caption feeds.
+        assert float(student.grad.norm()) > 0
+        assert float(student_uncond.grad.norm()) > 0
+
+    def test_guidance_zero_never_evaluates_the_unconditional_branch(self):
+        # Off must mean off: no extra forward, and no cost for a feature nobody enabled.
+        from tools.distill_refiner import rollout_loss
+        import random
+        dit = self._dit()
+        teacher, visited = self._trajectory(dit, steps=4)
+        student = torch.randn_like(teacher)
+
+        calls = []
+        original = dit.forward
+        dit.forward = lambda *a, **k: (calls.append(1), original(*a, **k))[1]
+        rollout_loss(dit, visited, teacher, student, torch.randn_like(teacher),
+                     torch.randn_like(teacher), 0.0, 2, random.Random(0))
+        dit.forward = original
+        assert len(calls) == 4, f'expected 2 points x 2 models, got {len(calls)}'
+
+
+class TestRolloutIsOffByDefault:
+    """The feature must be invisible until someone asks for it."""
+
+    def test_the_default_config_does_not_enable_it(self):
+        import toml
+        config = toml.load(REPO / 'examples/anima_refiner/distill.toml')
+        assert config.get('rollout', {}).get('loss_weight', 0.0) == 0.0, (
+            'the shipped config must leave the rollout off; it costs several GB of resident DiT'
+        )
+
+    def test_build_teacher_discards_the_dit_when_it_is_off(self):
+        # Reading the source rather than running build_teacher, which needs real checkpoints.
+        source = (REPO / 'tools/distill_refiner.py').read_text(encoding='utf-8')
+        body = source[source.index('def build_teacher'):source.index('def build_student')]
+        assert "rollout_config.get('loss_weight', 0.0) > 0" in body
+        assert 'dit.blocks = None' in body, 'the off path must still throw the DiT away'

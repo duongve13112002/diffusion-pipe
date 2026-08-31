@@ -239,15 +239,25 @@ def build_teacher(config, dtype, device):
     model_channels = dit_config['model_channels']
     crossattn_emb_channels = dit_config['crossattn_emb_channels']
 
-    # Everything else in the DiT is dead weight for this stage.
-    dit.blocks = None
-    dit.llm_adapter = None
-    del dit, state_dict
+    # Everything else in the DiT is dead weight for this stage -- unless the denoising rollout
+    # is on, which needs the whole thing to predict with. Keeping it costs several GB, which is
+    # why it is opt-in and why the default path still throws it away.
+    rollout_config = config.get('rollout', {})
+    keep_dit = rollout_config.get('loss_weight', 0.0) > 0
+    if keep_dit:
+        dit.llm_adapter = None
+        dit.to(device).eval().requires_grad_(False)
+    else:
+        dit.blocks = None
+        dit.llm_adapter = None
+        dit = None
+    del state_dict
 
     text_encoder.to(device).eval().requires_grad_(False)
     llm_adapter.to(device).eval().requires_grad_(False)
     cross_attns.to(device).eval().requires_grad_(False)
-    return tokenizer, text_encoder, llm_adapter, cross_attns, model_channels, crossattn_emb_channels
+    return (tokenizer, text_encoder, llm_adapter, cross_attns, model_channels,
+            crossattn_emb_channels, dit, dit_config)
 
 
 def build_student(config, dtype, device, model_dim):
@@ -326,6 +336,75 @@ def encode(text_encoder, input_ids, attn_mask, hidden_layer):
         ).hidden_states[hidden_layer].clone()
     out[~attn_mask.bool()] = 0
     return out
+
+
+def _velocity(dit, x, t, cond_feats, uncond_feats, guidance_scale):
+    """One frozen-DiT prediction, optionally with classifier-free guidance.
+
+    Anima is a rectified-flow model: the DiT predicts a velocity, and the sampling ODE is
+    dx/dt = v. That is why the caller advances with a plain Euler step rather than a DDPM
+    posterior -- the paper this follows is written for DDPM and the schedule does not carry
+    over unchanged.
+    """
+    padding_mask = torch.zeros(x.shape[0], 1, x.shape[3], x.shape[4], dtype=x.dtype, device=x.device)
+    v = dit(x, t, cond_feats, padding_mask=padding_mask)
+    if guidance_scale > 0 and uncond_feats is not None:
+        v_uncond = dit(x, t, uncond_feats, padding_mask=padding_mask)
+        v = v_uncond + guidance_scale * (v - v_uncond)
+    return v
+
+
+@torch.no_grad()
+def teacher_trajectory(dit, teacher_feats, teacher_uncond, shape, steps, guidance_scale,
+                       generator, device, dtype):
+    """Walk from pure noise toward clean, driven entirely by the teacher.
+
+    The student never advances the trajectory and never sees its own output as input, so there
+    is no error accumulation and none of the exposure-bias machinery that the phrase "rollout"
+    usually implies applies here. That is not a simplification of the method -- it is what the
+    method does (Scaling Down Text Encoders of Text-to-Image Diffusion Models, CVPR 2025,
+    Algorithm 1: both models are evaluated at the SAME x_t, and x_t is advanced with the
+    teacher's prediction).
+
+    The whole walk therefore runs under no_grad. It exists to produce x_t that lie on a real
+    sampling trajectory, which matters because this stage has no images: without x_0 there is
+    no way to build x_t = (1-t)*x_0 + t*noise the way training normally would.
+
+    Returns the visited (x_t, t) pairs. t runs from 1 (pure noise) to just above 0.
+    """
+    x = torch.randn(shape, generator=generator, device='cpu').to(device=device, dtype=dtype)
+    schedule = torch.linspace(1.0, 0.0, steps + 1, device=device, dtype=torch.float32)
+    visited = []
+    for i in range(steps):
+        t = schedule[i].to(dtype).expand(shape[0], 1)
+        v = _velocity(dit, x, t, teacher_feats, teacher_uncond, guidance_scale)
+        visited.append((x, t))
+        x = x - (schedule[i] - schedule[i + 1]).to(dtype) * v
+    return visited
+
+
+def rollout_loss(dit, visited, teacher_feats, student_feats, teacher_uncond, student_uncond,
+                 guidance_scale, loss_points, rng):
+    """Compare what the frozen DiT predicts from the two text frontends, on the trajectory.
+
+    This is the objective the probe loss approximates. The probe measures agreement at the
+    cross-attention output for synthetic queries; this measures it where it actually matters,
+    at the model's own prediction, for queries the model itself produced.
+
+    Only the student side carries gradient. The teacher side and the trajectory are frozen, so
+    the cost of a longer rollout is inference cost, not backward cost -- `steps` and
+    `loss_points` are independent knobs on purpose.
+    """
+    if not visited:
+        return student_feats.sum() * 0.0
+    chosen = rng.sample(visited, min(loss_points, len(visited)))
+    loss = 0.0
+    for x, t in chosen:
+        with torch.no_grad():
+            target = _velocity(dit, x, t, teacher_feats, teacher_uncond, guidance_scale)
+        prediction = _velocity(dit, x, t, student_feats, student_uncond, guidance_scale)
+        loss = loss + F.mse_loss(prediction.float(), target.float())
+    return loss / len(chosen)
 
 
 def relational_loss(student_pooled, teacher_pooled):
@@ -854,6 +933,28 @@ def main():
     seed = config['distill'].get('seed', 42)
     pooled_weight = config['distill'].get('pooled_loss_weight', 0.1)
     relational_weight = config['distill'].get('relational_loss_weight', 1.0)
+
+    rollout_config = config.get('rollout', {})
+    rollout_weight = rollout_config.get('loss_weight', 0.0)
+    rollout_steps = rollout_config.get('steps', 8)
+    rollout_points = rollout_config.get('loss_points', 2)
+    rollout_resolution = rollout_config.get('resolution', 256)
+    rollout_guidance = rollout_config.get('guidance_scale', 0.0)
+    if rollout_weight > 0:
+        for key, value, minimum in (('steps', rollout_steps, 1),
+                                    ('loss_points', rollout_points, 1),
+                                    ('resolution', rollout_resolution, 16)):
+            if value < minimum:
+                raise RuntimeError(f'[rollout] {key} must be >= {minimum}, got {value}')
+        if rollout_guidance < 0:
+            raise RuntimeError(f'[rollout] guidance_scale must be >= 0, got {rollout_guidance}')
+        # The VAE downsamples by 8 and the DiT patches by 2, so the latent side has to be a
+        # multiple of 16 in pixels for the patch grid to come out whole.
+        if rollout_resolution % 16 != 0:
+            raise RuntimeError(
+                f'[rollout] resolution must be a multiple of 16, got {rollout_resolution}: the '
+                'VAE downsamples by 8 and the DiT patches by 2.'
+            )
     output_dir = Path(config['distill']['output_dir'])
     if is_main:
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -889,7 +990,8 @@ def main():
         vocab_file='configs/t5_old/spiece.model',
         tokenizer_file='configs/t5_old/tokenizer.json',
     )
-    teacher_tok, teacher_llm, llm_adapter, cross_attns, model_channels, crossattn_emb_channels = build_teacher(config, dtype, device)
+    (teacher_tok, teacher_llm, llm_adapter, cross_attns, model_channels,
+     crossattn_emb_channels, teacher_dit, teacher_dit_config) = build_teacher(config, dtype, device)
 
     if is_main:
         print('Building student...')
@@ -925,6 +1027,58 @@ def main():
 
     # The probe seed is deliberately NOT rank-offset: every rank must measure against the same
     # queries, or their gradients describe different objectives.
+
+    # Rollout setup. Everything here is skipped entirely when the feature is off, including
+    # keeping the DiT resident, so the default path is byte for byte what it was.
+    rollout_generator = None
+    teacher_uncond = None
+    uncond_student_ids = uncond_student_mask = None
+    if rollout_weight > 0:
+        if teacher_dit is None:
+            raise RuntimeError(
+                '[rollout] loss_weight > 0 but the teacher DiT was not retained. This is a bug: '
+                'build_teacher keys the decision off the same config value.'
+            )
+        # Rank-offset, so every rank walks a different trajectory and the effective sample count
+        # scales with world size, exactly as the caption stream already does.
+        rollout_generator = torch.Generator().manual_seed(seed + 10_000 + rank)
+        latent_side = rollout_resolution // 8
+        rollout_shape = (batch_size, teacher_dit_config['in_channels'], 1, latent_side, latent_side)
+        if is_main:
+            print(
+                f'Denoising rollout: weight={rollout_weight}, steps={rollout_steps}, '
+                f'loss_points={rollout_points}, latent={rollout_shape[1:]}'
+                + (f', guidance={rollout_guidance}' if rollout_guidance > 0 else ', no guidance')
+            )
+        if rollout_guidance > 0:
+            # Classifier-free guidance needs an unconditional branch on both sides. The
+            # teacher's is constant, so it is computed once; the student's moves as the refiner
+            # trains and has to be recomputed with gradient every step.
+            with torch.no_grad():
+                t_uncond = teacher_tok([''], return_tensors='pt', truncation=True,
+                                       padding='max_length', max_length=max_text_length)
+                t5_uncond = t5_tokenizer([''], return_tensors='pt', truncation=True,
+                                         padding='max_length', max_length=max_text_length)
+                uncond_hidden = encode(teacher_llm, t_uncond.input_ids.to(device),
+                                       t_uncond.attention_mask.to(device), None)
+                teacher_uncond = llm_adapter(
+                    source_hidden_states=uncond_hidden,
+                    target_input_ids=t5_uncond.input_ids.to(device),
+                    target_attention_mask=t5_uncond.attention_mask.to(device),
+                    source_attention_mask=t_uncond.attention_mask.to(device),
+                )
+                t5_uncond_mask = t5_uncond.attention_mask.to(device)
+                teacher_uncond = teacher_uncond * t5_uncond_mask.unsqueeze(-1).to(teacher_uncond.dtype)
+                s_uncond = student_tok([''], return_tensors='pt', truncation=True,
+                                       padding='max_length', max_length=max_text_length)
+                uncond_student_mask = s_uncond.attention_mask.to(device)
+                # An empty caption tokenizes to an all-padding row, which would make the
+                # refiner emit zeros and hand the DiT a context it was never trained on. One
+                # real token mirrors what old T5 produces for '', and matches what
+                # models/cosmos_predict2.py does on the training and sampling paths.
+                if uncond_student_mask.sum() == 0:
+                    uncond_student_mask[:, 0] = 1
+                uncond_student_ids = s_uncond.input_ids.to(device)
 
     provenance = refiner_provenance(config, cap_feat_dim, max_text_length)
 
@@ -1028,6 +1182,30 @@ def main():
                 if relational_weight > 0:
                     # Keeps distinct captions distinct. See relational_loss.
                     loss = loss + relational_weight * relational_loss(student_pooled, teacher_pooled)
+                if rollout_weight > 0:
+                    student_uncond = None
+                    if rollout_guidance > 0:
+                        # With gradient: the unconditional branch depends on the refiner too,
+                        # and it is the branch every CFG sample actually uses.
+                        student_uncond_hidden = encode(
+                            student_llm, uncond_student_ids, uncond_student_mask,
+                            config['student'].get('llm_hidden_layer', None),
+                        )
+                        student_uncond = train_module(
+                            student_uncond_hidden.to(precision.param_dtype), uncond_student_mask
+                        ).to(dtype).expand(len(batch), -1, -1)
+                    visited = teacher_trajectory(
+                        teacher_dit, teacher_feats.to(dtype),
+                        teacher_uncond.expand(len(batch), -1, -1).to(dtype) if teacher_uncond is not None else None,
+                        (len(batch),) + tuple(rollout_shape[1:]), rollout_steps,
+                        rollout_guidance, rollout_generator, device, dtype,
+                    )
+                    loss = loss + rollout_weight * rollout_loss(
+                        teacher_dit, visited, teacher_feats.to(dtype), student_feats.to(dtype),
+                        teacher_uncond.expand(len(batch), -1, -1).to(dtype) if teacher_uncond is not None else None,
+                        student_uncond, rollout_guidance, rollout_points, random,
+                    )
+
                 if is_main:
                     # Diagnostic only, and free: the pooled features already exist.
                     last_spread = mean_pairwise_cosine_distance(student_pooled.detach())
