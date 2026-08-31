@@ -65,7 +65,30 @@ order and any one's output can feed any other.
 | `refiner_crossattn` | refiner + cross-attention, diffusion loss | `examples/anima_refiner_refiner_crossattn.toml` |
 
 Plus `anima_refiner_lora.toml`, `anima_refiner_lokr.toml` and
-`anima_refiner_full_finetune.toml` for the adapter and full fine tune variants.
+`anima_refiner_full_finetune.toml` for the adapter and full fine tune variants, and
+`anima_refiner_onfly_lora.toml` + `anima_refiner_dataset.toml` for a worked example with
+on-the-fly text embeddings and per-access caption augmentation.
+
+All of them use `adamw8bitkahan`. Kahan summation is what makes an 8-bit optimizer usable with
+`bfloat16` weights: bf16 has 8 bits of mantissa, so a small update rounds away entirely, and the
+compensation term keeps it. Plain `adamw8bit` loses those updates silently.
+
+### On-the-fly text embeddings
+
+`cache_text_embeddings = false` keeps the text encoder resident and runs it every step. It costs
+VRAM and time, and buys caption augmentation that is re-drawn on every access rather than frozen
+into the cache.
+
+The difference is not cosmetic. With cached embeddings, `cache_shuffle_num` fixes how many tag
+orders and dropout draws exist for the entire run; `tag_dropout_rate` with `cache_shuffle_num = 1`
+gives a *single* permanent draw, which deletes those tags rather than augmenting them. With
+on-the-fly embeddings there is no such ceiling.
+
+The dataset code adapts automatically. When the model caches no text embeddings, the metadata
+keeps captions exactly as they are on disk — marker included — and `__getitem__` strips the
+marker, shuffles and drops tags on each access. Epoch length is unchanged: `cache_shuffle_num`
+still decides how many entries a caption contributes, those entries just differ every pass. VAE
+latents are cached either way; that is the expensive half and it does not depend on the caption.
 
 Ordering still matters *for results*, even though nothing enforces it. Unfreezing the DiT
 while the refiner still emits noise is what causes catastrophic forgetting: loss is highest at

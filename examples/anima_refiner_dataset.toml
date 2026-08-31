@@ -1,0 +1,85 @@
+# Dataset for anima_refiner with ON-THE-FLY text embeddings.
+#
+# Pair this with examples/anima_refiner_onfly_lora.toml, which sets
+# cache_text_embeddings = false. That choice is what makes everything below work the way it
+# reads: with no cached embedding, the caption string is what the text encoder tokenizes on
+# every step, so tag shuffling and tag dropout are re-drawn each time an image is fetched
+# rather than frozen into the cache. Point a model that DOES cache text embeddings at this
+# file and the same settings still work, but they get baked into the cache instead -- see the
+# note on cache_shuffle_num below.
+#
+# VAE latents are always cached, regardless. That is the expensive half and it does not depend
+# on the caption.
+
+# Global settings. Every [[directory]] inherits these and may override any of them.
+
+resolutions = [1024]
+enable_ar_bucket = true
+min_ar = 0.5
+max_ar = 2.0
+num_ar_buckets = 9
+frame_buckets = [1]
+
+# --- Captions -------------------------------------------------------------------------------
+
+# Each non-empty line of a .txt sidecar is its own caption, the way captions.json already allows
+# a list. Off by default because turning it on changes how many samples an existing dataset
+# produces; it needs --regenerate_cache to take effect.
+multiline_captions = true
+
+# One training sample per image, with the caption drawn at random on every access. An epoch is
+# therefore n_images, not n_images * n_captions, and an image gets a different caption each
+# pass. Every caption is still cached; the draw is just an index into the cache.
+caption_sampling = "random_per_epoch"
+
+# Shuffle the tag order. With on-the-fly text embeddings this is re-drawn per access, so the
+# value only sets how many entries each caption contributes to an epoch -- 1 is the right value
+# here. If you switch to cached text embeddings, raise this: the cache then holds exactly this
+# many frozen variants, and caption_sampling above draws from them.
+cache_shuffle_num = 1
+cache_shuffle_delimiter = ', '
+
+# Drop each tag independently with probability 0.1. At least one tag always survives: an
+# all-dropped caption is the *unconditional* embedding, which the trainer already produces
+# deliberately, so minting more would quietly shift the conditioning ratio.
+tag_dropout_rate = 0.1
+
+# Says which captions are tag lists rather than prose, so the two above never shuffle a
+# sentence on its commas. Matched case-insensitively; the marker and any whitespace after it
+# are stripped before the text encoder sees anything, so
+#     Special: 1girl, long hair, smile
+# trains as
+#     1girl, long hair, smile
+# while "A photo of a girl, smiling." is left exactly as written.
+prefix_tag_caption = "Special:"
+
+# Skip images whose caption is missing, rather than training them on an empty caption.
+skip_empty_caption = true
+
+# --- Directories ----------------------------------------------------------------------------
+#
+# num_repeats = 1 everywhere: these three folders are meant to contribute in proportion to how
+# many images they actually hold. Raise it on a folder you want oversampled.
+
+# Sidecar .txt files. With multiline_captions above, a file holding
+#     Special: 1girl, smile, outdoors
+#     A girl smiling outdoors.
+# gives that image two captions, and caption_sampling picks one per epoch.
+[[directory]]
+path = '/data/anime/booru_tags'
+num_repeats = 1
+
+# Same layout, different content. Overriding a global is per directory: this one is prose, so
+# it opts out of tag augmentation by giving the marker no captions to match.
+[[directory]]
+path = '/data/anime/natural_language'
+num_repeats = 1
+tag_dropout_rate = 0.0
+cache_shuffle_num = 0
+
+# captions.json instead of sidecars: {"image1.png": ["Special: a, b", "A photo of ..."], ...}.
+# When a captions.json exists, the .txt fallback is disabled for the WHOLE directory, so do not
+# mix the two in one folder.
+[[directory]]
+path = '/data/anime/curated'
+num_repeats = 1

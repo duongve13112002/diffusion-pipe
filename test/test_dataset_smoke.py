@@ -229,3 +229,72 @@ class TestCollapseToOneEntryPerImage:
 
     def test_empty_input(self):
         assert collapse_to_one_entry_per_image([]) == []
+
+
+class TestRuntimeAugmentation:
+    """When no text embeddings are cached, augmentation moves from cache time to __getitem__."""
+
+    def _dataset(self, tmp_path, caption, caches_text_embeddings, **overrides):
+        import json
+        d = tmp_path / 'imgs'
+        d.mkdir(parents=True, exist_ok=True)
+        Image.new('RGB', (64, 64), (128, 128, 128)).save(d / 'a.png')
+        (d / 'captions.json').write_text(json.dumps({'a.png': caption}))
+        ds = DirectoryDataset(
+            directory_config(d, **overrides), {'resolutions': [64]}, 'test_model',
+            skip_dataset_validation=True, caches_text_embeddings=caches_text_embeddings,
+        )
+        ds.cache_metadata()
+        return ds
+
+    def _captions(self, ds):
+        buckets = ds.size_bucket_datasets if ds.use_size_buckets else ds.ar_bucket_datasets
+        return [c for row in buckets[0].metadata_dataset['caption'] for c in row]
+
+    def test_uncached_keeps_the_marker_so_tags_stay_distinguishable(self, tmp_path):
+        ds = self._dataset(
+            tmp_path, ['Special: a, b, c', 'Some prose, with a comma.'], False,
+            prefix_tag_caption='Special:', cache_shuffle_num=1, tag_dropout_rate=0.1,
+        )
+        assert self._captions(ds) == ['Special: a, b, c', 'Some prose, with a comma.'], (
+            'raw captions must survive to __getitem__, or prose cannot be told from tags there'
+        )
+
+    def test_cached_bakes_augmentation_and_strips_the_marker(self, tmp_path):
+        ds = self._dataset(
+            tmp_path, ['Special: a, b, c', 'Some prose, with a comma.'], True,
+            prefix_tag_caption='Special:', cache_shuffle_num=1,
+        )
+        captions = self._captions(ds)
+        assert not any('Special' in c for c in captions)
+        assert sorted(captions[0].split(', ')) == ['a', 'b', 'c']
+        assert captions[1] == 'Some prose, with a comma.', 'prose must not be shuffled'
+
+    def test_epoch_length_is_unchanged_by_moving_augmentation(self, tmp_path):
+        # cache_shuffle_num still expands to the same number of variants; they are just
+        # augmented per access rather than frozen. Changing epoch length would silently
+        # rescale every existing training schedule.
+        lengths = {}
+        for caches in (True, False):
+            ds = self._dataset(
+                tmp_path / str(caches), ['a, b, c'], caches, cache_shuffle_num=7,
+            )
+            lengths[caches] = len(self._captions(ds))
+        assert lengths[True] == lengths[False] == 7, lengths
+
+    def test_flag_is_off_when_no_augmentation_is_configured(self, tmp_path):
+        ds = self._dataset(tmp_path, ['a, b'], False)
+        assert not ds.augment_at_runtime
+
+    def test_flag_is_off_when_the_model_caches(self, tmp_path):
+        ds = self._dataset(tmp_path, ['a, b'], True, cache_shuffle_num=4, tag_dropout_rate=0.1)
+        assert not ds.augment_at_runtime
+
+    def test_flag_is_on_for_dropout_alone(self, tmp_path):
+        ds = self._dataset(tmp_path, ['a, b'], False, tag_dropout_rate=0.1)
+        assert ds.augment_at_runtime
+
+    def test_no_frozen_dropout_warning_when_augmenting_at_runtime(self, tmp_path, caplog):
+        # The warning is about a single frozen draw. That cannot happen per access.
+        self._dataset(tmp_path, ['a, b, c'], False, tag_dropout_rate=0.5)
+        assert 'permanent tag deletion' not in caplog.text

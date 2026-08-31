@@ -51,15 +51,17 @@ rank = 16
 decompose_factor = -1
 rank_dropout = 0.0
 dtype = 'bfloat16'
-# Targets 'Block' (DiT) and 'RefinerBlock' (text refiner) by default.
+# Targets 'Block' (the DiT) and 'ContextRefiner' (the text refiner) by default.
+# ContextRefiner rather than RefinerBlock, so cap_embedder -- which hangs off the refiner
+# itself, not off any block -- is adapted too. It is the one projection that has to move
+# for a new text encoder to land.
 # Set this to train the refiner densely instead of adapting it. It is then excluded from the
-# LoRA targets and saved separately as context_refiner.safetensors, ready for
+# LoRA targets and saved separately under context_refiner/, ready for
 # context_refiner_path. Use it when starting from an untrained refiner.
 #train_context_refiner = true
 
 [optimizer]
-type = 'adamw_optimi'
+type = 'adamw8bitkahan'
 lr = 1e-4
 betas = [0.9, 0.99]
 weight_decay = 0.01
-eps = 1e-8

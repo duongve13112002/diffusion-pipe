@@ -1,0 +1,82 @@
+# LoRA on a TRAINED anima_refiner, with text embeddings computed ON THE FLY.
+#
+# Pairs with examples/anima_refiner_dataset.toml.
+#
+# The trade this config makes: the text encoder stays resident and runs every step, which costs
+# VRAM and time, in exchange for caption augmentation that is re-drawn on every access instead
+# of frozen into a cache. With cached embeddings, cache_shuffle_num decides how many tag orders
+# and dropout draws exist for the whole run; here there is no such ceiling. That matters most
+# with tag_dropout_rate, which at cache time with cache_shuffle_num = 1 would give a single
+# permanent draw -- deleting those tags rather than augmenting them.
+#
+# VAE latents are still cached either way. That is the expensive half, and it does not depend
+# on the caption, so nothing is given up there.
+#
+# A LoRA is a low-rank update to existing weights, so it has nothing to build on if the refiner
+# is still freshly initialised. Either point transformer_path / context_refiner_path at a
+# trained refiner (the normal case, as below), or set train_context_refiner in [adapter].
+
+output_dir = '/data/output/anima_refiner_onfly_lora'
+dataset = 'examples/anima_refiner_dataset.toml'
+
+epochs = 100
+micro_batch_size_per_gpu = 4
+pipeline_stages = 1
+gradient_accumulation_steps = 1
+gradient_clipping = 1
+warmup_steps = 100
+
+eval_every_n_epochs = 1
+eval_before_first_step = true
+eval_micro_batch_size_per_gpu = 4
+eval_gradient_accumulation_steps = 1
+
+save_every_n_epochs = 2
+activation_checkpointing = true
+partition_method = 'parameters'
+save_dtype = 'bfloat16'
+caching_batch_size = 8
+steps_per_print = 10
+blocks_to_swap = 20  # block swapping requires an [adapter] block, so it works here
+
+[model]
+type = 'anima_refiner'
+transformer_path = '/data/output/anima_refiner_refiner_crossattn/<run>/model.safetensors'
+vae_path = '/data2/imagegen_models/comfyui-models/qwen_image_vae.safetensors'
+llm_path = '/data2/imagegen_models/Qwen3.5-2B-Base'
+dtype = 'bfloat16'
+transformer_dtype = 'float8_e5m2'  # e4m3fn does NOT work well on this model family
+
+# The setting this config is built around. false keeps the text encoder loaded and runs it every
+# step, so the caption string -- freshly shuffled and tag-dropped by the dataset -- is what gets
+# tokenized. Budget for the encoder staying in VRAM alongside the DiT; lower
+# micro_batch_size_per_gpu or raise blocks_to_swap if it does not fit.
+cache_text_embeddings = false
+
+llm_hidden_layer = -1
+# n_refiner_layers is omitted: transformer_path already carries a refiner, and its layer count
+# is read from those weights. Setting it here would raise if the two disagree.
+max_text_length = 512
+# Needed if transformer_path does not already contain trained refiner weights.
+#context_refiner_path = '/data/output/anima_refiner_distill/context_refiner.safetensors'
+
+timestep_sample_method = 'logit_normal'
+
+[adapter]
+type = 'lora'
+rank = 32
+dtype = 'bfloat16'
+# Targets 'Block' (the DiT) and 'ContextRefiner' (the text refiner) by default. ContextRefiner
+# rather than RefinerBlock, so that cap_embedder -- which hangs off the refiner itself, not off
+# any block -- is adapted too. It is the one projection that has to move for a new text encoder
+# to land, so leaving it frozen would defeat the point.
+# Set this to train the refiner densely instead of adapting it. It is then excluded from the
+# LoRA targets and saved separately under context_refiner/, ready for context_refiner_path.
+# Use it when starting from an untrained refiner.
+#train_context_refiner = true
+
+[optimizer]
+type = 'adamw8bitkahan'
+lr = 1e-4
+betas = [0.9, 0.99]
+weight_decay = 0.01

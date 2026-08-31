@@ -60,4 +60,3 @@ type = 'adamw8bitkahan'
 lr = 5e-6
 betas = [0.9, 0.99]
 weight_decay = 0.01
-eps = 1e-8
