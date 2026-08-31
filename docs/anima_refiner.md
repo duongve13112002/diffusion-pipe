@@ -231,11 +231,61 @@ with the refiner attached and `llm_adapter` dropped — so distillation produces
 of artefact every other mode does. The DiT weights are untouched, so it is exactly equivalent
 to pairing the Anima checkpoint with `context_refiner_path`.
 
-Captions come from the ordinary `dataset.toml`, resolved by the same rules `DirectoryDataset`
-applies (`captions.json` first, then a matching `.txt`, then `skip_empty_caption`) with the
-same `caption_prefix` and tag shuffling. Images are enumerated but never opened. `num_repeats`
-is ignored unless `apply_num_repeats = true`: repeats rebalance how often *images* are sampled,
-which means little for captions alone. A directory holding only `.txt` files works too.
+### Where the captions come from
+
+Set exactly one of three sources under `[distill]`:
+
+| Key | What it is |
+| --- | --- |
+| `dataset` | The ordinary `dataset.toml`, resolved by the same rules `DirectoryDataset` applies (`captions.json` first, then a matching `.txt`, then `skip_empty_caption`) with the same `caption_prefix`. Images are enumerated but never opened. |
+| `caption_corpus` | A file from `tools/export_caption_corpus.py`: every caption of that same dataset, flattened once. |
+| `captions` | A bare file of one caption per line, or a directory of `.txt` files, for when there is no `dataset.toml` to hand. |
+
+`num_repeats` is ignored unless `apply_num_repeats = true`: repeats rebalance how often
+*images* are sampled, which means little for captions alone.
+
+### The caption corpus
+
+```
+python tools/export_caption_corpus.py --dataset examples/dataset.toml --output captions.jsonl
+```
+
+Reading captions straight from a `dataset.toml` stays exactly in step with the diffusion
+stages, but it walks every media file and opens every tar on every run, purely to discover
+which captions exist. For a few million images that is worth doing once. The corpus is a cache
+of that walk, not a different source of truth — the same strings come out either way.
+
+Format follows the extension:
+
+| | |
+| --- | --- |
+| `.jsonl` | One JSON object per line. Prefer this: it streams, needs no quoting rules, and a corrupt line is obviously a corrupt line. |
+| `.csv` | The same fields as columns, for spreadsheets. |
+| `.txt` | One caption per line, with newlines and backslashes escaped so a caption containing a line break survives the round trip. |
+
+`--dedupe` collapses identical captions and records how many times each occurred; reading
+expands the count back out, so the sampling distribution is unchanged either way. A `.txt`
+corpus has nowhere to put a count, so it repeats the line instead.
+
+Captions are written **exactly as the dataset holds them**, tag marker included, and shuffling
+is *not* baked in. Those are training-time concerns, which keeps one corpus usable by runs
+configured differently and lets every epoch see a fresh variant. `caption_prefix` is the one
+exception: it is a fixed string with no random component, so it is applied at export.
+
+### Caption augmentation
+
+`shuffle_tags` / `cache_shuffle_num`, `cache_shuffle_delimiter`, `tag_dropout_rate` and
+`prefix_tag_caption` (see [Multi-caption and tag augmentation](../README.md#multi-caption-and-tag-augmentation))
+all work here. Two differences from the diffusion stages:
+
+- **It is applied per sample, not baked into a cache.** Distillation re-embeds the text every
+  step, so there is no embedding cache to invalidate and no reason to freeze a fixed set of
+  variants. Each epoch sees a different tag order and a different dropout draw.
+- **Settings fall back to the `dataset.toml`.** Anything left unset under `[distill]` is read
+  from the dataset config's top level when `dataset` is the source, so a distillation run
+  matches the diffusion stages without restating them. Only top-level keys: a batch here is a
+  flat sample of captions with no directory attached, so per-directory overrides must be
+  restated under `[distill]` if they matter.
 
 **Why the loss is measured at the cross-attention output.** The obvious objective, a
 position-wise MSE between teacher and student features, does not work. Both sides are
@@ -354,6 +404,23 @@ Every key below is read only when `type = 'anima_refiner'`.
 | `base_lr` | optimizer `lr` | lr for otherwise unmatched parameters |
 | `refiner_lr` | `base_lr` | lr for the refiner |
 | `train_context_refiner` | `false` | in `[adapter]`: train the refiner densely |
+
+### Distillation config (`[distill]`)
+
+| Key | Default | Meaning |
+|---|---|---|
+| `dataset` | — | a `dataset.toml`; captions read through the training rules |
+| `caption_corpus` | — | a file from `tools/export_caption_corpus.py` |
+| `caption_corpus_format` | from extension | `jsonl`, `csv` or `txt` |
+| `captions` | — | bare file of one caption per line, or a directory of `.txt` |
+| `apply_num_repeats` | `false` | honour the dataset's `num_repeats` |
+| `shuffle_tags` / `cache_shuffle_num` | from `dataset.toml` | shuffle tag order, per sample |
+| `cache_shuffle_delimiter` | `', '` | tag separator |
+| `tag_dropout_rate` | from `dataset.toml` | drop each tag with this probability, per sample |
+| `prefix_tag_caption` | from `dataset.toml` | marks tag captions; stripped before training |
+
+Exactly one of `dataset`, `caption_corpus` and `captions` may be set; setting more than one is
+an error rather than a silent precedence rule.
 
 ## Tests
 

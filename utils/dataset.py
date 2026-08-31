@@ -31,7 +31,6 @@ import comfy.model_management as mm
 DEBUG = False
 IMAGE_SIZE_ROUND_TO_MULTIPLE = 32
 NUM_PROC = min(8, os.cpu_count())
-CAPTIONS_JSON_FILE = 'captions.json'
 ROUND_DECIMAL_DIGITS = 3
 
 UNCOND_FRACTION = 0.0
@@ -44,132 +43,16 @@ def shuffle_with_seed(l, seed=None):
     random.setstate(rng_state)
 
 
-def shuffle_captions(captions: list[str], count: int = 0, delimiter: str = ', ', caption_prefix: str = '') -> list[str]:
-    if count == 0:
-        return [caption_prefix + c for c in captions]
-
-    def shuffle_caption(caption: str, delimiter: str = ", ") -> str:
-        split = caption.split(delimiter)
-        random.shuffle(split)
-        return delimiter.join(split)
-
-    return [caption_prefix + shuffle_caption(caption, delimiter) for caption in captions for _ in range(count)]
-
-
-def bucket_suffix(key):
-    if len(key) == 2:
-        # AR, frames
-        return f'{key[0]:.{ROUND_DECIMAL_DIGITS}f}_{key[1]}'
-    elif len(key) == 3:
-        # width, height, frames
-        return f'{key[0]}x{key[1]}x{key[2]}'
-    elif len(key) == 4:
-        # AR, width, height, frames
-        return f'{key[0]:.{ROUND_DECIMAL_DIGITS}f}x{key[1]}x{key[2]}x{key[3]}'
-    else:
-        raise RuntimeError(f'Unexpected bucket: {key}')
-
-
-def dedup_and_sort(values):
-    values = set(round(x, ROUND_DECIMAL_DIGITS) for x in values)
-    values = list(values)
-    values.sort()
-    return np.array(values)
-
-
-def seed_from_hash(item):
-    return int(hashlib.md5(str.encode(str(item))).hexdigest(), 16) % int(1e9)
-
-
-# Extensions DirectoryDataset skips when enumerating media files.
-NON_MEDIA_SUFFIXES = ('.txt', '.npz', '.json', '.parquet', '.bak', '.db')
-
-
-def enumerate_captions(dataset_config, apply_num_repeats=False):
-    """Return every caption in a dataset config, without opening any media file.
-
-    This mirrors the caption resolution DirectoryDataset does (captions.json first, then a
-    matching .txt, then skip_empty_caption) and applies the same caption_prefix and tag
-    shuffling, so callers see the caption distribution training will see. It exists for tools
-    that need captions but not images -- tools/distill_refiner.py trains only the text frontend
-    and never touches the VAE or the DiT's image path.
-
-    As an accommodation for that use case, a directory holding only caption files with no
-    media alongside them is accepted: DirectoryDataset would assert, but for a text-only tool
-    the images are genuinely not needed.
-    """
-    captions = []
-    for directory_config in dataset_config['directory']:
-        def setting(key, default):
-            return directory_config.get(key, dataset_config.get(key, default))
-
-        path = Path(directory_config['path'])
-        caption_prefix = setting('caption_prefix', '')
-        shuffle_num = setting('cache_shuffle_num', 0)
-        if setting('shuffle_tags', False) and shuffle_num == 0:
-            shuffle_num = 1  # backwards compatibility, same as DirectoryDataset
-        delimiter = setting('cache_shuffle_delimiter', ', ')
-        skip_empty_caption = setting('skip_empty_caption', True)
-        num_repeats = setting('num_repeats', 1) if apply_num_repeats else 1
-
-        caption_data = None
-        captions_json = path / CAPTIONS_JSON_FILE
-        if captions_json.exists():
-            with open(captions_json) as f:
-                caption_data = json.load(f)
-
-        files = sorted(path.glob('*'))
-        # (tar_file_or_None, path_within_or_on_disk), mirroring DirectoryDataset's image_spec.
-        # The distinction matters for captions.json lookups: DirectoryDataset keys a plain file
-        # by basename but a tar member by its full path inside the archive.
-        media_specs = []
-        for file in files:
-            if not file.is_file() or file.suffix in NON_MEDIA_SUFFIXES:
-                continue
-            if file.suffix == '.tar':
-                with tarfile.TarFile(file) as tar_f:
-                    media_specs.extend((file, Path(name)) for name in tar_f.getnames())
-            else:
-                media_specs.append((None, file))
-
-        if not media_specs and caption_data is None:
-            # Text-only directory: take the caption files themselves as the unit of work.
-            media_specs = [(None, f) for f in files if f.is_file() and f.suffix == '.txt']
-
-        directory_captions = []
-        for tar_file, media_file in media_specs:
-            item = None
-            if caption_data is not None:
-                key = str(media_file) if tar_file is not None else media_file.name
-                item = caption_data.get(key, None)
-                if item is None:
-                    logger.warning(f'{key} has no entry in {CAPTIONS_JSON_FILE}')
-                else:
-                    assert isinstance(item, list), f'{CAPTIONS_JSON_FILE} must contain lists of captions'
-            elif media_file.suffix == '.txt':
-                item = [media_file.read_text().strip()]
-            else:
-                # DirectoryDataset disables the .txt fallback for the WHOLE directory as soon as
-                # a captions.json exists (`if has_captions_json or not os.path.exists(...)`).
-                # Keeping the fallback here would feed distillation captions the diffusion
-                # stages never see, which is the drift this helper exists to prevent.
-                caption_file = media_file.with_suffix('.txt')
-                if caption_file.exists():
-                    item = [caption_file.read_text().strip()]
-            if item is None:
-                if skip_empty_caption:
-                    logger.warning(f'Could not find caption for {media_file}. Skipping.')
-                    continue
-                item = ['']
-            directory_captions.extend(shuffle_captions(item, shuffle_num, delimiter, caption_prefix))
-
-        # num_repeats may be fractional -- SizeBucketDataset accepts any value > 0 and takes
-        # int(len * num_repeats), so mirror that rather than assuming an integer.
-        if directory_captions:
-            total = int(len(directory_captions) * num_repeats)
-            captions.extend(directory_captions[i % len(directory_captions)] for i in range(total))
-
-    return captions
+from utils.captions import (
+    CAPTIONS_JSON_FILE,
+    NON_MEDIA_SUFFIXES,
+    drop_tags,
+    enumerate_captions,
+    preprocess_caption,
+    read_caption_file,
+    shuffle_captions,
+    split_tag_prefix,
+)
 
 
 def _map_and_cache(dataset, map_fn, cache_dir, cache_file_prefix='', new_fingerprint_args=None, regenerate_cache=False, caching_batch_size=1):
@@ -322,6 +205,13 @@ class SizeBucketDataset:
         self.uncond_text_embeddings = []
         self.num_repeats = self.directory_config['num_repeats']
         self.shuffle_skip = max(directory_config.get('cache_shuffle_num', 0), 1) # Should be provided in DirectoryDataset
+        # Only used on the online_captions path, where the caption is chosen at __getitem__ time
+        # and so can still be augmented. On the cached path the embedding is already computed,
+        # so shuffling and dropout have to happen at cache time instead (shuffle_captions).
+        self.online_shuffle = directory_config.get('cache_shuffle_num', 0) > 0 or directory_config.get('shuffle_tags', False)
+        self.online_delimiter = directory_config.get('cache_shuffle_delimiter', ', ')
+        self.prefix_tag_caption = directory_config.get('prefix_tag_caption', '')
+        self.tag_dropout_rate = directory_config.get('tag_dropout_rate', 0.0)
         if self.num_repeats <= 0:
             raise ValueError(f'num_repeats must be >0, was {self.num_repeats}')
 
@@ -414,7 +304,13 @@ class SizeBucketDataset:
                 spec = entry['image_spec']
                 key = spec[-1]
                 if key in self.captions_dict:
-                    caption = self.captions_dict[key][entry['caption_number']]
+                    caption = preprocess_caption(
+                        self.captions_dict[key][entry['caption_number']],
+                        delimiter=self.online_delimiter,
+                        prefix_tag_caption=self.prefix_tag_caption,
+                        shuffle=self.online_shuffle,
+                        tag_dropout_rate=self.tag_dropout_rate,
+                    )
                 else:
                     print(f'WARNING: image {key} did not have entry in captions_dict. Using empty caption.')
                     caption = ''
@@ -576,6 +472,13 @@ class DirectoryDataset:
         self.cache_dir = self.path / 'cache' / self.model_name
         self.grouping_keys_json_file = self.cache_dir / 'metadata/grouping_keys.json'
         self.skip_empty_caption = directory_config.get('skip_empty_caption', dataset_config.get('skip_empty_caption', True))
+        self.multiline_captions = directory_config.get('multiline_captions', dataset_config.get('multiline_captions', False))
+        self.prefix_tag_caption = directory_config.get('prefix_tag_caption', dataset_config.get('prefix_tag_caption', ''))
+        self.tag_dropout_rate = directory_config.get('tag_dropout_rate', dataset_config.get('tag_dropout_rate', 0.0))
+        # SizeBucketDataset needs these at __getitem__ time for the online_captions path.
+        self.directory_config['prefix_tag_caption'] = self.prefix_tag_caption
+        self.directory_config['tag_dropout_rate'] = self.tag_dropout_rate
+        self.directory_config['cache_shuffle_delimiter'] = self.shuffle_delimiter
 
         if not self.path.exists() or not self.path.is_dir():
             raise RuntimeError(f'Invalid path: {self.path}')
@@ -843,8 +746,9 @@ class DirectoryDataset:
                 # Already put in dataset from captions.json file.
                 captions = example['caption'][0]
             if captions is None and caption_file:
-                with open(caption_file) as f:
-                    captions = [f.read().strip()]
+                captions = read_caption_file(Path(caption_file), self.multiline_captions)
+            if not captions:
+                captions = None
             if captions is None:
                 if self.skip_empty_caption:
                     logger.warning(f'Cound not find caption for {image_file}. Skipping image.')
@@ -854,7 +758,14 @@ class DirectoryDataset:
                     captions = ['']
             if self.directory_config['shuffle_tags'] and self.shuffle == 0: # backwards compatibility
                 self.shuffle = 1
-            captions = shuffle_captions(captions, self.shuffle, self.shuffle_delimiter, self.directory_config['caption_prefix'])
+            captions = shuffle_captions(
+                captions,
+                self.shuffle,
+                self.shuffle_delimiter,
+                self.directory_config['caption_prefix'],
+                self.prefix_tag_caption,
+                self.tag_dropout_rate,
+            )
             if self.control_path:
                 empty_return['control_file'] = []
 

@@ -20,9 +20,33 @@ dataset = 'examples/dataset.toml'
 # rebalance how often images are sampled, which does not mean much for captions alone.
 #apply_num_repeats = false
 
+# A caption corpus produced by tools/export_caption_corpus.py -- every caption of the dataset
+# flattened into one .jsonl, .csv or .txt file:
+#
+#   python tools/export_caption_corpus.py --dataset examples/dataset.toml --output captions.jsonl
+#
+# Same captions as reading the dataset.toml, but without walking millions of image files (and
+# opening every tar) on each run. Set exactly one of 'dataset', 'caption_corpus' or 'captions'.
+#caption_corpus = '/data/anime_dataset/captions.jsonl'
+# The format is taken from the extension; override it only if the extension does not say.
+#caption_corpus_format = 'jsonl'
+
 # Fallback when there is no dataset.toml to hand: a file with one caption per line, or a
-# directory of .txt files. Ignored when 'dataset' is set.
+# directory of .txt files.
 #captions = '/data/anime_dataset/captions.txt'
+
+# Caption augmentation, applied fresh to every sampled batch rather than baked in, so each
+# epoch sees a different tag order and a different dropout draw. When 'dataset' is the source,
+# any of these left unset here is read from the dataset.toml's top level instead, so a
+# distillation run matches the diffusion stages without restating them. (Only top-level keys:
+# a batch here is a flat sample of captions with no directory attached, so per-directory
+# overrides have to be restated here if they matter.)
+#shuffle_tags = true
+#cache_shuffle_delimiter = ', '
+#tag_dropout_rate = 0.1
+# Only captions starting with this marker are treated as tag lists; the marker is stripped
+# before the text encoder sees it. Unset means every caption is treated as tags.
+#prefix_tag_caption = 'Special: '
 
 output_dir = '/data/output/anima_refiner_distill'
 # Also write a complete anima_refiner checkpoint (the teacher's DiT with the trained

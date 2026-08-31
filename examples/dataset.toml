@@ -46,6 +46,25 @@ frame_buckets = [1, 33]
 # Controls whether to skip images with missing captions (true, the default if unset), or use an empty caption (false).
 #skip_empty_caption = false
 
+# Drop each tag independently with this probability, as a caption augmentation. 0 (the default) disables it.
+# Applied at caching time alongside cache_shuffle_num, so changing it needs --regenerate_cache to take effect,
+# and combines well with cache_shuffle_num > 1 so each cached variant gets a different draw.
+# At least one tag always survives: an all-dropped caption is the unconditional embedding, which the trainer
+# already produces deliberately, and minting more of them would quietly change the conditioning ratio.
+# tag_dropout_rate = 0.1
+
+# Marks which captions are tag lists rather than natural language. Only captions starting with this string are
+# shuffled and tag-dropped; everything else is left alone. The marker is stripped before training, so with
+# prefix_tag_caption = "Special: " the caption "Special: a, b, c" is trained as "a, b, c".
+# Unset (the default) means the dataset is not annotated and every caption is treated as tags -- the behaviour
+# this repo had before the setting existed.
+# prefix_tag_caption = "Special: "
+
+# Treat each non-empty line of a .txt caption file as a separate caption, the way captions.json already allows a
+# list. Off by default: turning it on changes how many training samples a dataset with wrapped .txt files
+# produces, so it must be opted into, and needs --regenerate_cache to take effect.
+# multiline_captions = true
+
 [[directory]]
 # Path to directory of images/videos, and corresponding caption files. The caption files should match the media file name, but with a .txt extension.
 # A missing caption file will log a warning, but then just train using an empty caption.

@@ -53,7 +53,8 @@ from models.cosmos_predict2 import get_dit_config
 from models.cosmos_predict2_modeling import MiniTrainDIT
 from models.text_refiner import ContextRefiner, extract_refiner_state_dict
 from utils.common import iterate_safetensors, load_state_dict
-from utils.dataset import enumerate_captions
+from utils.caption_corpus import read_corpus
+from utils.dataset import enumerate_captions, preprocess_caption
 
 MAX_TEXT_LENGTH_DEFAULT = 512
 
@@ -66,16 +67,44 @@ def load_captions(config):
     .txt resolution, same caption_prefix and tag shuffling. Images are never opened: this stage
     trains only the text frontend.
 
+    `caption_corpus` points at a file produced by tools/export_caption_corpus.py: the same
+    captions, already flattened, so a few million images do not have to be walked again. It is
+    the same set of strings either way -- the corpus is a cache of the walk, not a different
+    source of truth.
+
     `captions` is a fallback for when there is no dataset.toml to hand: either a file with one
     caption per line, or a directory of .txt files.
     """
     distill_config = config['distill']
+    sources = [k for k in ('dataset', 'caption_corpus', 'captions') if k in distill_config]
+    if len(sources) > 1:
+        raise RuntimeError(
+            f"[distill] sets {' and '.join(repr(s) for s in sources)}; they are alternative "
+            f'caption sources, so set exactly one.'
+        )
+
     if 'dataset' in distill_config:
         dataset_config = toml.load(distill_config['dataset'])
-        return enumerate_captions(dataset_config, apply_num_repeats=distill_config.get('apply_num_repeats', False))
+        # apply_shuffle=False: shuffling and dropout are applied per sample below instead of
+        # being baked into a fixed set of variants here, so every epoch sees a fresh one.
+        return enumerate_captions(
+            dataset_config,
+            apply_num_repeats=distill_config.get('apply_num_repeats', False),
+            apply_shuffle=False,
+        )
+
+    if 'caption_corpus' in distill_config:
+        return read_corpus(
+            distill_config['caption_corpus'],
+            fmt=distill_config.get('caption_corpus_format', None),
+            apply_num_repeats=distill_config.get('apply_num_repeats', False),
+        )
 
     if 'captions' not in distill_config:
-        raise RuntimeError("set either 'dataset' (a dataset.toml) or 'captions' under [distill]")
+        raise RuntimeError(
+            "set one of 'dataset' (a dataset.toml), 'caption_corpus' (a file from "
+            "tools/export_caption_corpus.py) or 'captions' under [distill]"
+        )
 
     path = Path(distill_config['captions'])
     if path.is_dir():
@@ -84,6 +113,39 @@ def load_captions(config):
             if (text := txt.read_text(encoding='utf-8').strip())
         ]
     return [line.strip() for line in path.read_text(encoding='utf-8').splitlines() if line.strip()]
+
+
+def caption_augment_config(config):
+    """Resolve the caption augmentation applied to each sampled batch.
+
+    Settings are read from [distill] first, then from the dataset.toml when that is the caption
+    source, so a run driven by a dataset.toml augments the way the diffusion stages do without
+    having to restate it. Only top-level dataset.toml keys are picked up: a batch here is a
+    flat sample of captions with no directory attached, so per-directory overrides have nothing
+    to attach to and must be restated under [distill] if they matter. Unlike the diffusion stages, which bake a fixed number of shuffled
+    variants into the embedding cache, distillation re-embeds every step and so can augment per
+    sample -- each epoch sees a different tag order and a different dropout draw.
+    """
+    distill_config = config['distill']
+    fallback = {}
+    if 'dataset' in distill_config:
+        dataset_config = toml.load(distill_config['dataset'])
+        fallback = {k: v for k, v in dataset_config.items() if not isinstance(v, (list, dict))}
+
+    def setting(key, default):
+        if key in distill_config:
+            return distill_config[key]
+        return fallback.get(key, default)
+
+    shuffle = setting('cache_shuffle_num', 0) > 0 or setting('shuffle_tags', False)
+    # caption_prefix is deliberately absent: it is a fixed string with no random component, so
+    # both caption sources already have it applied. Adding it again here would double it.
+    return {
+        'delimiter': setting('cache_shuffle_delimiter', ', '),
+        'prefix_tag_caption': setting('prefix_tag_caption', ''),
+        'shuffle': shuffle,
+        'tag_dropout_rate': setting('tag_dropout_rate', 0.0),
+    }
 
 
 def build_teacher(config, dtype, device):
@@ -260,6 +322,13 @@ def main():
     if not captions:
         raise RuntimeError('No captions found. Check the dataset / captions path under [distill].')
     print(f'Loaded {len(captions)} captions')
+    augment = caption_augment_config(config)
+    if augment['shuffle'] or augment['tag_dropout_rate'] > 0:
+        print(
+            f"Caption augmentation: shuffle={augment['shuffle']} "
+            f"tag_dropout_rate={augment['tag_dropout_rate']} "
+            f"prefix_tag_caption={augment['prefix_tag_caption']!r}"
+        )
 
     print('Building teacher...')
     t5_tokenizer = T5TokenizerFast(
@@ -303,7 +372,10 @@ def main():
     progress_bar = tqdm(range(steps), desc='distill')
 
     for step in progress_bar:
-        batch = random.sample(captions, min(batch_size, len(captions)))
+        batch = [
+            preprocess_caption(c, **augment)
+            for c in random.sample(captions, min(batch_size, len(captions)))
+        ]
 
         with torch.no_grad():
             t_enc = teacher_tok(batch, return_tensors='pt', truncation=True, padding='max_length', max_length=max_text_length)

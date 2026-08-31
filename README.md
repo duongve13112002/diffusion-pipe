@@ -112,6 +112,38 @@ A dataset consists of one or more directories containing image or video files, a
 
 For images, any image format that can be loaded by Pillow should work. For videos, any format that can be loaded by ImageIO should work. Note that this means **WebP videos are not supported**, because ImageIO can't load multi-frame WebPs.
 
+### Multi-caption and tag augmentation
+
+An image can have more than one caption. `captions.json` holds a list per image, and every
+caption in that list becomes its own training sample — nothing is picked at random and
+discarded. A `.txt` sidecar is one caption by default, newlines included; set
+`multiline_captions = true` to treat each non-empty line as a separate caption instead. That
+one is opt-in because turning it on changes how many samples an existing dataset produces, and
+like `cache_shuffle_num` it needs `--regenerate_cache` to take effect.
+
+Two caption augmentations, both off by default and both settable per directory or dataset-wide:
+
+| Setting | What it does |
+| --- | --- |
+| `cache_shuffle_num` / `shuffle_tags` | Shuffle the tag order. `cache_shuffle_num` caches that many shuffled variants per caption. |
+| `tag_dropout_rate` | Drop each tag independently with this probability. At least one tag always survives — an all-dropped caption is the *unconditional* embedding, which the trainer already produces deliberately, so minting more of them would quietly change the conditioning ratio. |
+
+`prefix_tag_caption` says which captions those apply to. A dataset that mixes tag lists with
+natural language should not have its prose shuffled on commas; mark the tag captions with a
+prefix and only they are augmented:
+
+```toml
+prefix_tag_caption = "Special: "
+```
+
+The marker is **stripped before training**, so `"Special: a, b, c"` is trained as `"a, b, c"`.
+Unset (the default) means the dataset is not annotated and every caption is treated as tags,
+which is how this repo behaved before the setting existed.
+
+Both augmentations are applied when the text embeddings are cached, so changing either needs
+`--regenerate_cache`. With `online_captions = true` they are applied per sample instead, since
+that path picks the caption fresh each time.
+
 ## Supported models
 See the [supported models doc](./docs/supported_models.md) for more information on how to configure each model, the options it supports, and the format of the saved LoRAs.
 
