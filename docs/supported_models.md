@@ -592,7 +592,7 @@ mod_lr = 0
 refiner_lr = 1e-4
 ```
 
-Read [docs/anima_refiner.md](anima_refiner.md) before training this. Example configs for every
+Read [docs/anima_refiner/README.md](anima_refiner/README.md) before training this. Example configs for every
 mode live in `examples/`: `anima_refiner_distill`, `_refiner_only`, `_refiner_crossattn`,
 `_lora`, `_lokr`, `_full_finetune`. They are configurations, not a fixed pipeline — each loads
 the model the same way, so they run in any order and any one's output feeds any other. Ordering
@@ -620,7 +620,7 @@ alone. There is nothing to configure for this.
 An optional distillation mode warm-starts the refiner from Anima's existing adapter using
 captions only, no images:
 ```
-python -m tools.distill_refiner --config examples/anima_refiner_distill.toml
+python -m tools.distill_refiner --config examples/anima_refiner/distill.toml
 ```
 
 Anima Refiner LoRAs are saved in ComfyUI format. A densely trained refiner is saved alongside

@@ -1,6 +1,6 @@
 # Dataset for anima_refiner with on-the-fly text embeddings.
 #
-# Pair this with examples/anima_refiner_onfly_lora.toml, which sets
+# Pair this with examples/anima_refiner/onfly_lora.toml, which sets
 # cache_text_embeddings = false. That choice is what makes everything below work the way it
 # reads: with no cached embedding, the caption string is what the text encoder tokenizes on
 # every step, so tag shuffling and tag dropout are re-drawn each time an image is fetched

@@ -4,6 +4,10 @@
 `LLMAdapter`; this architecture routes them through a `ContextRefiner` instead, the frontend
 Lumina 2 and Z-Image use.
 
+**New here?** [training.md](./training.md) is the step-by-step path from a stock Anima
+checkpoint to a sampled image. This file is the architecture and the config reference;
+[lessons.md](./lessons.md) is the rules the mistakes on this branch turned into.
+
 ## Why
 
 Anima's DiT is Cosmos-Predict2's. In ComfyUI the class is literally
@@ -60,13 +64,13 @@ order and any one's output can feed any other.
 
 | Mode | Trains | Config |
 |---|---|---|
-| `distill` | refiner, against Anima's LLMAdapter, captions only | `examples/anima_refiner_distill.toml` |
-| `refiner_only` | refiner, diffusion loss, DiT frozen | `examples/anima_refiner_refiner_only.toml` |
-| `refiner_crossattn` | refiner + cross-attention, diffusion loss | `examples/anima_refiner_refiner_crossattn.toml` |
+| `distill` | refiner, against Anima's LLMAdapter, captions only | `examples/anima_refiner/distill.toml` |
+| `refiner_only` | refiner, diffusion loss, DiT frozen | `examples/anima_refiner/refiner_only.toml` |
+| `refiner_crossattn` | refiner + cross-attention, diffusion loss | `examples/anima_refiner/refiner_crossattn.toml` |
 
-Plus `anima_refiner_lora.toml`, `anima_refiner_lokr.toml` and
-`anima_refiner_full_finetune.toml` for the adapter and full fine tune variants, and
-`anima_refiner_onfly_lora.toml` + `anima_refiner_dataset.toml` for a worked example with
+Plus `lora.toml`, `lokr.toml` and
+`full_finetune.toml` for the adapter and full fine tune variants, and
+`onfly_lora.toml` + `dataset.toml` for a worked example with
 on-the-fly text embeddings and per-access caption augmentation.
 
 All of them use `adamw8bitkahan`. Kahan summation is what makes an 8-bit optimizer usable with
@@ -201,6 +205,52 @@ Lumina 2 takes `hidden_states[-2]`. Copying that blindly is a mistake for Qwen3.
 The default here is `-1`. `20` (the output of layer 19) is the other candidate worth sweeping.
 Anima itself uses the final hidden state, but it can afford to: its adapter compensates.
 
+## How a caption reaches the text encoder
+
+Five stages. Only the last runs on every access; the rest are cached to disk.
+
+| # | Stage | Runs |
+|---|---|---|
+| 1 | Find the captions: `captions.json` gives a list; a `.txt` sidecar gives one caption, or one per non-empty line under `multiline_captions` | once |
+| 2 | Expand and augment: strip the tag marker, shuffle, drop tags, apply `caption_prefix`, producing `cache_shuffle_num` variants | once |
+| 3 | Build the iteration order | once |
+| 4 | Embed each (image, variant) pair | once, if the model caches |
+| 5 | `__getitem__`: choose the caption number, handle the unconditional draw, augment if allowed, fetch the embedding by that number | **every access** |
+
+Stage 2 is skipped when the model caches no text embeddings. The metadata then holds the
+captions exactly as they are on disk, marker included, and stage 5 does the whole pipeline
+instead. Epoch length is unchanged either way: `cache_shuffle_num` still decides how many
+entries a caption contributes.
+
+| Configuration | Augmentation happens at | What an epoch sees |
+|---|---|---|
+| cached embeddings, `caption_sampling = "all"` | stage 2, frozen | those N variants, forever |
+| cached embeddings, `caption_sampling = "random_per_epoch"` | stage 2, frozen | a random one of the N each pass |
+| no cached embeddings | stage 5, per access | a fresh draw every time |
+| `online_captions = true` | stage 5, per access | fresh text — but see below |
+
+### Which models can compute embeddings on the fly
+
+Only three of the repo's models read `inputs['caption']` at all. The other twenty consume
+pre-computed embedding tensors and never look at the string, so setting
+`cache_text_embeddings = false` on them does nothing except keep the text encoder resident in
+VRAM (`train.py` skips `free_vae_and_te()`), while the dataset caches embeddings and the model
+uses them as before.
+
+| Model | Behaviour |
+|---|---|
+| `cosmos_predict2` (so `anima` and `anima_refiner`) | the only one that implements the flag: `get_text_encoders()` returns `[]` when it is false, and `prepare_inputs` tokenizes at runtime |
+| `sdxl` | always on the fly, not configurable — `get_text_encoders()` returns `[]` with a `TODO: support training with cached text embeddings` |
+| `hidream` | hybrid, not configurable: caches CLIP×2 and T5, tokenizes Llama3 from the live caption |
+
+HiDream is why the runtime-augmentation check is `not self.text_embedding_datasets` rather than
+a config lookup. It has cached embeddings, so it is excluded — re-augmenting its text would
+make the live Llama3 caption and the frozen CLIP/T5 embeddings describe different captions.
+
+The trap with `online_captions`: it re-reads the caption at access time, but for a model with
+cached embeddings that text is never used. Editing `captions.json` changes nothing until the
+cache is regenerated.
+
 ## Caching
 
 Latents and text embeddings share a cache directory but are fingerprinted **separately**. The
@@ -234,7 +284,7 @@ as long ones, so `max_text_length` is worth setting to fit the data.
 ## Distillation
 
 ```
-python -m tools.distill_refiner --config examples/anima_refiner_distill.toml
+python -m tools.distill_refiner --config examples/anima_refiner/distill.toml
 ```
 
 Captions only. No images, no VAE, no diffusion, roughly 6GB of VRAM. It teaches the new
@@ -312,7 +362,7 @@ warns and does nothing.
 ### Caption augmentation
 
 `shuffle_tags` / `cache_shuffle_num`, `cache_shuffle_delimiter`, `tag_dropout_rate` and
-`prefix_tag_caption` (see [Multi-caption and tag augmentation](../README.md#multi-caption-and-tag-augmentation))
+`prefix_tag_caption` (see [Multi-caption and tag augmentation](../../README.md#multi-caption-and-tag-augmentation))
 all work here. Two differences from the diffusion stages:
 
 - **It is applied per sample, not baked into a cache.** Distillation re-embeds the text every
@@ -406,7 +456,7 @@ is no automatic fallback to it. All the example configs here use `true`.
 
 ```
 python -m tools.sample_anima_refiner \
-    --config examples/anima_refiner_refiner_only.toml \
+    --config examples/anima_refiner/refiner_only.toml \
     --prompt '1girl, solo, blue eyes' \
     --steps 30 --cfg 5 --output out.png
 ```

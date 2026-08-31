@@ -9,7 +9,7 @@
 #
 # Only k_proj/v_proj really matter here -- they project the TEXT side, which is what changed.
 # q_proj and output_proj work on the image side. get_param_groups matches '.cross_attn', so
-# cross_attn_lr covers all four; see docs/anima_refiner.md to restrict it to k/v.
+# cross_attn_lr covers all four; see docs/anima_refiner/README.md to restrict it to k/v.
 
 output_dir = '/data/output/anima_refiner_refiner_crossattn'
 dataset = 'examples/dataset.toml'

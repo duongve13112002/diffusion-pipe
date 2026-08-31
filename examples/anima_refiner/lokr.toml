@@ -1,4 +1,4 @@
-# LoKr on top of a TRAINED anima_refiner model. See anima_refiner_lora.toml for the shared notes.
+# LoKr on top of a TRAINED anima_refiner model. See lora.toml for the shared notes.
 #
 # Important: a LoRA is a low-rank update to existing weights, so it has nothing to build on if
 # the refiner is still freshly initialised. Either point context_refiner_path at a trained

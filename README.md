@@ -19,7 +19,7 @@ Models supported: SDXL, Flux, LTX-Video, HunyuanVideo (t2v), Cosmos, Lumina Imag
   - Add `tag_dropout_rate`, `prefix_tag_caption` and `multiline_captions` dataset settings. All default off; see [Multi-caption and tag augmentation](#multi-caption-and-tag-augmentation).
   - Add `tools/export_caption_corpus.py` to flatten a dataset's captions into a single `.jsonl`/`.csv`/`.txt` file, which `tools/distill_refiner.py` can read via `caption_corpus` instead of walking every image.
 - 2026-08-30
-  - Support Anima Refiner (`type = 'anima_refiner'`): Anima with its LLMAdapter replaced by the Lumina 2 / Z-Image text frontend (`cap_embedder` plus bidirectional refiner blocks). Drops the T5 tokenizer and its embedding table, and lets any Transformers LLM be the text encoder. See [docs/anima_refiner.md](./docs/anima_refiner.md) and the `examples/anima_refiner_*.toml` configs.
+  - Support Anima Refiner (`type = 'anima_refiner'`): Anima with its LLMAdapter replaced by the Lumina 2 / Z-Image text frontend (`cap_embedder` plus bidirectional refiner blocks). Drops the T5 tokenizer and its embedding table, and lets any Transformers LLM be the text encoder. See [docs/anima_refiner/README.md](./docs/anima_refiner/README.md) and the `examples/anima_refiner_*.toml` configs.
   - Add `tools/distill_refiner.py` to warm-start a refiner from Anima's existing adapter using captions only.
 - 2026-08-08
   - Add CFG-augmented training for MiniMax H3. You need to enable it, see the example TOML file. You probably always want to use either this, or a training adapter.

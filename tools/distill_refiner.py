@@ -8,7 +8,7 @@ for every step.
 
 This script gets the refiner into roughly the right space using captions only: no images, no
 VAE, no diffusion. It is a warm start, not a finished model -- follow it with a diffusion-loss
-stage (see docs/anima_refiner.md).
+stage (see docs/anima_refiner/README.md).
 
 The loss is measured at the cross-attention output, not position by position. The obvious
 objective, a position-wise MSE between teacher and student features, does not work here. The teacher's output sequence is indexed by *T5* tokens (the LLMAdapter embeds T5
@@ -22,7 +22,7 @@ modules and comparing there sidesteps the mismatch entirely, and it optimises ex
 quantity the DiT will consume.
 
 Usage:
-    python -m tools.distill_refiner --config examples/anima_refiner_distill.toml
+    python -m tools.distill_refiner --config examples/anima_refiner/distill.toml
 """
 
 import argparse

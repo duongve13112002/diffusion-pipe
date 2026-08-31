@@ -197,6 +197,70 @@ from a real multi-million-image dataset, and the claim that reading a corpus is 
 faster than walking a dataset is reasoning about I/O, not a measurement.</p>
 </div>
 
+<h3>A third QA pass, and the worst bug on the branch</h3>
+
+<p>The first finding was mine, it was a blocker, and it had nothing to do with the feature being
+reviewed. <code>ContextRefiner.init_weights()</code> was written to run <em>after</em>
+<code>__init__</code>, so it set only the ten values that differ from PyTorch's defaults. But the
+pipeline builds the refiner under <code>init_empty_weights()</code> and materialises every
+parameter with <code>torch.empty</code>. The other eighteen kept whatever the allocator last
+held — measured up to 1e32, sometimes NaN.</p>
+
+<p>The reviewer saw NaN in <code>k_proj</code> and NaN gradients on step 1. The same script here
+produced garbage that stayed finite through four training steps, because the zeroed residual
+branches mask it until training moves them off zero. That difference is the point: the behaviour
+depended on allocator residue, so it differed between machines and between runs. A comment in
+<code>cosmos_predict2.py</code> asserted <code>init_weights()</code> "overwrites it". It did
+not.</p>
+
+<table>
+  <tr><th>Also found</th><th>What it was</th></tr>
+
+  <tr><td>Metadata cache poisoning across a <code>cache_text_embeddings</code> flip.</td>
+      <td>The cache is keyed by directory and model name; <code>anima</code> and
+      <code>anima_refiner</code> deliberately share a tree, and <code>--trust_cache</code> reuses
+      it without looking. Reproduced both directions: raw captions with the tag marker intact fed
+      to the text encoder, and <code>anime, anime, red, green, blue</code> — the prefix applied
+      twice and then shuffled into the middle of the tag list. Every metadata artefact derived
+      from caption text now carries a suffix, empty at the defaults so existing caches stay
+      valid.</td></tr>
+
+  <tr><td>A claim in the docs that the code did not support.</td>
+      <td>"The same draw selects the caption text and its embedding, so the two can never
+      disagree." Measured: 8 of 9 rows disagreed. The iteration-order builder shuffles each
+      image's caption list and then uses the post-shuffle position to index an embedding cache
+      built in the <em>original</em> order. Pre-existing at <code>ca42315</code> — but the claim
+      was new, and HiDream reads both.</td></tr>
+
+  <tr><td>Distillation from a caption corpus trained the tag marker as a tag.</td>
+      <td>Only the <code>dataset</code> source inherited caption settings. The corpus source —
+      the one the docs recommend for large datasets — got none, so the exact failure the corpus
+      commit claimed to have fixed survived in the path it recommends.</td></tr>
+
+  <tr><td><code>blocks_to_swap</code> with <code>cache_text_embeddings = false</code>, shipped in
+      the example config.</td>
+      <td>Block swapping replaces <code>PipelineModule.to</code> with a no-op and moves only the
+      transformer to CUDA. The text encoder lives on the pipeline layer, so it stays on CPU and
+      returns CPU embeddings into a CUDA batch. Unverifiable without a GPU, so it now asserts
+      rather than attempting an untested device move.</td></tr>
+
+  <tr><td>Two spellings of one setting behaving differently.</td>
+      <td>The <code>shuffle_tags</code> back-compat fixup lived inside a function that runs in a
+      worker process, after every gate that reads the value. <code>shuffle_tags = true</code> got
+      frozen shuffling; the identical <code>cache_shuffle_num = 1</code> got per-access.</td></tr>
+
+  <tr><td>A test that failed 12% of runs, with a vacuous assertion attached.</td>
+      <td>It asserted set equality between 500 round-trip draws and 4 cache-time draws over a
+      two-tag caption, which cannot hold when all four land on the same order. The
+      <code>assert random</code> beneath it — a module object, always truthy — claimed the draws
+      were seeded. They were not.</td></tr>
+</table>
+
+<p>What the reviewer confirmed rather than found: epoch length really is unchanged versus
+<code>ca42315</code>, established by extracting the old <code>shuffle_captions</code> and sweeping
+the full setting matrix — the differential test the branch's own version should have been, since
+that one only compared the new code to itself.</p>
+
 <h2>2026-08-30 — Anima Refiner: replacing Anima's LLMAdapter text frontend</h2>
 
 <p><strong>Request.</strong> Add an architecture that swaps Anima's <code>LLMAdapter</code> for the
@@ -423,8 +487,8 @@ execution still needs <code>deepspeed --num_gpus=2 --module test.debug_deepspeed
 <p>Also unproven: sampling quality. <code>tools/sample_anima_refiner.py</code> is verified for
 integration math and shape handling, not for producing good images.</p>
 
-<p>See <a href="docs/anima_refiner.md">docs/anima_refiner.md</a> for the architecture and
-<a href="docs/anima_refiner_lessons.md">docs/anima_refiner_lessons.md</a> for the rules these
+<p>See <a href="docs/anima_refiner/README.md">docs/anima_refiner/README.md</a> for the architecture and
+<a href="docs/anima_refiner/lessons.md">docs/anima_refiner/lessons.md</a> for the rules these
 mistakes turned into.</p>
 
 <h2>2026-07-29 — bitsandbytes 0.50 and torch 2.13 upstream drift</h2>

@@ -284,7 +284,7 @@ class CosmosPredict2Pipeline(BasePipeline):
 
         # The anima_refiner architecture swaps Anima's LLMAdapter (T5 token queries cross
         # attending into the LLM) for the Lumina 2 / Z-Image text frontend (cap_embedder plus
-        # bidirectional refiner blocks). See docs/anima_refiner.md.
+        # bidirectional refiner blocks). See docs/anima_refiner/README.md.
         #
         # Every option this architecture adds is read only when it is active, so cosmos_predict2
         # and anima keep exactly the config surface they had before.

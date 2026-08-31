@@ -1,6 +1,6 @@
 # LoRA on a TRAINED anima_refiner, with text embeddings computed ON THE FLY.
 #
-# Pairs with examples/anima_refiner_dataset.toml.
+# Pairs with examples/anima_refiner/dataset.toml.
 #
 # The trade this config makes: the text encoder stays resident and runs every step, which costs
 # VRAM and time, in exchange for caption augmentation that is re-drawn on every access instead
@@ -17,7 +17,7 @@
 # trained refiner (the normal case, as below), or set train_context_refiner in [adapter].
 
 output_dir = '/data/output/anima_refiner_onfly_lora'
-dataset = 'examples/anima_refiner_dataset.toml'
+dataset = 'examples/anima_refiner/dataset.toml'
 
 epochs = 100
 micro_batch_size_per_gpu = 4

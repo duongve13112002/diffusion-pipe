@@ -182,6 +182,54 @@ setting.
 Match the surrounding code's density and punctuation. If a comment needs a banner to be found,
 the file wants splitting; if a word needs capitals to be believed, the sentence wants rewriting.
 
+## An init function that only sets the overrides is not an init function
+
+`ContextRefiner.init_weights()` was written to run after `__init__`, so it only set the ten
+values that differ from PyTorch's defaults. The pipeline builds the module under
+`init_empty_weights()` and materialises parameters with `torch.empty`, so the other eighteen
+kept allocator residue — measured up to 1e32, sometimes NaN, differing between machines. The
+zeroed residual branches hid it in a forward pass.
+
+Any function that runs where default init did not must cover every parameter. Delegate to each
+submodule's `reset_parameters()` rather than hand-rolling the bounds, so it stays identical to
+what PyTorch would have done.
+
+## A cache at a fixed path is a promise that its inputs never change
+
+The metadata cache is keyed by directory and model name only, and `--trust_cache` reuses it
+without looking. Adding settings that change the caption *text* meant a run that flipped one
+read back captions built under the other: raw text with the tag marker intact going into the
+text encoder, or `caption_prefix` applied twice and then shuffled into the middle of the tag
+list. Both directions, silently.
+
+When you add a setting that changes cached content, it goes in the cache path. And the suffix
+must be empty at the defaults, or you invalidate every cache in every existing install — the
+same rule `text_encoder_cache_key` already follows. Note also that the *columns* of a cached
+dataset are content: `caption_sampling` changes them, so a shared path meant a `KeyError`
+inside the dataloader after the whole latent cache had been built.
+
+## Do not assert a property you have not checked
+
+The docs, three commit messages and a docstring all claimed "the same draw selects the caption
+text and its embedding, so the two can never disagree." Measured: 8 of 9 rows disagreed, because
+the iteration-order builder shuffled the caption list and then used the post-shuffle position to
+index an embedding cache built in the original order. The bug was pre-existing; the claim was
+new, and a claim is what makes a latent bug into a relied-upon one.
+
+## Fix the path you recommend, not just the one you tested
+
+The corpus commit fixed `caption_prefix` and marker stripping for the `dataset` source and left
+the `caption_corpus` source — the one the docs recommend for large datasets — silently training
+the marker as a tag with no shuffling and no dropout. The exporter even printed the config line
+to fix it, and nothing checked that anyone had. When a setting can only come from somewhere
+else, say so at the point it is missing.
+
+## Half-supported settings are worse than unsupported ones
+
+`shuffle_tags` and `cache_shuffle_num = 1` are documented as the same thing. One gate read the
+value where the back-compat fixup had run and the other where it had not, so the two spellings
+got opposite behaviour. Resolve legacy spellings once, at the point the value is first read.
+
 ## Git
 
 Commits carry no Claude attribution: no `Co-Authored-By: Claude ...`, no `Claude-Session:`

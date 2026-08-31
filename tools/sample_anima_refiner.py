@@ -12,7 +12,7 @@ sampling-only copy of the loading logic.
 
 Usage:
     python -m tools.sample_anima_refiner \\
-        --config examples/anima_refiner_refiner_only.toml \\
+        --config examples/anima_refiner/refiner_only.toml \\
         --prompt '1girl, solo, blue eyes, looking at viewer' \\
         --steps 30 --cfg 5 --output out.png
 

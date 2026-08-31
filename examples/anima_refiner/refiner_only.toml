@@ -4,7 +4,7 @@
 # refiner still emits noise is what actually causes forgetting: loss is highest at the start,
 # so the gradients are largest exactly when the signal is least meaningful.
 #
-# Run tools/distill_refiner.py first (examples/anima_refiner_distill.toml) and point
+# Run tools/distill_refiner.py first (examples/anima_refiner/distill.toml) and point
 # context_refiner_path at its output for a much cheaper start. Without it the refiner begins
 # from a zero-init identity, which still trains, just more slowly.
 #
