@@ -22,7 +22,9 @@ sys.path.insert(0, str(REPO))
 
 import utils.dataset as dataset_module  # noqa: E402
 from utils.dataset import (  # noqa: E402
+    CAPTION_CACHE_SETTINGS,
     DirectoryDataset,
+    caption_cache_suffix,
     bucket_suffix,
     collapse_to_one_entry_per_image,
     dedup_and_sort,
@@ -298,3 +300,84 @@ class TestRuntimeAugmentation:
         # The warning is about a single frozen draw. That cannot happen per access.
         self._dataset(tmp_path, ['a, b, c'], False, tag_dropout_rate=0.5)
         assert 'permanent tag deletion' not in caplog.text
+
+
+class TestCaptionCacheFingerprint:
+    """Caption settings must reach the metadata cache path, or --trust_cache serves stale text.
+
+    The metadata cache lives at a fixed path and is reused under --trust_cache. Flipping a
+    setting that changes the caption text used to hand back captions built under the old one:
+    raw text with its tag marker intact going straight into the text encoder, or caption_prefix
+    applied a second time and then shuffled into the middle of the tag list.
+    """
+
+    def _dataset(self, tmp_path, caches_text_embeddings=True, **overrides):
+        d = tmp_path / 'imgs'
+        d.mkdir(parents=True, exist_ok=True)
+        Image.new('RGB', (64, 64), (128, 128, 128)).save(d / 'a.png')
+        (d / 'a.txt').write_text('Special: red, blue, green')
+        cfg = directory_config(d, prefix_tag_caption='Special:', caption_prefix='anime, ',
+                               cache_shuffle_num=4)
+        cfg.update(overrides)
+        ds = DirectoryDataset(cfg, {'resolutions': [64]}, 'anima', skip_dataset_validation=True,
+                              caches_text_embeddings=caches_text_embeddings)
+        ds.cache_metadata(trust_cache=True)
+        return ds
+
+    def _captions(self, ds):
+        buckets = ds.size_bucket_datasets if ds.use_size_buckets else ds.ar_bucket_datasets
+        return [c for row in buckets[0].metadata_dataset['caption'] for c in row]
+
+    def test_default_settings_keep_the_legacy_cache_paths(self, tmp_path):
+        # Any suffix at the defaults would invalidate every cache in every existing install.
+        assert caption_cache_suffix(dict(CAPTION_CACHE_SETTINGS)) == ''
+        d = tmp_path / 'plain'
+        d.mkdir()
+        Image.new('RGB', (64, 64), (128, 128, 128)).save(d / 'a.png')
+        (d / 'a.txt').write_text('a, b')
+        ds = DirectoryDataset(
+            directory_config(d, cache_shuffle_num=3, caption_prefix='anime, '),
+            {'resolutions': [64]}, 'flux', skip_dataset_validation=True,
+        )
+        ds.cache_metadata()
+        assert ds.caption_cache_suffix == ''
+        written = sorted(p.name for p in (ds.cache_dir / 'metadata').glob('*'))
+        assert 'metadata.arrow' in written and 'grouping_keys.json' in written
+
+    def test_flipping_cache_text_embeddings_changes_the_suffix(self, tmp_path):
+        a = self._dataset(tmp_path / 'a', caches_text_embeddings=False)
+        b = self._dataset(tmp_path / 'b', caches_text_embeddings=True)
+        assert a.caption_cache_suffix != b.caption_cache_suffix
+
+    def test_stale_metadata_is_not_served_across_the_flip(self, tmp_path):
+        # Same directory, same cache tree, --trust_cache on both runs.
+        raw = self._captions(self._dataset(tmp_path, caches_text_embeddings=False))
+        baked = self._captions(self._dataset(tmp_path, caches_text_embeddings=True))
+        assert all(c.startswith('Special: ') for c in raw), raw
+        assert not any('Special' in c for c in baked), baked
+        assert all(c.startswith('anime, ') for c in baked), baked
+        assert all(c.count('anime, ') == 1 for c in baked), 'caption_prefix applied twice'
+        again = self._captions(self._dataset(tmp_path, caches_text_embeddings=False))
+        assert again == raw, 'flipping back must not serve the baked captions'
+
+    @pytest.mark.parametrize('setting,value', [
+        ('prefix_tag_caption', 'Tags:'),
+        ('tag_dropout_rate', 0.25),
+        ('multiline_captions', True),
+    ])
+    def test_each_caption_setting_reaches_the_suffix(self, setting, value):
+        base = dict(CAPTION_CACHE_SETTINGS)
+        changed = dict(base, **{setting: value})
+        assert caption_cache_suffix(changed) != caption_cache_suffix(base), setting
+
+    def test_caption_sampling_separates_the_iteration_order(self, tmp_path):
+        # iteration_order stores different COLUMNS per mode. Sharing a path meant a run that
+        # flipped the mode read back the wrong ones and died on KeyError inside the dataloader.
+        a = self._dataset(tmp_path / 'a', caption_sampling='all')
+        b = self._dataset(tmp_path / 'b', caption_sampling='random_per_epoch')
+        assert a.caption_sampling == 'all'
+        assert b.caption_sampling == 'random_per_epoch'
+        # The caption text is identical, so the caption suffix matches; the mode is what
+        # separates the two iteration_order directories, appended after that suffix.
+        assert a.caption_cache_suffix == b.caption_cache_suffix
+        assert a.directory_config['caption_sampling'] != b.directory_config['caption_sampling']

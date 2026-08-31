@@ -206,6 +206,28 @@ def _cache_text_embeddings(metadata_dataset, map_fn, i, cache_dir, regenerate_ca
 
 CAPTION_SAMPLING_MODES = ('all', 'random_per_epoch')
 
+# Settings that change the caption text stored in the metadata cache, with their defaults. The
+# cache lives at a fixed path and is reused under --trust_cache, so without this a run that
+# flips one of them reads back captions built under the old setting: raw text with its tag
+# marker intact fed straight to the text encoder, or caption_prefix applied a second time.
+#
+# The suffix is empty when every one of them is at its default, so caches written before these
+# settings existed stay valid. That is the same rule text_encoder_cache_key follows.
+CAPTION_CACHE_SETTINGS = {
+    'augment_at_runtime': False,
+    'prefix_tag_caption': '',
+    'tag_dropout_rate': 0.0,
+    'multiline_captions': False,
+}
+
+
+def caption_cache_suffix(settings):
+    non_default = {k: v for k, v in settings.items() if v != CAPTION_CACHE_SETTINGS[k]}
+    if not non_default:
+        return ''
+    digest = hashlib.md5(json.dumps(non_default, sort_keys=True, default=str).encode()).hexdigest()
+    return '_' + digest[:12]
+
 
 def collapse_to_one_entry_per_image(iteration_order_list):
     """Group (image_spec, latents_idx, caption, caption_number) rows by image.
@@ -281,7 +303,10 @@ class SizeBucketDataset:
         )
         assert len(self.latent_dataset) == len(self.metadata_dataset), (len(self.latent_dataset), len(self.metadata_dataset))
 
-        iteration_order_cache_dir = self.cache_dir / 'iteration_order'
+        suffix = self.directory_config.get('caption_cache_suffix', '')
+        if self.caption_sampling != 'all':
+            suffix += '_' + self.caption_sampling
+        iteration_order_cache_dir = self.cache_dir / f'iteration_order{suffix}'
 
         if regenerate_cache or not iteration_order_cache_dir.exists() or not trust_cache:
             print('Building iteration order')
@@ -570,7 +595,20 @@ class DirectoryDataset:
         # For testing. Default if a mask is missing.
         self.default_mask_file = Path(self.directory_config['default_mask_file']) if 'default_mask_file' in self.directory_config else None
         self.cache_dir = self.path / 'cache' / self.model_name
-        self.grouping_keys_json_file = self.cache_dir / 'metadata/grouping_keys.json'
+        # Every metadata artefact derived from the caption text carries this suffix. It is
+        # empty at the default settings, so caches written before they existed stay valid.
+        self.caption_cache_suffix = caption_cache_suffix({
+            'augment_at_runtime': (
+                not caches_text_embeddings
+                and (directory_config.get('cache_shuffle_num', dataset_config.get('cache_shuffle_num', 0)) > 0
+                     or directory_config.get('shuffle_tags', dataset_config.get('shuffle_tags', False))
+                     or directory_config.get('tag_dropout_rate', dataset_config.get('tag_dropout_rate', 0.0)) > 0)
+            ),
+            'prefix_tag_caption': directory_config.get('prefix_tag_caption', dataset_config.get('prefix_tag_caption', '')),
+            'tag_dropout_rate': directory_config.get('tag_dropout_rate', dataset_config.get('tag_dropout_rate', 0.0)),
+            'multiline_captions': directory_config.get('multiline_captions', dataset_config.get('multiline_captions', False)),
+        })
+        self.grouping_keys_json_file = self.cache_dir / f'metadata/grouping_keys{self.caption_cache_suffix}.json'
         self.skip_empty_caption = directory_config.get('skip_empty_caption', dataset_config.get('skip_empty_caption', True))
         self.multiline_captions = directory_config.get('multiline_captions', dataset_config.get('multiline_captions', False))
         self.prefix_tag_caption = directory_config.get('prefix_tag_caption', dataset_config.get('prefix_tag_caption', ''))
@@ -599,6 +637,7 @@ class DirectoryDataset:
         )
         self.directory_config['augment_at_runtime'] = self.augment_at_runtime
         self.directory_config['caption_prefix'] = self.directory_config.get('caption_prefix', '')
+        self.directory_config['caption_cache_suffix'] = self.caption_cache_suffix
         # SizeBucketDataset needs these at __getitem__ time for the online_captions path.
         self.directory_config['prefix_tag_caption'] = self.prefix_tag_caption
         self.directory_config['tag_dropout_rate'] = self.tag_dropout_rate
@@ -665,7 +704,7 @@ class DirectoryDataset:
                     # Using AR buckets but have size bucket keys
                     return False, unique_grouping_keys
                 all_grouped_metadata_exists = all(
-                    (self.cache_dir / f'metadata/grouped_metadata_{bucket_suffix(key)}').exists()
+                    (self.cache_dir / f'metadata/grouped_metadata_{bucket_suffix(key)}{self.caption_cache_suffix}').exists()
                     for key in unique_grouping_keys
                 )
             return all_grouped_metadata_exists, unique_grouping_keys
@@ -680,7 +719,7 @@ class DirectoryDataset:
             print('Found grouped metadata cache. Directly loading it.')
 
         for grouping_key in unique_grouping_keys:
-            grouped_cache_dir = self.cache_dir / f'metadata/grouped_metadata_{bucket_suffix(grouping_key)}'
+            grouped_cache_dir = self.cache_dir / f'metadata/grouped_metadata_{bucket_suffix(grouping_key)}{self.caption_cache_suffix}'
             print(f'Loading grouped metadata with grouping key {grouping_key}')
             metadata = datasets.load_from_disk(str(grouped_cache_dir))
             if self.use_size_buckets:
@@ -726,12 +765,12 @@ class DirectoryDataset:
         if self.use_size_buckets:
             for size_bucket, metadata in grouped_metadata.items():
                 metadata = datasets.Dataset.from_dict(metadata)
-                grouped_cache_dir = self.cache_dir / f'metadata/grouped_metadata_{bucket_suffix(size_bucket)}'
+                grouped_cache_dir = self.cache_dir / f'metadata/grouped_metadata_{bucket_suffix(size_bucket)}{self.caption_cache_suffix}'
                 metadata.save_to_disk(str(grouped_cache_dir))
         else:
             for ar_bucket, metadata in grouped_metadata.items():
                 metadata = datasets.Dataset.from_dict(metadata)
-                grouped_cache_dir = self.cache_dir / f'metadata/grouped_metadata_{bucket_suffix(ar_bucket)}'
+                grouped_cache_dir = self.cache_dir / f'metadata/grouped_metadata_{bucket_suffix(ar_bucket)}{self.caption_cache_suffix}'
                 metadata.save_to_disk(str(grouped_cache_dir))
 
         with open(self.grouping_keys_json_file, 'w') as f:
@@ -742,7 +781,7 @@ class DirectoryDataset:
     def _get_ungrouped_metadata(self, regenerate_cache=False, trust_cache=False):
         # This method caches some intermediate datasets so we don't have to enumerate all the files each time.
         metadata_cache_file_1 = self.cache_dir / 'metadata/metadata_intermediate'
-        metadata_cache_file_2 = self.cache_dir / 'metadata/metadata.arrow'
+        metadata_cache_file_2 = self.cache_dir / f'metadata/metadata{self.caption_cache_suffix}.arrow'
 
         if regenerate_cache or not metadata_cache_file_1.exists() or not trust_cache:
             print('Intermediate metadata is not cached. Enumerating all files.')
