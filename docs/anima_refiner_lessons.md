@@ -170,6 +170,18 @@ caches optionally; HiDream caches CLIP and T5 but tokenizes Llama3 live, so augm
 would contradict its own frozen embeddings. The right test was `not self.text_embedding_datasets`
 — a property of the data, naming no model — and it was only findable by reading all three.
 
+## Write in the codebase's voice, not a generated one
+
+Comments and configs on this branch arrived with tells that nothing else in the repo has:
+`# ---- Section ----` banner dividers, RST underline headings inside docstrings, and words
+shouted in capitals for emphasis (`the WHOLE directory`, `this string IS what the model
+tokenizes`, `MUST NOT be baked in`). None of it carries information. `examples/dataset.toml`,
+the file these configs sit beside, has no section banners at all -- just a comment above each
+setting.
+
+Match the surrounding code's density and punctuation. If a comment needs a banner to be found,
+the file wants splitting; if a word needs capitals to be believed, the sentence wants rewriting.
+
 ## Git
 
 Commits carry no Claude attribution: no `Co-Authored-By: Claude ...`, no `Claude-Session:`

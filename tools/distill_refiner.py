@@ -1,7 +1,5 @@
 """Stage 1 for the anima_refiner architecture: distil a ContextRefiner from Anima's LLMAdapter.
 
-Why this exists
----------------
 anima_refiner replaces Anima's LLMAdapter with a ContextRefiner (models/text_refiner.py). The
 DiT's cross-attention was trained to consume whatever the LLMAdapter emits, so a freshly
 initialised refiner produces features the frozen DiT cannot read. Training it from a random
@@ -12,10 +10,8 @@ This script gets the refiner into roughly the right space using captions only: n
 VAE, no diffusion. It is a warm start, not a finished model -- follow it with a diffusion-loss
 stage (see docs/anima_refiner.md).
 
-Why the loss is measured at the cross-attention output
-------------------------------------------------------
-The obvious objective, a position-wise MSE between teacher and student features, does not
-work here. The teacher's output sequence is indexed by *T5* tokens (the LLMAdapter embeds T5
+The loss is measured at the cross-attention output, not position by position. The obvious
+objective, a position-wise MSE between teacher and student features, does not work here. The teacher's output sequence is indexed by *T5* tokens (the LLMAdapter embeds T5
 ids as its query sequence) while the student's is indexed by the source LLM's own tokens. Both
 are (B, L, 1024) so the shapes match and the code would run, but position i means different
 things on each side, and the loss plateaus without ever converging.

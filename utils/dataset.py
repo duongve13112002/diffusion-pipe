@@ -193,7 +193,7 @@ def _cache_text_embeddings(metadata_dataset, map_fn, i, cache_dir, regenerate_ca
         cache_dir,
         cache_file_prefix=f'text_embeddings_{i}_',
         # text_encoder_key identifies which text encoder produced these embeddings, and is
-        # deliberately only in THIS fingerprint: latents are cached separately, so swapping
+        # deliberately only in this fingerprint: latents are cached separately, so swapping
         # the text encoder must not invalidate them. Models that supply no key keep their
         # original fingerprint exactly, so existing caches stay valid.
         new_fingerprint_args=[i, text_encoder_key] if text_encoder_key else [i],
@@ -404,7 +404,7 @@ class SizeBucketDataset:
             else:
                 caption = entry_caption
                 if self._augment_at_runtime:
-                    # Nothing was cached, so this string IS what the model tokenizes, every
+                    # Nothing was cached, so this string is what the model tokenizes, every
                     # step. Augmenting per sample is free here and strictly better than the
                     # fixed variants baked in at cache time. Models that DO cache are excluded:
                     # re-augmenting text whose embedding is frozen would make the two disagree.

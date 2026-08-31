@@ -19,7 +19,7 @@ to eyeball and hand-edit, and CSV because spreadsheets exist.
 Captions are stored exactly as the dataset has them: tag marker included, no caption_prefix, no
 shuffling. Those are training-time concerns -- see utils.captions.preprocess_caption -- so that
 one corpus can serve runs configured differently, and so the marker is still there to say which
-captions are tag lists. The prefix in particular MUST NOT be baked in: training builds a caption
+captions are tag lists. The prefix in particular must not be baked in: training builds a caption
 as caption_prefix + augment(strip_marker(raw)), so a stored "anime, Special: red, blue" no
 longer starts with the marker and would train the marker as if it were a tag.
 

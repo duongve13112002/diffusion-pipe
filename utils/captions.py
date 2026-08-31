@@ -187,7 +187,7 @@ def enumerate_captions(dataset_config, apply_num_repeats=False, apply_shuffle=Tr
             #
             # caption_prefix is dropped too, and that is not an oversight. Training builds a
             # caption as caption_prefix + augment(strip_marker(raw)), so the prefix goes on
-            # AFTER the marker comes off. Baking it in here would produce
+            # after the marker comes off. Baking it in here would produce
             # "anime, Special: red, blue", which no longer starts with the marker -- the
             # consumer would fail to strip it, silently disable augmentation, and train the
             # marker as if it were a tag. The prefix is re-applied at training time instead.
@@ -235,7 +235,7 @@ def enumerate_captions(dataset_config, apply_num_repeats=False, apply_shuffle=Tr
             elif media_file.suffix == '.txt':
                 item = read_caption_file(media_file, multiline_captions)
             else:
-                # DirectoryDataset disables the .txt fallback for the WHOLE directory as soon as
+                # DirectoryDataset disables the .txt fallback for the whole directory as soon as
                 # a captions.json exists (`if has_captions_json or not os.path.exists(...)`).
                 # Keeping the fallback here would feed distillation captions the diffusion
                 # stages never see, which is the drift this helper exists to prevent.

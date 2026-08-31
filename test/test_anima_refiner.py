@@ -172,7 +172,7 @@ class TestCrossAttentionInvariance:
         torch.testing.assert_close(out, out_permuted, atol=1e-5, rtol=1e-5)
 
     def test_output_magnitude_depends_on_padded_length(self):
-        """The property permutation invariance does NOT give you, and the reason the auxiliary
+        """The property permutation invariance does not give you, and the reason the auxiliary
         distillation term normalises by the padded length rather than the real token count.
 
         Padded rows project to k = 0 (k_proj has no bias, RMSNorm(0) = 0), so each contributes
@@ -534,7 +534,7 @@ class TestCheckpointResolution:
         external = self.refiner_weights(2)
         safetensors.torch.save_file({k: v.contiguous() for k, v in external.items()}, str(path))
 
-        # Checkpoint has a DIFFERENT layer count, so the winner is unambiguous.
+        # Checkpoint has a different layer count, so the winner is unambiguous.
         state_dict = self.refiner_weights(4, prefix='context_refiner.')
         result, dit_config = self.resolve({'context_refiner_path': str(path),
                                            'transformer_path': 'ckpt.safetensors'}, state_dict)
@@ -776,7 +776,7 @@ class TestCaptionEnumerationMatchesTraining:
         return {'directory': [{'path': str(tmp_path)}]}
 
     def test_captions_json_disables_the_txt_fallback(self, tmp_path):
-        """DirectoryDataset kills the .txt fallback for the WHOLE directory once a
+        """DirectoryDataset kills the .txt fallback for the whole directory once a
         captions.json exists (`if has_captions_json or not os.path.exists(...)`), so an image
         missing from the json is dropped rather than falling back to its .txt."""
         config = self.write(tmp_path, {

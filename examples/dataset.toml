@@ -57,7 +57,7 @@ frame_buckets = [1, 33]
 
 # Drop each tag independently with this probability, as a caption augmentation. 0 (the default) disables it.
 # Applied at caching time alongside cache_shuffle_num, so changing it needs --regenerate_cache to take effect.
-# IMPORTANT: with cache_shuffle_num = 0 this produces ONE frozen draw per caption -- the dropped tags are gone
+# With cache_shuffle_num = 0 this produces one frozen draw per caption -- the dropped tags are gone
 # for good, which is permanent deletion rather than augmentation. Set cache_shuffle_num > 1 so several draws
 # are cached, and/or caption_sampling = "random_per_epoch" so a different one is used each epoch. The code
 # warns if you leave it at 0.

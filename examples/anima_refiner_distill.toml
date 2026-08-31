@@ -3,7 +3,7 @@
 # Run with:
 #   python -m tools.distill_refiner --config examples/anima_refiner_distill.toml
 #
-# This is NOT a diffusion training run and does not use train.py. It needs captions only --
+# This is not a diffusion training run and does not use train.py. It needs captions only --
 # no images, no VAE, no DiT forward pass -- and gets the refiner into roughly the space the
 # frozen DiT can read. Follow it with anima_refiner_refiner_only.toml.
 #
