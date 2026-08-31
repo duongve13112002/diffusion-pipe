@@ -607,3 +607,72 @@ class TestOptimizerAndScheduler:
             opt.step()
             sched.step()
         assert opt.param_groups[0]['lr'] > 0
+
+
+class TestGradientClipping:
+    """max_grad_norm must actually clip in every mode, by two different mechanisms.
+
+    Under DDP this code calls clip_grad_norm_ itself; under ZeRO the engine does it from
+    gradient_clipping in the config and this code must NOT clip again. Both need checking,
+    because "the setting is present" and "the gradient is clipped" are different claims.
+    """
+
+    MAX_NORM = 1.0
+
+    def _explode(self, precision_name):
+        """One step with a deliberately enormous gradient, returning (reported, post-clip)."""
+        from tools.distill_refiner import build_strategy, resolve_precision
+        cfg = {'distill': {'precision': precision_name, 'max_grad_norm': self.MAX_NORM}}
+        precision = resolve_precision(cfg)
+        torch.manual_seed(0)
+        model = torch.nn.Linear(128, 128).to(dtype=precision.param_dtype)
+        opt = torch.optim.AdamW(model.parameters(), lr=0.0)  # lr 0: grads survive the step
+        sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda s: 1.0)
+        strategy = build_strategy(cfg, model, 1, 0, torch.device('cpu'), 4, 1, opt, sched,
+                                  precision)
+        strategy.zero_grad()
+        out = model(torch.randn(32, 128, dtype=precision.param_dtype) * 100)
+        strategy.backward(out.float().pow(2).sum())
+        # step() ends with zero_grad, which would erase what we came to measure.
+        opt.zero_grad = lambda **kw: None
+        reported = strategy.step()
+        post = torch.cat([p.grad.flatten().float() for p in model.parameters()]).norm().item()
+        return reported, post
+
+    @pytest.mark.parametrize('name', ['fp32', 'bf16-mixed', 'fp16-mixed', 'bf16-full'])
+    def test_ddp_clips_to_max_grad_norm(self, name):
+        reported, post = self._explode(name)
+        assert reported > 1e3, f'{name}: test is meaningless unless the gradient is large'
+        # bf16-full accumulates the norm in bf16, so allow a little slack.
+        assert post <= self.MAX_NORM * 1.02, f'{name}: not clipped, norm is {post}'
+
+    @pytest.mark.parametrize('name', ['fp32', 'bf16-mixed', 'fp16-mixed', 'bf16-full'])
+    def test_the_reported_norm_is_pre_clip(self, name):
+        # Logging a post-clip norm would show a flat line at max_grad_norm and hide the signal.
+        reported, post = self._explode(name)
+        assert reported > post * 100
+
+    @pytest.mark.parametrize('precision_name', ['fp32', 'bf16-full', 'fp16-mixed'])
+    def test_zero_hands_clipping_to_the_engine_and_does_not_double_clip(self, precision_name,
+                                                                       monkeypatch):
+        from deepspeed.runtime.config import DeepSpeedConfig
+        from tools.distill_refiner import DeepSpeedZeROStrategy, resolve_precision
+        import deepspeed
+
+        captured = {}
+
+        def fake_initialize(model=None, optimizer=None, lr_scheduler=None, config=None, **kw):
+            captured['config'] = config
+            return object(), optimizer, None, lr_scheduler
+
+        monkeypatch.setattr(deepspeed, 'initialize', fake_initialize)
+        monkeypatch.setattr(torch.distributed, 'is_initialized', lambda: True)
+
+        precision = resolve_precision({'distill': {'precision': precision_name,
+                                                   'distributed_strategy': 'zero1'}})
+        model = torch.nn.Linear(8, 8).to(precision.param_dtype)
+        opt = torch.optim.AdamW(model.parameters(), lr=1e-4)
+        sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda s: 1.0)
+        DeepSpeedZeROStrategy(model, 1, 2, 16, 2, opt, sched, 0.7, precision)
+
+        assert DeepSpeedConfig(captured['config']).gradient_clipping == 0.7
