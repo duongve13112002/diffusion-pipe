@@ -405,10 +405,9 @@ class SizeBucketDataset:
                 caption = entry_caption
                 if self._augment_at_runtime:
                     # Nothing was cached, so this string is what the model tokenizes, every
-                    # step. Augmenting per sample is free here and strictly better than the
-                    # fixed variants baked in at cache time. Models that DO cache are excluded:
+                    # step. Augmenting per sample is free here and better than the fixed
+                    # variants baked in at cache time. Models that do cache are excluded:
                     # re-augmenting text whose embedding is frozen would make the two disagree.
-                    #
                     caption = preprocess_caption(
                         caption,
                         delimiter=self.online_delimiter,
