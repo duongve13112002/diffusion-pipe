@@ -36,6 +36,7 @@ def get_lin_function(x1: float = 256, y1: float = 0.5, x2: float = 4096, y2: flo
 
 class HiDreamPipeline(BasePipeline):
     name = 'hidream'
+    vae_config_keys = ('diffusers_path',)
 
     checkpointable_layers = [
         'TransformerWrapper',

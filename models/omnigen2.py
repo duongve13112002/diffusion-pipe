@@ -33,6 +33,7 @@ def time_shift(mu: float, sigma: float, t: torch.Tensor):
 
 class OmniGen2Pipeline(BasePipeline):
     name = 'omnigen2'
+    vae_config_keys = ('diffusers_path',)
     checkpointable_layers = ['TransformerLayer']
     adapter_target_modules = ['OmniGen2TransformerBlock']
 

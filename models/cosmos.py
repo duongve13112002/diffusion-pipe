@@ -136,6 +136,7 @@ def dataset_config_validation(config):
 
 class CosmosPipeline(BasePipeline):
     name = 'cosmos'
+    vae_config_keys = ('vae_path',)
     framerate = FRAMERATE
     checkpointable_layers = ['InitialLayer', 'TransformerLayer', 'FinalLayer']
     adapter_target_modules = ['GeneralDITTransformerBlock']

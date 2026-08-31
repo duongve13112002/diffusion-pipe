@@ -35,6 +35,7 @@ def time_shift(mu: float, sigma: float, t: torch.Tensor):
 
 class Lumina2Pipeline(BasePipeline):
     name = 'lumina_2'
+    vae_config_keys = ('vae_path',)
     checkpointable_layers = ['InitialLayer', 'TransformerLayer']
     # This will also train the noise_refiner and context_refiner layers, which aren't part of the main stack of transformer
     # layers, since they also use this class.

@@ -125,6 +125,7 @@ modulation_distribute_dict = distribute_modulations()
 
 class ChromaPipeline(BasePipeline):
     name = 'chroma'
+    vae_config_keys = ('diffusers_path',)
 
     checkpointable_layers = [
         'TransformerWrapper',

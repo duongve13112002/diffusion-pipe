@@ -189,6 +189,7 @@ def vae_encode(tensor, vae):
 
 class HunyuanVideoPipeline(BasePipeline):
     name = 'hunyuan-video'
+    vae_config_keys = ('vae_path', 'ckpt_path',)
     framerate = 24
     checkpointable_layers = ['DoubleBlock', 'SingleBlock']
     adapter_target_modules = ['MMDoubleStreamBlock', 'MMSingleStreamBlock']

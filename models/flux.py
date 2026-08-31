@@ -153,6 +153,7 @@ def bypass_flux_guidance(transformer):
 class FluxPipeline(BasePipeline):
     # Unique name, used to make the cache_dir path.
     name = 'flux'
+    vae_config_keys = ('diffusers_path',)
 
     # layers that will participate in activation checkpointing
     checkpointable_layers = [

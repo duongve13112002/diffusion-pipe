@@ -369,6 +369,35 @@ class BasePipeline(CommonPipeline):
     def save_adapter(self, save_dir, peft_state_dict):
         raise NotImplementedError()
 
+    # Config keys naming the checkpoint this model's VAE is loaded from. They differ per model
+    # -- vae_path, diffusers_path, ckpt_path, checkpoint_path -- and there is no rule that
+    # derives them, because plenty of other keys also name a file without affecting what the
+    # cache holds (transformer_path is the clear case: swapping the DiT changes nothing about
+    # the latents). So each model declares its own, and an empty tuple means no identity is
+    # recorded and every existing cache stays valid.
+    vae_config_keys = ()
+
+    def vae_cache_key(self):
+        """Identity of the VAE, recorded in the latent cache's manifest.
+
+        Latents are fingerprinted over the images and the bucketing, never over the VAE, so
+        without this a run pointed at a different VAE silently reuses latents that belong to
+        the old one. Recorded rather than fingerprinted, so adding it invalidates nothing.
+        """
+        if not self.vae_config_keys:
+            return ''
+        parts = [str(self.model_config.get(key, '')) for key in self.vae_config_keys]
+        parts.append(str(self.model_config.get('dtype', '')))
+        return '|'.join(parts)
+
+    def text_encoder_cache_key(self, i):
+        """Identity of text encoder `i`, recorded in that encoder's cache manifest.
+
+        Default is empty, which records nothing: a model that has not declared what identifies
+        its text encoder keeps exactly the behaviour it had. cosmos_predict2 overrides this.
+        """
+        return ''
+
     def load_adapter_weights(self, adapter_path):
         if is_main_process():
             print(f'Loading adapter weights from path {adapter_path}')

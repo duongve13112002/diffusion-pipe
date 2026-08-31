@@ -702,3 +702,147 @@ class TestLatentCacheIgnoresCaptions:
             'if this ever becomes equal, datasets stopped returning a lazy Column and the '
             'list() in _map_and_cache can be simplified'
         )
+
+
+class TestCacheCompatibilityManifest:
+    """A cache records what produced it, so an incompatible one is rebuilt rather than served.
+
+    The identity is recorded in a manifest beside the cache, never folded into the fingerprint.
+    That is the whole point: folding it in would move the cache path of every existing install
+    and rebuild caches that are perfectly good. A cache with no manifest predates this check,
+    so nothing is known about it and nothing is claimed.
+    """
+
+    @staticmethod
+    def _cache(tmp_path, identity, keep=False):
+        from utils.cache import Cache
+        return Cache(str(tmp_path / 'latents'), 'fingerprint-a',
+                     keep_on_fingerprint_change=keep, identity=identity)
+
+    @classmethod
+    def _closed_cache(cls, tmp_path, identity):
+        """A cache from a previous run: written, then released.
+
+        Production reaches this state by the process exiting. Windows will not delete a sqlite
+        file while another handle holds it open, so a test that models two runs has to close
+        the first one explicitly or the rebuild fails on a file lock rather than on logic.
+        """
+        cache = cls._cache(tmp_path, identity)
+        cache.write_manifest()
+        cache.con.close()
+        return cache
+
+    def test_a_cache_with_no_manifest_is_treated_as_compatible(self, tmp_path):
+        cache = self._cache(tmp_path, identity='vae-A')
+        assert cache.check_identity() == (True, '')
+        assert not cache.manifest_file.exists(), 'nothing is claimed until contents are complete'
+
+    def test_the_manifest_is_written_only_when_asked(self, tmp_path):
+        cache = self._cache(tmp_path, identity='vae-A')
+        cache.write_manifest()
+        assert cache.manifest_file.exists()
+        assert self._cache(tmp_path, identity='vae-A').check_identity()[0] is True
+
+    def test_a_different_producer_is_incompatible(self, tmp_path):
+        # Checked before construction: Cache.__init__ acts on the answer immediately and clears
+        # the cache, manifest included, so asking afterwards finds no evidence either way.
+        from utils.cache import Cache
+        self._closed_cache(tmp_path, identity='vae-A')
+        probe = object.__new__(Cache)
+        probe.path = tmp_path / 'latents'
+        probe.identity = 'vae-B'
+        compatible, reason = probe.check_identity()
+        assert compatible is False
+        assert 'vae-A' in reason and 'vae-B' in reason
+
+    def test_an_incompatible_cache_is_actually_rebuilt(self, tmp_path):
+        # The behaviour that matters: opening it with a different producer wipes it.
+        self._closed_cache(tmp_path, identity='vae-A')
+        cache = self._cache(tmp_path, identity='vae-B')
+        assert len(cache) == 0, 'an incompatible cache must be emptied, not served'
+        assert not cache.manifest_file.exists(), (
+            'the manifest describes contents that no longer exist and must go with them'
+        )
+
+    def test_keep_cannot_rescue_an_incompatible_cache(self, tmp_path):
+        # keep_* means "do not recache unnecessarily", never "reuse anything". Latents produced
+        # by a different VAE are wrong data, and no flag should let them through.
+        self._closed_cache(tmp_path, identity='vae-A')
+        cache = self._cache(tmp_path, identity='vae-B', keep=True)
+        assert len(cache) == 0, 'keep_* must not make an incompatible cache usable'
+
+    def test_a_model_that_declares_no_identity_is_unaffected(self, tmp_path):
+        # Every model behaved this way before the manifest existed, and most still do.
+        self._closed_cache(tmp_path, identity='vae-A')
+        assert self._cache(tmp_path, identity='').check_identity() == (True, '')
+
+    def test_an_unreadable_manifest_does_not_destroy_the_cache(self, tmp_path):
+        cache = self._cache(tmp_path, identity='vae-A')
+        cache.write_manifest()
+        cache.manifest_file.write_text('{ this is not json', encoding='utf-8')
+        assert self._cache(tmp_path, identity='vae-A').check_identity() == (True, '')
+
+
+class TestVaeCacheKeyIsDeclaredPerModel:
+    """There is no config key that names the VAE across models, so each declares its own."""
+
+    def test_the_default_records_nothing(self):
+        from models.base import BasePipeline
+        stub = object.__new__(BasePipeline)
+        stub.model_config = {'vae_path': '/models/vae.safetensors', 'dtype': 'bfloat16'}
+        assert BasePipeline.vae_cache_key(stub) == '', (
+            'a model that has not declared vae_config_keys must record no identity, or adding '
+            'this would invalidate its existing caches'
+        )
+
+    def test_a_declared_key_produces_an_identity(self):
+        from models.base import BasePipeline
+
+        class Declared(BasePipeline):
+            vae_config_keys = ('vae_path',)
+
+        stub = object.__new__(Declared)
+        stub.model_config = {'vae_path': '/models/vae.safetensors', 'dtype': 'bfloat16'}
+        key = Declared.vae_cache_key(stub)
+        assert '/models/vae.safetensors' in key and 'bfloat16' in key
+
+    def test_changing_the_vae_changes_the_identity(self):
+        from models.base import BasePipeline
+
+        class Declared(BasePipeline):
+            vae_config_keys = ('vae_path',)
+
+        def key(path):
+            stub = object.__new__(Declared)
+            stub.model_config = {'vae_path': path, 'dtype': 'bfloat16'}
+            return Declared.vae_cache_key(stub)
+
+        assert key('/models/a.safetensors') != key('/models/b.safetensors')
+
+    def test_every_declaration_names_a_key_the_model_actually_reads(self):
+        # A typo would make the identity a constant empty string, silently disabling the check
+        # for that model. Checked by reading the source rather than importing: several model
+        # modules need GPU-only packages (flash_attn) that a CPU test box does not have.
+        import ast as ast_module
+        from pathlib import Path as P
+
+        checked = 0
+        for path in sorted(P('models').rglob('*.py')):
+            tree = ast_module.parse(path.read_text(encoding='utf-8'))
+            source = path.read_text(encoding='utf-8')
+            for node in ast_module.walk(tree):
+                if not isinstance(node, ast_module.Assign):
+                    continue
+                if not any(getattr(t, 'id', None) == 'vae_config_keys' for t in node.targets):
+                    continue
+                keys = ast_module.literal_eval(node.value)
+                if not keys:
+                    # models/base.py declares the empty default every model inherits.
+                    continue
+                for key in keys:
+                    assert repr(key) in source or f'"{key}"' in source, (
+                        f'{path} declares vae_config_keys={keys} but never mentions {key!r}, '
+                        'so the identity would always be empty'
+                    )
+                checked += 1
+        assert checked >= 10, f'expected the declarations to still be there, found {checked}'

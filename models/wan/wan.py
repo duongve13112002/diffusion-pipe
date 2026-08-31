@@ -66,6 +66,7 @@ class VaeAndClip(nn.Module):
 
 class WanPipeline(BasePipeline):
     name = 'wan'
+    vae_config_keys = ('ckpt_path',)
     framerate = 16
     checkpointable_layers = ['TransformerLayer']
     adapter_target_modules = ['WanAttentionBlock']

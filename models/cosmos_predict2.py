@@ -308,6 +308,7 @@ def _load_llm_from_single_file(llm_path, model_config, dtype):
 
 class CosmosPredict2Pipeline(BasePipeline):
     name = 'cosmos_predict2'
+    vae_config_keys = ('vae_path',)
     framerate = 16
     checkpointable_layers = ['TransformerLayer', 'ContextRefinerLayer']
     adapter_target_modules = [
