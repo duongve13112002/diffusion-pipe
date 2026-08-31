@@ -475,6 +475,45 @@ class CosmosPredict2Pipeline(BasePipeline):
             self.cap_feat_dim,
         ))
 
+    def _warn_on_refiner_provenance(self, path):
+        """Compare what a refiner file says it was distilled against with what this run provides.
+
+        Shapes already rule out a differently sized refiner, but they cannot tell two 2048-wide
+        LLMs apart and say nothing about which hidden layer was read -- and the last hidden
+        state is post-final-RMSNorm, roughly 50x larger in RMS than a raw residual-stream layer.
+        A mismatch there trains, converges to something plausible-but-bad, and takes days to
+        diagnose.
+
+        Warns rather than raises, and stays silent on a file with no metadata: refiners written
+        before this existed are perfectly usable and must keep loading.
+        """
+        try:
+            with safetensors.safe_open(path, framework='pt') as f:
+                metadata = f.metadata() or {}
+        except Exception:
+            return  # not a safetensors file, or unreadable; the loader below will say so
+
+        expected = {
+            'llm_path': str(self.model_config.get('llm_path', '')),
+            'llm_hidden_layer': str(self.model_config.get('llm_hidden_layer', '')),
+            'max_text_length': str(self.max_text_length),
+        }
+        mismatched = {
+            key: (metadata[key], value)
+            for key, value in expected.items()
+            if metadata.get(key) not in (None, '', value)
+        }
+        if mismatched and is_main_process():
+            lines = '\n'.join(f'    {k}: distilled against {was!r}, this run uses {now!r}'
+                               for k, (was, now) in sorted(mismatched.items()))
+            print(
+                f'\nWARNING: {path} records a different text encoder setup than this run:\n'
+                f'{lines}\n'
+                '  The refiner bridges one specific text encoder to the DiT. Feeding it a\n'
+                '  different one has identical shapes and a different input distribution, so\n'
+                '  this will train and converge to something worse for no visible reason.\n'
+            )
+
     def _resolve_context_refiner(self, state_dict, dit_config, dtype):
         """Decide where the refiner's weights and shape come from, and fill in dit_config.
 
@@ -515,6 +554,9 @@ class CosmosPredict2Pipeline(BasePipeline):
                 '  Remove context_refiner_path to train on from the refiner inside the '
                 'checkpoint.\n'
             )
+
+        if path := self.model_config.get('context_refiner_path', None):
+            self._warn_on_refiner_provenance(path)
 
         weights = from_path if from_path is not None else (in_checkpoint or None)
         if weights is None:

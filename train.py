@@ -770,6 +770,22 @@ if __name__ == '__main__':
         else:
             param_groups = model.get_param_groups(model_parameters)
 
+        if not param_groups:
+            # get_param_groups legitimately returns [] when every learning rate that applies to
+            # this rank is 0. The DummyOptimizer escape above cannot catch it, because
+            # parameters_to_train is snapshotted from requires_grad BEFORE get_param_groups
+            # freezes the zero-lr groups. Left alone, the optimizer constructor raises
+            # 'optimizer got an empty parameter list', which names neither the learning rate nor
+            # the pipeline stage.
+            raise RuntimeError(
+                'No trainable parameters on this pipeline stage: every learning rate that '
+                'applies here is 0.\n'
+                '  A refiner-only configuration (base_lr = self_attn_lr = cross_attn_lr = '
+                'mlp_lr = mod_lr = 0) has trainable parameters only on the stage holding the '
+                'refiner, so it needs pipeline_stages = 1. Use data parallelism across GPUs '
+                'instead, or give another parameter group a non-zero learning rate.'
+            )
+
         # split weight decay and no weight decay params
         new_param_groups = []
         for pg in param_groups:

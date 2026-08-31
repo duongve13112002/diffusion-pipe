@@ -392,7 +392,9 @@ class TestPipelineIntegration:
         module = self.pipeline_module()
 
         class Stub:
-            pass
+            # The real pipeline checks the refiner file's provenance metadata; a double that
+            # lacks the method no longer matches the interface under test.
+            _warn_on_refiner_provenance = lambda self, path: None
 
         stub = Stub()
         stub.model_config = model_config
@@ -591,7 +593,9 @@ class TestCheckpointResolution:
         module = pytest.importorskip('models.cosmos_predict2')
 
         class Stub:
-            pass
+            # The real pipeline checks the refiner file's provenance metadata; a double that
+            # lacks the method no longer matches the interface under test.
+            _warn_on_refiner_provenance = lambda self, path: None
 
         stub = Stub()
         stub.model_config = model_config
@@ -672,7 +676,9 @@ class TestTextEncoderCacheKey:
         module = pytest.importorskip('models.cosmos_predict2')
 
         class Stub:
-            pass
+            # The real pipeline checks the refiner file's provenance metadata; a double that
+            # lacks the method no longer matches the interface under test.
+            _warn_on_refiner_provenance = lambda self, path: None
 
         stub = Stub()
         stub.model_config = model_config

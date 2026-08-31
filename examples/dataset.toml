@@ -108,3 +108,10 @@ num_repeats = 1
 # [[directory]]
 # path = '/home/anon/data/images/something_else'
 # num_repeats = 5
+
+# Reuse the VAE latent cache even when its fingerprint no longer matches. Off by default, and
+# rarely needed: latents are fingerprinted over the image, mask, control image and size bucket
+# only, so caption settings no longer invalidate them. Turn this on only when you know the
+# images, the VAE and the bucketing are unchanged -- nothing verifies that, and reusing latents
+# from a different VAE trains on silently wrong data. It prints a warning every time.
+#keep_latent_cache = true

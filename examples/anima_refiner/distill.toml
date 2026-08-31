@@ -162,14 +162,41 @@ n_refiner_layers = 6
 # reachable again from a model trained by any other mode.
 #resume_from = '/data/output/anima_refiner_refiner_crossattn/<run>/model.safetensors'
 
+# Keeps distinct captions distinct. The probe loss compares one caption at a time, so it
+# constrains where each caption lands but says nothing about how captions sit relative to each
+# other -- and a student that maps every caption to the same feature satisfies it about as well
+# as one that keeps them apart. That is the mode collapse reported for naive text-encoder
+# distillation (Scaling Down Text Encoders of Text-to-Image Diffusion Models, CVPR 2025, where
+# "rat", "cat" and "man" collapse to identical embeddings).
+#
+# This is Relational Knowledge Distillation's distance-wise term: match the teacher's pairwise
+# distance structure within the batch. It costs nothing -- both feature sets are already
+# computed -- and needs no images, so the stage keeps the property that is its whole reason to
+# exist. Set to 0 to disable, and watch 'spread' in the progress bar if you do.
+relational_loss_weight = 1.0
+
 [probe]
 # Fixed random queries pushed through the DiT's frozen cross-attention. The loss is measured
 # on the output, which is a weighted sum over text positions and therefore does not depend on
 # how that text is tokenised -- teacher (T5 indexed) and student (LLM indexed) sequences can
 # be compared even though position i means different things on each side.
-num_queries = 64
+#
+# Defaults to 2 * head_dim, which is 256 for Anima (model_channels 2048 / 16 heads = 128).
+# The number that matters is num_queries / head_dim, not num_queries alone: inside one
+# attention head the probe only ever constrains the span of its own projected queries, so
+# below head_dim there are directions of the key space the student can fill with anything.
+# Measured on a reduced-scale replica -- held-out probe error relative to training-probe
+# error: 0.25 -> 2.8x, 0.5 -> 1.63x, 1.0 -> 1.32x, 2.0 -> 1.16x, 4.0 -> 1.04x.
+#
+# Raising it to 512 or 1024 is safe and helps a little. It buys progressively less -- the
+# curve is already flat past 2x head_dim -- while costing linearly in probe compute and
+# activation memory, since every query is pushed through every probe block. 256 is the knee.
+# There is no correctness risk at any value; it is purely a compute-for-coverage trade.
+#num_queries = 256
 # Adjacent DiT blocks give highly correlated signal, so a spread of them covers the same
-# ground for less compute.
+# ground for less compute. Do NOT go below 4. Each block projects the queries differently, so
+# blocks cover directions that more queries within one block cannot: at the default query
+# count, 8 blocks give a 1.14x held-out gap, 4 give 1.28x, 2 give 1.63x and 1 gives 2.27x.
 num_blocks = 8
 
 # Optional, and an ALTERNATIVE to the flat lr / betas / weight_decay under [distill] above --

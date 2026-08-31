@@ -8,7 +8,8 @@ import torch
 
 
 class Cache:
-    def __init__(self, path: str, fingerprint: str, shard_size_gb=1):
+    def __init__(self, path: str, fingerprint: str, shard_size_gb=1, keep_on_fingerprint_change=False):
+        self.keep_on_fingerprint_change = keep_on_fingerprint_change
         self.path = Path(path)
         self.fingerprint = fingerprint
         self.metadata_db = self.path / 'metadata.db'
@@ -48,9 +49,19 @@ class Cache:
             existing_fingerprint = existing_fingerprint[0]
             print(f'[CACHE] Existing cache has fingerprint {existing_fingerprint}')
             if self.fingerprint != existing_fingerprint:
-                print('[CACHE] Fingerprint changed, deleting existing cache files')
-                self.clear()
-                return
+                if self.keep_on_fingerprint_change:
+                    # The caller asserts the contents are still valid. Nothing verifies that,
+                    # which is why it is opt-in and says so every time.
+                    print(
+                        f'[CACHE] Fingerprint changed ({existing_fingerprint} -> '
+                        f'{self.fingerprint}) but this cache is pinned, so the existing files '
+                        'are being reused UNVERIFIED. If the images, the VAE or the bucketing '
+                        'changed, this cache is wrong.'
+                    )
+                else:
+                    print('[CACHE] Fingerprint changed, deleting existing cache files')
+                    self.clear()
+                    return
         else:
             print(f'[CACHE] Storing new fingerprint: {self.fingerprint}')
             self.con.execute('INSERT INTO fingerprint VALUES(?)', (self.fingerprint,))

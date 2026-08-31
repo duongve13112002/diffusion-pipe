@@ -810,3 +810,125 @@ class TestZeROAccumulationBoundaryForReal:
         assert calls == [False, False, True], (
             f'the boundary must be False until the last micro batch, got {calls}'
         )
+
+
+class TestRelationalTermCatchesCollapse:
+    """The probe loss compares captions one at a time, so it cannot see them merging.
+
+    A student mapping every caption to the same feature satisfies a per-caption objective about
+    as well as one that keeps them apart. That is the mode collapse reported for naive
+    text-encoder distillation (CVPR 2025), and the relational term is what makes it costly.
+    """
+
+    @staticmethod
+    def _collapsed(teacher, fraction):
+        centre = teacher.mean(0, keepdim=True)
+        return teacher * (1 - fraction) + centre * fraction
+
+    def test_the_penalty_grows_with_collapse(self):
+        from tools.distill_refiner import relational_loss
+        torch.manual_seed(0)
+        teacher = torch.randn(8, 32)
+        losses = [float(relational_loss(self._collapsed(teacher, f), teacher))
+                  for f in (0.0, 0.25, 0.5, 0.75, 1.0)]
+        assert losses[0] < 1e-6, 'an exact match must cost nothing'
+        assert all(a < b for a, b in zip(losses, losses[1:])), (
+            f'the penalty must increase monotonically with collapse, got {losses}'
+        )
+
+    def test_uniform_shrinkage_is_visible(self):
+        # The usual RKD formulation normalises each side by its own mean, which makes the loss
+        # scale invariant -- and uniform shrinkage toward a centroid is exactly a scale change,
+        # so collapse became invisible. Both sides share the teacher's scale for this reason.
+        from tools.distill_refiner import relational_loss
+        torch.manual_seed(0)
+        teacher = torch.randn(8, 32)
+        assert float(relational_loss(teacher * 0.25, teacher)) > 0.01
+
+    def test_a_single_sample_has_no_structure_and_no_gradient_blow_up(self):
+        from tools.distill_refiner import relational_loss
+        one = torch.randn(1, 32, requires_grad=True)
+        loss = relational_loss(one, torch.randn(1, 32))
+        loss.backward()
+        assert float(loss) == 0.0
+        assert torch.isfinite(one.grad).all()
+
+    def test_the_diagnostic_tracks_spread(self):
+        from tools.distill_refiner import mean_pairwise_cosine_distance
+        torch.manual_seed(0)
+        teacher = torch.randn(8, 32)
+        assert mean_pairwise_cosine_distance(teacher) > 0.5
+        assert mean_pairwise_cosine_distance(self._collapsed(teacher, 1.0)) < 0.01
+
+
+class TestDistillResumeIsComplete:
+    """resume_from restored the weights and nothing else.
+
+    Adam's moments restarted at zero and the LR schedule rebuilt from step 0, so a run resumed
+    at 15,000 of 20,000 steps re-ran its warmup at peak learning rate and then the whole cosine
+    again -- a visible regression that costs more than the interruption did.
+    """
+
+    def test_optimizer_scheduler_and_step_round_trip(self, tmp_path):
+        from tools.distill_refiner import save_training_state, load_training_state
+
+        model = torch.nn.Linear(4, 4)
+        opt = torch.optim.AdamW(model.parameters(), lr=0.1)
+        sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda s: 0.5 ** s)
+        for _ in range(3):
+            model(torch.randn(2, 4)).sum().backward()
+            opt.step()
+            sched.step()
+
+        refiner_path = tmp_path / 'context_refiner.safetensors'
+        save_training_state(refiner_path, opt, sched, step=1234)
+
+        fresh_model = torch.nn.Linear(4, 4)
+        fresh_opt = torch.optim.AdamW(fresh_model.parameters(), lr=0.1)
+        fresh_sched = torch.optim.lr_scheduler.LambdaLR(fresh_opt, lambda s: 0.5 ** s)
+        step = load_training_state(refiner_path, fresh_opt, fresh_sched, is_main=False)
+
+        assert step == 1234
+        assert fresh_sched.get_last_lr() == sched.get_last_lr()
+        assert fresh_opt.state_dict()['state'], 'the optimizer moments must come back non-empty'
+
+    def test_a_missing_state_file_is_not_an_error(self, tmp_path):
+        from tools.distill_refiner import load_training_state
+        model = torch.nn.Linear(4, 4)
+        opt = torch.optim.AdamW(model.parameters(), lr=0.1)
+        sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda s: 1.0)
+        # A refiner distilled before this existed must still be usable as a warm start.
+        assert load_training_state(tmp_path / 'context_refiner.safetensors', opt, sched, False) == 0
+
+    def test_the_refiner_is_saved_in_fp32(self, tmp_path):
+        # dtype describes the frozen modules; the trainable refiner has always been fp32, and
+        # saving through bf16 threw away sixteen mantissa bits on every periodic save.
+        import safetensors.torch
+        from tools.distill_refiner import save_refiner
+        from models.text_refiner import ContextRefiner
+
+        refiner = ContextRefiner(cap_feat_dim=16, model_dim=8, num_layers=1, num_heads=2)
+        refiner.init_weights()
+        path = tmp_path / 'context_refiner.safetensors'
+        save_refiner(refiner, path, torch.bfloat16)
+
+        loaded = safetensors.torch.load_file(str(path))
+        assert all(v.dtype == torch.float32 for v in loaded.values())
+
+    def test_provenance_is_recorded(self, tmp_path):
+        import safetensors
+        from tools.distill_refiner import save_refiner, refiner_provenance
+        from models.text_refiner import ContextRefiner
+
+        config = {'student': {'llm_path': '/models/Qwen3.5-2B-Base', 'llm_hidden_layer': 20}}
+        refiner = ContextRefiner(cap_feat_dim=16, model_dim=8, num_layers=1, num_heads=2)
+        refiner.init_weights()
+        path = tmp_path / 'context_refiner.safetensors'
+        save_refiner(refiner, path, torch.float32,
+                     metadata=refiner_provenance(config, cap_feat_dim=16, max_text_length=512))
+
+        with safetensors.safe_open(str(path), framework='pt') as f:
+            metadata = f.metadata()
+        assert metadata['llm_path'] == '/models/Qwen3.5-2B-Base'
+        assert metadata['llm_hidden_layer'] == '20'
+        assert metadata['max_text_length'] == '512'

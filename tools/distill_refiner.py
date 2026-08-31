@@ -328,6 +328,57 @@ def encode(text_encoder, input_ids, attn_mask, hidden_layer):
     return out
 
 
+def relational_loss(student_pooled, teacher_pooled):
+    """Match the teacher's pairwise distance structure, not just its per-sample values.
+
+    The probe objective compares captions one at a time, so it constrains where each caption
+    lands but says nothing about how captions sit relative to each other. A student that maps
+    every caption to the same point satisfies it about as well as one that keeps them apart --
+    which is exactly the mode collapse reported for naive text-encoder distillation
+    (Scaling Down Text Encoders of Text-to-Image Diffusion Models, CVPR 2025: "rat", "cat" and
+    "man" receiving identical embeddings).
+
+    This is Relational Knowledge Distillation's distance-wise term (Park et al., 2019): take the
+    pairwise distances within the batch, normalise each side by its own mean so absolute scale
+    does not matter, and match the two structures. Collapse drives every student distance toward
+    zero, which this penalises directly and the probe loss does not see at all.
+
+    It costs nothing extra -- both feature sets are already computed for the probe term -- and
+    needs no images, so the stage keeps the property that is its whole reason to exist.
+    """
+    if student_pooled.shape[0] < 2:
+        # A single sample has no pairs, so there is no structure to preserve.
+        return student_pooled.sum() * 0.0
+
+    teacher_distances = torch.cdist(teacher_pooled, teacher_pooled)
+    student_distances = torch.cdist(student_pooled, student_pooled)
+    # BOTH sides are divided by the teacher's mean distance, not each by its own. Dividing each
+    # by its own -- which is how RKD is usually written -- makes the loss scale invariant, and
+    # scale is precisely what collapse destroys: a student whose captions all drift toward one
+    # point has uniformly smaller distances, and normalising that away hides it. Measured on a
+    # synthetic teacher, per-side normalisation scored 0.0000 at every collapse fraction from
+    # 25% to 90%. A shared teacher-side scale keeps the comparison unit-free while leaving
+    # shrinkage visible.
+    n = teacher_pooled.shape[0]
+    scale = (teacher_distances.sum() / (n * (n - 1))).clamp_min(1e-8)
+    return F.smooth_l1_loss(student_distances / scale, teacher_distances / scale)
+
+
+def mean_pairwise_cosine_distance(x):
+    """Collapse diagnostic: how far apart distinct captions sit, on average.
+
+    Falling toward zero means the refiner is mapping different captions to the same feature.
+    Logged rather than acted on, because the number is only meaningful as a trend.
+    """
+    if x.shape[0] < 2:
+        return 0.0
+    normed = F.normalize(x.float(), dim=-1)
+    similarity = normed @ normed.T
+    n = x.shape[0]
+    off_diagonal = (similarity.sum() - similarity.diagonal().sum()) / (n * (n - 1))
+    return float(1.0 - off_diagonal)
+
+
 def padded_mean(x, mask, length):
     """Sum over real tokens divided by the PADDED length, not by the number of real tokens.
 
@@ -782,11 +833,27 @@ def main():
         device = torch.device('cpu')
     dtype = getattr(torch, config['distill'].get('dtype', 'bfloat16'))
     max_text_length = config['distill'].get('max_text_length', MAX_TEXT_LENGTH_DEFAULT)
+    if max_text_length != MAX_TEXT_LENGTH_DEFAULT and is_main:
+        # The DiT's cross-attention carries no attention mask: padding is handled by padded keys
+        # being exactly zero, so each pad position still contributes exp(0) = 1 to the softmax
+        # denominator. The gain of every text pathway therefore scales roughly as
+        # 1/(max_text_length - n). The DiT is frozen and was trained at 512, so any other value
+        # amplifies or attenuates the text signal into a network calibrated for 512.
+        print(
+            f'\nWARNING: max_text_length = {max_text_length}, not {MAX_TEXT_LENGTH_DEFAULT}.\n'
+            '  Padded keys are exactly zero and the DiT cross-attention has no mask, so every\n'
+            '  padding position still adds 1 to the softmax denominator. Changing this length\n'
+            '  rescales the text signal reaching a DiT that was frozen at '
+            f'{MAX_TEXT_LENGTH_DEFAULT}.\n'
+            '  It must match [model] max_text_length in the training config, and both should\n'
+            f'  stay at {MAX_TEXT_LENGTH_DEFAULT} unless you are also unfreezing the DiT.\n'
+        )
     batch_size = config['distill'].get('batch_size', 8)
     grad_accum = max(1, config['distill'].get('gradient_accumulation_steps', 1))
     steps = config['distill'].get('steps', 20000)
     seed = config['distill'].get('seed', 42)
     pooled_weight = config['distill'].get('pooled_loss_weight', 0.1)
+    relational_weight = config['distill'].get('relational_loss_weight', 1.0)
     output_dir = Path(config['distill']['output_dir'])
     if is_main:
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -843,18 +910,41 @@ def main():
     # any query set works as a measuring stick; a fixed one keeps the objective stationary
     # across steps. Matching the output for many random queries is a strong proxy for matching
     # the key/value content itself, without ever comparing individual token positions.
-    num_queries = config.get('probe', {}).get('num_queries', 64)
+    # Derived from head_dim, not hardcoded. Within one attention head the probe only ever
+    # constrains the span of its own projected queries, so num_queries below head_dim leaves
+    # directions of the key space that the student can fill with anything. Anima has
+    # head_dim = model_channels // num_heads = 2048 // 16 = 128, so the default here is 256.
+    # Measured on a reduced-scale replica, held-out probe error against num_queries/head_dim:
+    # 0.25 -> 2.8x the training-probe error, 0.5 -> 1.63x, 2.0 -> 1.16x. num_blocks recovers
+    # most of it (8 blocks bring 0.5 down to 1.14x) because each block projects differently,
+    # but more queries are cheap and strictly help.
+    head_dim = model_channels // config.get('probe', {}).get('num_heads', 16)
+    num_queries = config.get('probe', {}).get('num_queries', 2 * head_dim)
     generator = torch.Generator(device='cpu').manual_seed(seed)
     probe = torch.randn(1, num_queries, model_channels, generator=generator).to(device=device, dtype=dtype)
 
     # The probe seed is deliberately NOT rank-offset: every rank must measure against the same
     # queries, or their gradients describe different objectives.
 
+    provenance = refiner_provenance(config, cap_feat_dim, max_text_length)
+
     optimizer = build_optimizer(config, refiner, is_main)
     scheduler = build_lr_scheduler(config, optimizer, steps)
     if is_main:
         print(f'Optimizer: {type(optimizer).__name__} | '
               f"lr_scheduler: {config['distill'].get('lr_scheduler', 'cosine')}")
+
+    # Resume the rest of the training state now that the optimizer and scheduler exist, and
+    # before the strategy wraps them -- ZeRO takes ownership of both.
+    start_step = 0
+    resume_path = config['student'].get('resume_from', None)
+    if resume_path:
+        start_step = load_training_state(resume_path, optimizer, scheduler, is_main)
+        if start_step >= steps:
+            raise RuntimeError(
+                f'{resume_path} was already trained for {start_step} steps and this config asks '
+                f'for {steps}. Raise steps, or point resume_from at an earlier checkpoint.'
+            )
 
     # Built after the optimizer and scheduler: ZeRO wraps both, so they have to exist first.
     strategy = build_strategy(config, refiner, world_size, local_rank, device, batch_size,
@@ -875,7 +965,9 @@ def main():
                 'larger than `steps`.'
             )
     running = 0.0
-    progress_bar = tqdm(range(steps), desc='distill', disable=not is_main)
+    last_spread = last_teacher_spread = 0.0
+    progress_bar = tqdm(range(start_step, steps), initial=start_step, total=steps,
+                        desc='distill', disable=not is_main)
 
     strategy.zero_grad()
     for step in progress_bar:
@@ -929,12 +1021,17 @@ def main():
 
                 # Auxiliary global term. Also permutation invariant, and it gives a useful
                 # gradient early on while the probe-attention term is still dominated by noise.
+                student_pooled = padded_mean(student_feats.float(), s_mask, max_text_length)
+                teacher_pooled = padded_mean(teacher_feats.float(), t5_mask, max_text_length)
                 if pooled_weight > 0:
-                    pooled_loss = F.mse_loss(
-                        padded_mean(student_feats.float(), s_mask, max_text_length),
-                        padded_mean(teacher_feats.float(), t5_mask, max_text_length),
-                    )
-                    loss = loss + pooled_weight * pooled_loss
+                    loss = loss + pooled_weight * F.mse_loss(student_pooled, teacher_pooled)
+                if relational_weight > 0:
+                    # Keeps distinct captions distinct. See relational_loss.
+                    loss = loss + relational_weight * relational_loss(student_pooled, teacher_pooled)
+                if is_main:
+                    # Diagnostic only, and free: the pooled features already exist.
+                    last_spread = mean_pairwise_cosine_distance(student_pooled.detach())
+                    last_teacher_spread = mean_pairwise_cosine_distance(teacher_pooled.detach().float())
 
                 strategy.backward(loss)
             accum_loss += loss.item() / grad_accum
@@ -947,6 +1044,10 @@ def main():
                 'loss': f'{running / log_every:.5f}',
                 'grad': f'{grad_norm:.3f}',
                 'lr': f'{strategy.last_lr():.2e}',
+                # spread is the mean pairwise cosine distance between captions in the batch.
+                # It should track the teacher's. Falling toward 0 means collapse: distinct
+                # captions are being mapped to the same feature.
+                'spread': f'{last_spread:.3f}/{last_teacher_spread:.3f}',
             })
             running = 0.0
 
@@ -954,7 +1055,9 @@ def main():
             # Every rank holds the full, identical weights -- DDP all-reduces them, and ZeRO
             # 1/2 shard optimizer state and gradients but never the parameters. Only one writes.
             if is_main:
-                save_refiner(refiner, output_dir / 'context_refiner.safetensors', dtype)
+                refiner_path = output_dir / 'context_refiner.safetensors'
+                save_refiner(refiner, refiner_path, dtype, metadata=provenance)
+                save_training_state(refiner_path, optimizer, scheduler, step + 1)
             if world_size > 1:
                 dist.barrier()
 
@@ -1009,9 +1112,81 @@ def _save_file_atomically(state_dict, path, metadata):
     os.replace(tmp, path)
 
 
-def save_refiner(refiner, path, dtype):
-    state_dict = {k: v.detach().to(dtype).cpu().contiguous() for k, v in refiner.state_dict().items()}
-    _save_file_atomically(state_dict, path, {'format': 'pt'})
+def refiner_provenance(config, cap_feat_dim, max_text_length):
+    """What a refiner file has to record about the text encoder it was distilled against.
+
+    _resolve_context_refiner can check the layer count and cap_feat_dim from the tensor shapes,
+    but shapes cannot tell two 2048-wide LLMs apart, and they say nothing about which hidden
+    layer was read. A refiner distilled on layer 20 and used with the default last layer has
+    identical shapes and a completely different input distribution -- the last hidden state is
+    post-final-RMSNorm and roughly 50x larger in RMS than a raw residual-stream layer.
+
+    Written as safetensors metadata, which is plain string-to-string, so every value is a str.
+    """
+    return {
+        'format': 'pt',
+        'llm_path': str(config['student'].get('llm_path', '')),
+        'llm_hidden_layer': str(config['student'].get('llm_hidden_layer', '')),
+        'cap_feat_dim': str(cap_feat_dim),
+        'max_text_length': str(max_text_length),
+    }
+
+
+def save_refiner(refiner, path, dtype, metadata=None):
+    """Write the refiner.
+
+    fp32, not `dtype`. dtype describes the FROZEN modules -- both LLMs, the adapter, the probes
+    -- and the trainable refiner has always been fp32 regardless, which the example config says
+    in as many words. Saving through bf16 threw away sixteen mantissa bits on every periodic
+    save, and again on every resume, for no benefit: the file is ~310 MB either way.
+    """
+    state_dict = {k: v.detach().float().cpu().contiguous() for k, v in refiner.state_dict().items()}
+    _save_file_atomically(state_dict, path, metadata or {'format': 'pt'})
+
+
+def training_state_path(refiner_path):
+    return Path(refiner_path).with_name('distill_state.pt')
+
+
+def save_training_state(refiner_path, optimizer, scheduler, step):
+    """Save what a resume needs beyond the weights.
+
+    Without this, resume_from restarted Adam's moments at zero and rebuilt the LR schedule from
+    step 0, so a run resumed at 15,000 of 20,000 steps re-ran its warmup at peak LR and then the
+    whole cosine again. That regresses the model visibly and costs more than the interruption
+    did. train.py checkpoints full state for every other mode; this brings distillation in line.
+    """
+    path = training_state_path(refiner_path)
+    tmp = path.with_name(path.name + '.tmp')
+    torch.save({
+        'step': step,
+        'optimizer': optimizer.state_dict(),
+        'scheduler': scheduler.state_dict(),
+    }, tmp)
+    os.replace(tmp, path)
+
+
+def load_training_state(refiner_path, optimizer, scheduler, is_main):
+    """Restore optimizer, scheduler and step. Returns the step to resume from.
+
+    A missing file is not an error: it is a refiner distilled before this existed, or one
+    produced by another mode. Say so and start the schedule from zero, rather than pretending.
+    """
+    path = training_state_path(refiner_path)
+    if not path.exists():
+        if is_main:
+            print(
+                f'No {path.name} beside {Path(refiner_path).name}: resuming the weights only. '
+                'The optimizer moments restart at zero and the LR schedule restarts from step 0, '
+                'so expect a visible bump in the loss.'
+            )
+        return 0
+    state = torch.load(path, map_location='cpu', weights_only=False)
+    optimizer.load_state_dict(state['optimizer'])
+    scheduler.load_state_dict(state['scheduler'])
+    if is_main:
+        print(f'Resumed optimizer and LR schedule from {path} at step {state["step"]}')
+    return int(state['step'])
 
 
 if __name__ == '__main__':

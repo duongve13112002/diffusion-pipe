@@ -653,3 +653,52 @@ class TestCaptionSettingsAreRecorded:
         with caplog.at_level('WARNING'):
             second.cache_metadata(trust_cache=True)
         assert 'caption_prefix' not in caplog.text
+
+
+class TestLatentCacheIgnoresCaptions:
+    """Latents depend on pixels, never on the text beside them.
+
+    The latent cache was fingerprinted with the metadata dataset's own fingerprint, which covers
+    every column -- captions included. Adding a caption_prefix, or changing tag dropout, moved it
+    and re-encoded the whole dataset through a VAE that had not changed.
+    """
+
+    @staticmethod
+    def _latent_fingerprint(captions, image_specs=(('a', 'b'), ('c', 'd'))):
+        import datasets
+        from datasets.fingerprint import Hasher
+        ds = datasets.Dataset.from_dict({
+            'image_spec': list(image_specs),
+            'size_bucket': [(64, 64, 1)] * len(image_specs),
+            'caption': captions,
+        })
+        hasher = Hasher()
+        for column in sorted(c for c in ds.column_names if c != 'caption'):
+            hasher.update(column)
+            hasher.update(list(ds[column]))
+        return hasher.hexdigest()
+
+    def test_changing_the_captions_does_not_move_it(self):
+        plain = self._latent_fingerprint([['red'], ['blue']])
+        prefixed = self._latent_fingerprint([['anime, red'], ['anime, blue']])
+        assert plain == prefixed, 'a caption change must not invalidate the VAE latent cache'
+
+    def test_changing_the_images_does_move_it(self):
+        # The decoupling must not go so far that a real change stops invalidating.
+        plain = self._latent_fingerprint([['red'], ['blue']])
+        other = self._latent_fingerprint([['red'], ['blue']], image_specs=(('a', 'b'), ('X', 'Y')))
+        assert plain != other, 'a different set of images must invalidate the latent cache'
+
+    def test_a_lazy_column_would_have_defeated_it(self):
+        # Regression guard for the subtle part: dataset[column] returns a lazy Column holding a
+        # reference to its parent, so hashing it drags the captions back in. Only list() works.
+        import datasets
+        from datasets.fingerprint import Hasher
+        common = {'image_spec': [('a', 'b')], 'size_bucket': [(64, 64, 1)]}
+        a = datasets.Dataset.from_dict({**common, 'caption': [['red']]})
+        b = datasets.Dataset.from_dict({**common, 'caption': [['blue']]})
+        assert Hasher.hash(list(a['image_spec'])) == Hasher.hash(list(b['image_spec']))
+        assert Hasher.hash(a['image_spec']) != Hasher.hash(b['image_spec']), (
+            'if this ever becomes equal, datasets stopped returning a lazy Column and the '
+            'list() in _map_and_cache can be simplified'
+        )

@@ -84,14 +84,31 @@ def seed_from_hash(item):
     return int(hashlib.md5(str.encode(str(item))).hexdigest(), 16) % int(1e9)
 
 
-def _map_and_cache(dataset, map_fn, cache_dir, cache_file_prefix='', new_fingerprint_args=None, regenerate_cache=False, caching_batch_size=1):
-    new_fingerprint_args = [] if new_fingerprint_args is None else new_fingerprint_args
-    new_fingerprint_args.append(dataset._fingerprint)
+def _map_and_cache(dataset, map_fn, cache_dir, cache_file_prefix='', new_fingerprint_args=None,
+                   regenerate_cache=False, caching_batch_size=1, fingerprint_columns=None,
+                   keep_on_fingerprint_change=False):
+    new_fingerprint_args = [] if new_fingerprint_args is None else list(new_fingerprint_args)
+    if fingerprint_columns is None:
+        new_fingerprint_args.append(dataset._fingerprint)
+    else:
+        # Fingerprint only the columns this cache's contents actually depend on. The dataset's
+        # own fingerprint covers every column, captions included, so anything that rewrites the
+        # caption text -- a prefix, tag dropout, a different shuffle count -- moved the latent
+        # fingerprint too and re-encoded the entire dataset through a VAE that had not changed.
+        hasher = Hasher()
+        for column in sorted(fingerprint_columns):
+            hasher.update(column)
+            # list(), not dataset[column]: indexing returns a lazy Column that holds a reference
+            # to its parent dataset, so hashing it drags the whole dataset -- captions included
+            # -- back into the digest and defeats the entire point of selecting columns.
+            hasher.update(list(dataset[column]))
+        new_fingerprint_args.append(hasher.hexdigest())
     new_fingerprint = Hasher.hash(new_fingerprint_args)
     if cache_file_prefix:
         cache_dir = cache_dir / cache_file_prefix.strip('_')
 
-    cache = Cache(cache_dir, new_fingerprint, shard_size_gb=10)
+    cache = Cache(cache_dir, new_fingerprint, shard_size_gb=10,
+                  keep_on_fingerprint_change=keep_on_fingerprint_change)
 
     if map_fn is None:
         # loading directly from cache without mapping
@@ -177,7 +194,7 @@ class TextEmbeddingDataset:
         return self.te_dataset[self.image_spec_to_te_idx[image_spec][caption_number]]
 
 
-def _cache_text_embeddings(metadata_dataset, map_fn, i, cache_dir, regenerate_cache, caching_batch_size, text_encoder_key=''):
+def _cache_text_embeddings(metadata_dataset, map_fn, i, cache_dir, regenerate_cache, caching_batch_size, text_encoder_key='', keep_on_fingerprint_change=False):
 
     def flatten_captions(example):
         result = {key: [] for key in example}
@@ -196,6 +213,7 @@ def _cache_text_embeddings(metadata_dataset, map_fn, i, cache_dir, regenerate_ca
         map_fn,
         cache_dir,
         cache_file_prefix=f'text_embeddings_{i}_',
+        keep_on_fingerprint_change=keep_on_fingerprint_change,
         # text_encoder_key identifies which text encoder produced these embeddings, and is
         # deliberately only in this fingerprint: latents are cached separately, so swapping
         # the text encoder must not invalidate them. Models that supply no key keep their
@@ -310,6 +328,10 @@ class SizeBucketDataset:
 
     def cache_latents(self, map_fn, regenerate_cache=False, trust_cache=False, caching_batch_size=1):
         print(f'caching latents: {self.size_bucket}')
+        # Latents depend on the image, its mask, its control image and the size bucket -- never
+        # on the caption, which is only carried alongside them. Fingerprinting the caption
+        # column too meant every caption setting change wiped the whole VAE cache.
+        latent_columns = [c for c in self.metadata_dataset.column_names if c != 'caption']
         self.latent_dataset = _map_and_cache(
             self.metadata_dataset,
             map_fn,
@@ -317,6 +339,8 @@ class SizeBucketDataset:
             cache_file_prefix='latents_',
             regenerate_cache=regenerate_cache,
             caching_batch_size=caching_batch_size,
+            fingerprint_columns=latent_columns,
+            keep_on_fingerprint_change=self.directory_config.get('keep_latent_cache', False),
         )
         assert len(self.latent_dataset) == len(self.metadata_dataset), (len(self.latent_dataset), len(self.metadata_dataset))
 

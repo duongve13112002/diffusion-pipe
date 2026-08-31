@@ -146,6 +146,52 @@ the repo had ever constructed a `DirectoryDataset`.
 shared code, ask which test would fail if the change were wrong. If the answer is none, that is
 the test to write.
 
+## What the probe objective does and does not constrain
+
+Cross-attention output is a weighted sum over text positions, which is exactly what makes the
+teacher/student comparison legal across two different tokenizations. It also bounds what the
+objective can see. Expanding the softmax in the regime the padding creates, what the loss
+actually compares is the sums over positions -- and a sum does not care which token holds which
+content. A student that smears the same average content across all of its positions satisfies it
+about as well as one that puts the right content in the right place.
+
+That is not a hypothetical. *Scaling Down Text Encoders of Text-to-Image Diffusion Models*
+(CVPR 2025) reports exactly this failure for naive text-encoder distillation: the student's
+embedding space collapses, and "rat", "cat" and "man" come back as the same embedding.
+
+Two things follow, and both are now in the code.
+
+**A relational term.** `relational_loss` matches the teacher's *pairwise distance structure*
+within the batch, which is Relational Knowledge Distillation's distance-wise loss. Collapse
+destroys that structure by construction, so the term prices it directly while the probe loss
+cannot see it at all. It costs nothing -- both feature sets already exist for the probe -- and
+needs no images, so the stage keeps the property that justifies its existence.
+
+One deviation from the textbook form is deliberate. RKD normalises each side by its own mean
+distance, which makes the loss scale invariant; uniform shrinkage toward a centroid is exactly a
+scale change, so that formulation scores 0.0000 at every collapse fraction from 25% to 90%.
+Both sides are divided by the *teacher's* mean here instead, which keeps the comparison unit-free
+while leaving shrinkage visible: 0.0277 at 25% collapsed, 0.1106 at 50%, 0.4396 at 100%.
+
+**A diagnostic.** The progress bar reports `spread`, the mean pairwise cosine distance between
+the batch's student features, against the teacher's. It should track the teacher's number.
+Falling toward zero is collapse, and it is the only cheap way to see it happening.
+
+### What is still not addressed
+
+The published remedy goes further: push both feature sets through the frozen diffusion model and
+compare its *predictions*, over a short denoising trajectory started from pure noise. That keeps
+distillation image-free -- no VAE, no dataset of images -- which is why it fits here in
+principle. It is not implemented, because `build_teacher` deliberately discards the DiT after
+taking its cross-attention modules (`dit.blocks = None`), and keeping the whole DiT resident
+would cost several GB and undo the ~6 GB figure this stage advertises. It is the right next step
+if the relational term and the spread diagnostic show collapse is still happening.
+
+There is also an irreducible floor, measured at roughly 0.3 relative RMS, that comes purely from
+the teacher and student having different token counts: a student sequence cannot reproduce a
+teacher sequence's output for every possible query. **A plateau in the distillation loss is
+therefore expected behaviour, not a failure.**
+
 ## The unconditional embedding
 
 An empty caption is not an edge case here: `uncond_fraction` produces them during training and
