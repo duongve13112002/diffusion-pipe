@@ -7,7 +7,7 @@ corpus file is that walk, done once.
 
 Three formats, chosen by extension:
 
-  .jsonl  one JSON object per line: {"caption": ..., "num_repeats": 1.0, "count": 1}
+  .jsonl  one JSON object per line: {"caption": ..., "count": 1}
   .csv    the same fields as columns
   .txt    one caption per line, with newline and backslash escaped so a caption containing a
           line break survives the round trip
@@ -16,10 +16,17 @@ JSONL is the one to prefer: it streams, it needs no quoting rules, and it is the
 where a corrupt line is obviously a corrupt line. TXT is here because it is the easiest thing
 to eyeball and hand-edit, and CSV because spreadsheets exist.
 
-Captions are stored exactly as the dataset has them, tag marker included. Stripping the marker
-and applying shuffling or dropout are training-time concerns -- see utils.dataset.
-preprocess_caption -- so that one corpus can serve runs configured differently, and so the
-marker is still there to say which captions are tag lists.
+Captions are stored exactly as the dataset has them: tag marker included, no caption_prefix, no
+shuffling. Those are training-time concerns -- see utils.captions.preprocess_caption -- so that
+one corpus can serve runs configured differently, and so the marker is still there to say which
+captions are tag lists. The prefix in particular MUST NOT be baked in: training builds a caption
+as caption_prefix + augment(strip_marker(raw)), so a stored "anime, Special: red, blue" no
+longer starts with the marker and would train the marker as if it were a tag.
+
+`num_repeats` is deliberately not a field. It is a per-directory oversampling knob whose
+semantics are int(len(directory_captions) * num_repeats) over a whole directory; applied per
+caption it would floor every value below 1 to zero and delete captions outright. Use the
+exporter's --apply-num-repeats, which expands it with the dataset's own semantics.
 """
 
 import csv
@@ -88,51 +95,56 @@ def write_corpus(path, entries, fmt=None):
     n = 0
     with open(path, 'w', encoding='utf-8', newline='') as f:
         if fmt == 'csv':
-            writer = csv.DictWriter(f, fieldnames=['caption', 'num_repeats', 'count'])
+            writer = csv.DictWriter(f, fieldnames=['caption', 'count'])
             writer.writeheader()
         for entry in entries:
             caption = entry['caption']
             if fmt == 'jsonl':
                 f.write(json.dumps(entry, ensure_ascii=False) + '\n')
             elif fmt == 'csv':
-                writer.writerow({
-                    'caption': caption,
-                    'num_repeats': entry.get('num_repeats', 1.0),
-                    'count': entry.get('count', 1),
-                })
+                writer.writerow({'caption': caption, 'count': entry.get('count', 1)})
             else:
-                # TXT keeps only the caption. num_repeats and count have nowhere to live in a
-                # one-caption-per-line file, so they are applied by duplicating lines instead.
+                # TXT keeps only the caption. A count has nowhere to live in a
+                # one-caption-per-line file, so it is applied by duplicating lines instead.
                 f.write(_escape(caption) + '\n')
             n += 1
     return n
 
 
-def read_corpus(path, fmt=None, apply_num_repeats=True, apply_count=True):
+def read_corpus(path, fmt=None, apply_count=True):
     """Read a corpus into a flat list of caption strings.
 
-    `count` (how many times a deduplicated caption occurred) and `num_repeats` (the dataset's
-    own oversampling knob) are expanded into repeated list entries, so the caller samples from
-    the same distribution whether or not the corpus was deduplicated.
+    `count` -- how many times a deduplicated caption occurred -- is expanded into repeated list
+    entries, so the caller samples from the same distribution whether or not the corpus was
+    deduplicated.
     """
     path = Path(path)
     fmt = format_for(path, fmt)
     captions = []
+    location = [0]
 
-    def add(caption, num_repeats, count):
+    def add(caption, count):
         if not caption:
             return
         reps = 1
         if apply_count:
-            reps *= max(int(count), 0)
-        if apply_num_repeats:
-            reps = int(reps * float(num_repeats))
-        for _ in range(max(reps, 0) if (apply_count or apply_num_repeats) else 1):
-            captions.append(caption)
+            try:
+                reps = int(count)
+            except (TypeError, ValueError):
+                raise RuntimeError(
+                    f'{path}:{location[0]} has a non-integer count {count!r}'
+                ) from None
+            if reps < 1:
+                raise RuntimeError(
+                    f'{path}:{location[0]} has count {reps}, which would silently drop the '
+                    f'caption. Remove the record instead.'
+                )
+        captions.extend([caption] * reps)
 
     with open(path, encoding='utf-8', newline='') as f:
         if fmt == 'jsonl':
             for lineno, line in enumerate(f, 1):
+                location[0] = lineno
                 line = line.strip()
                 if not line:
                     continue
@@ -141,19 +153,21 @@ def read_corpus(path, fmt=None, apply_num_repeats=True, apply_count=True):
                 except json.JSONDecodeError as e:
                     raise RuntimeError(f'{path}:{lineno} is not valid JSON: {e}') from e
                 if isinstance(record, str):
-                    add(record, 1.0, 1)
+                    add(record, 1)
                     continue
                 if 'caption' not in record:
                     raise RuntimeError(f"{path}:{lineno} has no 'caption' field")
-                add(record['caption'], record.get('num_repeats', 1.0), record.get('count', 1))
+                add(record['caption'], record.get('count', 1))
         elif fmt == 'csv':
             reader = csv.DictReader(f)
             if reader.fieldnames is None or 'caption' not in reader.fieldnames:
                 raise RuntimeError(f"{path} has no 'caption' column")
-            for record in reader:
-                add(record['caption'] or '', record.get('num_repeats') or 1.0, record.get('count') or 1)
+            for lineno, record in enumerate(reader, 2):  # 1 is the header
+                location[0] = lineno
+                add(record['caption'] or '', record.get('count') or 1)
         else:
-            for line in f:
-                add(_unescape(line.rstrip('\n').rstrip('\r')), 1.0, 1)
+            for lineno, line in enumerate(f, 1):
+                location[0] = lineno
+                add(_unescape(line.rstrip('\n').rstrip('\r')), 1)
 
     return captions

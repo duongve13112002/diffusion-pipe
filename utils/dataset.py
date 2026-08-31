@@ -204,9 +204,37 @@ def _cache_text_embeddings(metadata_dataset, map_fn, i, cache_dir, regenerate_ca
     return TextEmbeddingDataset(te_dataset, flattened_captions)
 
 
+CAPTION_SAMPLING_MODES = ('all', 'random_per_epoch')
+
+
+def collapse_to_one_entry_per_image(iteration_order_list):
+    """Group (image_spec, latents_idx, caption, caption_number) rows by image.
+
+    Used by caption_sampling = 'random_per_epoch'. Instead of one entry per caption, each image
+    gets a single entry carrying all of its captions and their cache indices; __getitem__ draws
+    one per access. An epoch becomes len(images) rather than len(images) * len(captions), and an
+    image gets a different caption on each pass.
+
+    Every caption's embedding is still cached -- selection is an index into that cache -- so
+    this costs nothing extra to cache. Keeping the caption and its index together is what lets
+    __getitem__ pick both with one draw, which models that read the text as well as the cached
+    embedding (HiDream) depend on.
+    """
+    by_image = {}
+    for image_spec, latents_idx, caption, caption_number in iteration_order_list:
+        key = tuple(image_spec)
+        if key not in by_image:
+            by_image[key] = (image_spec, latents_idx, [], [])
+        by_image[key][2].append(caption)
+        by_image[key][3].append(caption_number)
+    return list(by_image.values())
+
+
 # The smallest unit of a dataset. Represents a single size bucket from a single folder of images
 # and captions on disk. Not batched; returns individual items.
 class SizeBucketDataset:
+    _warned_runtime_augment_prefix = False
+
     def __init__(self, metadata_dataset, directory_config, size_bucket, cache_base, directory_dataset):
         # Shuffle deterministically based on size bucket, so that two resolutions of the same aspect ratio get different
         # orders, which mixes data better when training on multiple resolutions at once.
@@ -233,6 +261,7 @@ class SizeBucketDataset:
         # Only used on the online_captions path, where the caption is chosen at __getitem__ time
         # and so can still be augmented. On the cached path the embedding is already computed,
         # so shuffling and dropout have to happen at cache time instead (shuffle_captions).
+        self.caption_sampling = directory_config.get('caption_sampling', 'all')
         self.online_shuffle = directory_config.get('cache_shuffle_num', 0) > 0 or directory_config.get('shuffle_tags', False)
         self.online_delimiter = directory_config.get('cache_shuffle_delimiter', ', ')
         self.prefix_tag_caption = directory_config.get('prefix_tag_caption', '')
@@ -295,12 +324,19 @@ class SizeBucketDataset:
                         iteration_order_list.append((image_spec, latents_idx, caption, i))
                 shuffle_with_seed(iteration_order_list, 42)
 
+            if self.caption_sampling == 'random_per_epoch':
+                iteration_order_list = collapse_to_one_entry_per_image(iteration_order_list)
+
             iteration_order_dict = defaultdict(list)
             for image_spec, latents_idx, caption, caption_number in iteration_order_list:
                 iteration_order_dict['image_spec'].append(image_spec)
                 iteration_order_dict['latents_idx'].append(latents_idx)
-                iteration_order_dict['caption'].append(caption)
-                iteration_order_dict['caption_number'].append(caption_number)
+                if self.caption_sampling == 'random_per_epoch':
+                    iteration_order_dict['captions'].append(caption)
+                    iteration_order_dict['caption_numbers'].append(caption_number)
+                else:
+                    iteration_order_dict['caption'].append(caption)
+                    iteration_order_dict['caption_number'].append(caption_number)
             iteration_order = datasets.Dataset.from_dict(iteration_order_dict)
             iteration_order.save_to_disk(str(iteration_order_cache_dir))
             del iteration_order
@@ -315,11 +351,54 @@ class SizeBucketDataset:
     def add_text_embedding_dataset(self, te_dataset):
         self.text_embedding_datasets.append(te_dataset)
 
+    @property
+    def _augment_at_runtime(self):
+        """Whether __getitem__ should shuffle and drop tags itself.
+
+        Only when no text embeddings were cached: then the caption string is what the model
+        tokenizes every step, so a fresh draw per sample costs nothing and beats the fixed
+        variants baked in at cache time. A model that caches (or caches only some encoders,
+        like HiDream) must not have its text re-augmented behind a frozen embedding.
+
+        It is also disabled when prefix_tag_caption is in use. The marker is stripped when the
+        metadata is built, so by the time a caption reaches here there is no way to tell a tag
+        list from prose, and augmenting everything would shuffle natural language on its commas
+        -- exactly what the marker exists to prevent. Augmentation still happens at cache time
+        in that case; it is just frozen to cache_shuffle_num variants.
+        """
+        if self.text_embedding_datasets:
+            return False
+        if not (self.online_shuffle or self.tag_dropout_rate > 0):
+            return False
+        if self.prefix_tag_caption:
+            if not SizeBucketDataset._warned_runtime_augment_prefix:
+                SizeBucketDataset._warned_runtime_augment_prefix = True
+                logger.warning(
+                    'This model does not cache text embeddings, so tag shuffling and dropout '
+                    'could be applied fresh every step -- but prefix_tag_caption is set, and '
+                    'the marker is stripped when the metadata is built, so tag captions can no '
+                    'longer be told apart here. Augmentation stays frozen to cache_shuffle_num '
+                    'variants. Raise cache_shuffle_num for more variety.'
+                )
+            return False
+        return True
+
     def __getitem__(self, idx):
         idx = idx % len(self.iteration_order)
         entry = self.iteration_order[idx]
 
         ret = self.latent_dataset[entry['latents_idx']]
+
+        if self.caption_sampling == 'random_per_epoch':
+            # Every caption of this image is cached; pick which one this pass uses. The same
+            # index selects both the text and the cached embedding, so the two never disagree
+            # -- which matters for models like HiDream that read both.
+            pick = random.randrange(len(entry['captions']))
+            caption_number = entry['caption_numbers'][pick]
+            entry_caption = entry['captions'][pick]
+        else:
+            caption_number = entry['caption_number']
+            entry_caption = entry['caption']
 
         use_uncond = UNCOND_FRACTION > 0 and random.random() < UNCOND_FRACTION
         if use_uncond:
@@ -330,7 +409,7 @@ class SizeBucketDataset:
                 key = spec[-1]
                 if key in self.captions_dict:
                     caption = preprocess_caption(
-                        self.captions_dict[key][entry['caption_number']],
+                        self.captions_dict[key][caption_number],
                         delimiter=self.online_delimiter,
                         prefix_tag_caption=self.prefix_tag_caption,
                         shuffle=self.online_shuffle,
@@ -340,10 +419,24 @@ class SizeBucketDataset:
                     print(f'WARNING: image {key} did not have entry in captions_dict. Using empty caption.')
                     caption = ''
             else:
-                caption = entry['caption']
+                caption = entry_caption
+                if self._augment_at_runtime:
+                    # Nothing was cached, so this string IS what the model tokenizes, every
+                    # step. Augmenting per sample is free here and strictly better than the
+                    # fixed variants baked in at cache time. Models that DO cache are excluded:
+                    # re-augmenting text whose embedding is frozen would make the two disagree.
+                    #
+                    # prefix_tag_caption is passed as '' because the marker was already
+                    # stripped when the metadata was built. See _augment_at_runtime.
+                    caption = preprocess_caption(
+                        caption,
+                        delimiter=self.online_delimiter,
+                        shuffle=self.online_shuffle,
+                        tag_dropout_rate=self.tag_dropout_rate,
+                    )
 
         for ds, uncond_ds in zip(self.text_embedding_datasets, self.uncond_text_embeddings):
-            emb_dict = uncond_ds[0] if use_uncond else ds.get_text_embeddings(tuple(entry['image_spec']), entry['caption_number'])
+            emb_dict = uncond_ds[0] if use_uncond else ds.get_text_embeddings(tuple(entry['image_spec']), caption_number)
             ret.update(emb_dict)
         ret['caption'] = caption
         return ret
@@ -500,6 +593,21 @@ class DirectoryDataset:
         self.multiline_captions = directory_config.get('multiline_captions', dataset_config.get('multiline_captions', False))
         self.prefix_tag_caption = directory_config.get('prefix_tag_caption', dataset_config.get('prefix_tag_caption', ''))
         self.tag_dropout_rate = directory_config.get('tag_dropout_rate', dataset_config.get('tag_dropout_rate', 0.0))
+        self.caption_sampling = directory_config.get('caption_sampling', dataset_config.get('caption_sampling', 'all'))
+        if self.caption_sampling not in CAPTION_SAMPLING_MODES:
+            raise ValueError(
+                f'caption_sampling must be one of {CAPTION_SAMPLING_MODES}, got '
+                f'{self.caption_sampling!r}'
+            )
+        if self.tag_dropout_rate > 0 and self.shuffle == 0 and self.caption_sampling == 'all':
+            logger.warning(
+                f'{self.path}: tag_dropout_rate={self.tag_dropout_rate} with cache_shuffle_num=0 '
+                f'produces ONE frozen variant per caption, so the dropped tags are gone for good '
+                f'-- that is permanent tag deletion, not augmentation. Set cache_shuffle_num > 1 '
+                f'to cache several draws, or caption_sampling = "random_per_epoch" to pick a '
+                f'different one each epoch.'
+            )
+        self.directory_config['caption_sampling'] = self.caption_sampling
         # SizeBucketDataset needs these at __getitem__ time for the online_captions path.
         self.directory_config['prefix_tag_caption'] = self.prefix_tag_caption
         self.directory_config['tag_dropout_rate'] = self.tag_dropout_rate

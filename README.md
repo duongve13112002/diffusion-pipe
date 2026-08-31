@@ -15,6 +15,7 @@ Models supported: SDXL, Flux, LTX-Video, HunyuanVideo (t2v), Cosmos, Lumina Imag
 
 ## Recent changes
 - 2026-08-31
+  - Add `caption_sampling = "random_per_epoch"`: one training sample per image with the caption drawn at random each access, instead of one sample per caption.
   - Add `tag_dropout_rate`, `prefix_tag_caption` and `multiline_captions` dataset settings. All default off; see [Multi-caption and tag augmentation](#multi-caption-and-tag-augmentation).
   - Add `tools/export_caption_corpus.py` to flatten a dataset's captions into a single `.jsonl`/`.csv`/`.txt` file, which `tools/distill_refiner.py` can read via `caption_corpus` instead of walking every image.
 - 2026-08-30
@@ -145,9 +146,47 @@ whitespace — `"Special:"`, `"special: "` and `"SPECIAL:"` all match, and `"SPE
 still trains as `"a, b"`. Unset (the default) means the dataset is not annotated and every
 caption is treated as tags, which is how this repo behaved before the setting existed.
 
-Both augmentations are applied when the text embeddings are cached, so changing either needs
-`--regenerate_cache`. With `online_captions = true` they are applied per sample instead, since
-that path picks the caption fresh each time.
+Both augmentations are applied when the text embeddings are **cached**, so changing either needs
+`--regenerate_cache`, and each cached variant is a separate training sample. That means
+`tag_dropout_rate` with `cache_shuffle_num = 0` gives exactly **one** frozen draw — permanent tag
+deletion, not augmentation. Raise `cache_shuffle_num` to cache several draws; the code warns if
+you don't.
+
+They are applied fresh per sample in two cases: when the model caches no text embeddings at all
+(so the caption string is what gets tokenized every step — SDXL always, Cosmos with
+`cache_text_embeddings = false`), and on the `online_captions` path below. A model that caches
+*some* encoders and reads the caption for others, like HiDream, is deliberately excluded:
+re-augmenting text whose embedding is already frozen would make the two disagree.
+
+### Choosing which caption an image trains on
+
+By default **every** caption is its own training sample: an image with three captions appears
+three times per epoch, and one epoch is `n_images × n_captions`. Nothing is picked at random and
+discarded.
+
+```toml
+caption_sampling = "random_per_epoch"
+```
+
+switches to one sample per image, with a caption drawn at random on every access — so an epoch is
+`n_images` and an image gets a different caption on each pass. Every caption's embedding is still
+cached; the draw is just an index into that cache, so it costs nothing extra to cache. The same
+draw selects the caption text and its embedding together, so the two can never disagree.
+
+This also restores tag augmentation with cached embeddings: with `cache_shuffle_num = 10` the
+cache holds ten shuffled/dropped variants per caption, and each epoch draws a different one.
+
+### `online_captions`
+
+```toml
+online_captions = true
+```
+
+reads captions from `captions.json` at access time instead of from the cached metadata, so you can
+edit captions without rebuilding the metadata cache. It does **not** change how many samples an
+image produces. And note the caption text only reaches the model when the model does not have a
+cached embedding for it — with text embeddings cached, editing `captions.json` changes nothing
+until you regenerate the cache.
 
 ## Supported models
 See the [supported models doc](./docs/supported_models.md) for more information on how to configure each model, the options it supports, and the format of the saved LoRAs.

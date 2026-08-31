@@ -267,10 +267,24 @@ Format follows the extension:
 expands the count back out, so the sampling distribution is unchanged either way. A `.txt`
 corpus has nowhere to put a count, so it repeats the line instead.
 
-Captions are written **exactly as the dataset holds them**, tag marker included, and shuffling
-is *not* baked in. Those are training-time concerns, which keeps one corpus usable by runs
-configured differently and lets every epoch see a fresh variant. `caption_prefix` is the one
-exception: it is a fixed string with no random component, so it is applied at export.
+Captions are written **exactly as the dataset holds them**: tag marker included, no
+`caption_prefix`, no shuffling. Those are training-time concerns, which keeps one corpus usable
+by runs configured differently and lets every epoch see a fresh variant.
+
+The prefix in particular must *not* be baked in. Training builds a caption as
+`caption_prefix + augment(strip_marker(raw))`, so a stored `"anime, Special: red, blue"` no
+longer starts with the marker: distillation would fail to strip it, silently skip augmentation,
+and train the marker as though it were a tag.
+
+The exporter prints the markers it found and the exact `prefix_tag_caption` line to add under
+`[distill]`. A dataset that annotates its directories differently is fine — `prefix_tag_caption`
+accepts a list, which is the only way a flat corpus can represent several markers.
+
+`num_repeats` is not a corpus field. The dataset applies it per directory as
+`int(len(directory_captions) * num_repeats)`; stored per caption, any value below 1 would floor
+to zero and delete captions outright. Use `--apply-num-repeats` at export, which expands it with
+the dataset's own semantics. Setting `apply_num_repeats` under `[distill]` with a corpus source
+warns and does nothing.
 
 ### Caption augmentation
 
@@ -413,11 +427,12 @@ Every key below is read only when `type = 'anima_refiner'`.
 | `caption_corpus` | — | a file from `tools/export_caption_corpus.py` |
 | `caption_corpus_format` | from extension | `jsonl`, `csv` or `txt` |
 | `captions` | — | bare file of one caption per line, or a directory of `.txt` |
-| `apply_num_repeats` | `false` | honour the dataset's `num_repeats` |
+| `apply_num_repeats` | `false` | honour the dataset's `num_repeats`; `dataset` source only |
 | `shuffle_tags` / `cache_shuffle_num` | from `dataset.toml` | shuffle tag order, per sample |
 | `cache_shuffle_delimiter` | `', '` | tag separator |
 | `tag_dropout_rate` | from `dataset.toml` | drop each tag with this probability, per sample |
-| `prefix_tag_caption` | from `dataset.toml` | marks tag captions; matched case-insensitively and stripped before training |
+| `prefix_tag_caption` | markers found in the `dataset.toml` | string or list of markers for tag captions; matched case-insensitively and stripped before training |
+| `caption_prefix` | from `dataset.toml` | prepended after the marker is stripped |
 
 Exactly one of `dataset`, `caption_corpus` and `captions` may be set; setting more than one is
 an error rather than a silent precedence rule.

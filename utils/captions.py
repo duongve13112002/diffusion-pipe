@@ -17,6 +17,20 @@ logger = logging.getLogger(__name__)
 CAPTIONS_JSON_FILE = 'captions.json'
 
 
+def tag_markers(prefix_tag_caption) -> list[str]:
+    """Normalise `prefix_tag_caption` into a list of markers.
+
+    A single string is the common case. A list is accepted because a dataset can annotate its
+    directories differently, and a caption corpus is flat -- once captions from several
+    directories are in one file, the only way to strip every marker is to know all of them.
+    """
+    if prefix_tag_caption is None:
+        return []
+    if isinstance(prefix_tag_caption, str):
+        prefix_tag_caption = [prefix_tag_caption]
+    return [m for m in (marker.strip() for marker in prefix_tag_caption) if m]
+
+
 def split_tag_prefix(caption: str, prefix_tag_caption: str = '') -> tuple[str, bool]:
     """Split a caption into (body, is_tag_caption).
 
@@ -33,14 +47,12 @@ def split_tag_prefix(caption: str, prefix_tag_caption: str = '') -> tuple[str, b
     silently keeps a leading space or an unstripped "Special:" is a caption the text encoder
     tokenizes differently from its neighbours for no reason anyone intended.
     """
-    marker = prefix_tag_caption.strip()
-    if not marker:
-        return caption, True
-    # Compare only the first len(marker) characters rather than casefolding the whole caption:
-    # this runs per sample, and captions can be long.
-    if caption[:len(marker)].casefold() == marker.casefold():
-        return caption[len(marker):].strip(), True
-    return caption, False
+    for marker in tag_markers(prefix_tag_caption):
+        # Compare only the first len(marker) characters rather than casefolding the whole
+        # caption: this runs per sample, and captions can be long.
+        if caption[:len(marker)].casefold() == marker.casefold():
+            return caption[len(marker):].strip(), True
+    return caption, prefix_tag_caption is None or not tag_markers(prefix_tag_caption)
 
 
 def drop_tags(tags: list[str], tag_dropout_rate: float, rng=random) -> list[str]:
@@ -99,7 +111,7 @@ def shuffle_captions(
     either setting needs --regenerate_cache to take effect, which is this repo's existing
     behaviour for cache_shuffle_num.
     """
-    if count == 0 and tag_dropout_rate <= 0 and not prefix_tag_caption.strip():
+    if count == 0 and tag_dropout_rate <= 0 and not tag_markers(prefix_tag_caption):
         return [caption_prefix + c for c in captions]
 
     variants = max(count, 1)
@@ -135,7 +147,7 @@ def read_caption_file(path: Path, multiline_captions: bool = False) -> list[str]
 NON_MEDIA_SUFFIXES = ('.txt', '.npz', '.json', '.parquet', '.bak', '.db')
 
 
-def enumerate_captions(dataset_config, apply_num_repeats=False, apply_shuffle=True):
+def enumerate_captions(dataset_config, apply_num_repeats=False, apply_shuffle=True, markers_seen=None):
     """Return every caption in a dataset config, without opening any media file.
 
     This mirrors the caption resolution DirectoryDataset does (captions.json first, then a
@@ -147,6 +159,11 @@ def enumerate_captions(dataset_config, apply_num_repeats=False, apply_shuffle=Tr
     As an accommodation for that use case, a directory holding only caption files with no
     media alongside them is accepted: DirectoryDataset would assert, but for a text-only tool
     the images are genuinely not needed.
+
+    `apply_shuffle=False` returns the captions as they sit on disk -- markers intact, no
+    shuffling, no dropout, no caption_prefix -- for callers that augment per sample instead.
+    Pass a set as `markers_seen` to collect the `prefix_tag_caption` values that were skipped,
+    so the caller can report which markers a consumer will need to strip.
     """
     captions = []
     for directory_config in dataset_config['directory']:
@@ -167,9 +184,19 @@ def enumerate_captions(dataset_config, apply_num_repeats=False, apply_shuffle=Tr
         if not apply_shuffle:
             # Exporting a corpus: keep the captions as they are on disk so shuffling and
             # dropout stay runtime augmentations instead of being frozen into the file.
+            #
+            # caption_prefix is dropped too, and that is not an oversight. Training builds a
+            # caption as caption_prefix + augment(strip_marker(raw)), so the prefix goes on
+            # AFTER the marker comes off. Baking it in here would produce
+            # "anime, Special: red, blue", which no longer starts with the marker -- the
+            # consumer would fail to strip it, silently disable augmentation, and train the
+            # marker as if it were a tag. The prefix is re-applied at training time instead.
             shuffle_num = 0
             tag_dropout_rate = 0.0
             prefix_tag_caption = ''
+            caption_prefix = ''
+            if markers_seen is not None:
+                markers_seen.update(tag_markers(setting('prefix_tag_caption', '')))
 
         caption_data = None
         captions_json = path / CAPTIONS_JSON_FILE

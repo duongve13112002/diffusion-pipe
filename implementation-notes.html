@@ -110,6 +110,85 @@ to <code>utils/captions.py</code>, re-exported from <code>utils/dataset.py</code
 caller changed. The tests went from 52s to 0.5s — that number <em>is</em> the import cost, paid on
 every invocation of the exporter, for nothing.</p>
 
+<h3>The QA pass that mattered most</h3>
+
+<p>The reviewer's first finding was mine, it was a blocker, and it had nothing to do with
+captions. Extracting the caption code by <em>text range</em> swallowed
+<code>bucket_suffix</code>, <code>dedup_and_sort</code> and <code>seed_from_hash</code>, which
+happened to sit between <code>shuffle_captions</code> and <code>_map_and_cache</code>.
+<code>utils/dataset.py</code> calls all three at twelve sites. Every training run, for every
+model in the repo, died at dataset construction. The copies that landed in
+<code>utils/captions.py</code> were broken too — that module imports neither numpy, hashlib nor
+<code>ROUND_DECIMAL_DIGITS</code>.</p>
+
+<p>And 182 tests passed. The module still <em>imported</em> cleanly, and not one test in this
+repository had ever constructed a <code>DirectoryDataset</code>, <code>ARBucketDataset</code> or
+<code>SizeBucketDataset</code>. A green suite was not evidence of anything here.
+<code>test/test_dataset_smoke.py</code> now builds those objects against real images, and walks
+<code>utils/dataset.py</code>'s AST asserting every global name it loads actually resolves —
+which catches the class of bug, not just these three names. Reverting the fix makes it fail at
+collection.</p>
+
+<table>
+  <tr><th>Also found</th><th>What it was</th></tr>
+
+  <tr><td><code>caption_prefix</code> was baked into the exported corpus, in front of the tag
+      marker.</td>
+      <td>Training builds a caption as <code>caption_prefix + augment(strip_marker(raw))</code>.
+      Storing <code>"anime, Special: red, blue"</code> means it no longer starts with the
+      marker, so the consumer fails to strip it, silently skips augmentation, and trains
+      <code>Special</code> as a tag. Measured: distillation got
+      <code>anime, Special: red, blue</code> where training got <code>anime, blue, red</code>.
+      The prefix is now applied at training time, after stripping.</td></tr>
+
+  <tr><td>A dataset whose directories use different markers could not be recovered from a flat
+      corpus at all.</td>
+      <td>The docs said "restate the per-directory override under <code>[distill]</code>", but
+      with two markers there is no single value to restate. <code>prefix_tag_caption</code> now
+      accepts a list, <code>enumerate_captions</code> reports the markers it skipped, and the
+      exporter prints the exact config line.</td></tr>
+
+  <tr><td><code>num_repeats</code> stored per caption in the corpus, floored per entry.</td>
+      <td>The dataset's semantics are <code>int(len(directory_captions) * num_repeats)</code>
+      over a whole directory. Per caption, any value below 1 floors to zero and deletes the
+      caption: <code>[a, b, c]</code> at 0.5 came back as <code>['b', 'c', 'c']</code> with
+      <code>a</code> simply gone. The field is removed; <code>--apply-num-repeats</code> expands
+      it at export with the dataset's own arithmetic, and setting it on a corpus source now
+      warns instead of silently doing nothing.</td></tr>
+
+  <tr><td>A <code>count</code> of 0, a negative, or a string.</td>
+      <td>Silently dropped the caption, or threw a bare <code>ValueError</code> three lines below
+      a reader that raises careful <code>path:lineno</code> errors. Now validated with the same
+      message shape.</td></tr>
+</table>
+
+<p>The reviewer also confirmed, by differential test against the pre-branch implementation, that
+<code>shuffle_captions</code> at its defaults is byte-identical including the RNG call sequence;
+that fuzzing 3000 adversarial strings through all three corpus formats round-trips cleanly; and
+that the <code>casefold()</code> slicing concern does not materialise, because the same index
+partitions the caption on both sides.</p>
+
+<h3>What the frozen-dropout question exposed</h3>
+
+<p>Asked whether tag dropout does anything when embeddings are cached, the honest answer turned
+out to be "sometimes not". Augmentation is baked into the embedding cache, so
+<code>tag_dropout_rate</code> with <code>cache_shuffle_num = 0</code> produces exactly one draw,
+frozen forever — permanent tag deletion wearing an augmentation's name. It now warns.</p>
+
+<p>That question also produced the better feature.
+<code>caption_sampling = "random_per_epoch"</code> gives one sample per image with the caption
+drawn on each access, instead of one sample per caption. All the embeddings are already cached
+and already indexable, so the draw is just an index — nothing extra to cache. And because the
+draw ranges over every cached variant, shuffling and dropout become real augmentation again with
+cached embeddings, which is what the frozen-draw problem needed.</p>
+
+<p>One constraint fell out of reading the other models rather than assuming: per-sample
+augmentation is applied only when <em>no</em> text embeddings were cached (SDXL always; Cosmos
+with <code>cache_text_embeddings = false</code>). HiDream caches CLIP and T5 but tokenizes Llama3
+from the live caption — re-augmenting there would make the cached embedding and the live text
+describe different captions. The check is <code>not self.text_embedding_datasets</code>, which
+excludes it correctly without naming any model.</p>
+
 <div class="flag">
 <p><strong>Not verified.</strong> Still no training run, no multi-GPU run, no image. The corpus
 round-trip, the augmentation semantics and the exporter are covered by 56 CPU tests including

@@ -21,7 +21,13 @@ REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
 
 import utils.dataset as dataset_module  # noqa: E402
-from utils.dataset import DirectoryDataset, bucket_suffix, dedup_and_sort, seed_from_hash  # noqa: E402
+from utils.dataset import (  # noqa: E402
+    DirectoryDataset,
+    bucket_suffix,
+    collapse_to_one_entry_per_image,
+    dedup_and_sort,
+    seed_from_hash,
+)
 
 
 def make_image_dir(tmp_path, captions, size=(64, 64), multiline=False):
@@ -146,3 +152,80 @@ class TestDirectoryDatasetConstruction:
         ds.cache_metadata()
         captions = cached_captions(ds)
         assert captions[0] == ['x, y'], 'the marker must never reach the text encoder'
+
+
+class TestCaptionSampling:
+    """caption_sampling = 'random_per_epoch': one sample per image, caption drawn each pass."""
+
+    def _dataset(self, tmp_path, captions_json, **overrides):
+        import json
+        d = tmp_path / 'imgs'
+        d.mkdir(exist_ok=True)
+        for name in captions_json:
+            Image.new('RGB', (64, 64), (128, 128, 128)).save(d / name)
+        (d / 'captions.json').write_text(json.dumps(captions_json))
+        return DirectoryDataset(
+            directory_config(d, **overrides), {'resolutions': [64]},
+            'test_model', skip_dataset_validation=True,
+        )
+
+    def test_rejects_an_unknown_value(self, tmp_path):
+        with pytest.raises(ValueError, match='caption_sampling'):
+            self._dataset(tmp_path, {'a.png': ['x']}, caption_sampling='nonsense')
+
+    def test_default_is_all(self, tmp_path):
+        assert self._dataset(tmp_path, {'a.png': ['x']}).caption_sampling == 'all'
+
+    def test_setting_reaches_the_size_bucket(self, tmp_path):
+        ds = self._dataset(tmp_path, {'a.png': ['x']}, caption_sampling='random_per_epoch')
+        assert ds.directory_config['caption_sampling'] == 'random_per_epoch'
+
+
+class TestCollapseToOneEntryPerImage:
+    """The iteration-order transform behind caption_sampling = 'random_per_epoch'.
+
+    Tested directly rather than through cache_latents: utils/cache.py opens sqlite with
+    autocommit=, which needs Python 3.12, so the caching path cannot run on 3.11.
+    """
+
+    def rows(self):
+        return [
+            (['spec', 'a.png'], 0, 'one', 0),
+            (['spec', 'a.png'], 0, 'two', 1),
+            (['spec', 'a.png'], 0, 'three', 2),
+            (['spec', 'b.png'], 1, 'x', 0),
+            (['spec', 'b.png'], 1, 'y', 1),
+        ]
+
+    def test_one_entry_per_image(self):
+        out = collapse_to_one_entry_per_image(self.rows())
+        assert len(out) == 2, '5 caption rows over 2 images collapse to 2 entries'
+
+    def test_every_caption_is_kept(self):
+        out = collapse_to_one_entry_per_image(self.rows())
+        by_image = {tuple(spec): captions for spec, _, captions, _ in out}
+        assert by_image[('spec', 'a.png')] == ['one', 'two', 'three']
+        assert by_image[('spec', 'b.png')] == ['x', 'y']
+
+    def test_caption_and_cache_index_stay_paired(self):
+        # The pairing is the whole point: one draw must select the text and the embedding
+        # together, or a model reading both disagrees with itself.
+        out = collapse_to_one_entry_per_image(self.rows())
+        for _, _, captions, numbers in out:
+            assert len(captions) == len(numbers)
+        by_image = {tuple(spec): numbers for spec, _, _, numbers in out}
+        assert by_image[('spec', 'a.png')] == [0, 1, 2]
+        assert by_image[('spec', 'b.png')] == [0, 1]
+
+    def test_latents_index_is_preserved(self):
+        out = collapse_to_one_entry_per_image(self.rows())
+        assert {tuple(spec): idx for spec, idx, _, _ in out} == {
+            ('spec', 'a.png'): 0, ('spec', 'b.png'): 1,
+        }
+
+    def test_single_caption_images_are_unaffected_in_content(self):
+        rows = [(['spec', 'a.png'], 0, 'only', 0)]
+        assert collapse_to_one_entry_per_image(rows) == [(['spec', 'a.png'], 0, ['only'], [0])]
+
+    def test_empty_input(self):
+        assert collapse_to_one_entry_per_image([]) == []

@@ -54,7 +54,7 @@ from models.cosmos_predict2_modeling import MiniTrainDIT
 from models.text_refiner import ContextRefiner, extract_refiner_state_dict
 from utils.common import iterate_safetensors, load_state_dict
 from utils.caption_corpus import read_corpus
-from utils.dataset import enumerate_captions, preprocess_caption
+from utils.captions import enumerate_captions, preprocess_caption
 
 MAX_TEXT_LENGTH_DEFAULT = 512
 
@@ -94,10 +94,17 @@ def load_captions(config):
         )
 
     if 'caption_corpus' in distill_config:
+        # apply_num_repeats has no effect here: a corpus stores no num_repeats, because the
+        # dataset's semantics are per directory, not per caption. Expand it at export time with
+        # export_caption_corpus.py --apply-num-repeats instead.
+        if distill_config.get('apply_num_repeats', False):
+            print(
+                "WARNING: [distill] apply_num_repeats is set but the caption source is a corpus, "
+                "which stores no num_repeats. Re-export with --apply-num-repeats to honour it."
+            )
         return read_corpus(
             distill_config['caption_corpus'],
             fmt=distill_config.get('caption_corpus_format', None),
-            apply_num_repeats=distill_config.get('apply_num_repeats', False),
         )
 
     if 'captions' not in distill_config:
@@ -131,6 +138,13 @@ def caption_augment_config(config):
     if 'dataset' in distill_config:
         dataset_config = toml.load(distill_config['dataset'])
         fallback = {k: v for k, v in dataset_config.items() if not isinstance(v, (list, dict))}
+        # prefix_tag_caption is resolved per directory, so a single top-level value cannot
+        # represent a dataset that annotates its directories differently. Collect every marker
+        # actually in use and hand the whole list down; split_tag_prefix accepts a list.
+        markers = set()
+        enumerate_captions(dataset_config, apply_shuffle=False, markers_seen=markers)
+        if markers:
+            fallback['prefix_tag_caption'] = sorted(markers)
 
     def setting(key, default):
         if key in distill_config:
@@ -138,10 +152,12 @@ def caption_augment_config(config):
         return fallback.get(key, default)
 
     shuffle = setting('cache_shuffle_num', 0) > 0 or setting('shuffle_tags', False)
-    # caption_prefix is deliberately absent: it is a fixed string with no random component, so
-    # both caption sources already have it applied. Adding it again here would double it.
+    # caption_prefix is applied HERE, not by the caption source. Training builds a caption as
+    # caption_prefix + augment(strip_marker(raw)), so the prefix has to go on after the marker
+    # comes off; a source that baked it in would hide the marker behind it.
     return {
         'delimiter': setting('cache_shuffle_delimiter', ', '),
+        'caption_prefix': setting('caption_prefix', ''),
         'prefix_tag_caption': setting('prefix_tag_caption', ''),
         'shuffle': shuffle,
         'tag_dropout_rate': setting('tag_dropout_rate', 0.0),

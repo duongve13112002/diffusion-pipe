@@ -140,6 +140,36 @@ Related: tag dropout must never empty a caption. The empty string is the *uncond
 embedding, which the trainer already produces deliberately at `UNCOND_FRACTION`; producing more
 by accident shifts the conditioning ratio with no config change to explain it.
 
+## Never extract code by text range
+
+Moving the caption helpers into `utils/captions.py` by slicing `utils/dataset.py` between two
+function names silently took `bucket_suffix`, `dedup_and_sort` and `seed_from_hash` with them.
+Those were called at twelve sites and every training run died. Move code by *name*: list what
+you intend to move, move exactly that, then check what the source still references.
+
+## A green suite can be evidence of nothing
+
+The above shipped with 182 tests passing, because no test had ever constructed a
+`DirectoryDataset`. An import test proves a module parses. Before trusting a suite on a change to
+shared code, ask which test would fail if the change were wrong — and if the answer is none,
+that is the test to write. `test/test_dataset_smoke.py` builds the real objects and AST-checks
+that every global `utils/dataset.py` loads actually resolves.
+
+## Baked-in prefixes hide the markers that follow them
+
+Training composes a caption as `caption_prefix + augment(strip_marker(raw))`. Storing the prefix
+before the marker gives `"anime, Special: red, blue"`, which no longer starts with the marker, so
+the consumer stops recognising it and trains the marker as data. When two transformations are
+ordered, anything that persists an intermediate value has to persist it at the same point in that
+order.
+
+## Read the other models before choosing a condition
+
+Per-sample caption augmentation is only safe when nothing was cached. SDXL caches nothing; Cosmos
+caches optionally; HiDream caches CLIP and T5 but tokenizes Llama3 live, so augmenting its text
+would contradict its own frozen embeddings. The right test was `not self.text_embedding_datasets`
+— a property of the data, naming no model — and it was only findable by reading all three.
+
 ## Git
 
 Commits carry no Claude attribution: no `Co-Authored-By: Claude ...`, no `Claude-Session:`

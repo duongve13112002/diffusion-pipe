@@ -8,10 +8,14 @@ the diffusion stages see, but it walks every media file (and opens every tar) on
 a few million images that is slow enough to be worth doing once.
 
 The corpus is a faithful dump, not a preprocessed one: captions are written exactly as the
-dataset holds them, tag marker and all. Tag shuffling and tag dropout stay runtime
-augmentations, so one corpus serves runs configured differently and each epoch sees a fresh
-variant. `caption_prefix` is the exception -- it is a fixed string the dataset config prepends,
-with no random component, so it is baked in.
+dataset holds them, tag marker and all, with no `caption_prefix` and no shuffling. Those are
+training-time concerns, so one corpus serves runs configured differently and each epoch sees a
+fresh variant.
+
+The prefix in particular must not be baked in. Training builds a caption as
+`caption_prefix + augment(strip_marker(raw))`, so a stored `"anime, Special: red, blue"` no
+longer starts with the marker: the consumer would fail to strip it, silently skip augmentation,
+and train the marker as a tag.
 
 Output format follows the extension: .jsonl, .csv or .txt. See utils/caption_corpus.py.
 """
@@ -55,15 +59,31 @@ def main():
     parser.add_argument('--dedupe', action='store_true', help='Collapse identical captions, recording how many times each occurred.')
     parser.add_argument(
         '--apply-num-repeats', action='store_true',
-        help="Bake each directory's num_repeats into the corpus. Off by default: it multiplies "
-             'the file size and the same balance can be applied at training time.',
+        help="Bake each directory's num_repeats into the corpus by repeating captions. Off by "
+             'default: it multiplies the file size. This is the only way to honour num_repeats '
+             'in a corpus -- the file stores no per-caption repeat count, because the dataset '
+             'applies num_repeats per directory, and flooring it per caption would delete '
+             'every caption in a directory with num_repeats < 1.',
     )
     args = parser.parse_args()
 
     fmt = format_for(args.output, args.format)
+    if args.format and fmt != format_for(args.output):
+        print(
+            f'WARNING: writing {fmt} content to {args.output}, whose extension says '
+            f'{format_for(args.output)}. Readers infer the format from the extension, so this '
+            f'file will not read back correctly unless the format is passed explicitly.'
+        )
+
     dataset_config = toml.load(args.dataset)
 
-    captions = enumerate_captions(dataset_config, apply_num_repeats=args.apply_num_repeats, apply_shuffle=False)
+    markers = set()
+    captions = enumerate_captions(
+        dataset_config,
+        apply_num_repeats=args.apply_num_repeats,
+        apply_shuffle=False,
+        markers_seen=markers,
+    )
     if not captions:
         raise SystemExit(f'No captions found in {args.dataset}.')
 
@@ -79,6 +99,15 @@ def main():
     if args.dedupe and fmt != 'txt':
         print('Deduplicated: each record carries a count, which distillation expands back out '
               'so the sampling distribution is unchanged.')
+    if markers:
+        rendered = ', '.join(repr(m) for m in sorted(markers))
+        print(
+            f'\nThe dataset marks tag captions with {rendered}. Those markers are still in the '
+            f'corpus, on purpose -- they say which captions are tag lists. Whatever reads this '
+            f'file must strip them, or they will be trained as if they were tags. For '
+            f'distillation, set under [distill]:\n'
+            f'    prefix_tag_caption = {sorted(markers)!r}'
+        )
 
 
 if __name__ == '__main__':

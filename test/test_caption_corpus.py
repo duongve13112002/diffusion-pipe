@@ -324,3 +324,108 @@ class TestExportScript:
         result = self._run(dataset, tmp_path / 'corpus.parquet')
         assert result.returncode != 0
         assert 'Cannot infer' in (result.stderr + result.stdout)
+
+
+class TestMultipleMarkers:
+    """A flat corpus can mix directories, so several markers must be strippable at once."""
+
+    def test_a_list_of_markers_is_accepted(self):
+        assert split_tag_prefix('T1: a, b', ['T1: ', 'T2: ']) == ('a, b', True)
+        assert split_tag_prefix('T2: c, d', ['T1: ', 'T2: ']) == ('c, d', True)
+
+    def test_an_unmarked_caption_is_still_left_alone(self):
+        assert split_tag_prefix('prose here', ['T1: ', 'T2: ']) == ('prose here', False)
+
+    def test_an_empty_list_means_everything_is_tags(self):
+        assert split_tag_prefix('a, b', []) == ('a, b', True)
+        assert split_tag_prefix('a, b', '') == ('a, b', True)
+
+    def test_preprocess_strips_whichever_marker_matched(self):
+        assert preprocess_caption('T2: a, b', prefix_tag_caption=['T1: ', 'T2: ']) == 'a, b'
+
+
+class TestRawEnumerationIsFaithful:
+    """apply_shuffle=False must produce exactly what a consumer can reconstruct training from."""
+
+    def test_caption_prefix_is_not_baked_in(self, tmp_path):
+        # Baking it in would put the prefix in FRONT of the marker, so the consumer's
+        # split_tag_prefix would no longer match, silently disabling augmentation and training
+        # the marker as a tag.
+        config = _make_dataset(
+            tmp_path, {'a': 'Special: red, blue'},
+            extra_dataset={'caption_prefix': 'anime, ', 'prefix_tag_caption': 'Special: '},
+        )
+        assert enumerate_captions(config, apply_shuffle=False) == ['Special: red, blue']
+
+    def test_the_round_trip_reproduces_what_training_sees(self, tmp_path):
+        import random
+        config = _make_dataset(
+            tmp_path, {'a': 'Special: red, blue'},
+            extra_dataset={
+                'caption_prefix': 'anime, ', 'prefix_tag_caption': 'Special: ',
+                'cache_shuffle_num': 4,
+            },
+        )
+        raw = enumerate_captions(config, apply_shuffle=False)
+        rebuilt = {
+            preprocess_caption(
+                raw[0], caption_prefix='anime, ', prefix_tag_caption='Special: ', shuffle=True,
+            )
+            for _ in range(200)
+        }
+        training = set(enumerate_captions(config))
+        assert rebuilt == training, f'{rebuilt} != {training}'
+        assert all(c.startswith('anime, ') and 'Special' not in c for c in rebuilt)
+        assert random  # the draws above are seeded by the module-level RNG
+
+    def test_markers_seen_reports_every_directory(self, tmp_path):
+        d1, d2 = tmp_path / 'one', tmp_path / 'two'
+        for d, text in ((d1, 'T1: a, b'), (d2, 'T2: c, d')):
+            d.mkdir()
+            (d / 'x.jpg').write_bytes(b'x')
+            (d / 'x.txt').write_text(text)
+        config = {
+            'resolutions': [512],
+            'directory': [
+                {'path': str(d1), 'prefix_tag_caption': 'T1: '},
+                {'path': str(d2), 'prefix_tag_caption': 'T2: '},
+            ],
+        }
+        markers = set()
+        raw = enumerate_captions(config, apply_shuffle=False, markers_seen=markers)
+        assert sorted(raw) == ['T1: a, b', 'T2: c, d']
+        assert markers == {'T1:', 'T2:'}
+        # And the reported markers are exactly what makes the corpus usable again.
+        assert [preprocess_caption(c, prefix_tag_caption=sorted(markers)) for c in sorted(raw)] == ['a, b', 'c, d']
+
+
+class TestCountValidation:
+    def test_non_integer_count_names_the_line(self, tmp_path):
+        path = tmp_path / 'c.jsonl'
+        path.write_text('{"caption": "ok"}\n{"caption": "w", "count": "3.5"}\n', encoding='utf-8')
+        with pytest.raises(RuntimeError, match=r'c\.jsonl:2.*non-integer'):
+            read_corpus(path)
+
+    @pytest.mark.parametrize('bad', [0, -3])
+    def test_non_positive_count_is_rejected_rather_than_dropping_the_caption(self, tmp_path, bad):
+        path = tmp_path / 'c.jsonl'
+        path.write_text(json.dumps({'caption': 'w', 'count': bad}) + '\n', encoding='utf-8')
+        with pytest.raises(RuntimeError, match='silently drop'):
+            read_corpus(path)
+
+    def test_csv_line_numbers_account_for_the_header(self, tmp_path):
+        path = tmp_path / 'c.csv'
+        path.write_text('caption,count\nok,1\nbad,x\n', encoding='utf-8')
+        with pytest.raises(RuntimeError, match=r'c\.csv:3'):
+            read_corpus(path)
+
+    def test_apply_count_false_yields_each_caption_once(self, tmp_path):
+        path = tmp_path / 'c.jsonl'
+        write_corpus(path, [{'caption': 'a', 'count': 5}, {'caption': 'b', 'count': 2}])
+        assert read_corpus(path, apply_count=False) == ['a', 'b']
+
+    def test_num_repeats_is_not_a_corpus_field(self, tmp_path):
+        # It is per-directory in the dataset; per caption it would floor sub-1 values to zero.
+        path = tmp_path / 'c.csv'
+        write_corpus(path, [{'caption': 'a'}])
+        assert 'num_repeats' not in path.read_text().splitlines()[0]

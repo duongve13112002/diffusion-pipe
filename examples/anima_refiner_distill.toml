@@ -46,8 +46,14 @@ dataset = 'examples/dataset.toml'
 #tag_dropout_rate = 0.1
 # Only captions starting with this marker are treated as tag lists; the marker is stripped
 # before the text encoder sees it, case-insensitively and with surrounding whitespace removed.
-# Unset means every caption is treated as tags.
+# Unset means every caption is treated as tags. When 'dataset' is the source this defaults to
+# the markers actually in use across its directories, so it rarely needs setting by hand; with
+# 'caption_corpus' you must set it, and the exporter prints the exact line to paste.
+# A list is accepted, for a dataset whose directories use different markers.
 #prefix_tag_caption = 'Special: '
+#prefix_tag_caption = ['Tags: ', 'Special: ']
+# Prepended after the marker is stripped, so "Special: a, b" becomes "anime, a, b".
+#caption_prefix = 'anime, '
 
 output_dir = '/data/output/anima_refiner_distill'
 # Also write a complete anima_refiner checkpoint (the teacher's DiT with the trained

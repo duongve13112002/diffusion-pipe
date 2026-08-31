@@ -46,9 +46,21 @@ frame_buckets = [1, 33]
 # Controls whether to skip images with missing captions (true, the default if unset), or use an empty caption (false).
 #skip_empty_caption = false
 
+# Which caption an image trains on. "all" (the default) makes every caption its own training sample, so an
+# image with 3 captions appears 3 times per epoch and one epoch is n_images * n_captions.
+# "random_per_epoch" gives one sample per image with the caption drawn at random on each access: an epoch is
+# n_images, and the image gets a different caption every pass. All captions are still cached either way -- the
+# draw is just an index into the cache -- and the same draw picks the caption text and its embedding together.
+# This also brings tag shuffling and dropout back to life with cached embeddings: with cache_shuffle_num = 10
+# the cache holds 10 variants and each epoch draws a different one.
+# caption_sampling = "random_per_epoch"
+
 # Drop each tag independently with this probability, as a caption augmentation. 0 (the default) disables it.
-# Applied at caching time alongside cache_shuffle_num, so changing it needs --regenerate_cache to take effect,
-# and combines well with cache_shuffle_num > 1 so each cached variant gets a different draw.
+# Applied at caching time alongside cache_shuffle_num, so changing it needs --regenerate_cache to take effect.
+# IMPORTANT: with cache_shuffle_num = 0 this produces ONE frozen draw per caption -- the dropped tags are gone
+# for good, which is permanent deletion rather than augmentation. Set cache_shuffle_num > 1 so several draws
+# are cached, and/or caption_sampling = "random_per_epoch" so a different one is used each epoch. The code
+# warns if you leave it at 0.
 # At least one tag always survives: an all-dropped caption is the unconditional embedding, which the trainer
 # already produces deliberately, and minting more of them would quietly change the conditioning ratio.
 # tag_dropout_rate = 0.1
