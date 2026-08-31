@@ -34,6 +34,28 @@ class TestTagPrefix:
         body, is_tag = split_tag_prefix('A photo of a cat.', 'Special: ')
         assert (body, is_tag) == ('A photo of a cat.', False)
 
+    def test_matching_ignores_case(self):
+        for written in ('Special: a, b', 'special: a, b', 'SPECIAL: a, b', 'SpEcIaL: a, b'):
+            body, is_tag = split_tag_prefix(written, 'Special:')
+            assert (body, is_tag) == ('a, b', True), written
+
+    def test_marker_in_the_config_may_carry_whitespace(self):
+        assert split_tag_prefix('Special: a, b', '  Special:  ') == ('a, b', True)
+
+    def test_whitespace_after_the_marker_is_stripped(self):
+        assert split_tag_prefix('Special:\t  a, b', 'Special:') == ('a, b', True)
+        assert split_tag_prefix('Special:a, b', 'Special: ') == ('a, b', True)
+
+    def test_whitespace_only_marker_counts_as_unset(self):
+        assert split_tag_prefix('a, b', '   ') == ('a, b', True)
+
+    def test_a_caption_merely_containing_the_marker_is_not_matched(self):
+        body, is_tag = split_tag_prefix('A photo of a special: occasion', 'Special:')
+        assert (body, is_tag) == ('A photo of a special: occasion', False)
+
+    def test_stripped_marker_survives_the_full_pipeline(self):
+        assert preprocess_caption('SPECIAL:   a, b ', prefix_tag_caption='Special: ') == 'a, b'
+
     def test_marker_never_reaches_training(self):
         # The whole point: the model must see "a, b", never "Special: a, b".
         assert preprocess_caption('Special: a, b', prefix_tag_caption='Special: ') == 'a, b'

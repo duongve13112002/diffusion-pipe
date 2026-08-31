@@ -137,8 +137,10 @@ prefix_tag_caption = "Special: "
 ```
 
 The marker is **stripped before training**, so `"Special: a, b, c"` is trained as `"a, b, c"`.
-Unset (the default) means the dataset is not annotated and every caption is treated as tags,
-which is how this repo behaved before the setting existed.
+Matching **ignores case**, and both the marker and what follows it are stripped of surrounding
+whitespace — `"Special:"`, `"special: "` and `"SPECIAL:"` all match, and `"SPECIAL:   a, b"`
+still trains as `"a, b"`. Unset (the default) means the dataset is not annotated and every
+caption is treated as tags, which is how this repo behaved before the setting existed.
 
 Both augmentations are applied when the text embeddings are cached, so changing either needs
 `--regenerate_cache`. With `online_captions = true` they are applied per sample instead, since

@@ -417,7 +417,7 @@ Every key below is read only when `type = 'anima_refiner'`.
 | `shuffle_tags` / `cache_shuffle_num` | from `dataset.toml` | shuffle tag order, per sample |
 | `cache_shuffle_delimiter` | `', '` | tag separator |
 | `tag_dropout_rate` | from `dataset.toml` | drop each tag with this probability, per sample |
-| `prefix_tag_caption` | from `dataset.toml` | marks tag captions; stripped before training |
+| `prefix_tag_caption` | from `dataset.toml` | marks tag captions; matched case-insensitively and stripped before training |
 
 Exactly one of `dataset`, `caption_corpus` and `captions` may be set; setting more than one is
 an error rather than a silent precedence rule.

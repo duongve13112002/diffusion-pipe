@@ -26,11 +26,20 @@ def split_tag_prefix(caption: str, prefix_tag_caption: str = '') -> tuple[str, b
     model should ever be trained on. An empty marker (the default) means the dataset is not
     annotated at all, so every caption is treated as tags -- which is the behaviour this repo
     had before the marker existed.
+
+    Matching ignores case, and both the marker and what follows it are stripped of surrounding
+    whitespace. A marker is a hand-written annotation spread over a dataset of millions of
+    files; "Special:", "special:" and "SPECIAL: " all mean the same thing, and a caption that
+    silently keeps a leading space or an unstripped "Special:" is a caption the text encoder
+    tokenizes differently from its neighbours for no reason anyone intended.
     """
-    if not prefix_tag_caption:
+    marker = prefix_tag_caption.strip()
+    if not marker:
         return caption, True
-    if caption.startswith(prefix_tag_caption):
-        return caption[len(prefix_tag_caption):], True
+    # Compare only the first len(marker) characters rather than casefolding the whole caption:
+    # this runs per sample, and captions can be long.
+    if caption[:len(marker)].casefold() == marker.casefold():
+        return caption[len(marker):].strip(), True
     return caption, False
 
 
@@ -90,7 +99,7 @@ def shuffle_captions(
     either setting needs --regenerate_cache to take effect, which is this repo's existing
     behaviour for cache_shuffle_num.
     """
-    if count == 0 and tag_dropout_rate <= 0 and not prefix_tag_caption:
+    if count == 0 and tag_dropout_rate <= 0 and not prefix_tag_caption.strip():
         return [caption_prefix + c for c in captions]
 
     variants = max(count, 1)

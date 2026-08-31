@@ -56,6 +56,8 @@ frame_buckets = [1, 33]
 # Marks which captions are tag lists rather than natural language. Only captions starting with this string are
 # shuffled and tag-dropped; everything else is left alone. The marker is stripped before training, so with
 # prefix_tag_caption = "Special: " the caption "Special: a, b, c" is trained as "a, b, c".
+# Matching ignores case, and both the marker and what follows it are stripped of surrounding whitespace, so
+# "Special:", "special: " and "SPECIAL:" all match and "SPECIAL:   a, b" still trains as "a, b".
 # Unset (the default) means the dataset is not annotated and every caption is treated as tags -- the behaviour
 # this repo had before the setting existed.
 # prefix_tag_caption = "Special: "

@@ -45,7 +45,8 @@ dataset = 'examples/dataset.toml'
 #cache_shuffle_delimiter = ', '
 #tag_dropout_rate = 0.1
 # Only captions starting with this marker are treated as tag lists; the marker is stripped
-# before the text encoder sees it. Unset means every caption is treated as tags.
+# before the text encoder sees it, case-insensitively and with surrounding whitespace removed.
+# Unset means every caption is treated as tags.
 #prefix_tag_caption = 'Special: '
 
 output_dir = '/data/output/anima_refiner_distill'
