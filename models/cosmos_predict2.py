@@ -12,6 +12,7 @@
 
 import math
 import os.path
+import re
 
 import torch
 from torch import nn
@@ -34,6 +35,20 @@ KEEP_IN_HIGH_PRECISION = ['x_embedder', 't_embedder', 't_embedding_norm', 'final
 
 MULTISCALE_LOSS_THRESHOLDS = [size * 0.9 for size in [1024]]
 MULTISCALE_LOSS_THRESHOLDS.sort()
+
+
+def count_blocks(state_dict_keys, prefix_string):
+    count = 0
+    while True:
+        c = False
+        for k in state_dict_keys:
+            if k.startswith(prefix_string.format(count)):
+                c = True
+                break
+        if c == False:
+            break
+        count += 1
+    return count
 
 
 def time_shift(mu: float, sigma: float, t: torch.Tensor):
@@ -106,6 +121,7 @@ def vae_encode(tensor, vae):
 
 
 def get_dit_config(state_dict, key_prefix=''):
+    state_dict_keys = list(state_dict.keys())
     dit_config = {}
     dit_config["max_img_h"] = 1024
     dit_config["max_img_w"] = 1024
@@ -126,14 +142,12 @@ def get_dit_config(state_dict, key_prefix=''):
 
     dit_config["use_adaln_lora"] = True
     dit_config["adaln_lora_dim"] = 256
+    dit_config["num_blocks"] = count_blocks(state_dict_keys, '{}blocks.'.format(key_prefix) + '{}.')
     if dit_config["model_channels"] == 2048:
-        dit_config["num_blocks"] = 28
         dit_config["num_heads"] = 16
     elif dit_config["model_channels"] == 5120:
-        dit_config["num_blocks"] = 36
         dit_config["num_heads"] = 40
     elif dit_config["model_channels"] == 1280:
-        dit_config["num_blocks"] = 20
         dit_config["num_heads"] = 20
 
     if dit_config["in_channels"] == 16:
@@ -512,11 +526,11 @@ class CosmosPredict2Pipeline(BasePipeline):
         transformer_dtype = self.model_config.get('transformer_dtype', dtype)
 
         state_dict = load_state_dict(self.model_config['transformer_path'])
-        # Remove 'net.' prefix
         new_state_dict = {}
         for k, v in state_dict.items():
-            if k.startswith('net.'):
-                k = k[len('net.'):]
+            # Remove prefixes
+            k = re.sub(r'^net\.', '', k)  # Cosmos2 original
+            k = re.sub(r'^model\.diffusion_model\.', '', k)  # native ComfyUI
             new_state_dict[k] = v
         state_dict = new_state_dict
 
