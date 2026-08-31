@@ -27,7 +27,9 @@ multiline_captions = true
 
 # One training sample per image, with the caption drawn at random on every access. An epoch is
 # therefore n_images, not n_images * n_captions, and an image gets a different caption each
-# pass. Every caption is still cached; the draw is just an index into the cache.
+# pass. The same draw picks the caption text and its embedding index together, so the two never
+# disagree. With cache_text_embeddings = false, which the training TOML beside this file sets,
+# nothing is cached at all and the draw indexes a list of raw strings instead.
 caption_sampling = "random_per_epoch"
 
 # Shuffle the tag order. With on-the-fly text embeddings this is re-drawn per access, so the
@@ -65,8 +67,10 @@ skip_empty_caption = true
 path = '/data/anime/booru_tags'
 num_repeats = 1
 
-# Same layout, different content. Overriding a global is per directory: this one is prose, so
-# it opts out of tag augmentation by giving the marker no captions to match.
+# Same layout, different content. Overriding a global is per directory: this one is prose, so it
+# opts out of tag augmentation by zeroing both knobs below. The marker is still inherited, so a
+# caption here that did start with "Special:" would still have it stripped -- which is what you
+# want, since the marker is never training data.
 [[directory]]
 path = '/data/anime/natural_language'
 num_repeats = 1

@@ -26,10 +26,12 @@ gradient_accumulation_steps = 1
 gradient_clipping = 1
 warmup_steps = 100
 
-eval_every_n_epochs = 1
-eval_before_first_step = true
-eval_micro_batch_size_per_gpu = 4
-eval_gradient_accumulation_steps = 1
+# These are inert without an eval_datasets entry (train.py defaults it to []). Add one to use
+# them, e.g. eval_datasets = [{ path = 'examples/anima_refiner/dataset.toml' }].
+#eval_every_n_epochs = 1
+#eval_before_first_step = true
+#eval_micro_batch_size_per_gpu = 4
+#eval_gradient_accumulation_steps = 1
 
 save_every_n_epochs = 2
 activation_checkpointing = true
@@ -37,7 +39,10 @@ partition_method = 'parameters'
 save_dtype = 'bfloat16'
 caching_batch_size = 8
 steps_per_print = 10
-blocks_to_swap = 20  # block swapping requires an [adapter] block, so it works here
+# No blocks_to_swap here. Block swapping replaces PipelineModule.to with a no-op and moves only
+# the transformer to CUDA, so the text encoder this config keeps resident would stay on CPU.
+# train.py asserts against the combination. If you need block swapping, use the cached-embedding
+# config instead; if you need on-the-fly embeddings, lower micro_batch_size_per_gpu.
 
 [model]
 type = 'anima_refiner'

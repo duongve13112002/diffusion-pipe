@@ -584,6 +584,13 @@ if __name__ == '__main__':
     if blocks_to_swap := config.get('blocks_to_swap', 0):
         assert config['pipeline_stages'] == 1, 'Block swapping only works with pipeline_stages=1'
         assert 'adapter' in config, 'Block swapping only works when training LoRA'
+        assert config['model'].get('cache_text_embeddings', True), (
+            'blocks_to_swap cannot be combined with cache_text_embeddings = false. Block '
+            'swapping replaces PipelineModule.to with a no-op and moves only the transformer to '
+            'CUDA, so a resident text encoder -- which lives on the pipeline layer, not the '
+            'transformer -- silently stays on CPU and returns CPU embeddings into a CUDA batch. '
+            'Use one or the other.'
+        )
         # Don't automatically move to GPU, we'll do that ourselves.
         def to(self, *args, **kwargs):
             pass

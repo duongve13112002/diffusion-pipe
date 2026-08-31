@@ -50,7 +50,7 @@ from models.cosmos_predict2_modeling import MiniTrainDIT
 from models.text_refiner import ContextRefiner, extract_refiner_state_dict
 from utils.common import iterate_safetensors, load_state_dict
 from utils.caption_corpus import read_corpus
-from utils.captions import enumerate_captions, preprocess_caption
+from utils.captions import enumerate_captions, preprocess_caption, tag_markers
 
 MAX_TEXT_LENGTH_DEFAULT = 512
 
@@ -136,9 +136,14 @@ def caption_augment_config(config):
         fallback = {k: v for k, v in dataset_config.items() if not isinstance(v, (list, dict))}
         # prefix_tag_caption is resolved per directory, so a single top-level value cannot
         # represent a dataset that annotates its directories differently. Collect every marker
-        # actually in use and hand the whole list down; split_tag_prefix accepts a list.
+        # in use and hand the whole list down; split_tag_prefix accepts a list. Read from the
+        # config rather than by walking the dataset: the markers are config values, and a
+        # second full enumeration would re-open every image and every tar for nothing.
         markers = set()
-        enumerate_captions(dataset_config, apply_shuffle=False, markers_seen=markers)
+        for directory_config in dataset_config.get('directory', []):
+            markers.update(tag_markers(
+                directory_config.get('prefix_tag_caption', dataset_config.get('prefix_tag_caption', ''))
+            ))
         if markers:
             fallback['prefix_tag_caption'] = sorted(markers)
 
@@ -146,6 +151,21 @@ def caption_augment_config(config):
         if key in distill_config:
             return distill_config[key]
         return fallback.get(key, default)
+
+    if 'dataset' not in distill_config:
+        # A corpus or a bare caption file carries no dataset config to fall back on, so
+        # anything not restated under [distill] silently defaults to off. Say so, rather than
+        # quietly training on a distribution that differs from the diffusion stages'.
+        missing = [k for k in ('prefix_tag_caption', 'caption_prefix', 'cache_shuffle_num',
+                               'shuffle_tags', 'tag_dropout_rate') if k in distill_config]
+        if not missing:
+            print(
+                'WARNING: the caption source is not a dataset.toml, so no caption settings can '
+                'be inherited. Tag shuffling, tag dropout, caption_prefix and prefix_tag_caption '
+                'are all off. If the dataset uses any of them, restate them under [distill] -- '
+                'export_caption_corpus.py prints the prefix_tag_caption line to use. Without '
+                'prefix_tag_caption the tag marker is trained as if it were a tag.'
+            )
 
     shuffle = setting('cache_shuffle_num', 0) > 0 or setting('shuffle_tags', False)
     # caption_prefix is applied HERE, not by the caption source. Training builds a caption as

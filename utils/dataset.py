@@ -330,12 +330,20 @@ class SizeBucketDataset:
                 seed = 0
                 for example in self.metadata_dataset.select_columns(['image_spec', 'caption']):
                     image_spec = example['image_spec']
-                    captions = example['caption']
-                    shuffle_with_seed(captions, seed)
+                    # Shuffle the captions WITH their original positions. The text embedding
+                    # cache is indexed by position in the unshuffled metadata order
+                    # (_cache_text_embeddings flattens metadata_dataset['caption'] as it
+                    # stands), so shuffling the strings alone and then using the post-shuffle
+                    # position as caption_number hands back the embedding of a different
+                    # caption. Harmless for a model that ignores the caption string, wrong for
+                    # one that reads both -- HiDream tokenizes Llama3 from the live caption
+                    # while using cached CLIP and T5 embeddings.
+                    numbered = list(enumerate(example['caption']))
+                    shuffle_with_seed(numbered, seed)
                     seed += 1
                     latents_idx = image_spec_to_latents_idx[tuple(image_spec)]
-                    for i, caption in enumerate(captions):
-                        iteration_order_by_caption_num[i].append((image_spec, latents_idx, caption, i))
+                    for i, (caption_number, caption) in enumerate(numbered):
+                        iteration_order_by_caption_num[i].append((image_spec, latents_idx, caption, caption_number))
                 iteration_order_list = []
                 for l in iteration_order_by_caption_num:
                     iteration_order_list.extend(l)
@@ -413,16 +421,32 @@ class SizeBucketDataset:
             caption = ''
         else:
             if self.captions_dict:
-                spec = entry['image_spec']
-                key = spec[-1]
+                tar_file, image_file = entry['image_spec']
+                # Match how DirectoryDataset keys captions.json: a tar member by its full path
+                # inside the archive, a plain file by basename. Using the full on-disk path for
+                # both made every lookup miss on an ordinary image directory, so every caption
+                # became ''.
+                key = image_file if tar_file is not None else image_file.split('/')[-1]
                 if key in self.captions_dict:
-                    caption = preprocess_caption(
-                        self.captions_dict[key][caption_number],
-                        delimiter=self.online_delimiter,
-                        prefix_tag_caption=self.prefix_tag_caption,
-                        shuffle=self.online_shuffle,
-                        tag_dropout_rate=self.tag_dropout_rate,
-                    )
+                    caption = self.captions_dict[key][caption_number]
+                    if self._augment_at_runtime:
+                        caption = preprocess_caption(
+                            caption,
+                            delimiter=self.online_delimiter,
+                            caption_prefix=self.caption_prefix,
+                            prefix_tag_caption=self.prefix_tag_caption,
+                            shuffle=self.online_shuffle,
+                            tag_dropout_rate=self.tag_dropout_rate,
+                        )
+                    else:
+                        # The cached embedding for this caption was built with the marker
+                        # stripped and caption_prefix applied. Re-shuffling here would make the
+                        # text disagree with it, so only the deterministic parts are applied.
+                        caption = preprocess_caption(
+                            caption,
+                            caption_prefix=self.caption_prefix,
+                            prefix_tag_caption=self.prefix_tag_caption,
+                        )
                 else:
                     print(f'WARNING: image {key} did not have entry in captions_dict. Using empty caption.')
                     caption = ''
@@ -586,6 +610,12 @@ class DirectoryDataset:
             self.resolutions = dedup_and_sort(self.resolutions)
             self.ar_bucket_datasets = []
         self.shuffle = directory_config.get('cache_shuffle_num', dataset_config.get('cache_shuffle_num', 0))
+        if self.shuffle == 0 and directory_config.get('shuffle_tags', dataset_config.get('shuffle_tags', False)):
+            # Legacy spelling. This fixup used to live inside _metadata_map_fn's inner function,
+            # which runs later and in a worker process, so every gate computed here missed it --
+            # a config saying shuffle_tags got frozen shuffling while the identical config
+            # saying cache_shuffle_num = 1 got per-access shuffling.
+            self.shuffle = 1
         self.shuffle_metadata = directory_config['shuffle_metadata']
         self.directory_config['cache_shuffle_num'] = self.shuffle # Make accessible if it wasn't yet, for picking one out
         self.shuffle_delimiter = directory_config.get('cache_shuffle_delimiter', dataset_config.get('cache_shuffle_delimiter', ", "))
@@ -619,8 +649,10 @@ class DirectoryDataset:
                 f'caption_sampling must be one of {CAPTION_SAMPLING_MODES}, got '
                 f'{self.caption_sampling!r}'
             )
-        if (self.tag_dropout_rate > 0 and self.shuffle == 0 and self.caption_sampling == 'all'
-                and caches_text_embeddings):
+        # Not gated on caption_sampling: random_per_epoch draws from the cached variants, so
+        # with cache_shuffle_num = 0 there is still exactly one variant to draw from and the
+        # dropped tags are still gone for good.
+        if self.tag_dropout_rate > 0 and self.shuffle == 0 and caches_text_embeddings:
             logger.warning(
                 f'{self.path}: tag_dropout_rate={self.tag_dropout_rate} with cache_shuffle_num=0 '
                 f'produces ONE frozen variant per caption, so the dropped tags are gone for good '
@@ -807,7 +839,7 @@ class DirectoryDataset:
             mask_files = []
             control_files = []
             for file in tqdm(files):
-                if not file.is_file() or file.suffix in ('.txt', '.npz', '.json', '.parquet', '.bak', '.db'):
+                if not file.is_file() or file.suffix in NON_MEDIA_SUFFIXES:
                     continue
                 for image_spec in process_file(file):
                     image_file = Path(image_spec[1])
@@ -919,8 +951,6 @@ class DirectoryDataset:
                 else:
                     logger.warning(f'Cound not find caption for {image_file}. Using empty caption.')
                     captions = ['']
-            if self.directory_config['shuffle_tags'] and self.shuffle == 0: # backwards compatibility
-                self.shuffle = 1
             if self.augment_at_runtime:
                 # Keep the captions exactly as they are on disk, marker included, and expand to
                 # the same number of variants cache_shuffle_num would have produced so the
