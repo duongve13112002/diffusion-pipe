@@ -106,6 +106,40 @@ indirectly by asserting the invariants pipeline parallelism depends on (constant
 across micro batches; every layer boundary being a valid split point). Real DeepSpeed execution
 needs `deepspeed --num_gpus=2 --module test.debug_deepspeed_init`.
 
+## Check the premise before building on it
+
+A request to "gather the captions the pipeline drops when an image has several" was built on a
+belief that the flow picks one caption at random. It does not: `SizeBucketDataset.cache_latents`
+expands every caption into its own `iteration_order` entry. The only place captions genuinely
+collapse is a `.txt` sidecar, read whole as one string.
+
+The tool was still worth building — for a different reason (distillation should not walk three
+million image files to find text) — but the reason changes what it should do. Read the code and
+say plainly what is and is not true before implementing, even when the request sounds definite.
+
+## A tool that reads text should not import torch
+
+`enumerate_captions` lived in `utils/dataset.py`, so a caption-only script pulled in torch,
+DeepSpeed and ComfyUI: 50 seconds of import per invocation to read text files. It now lives in
+`utils/captions.py` (standard library only), re-exported from `utils/dataset.py` so no caller
+changed.
+
+The failure that exposed this was a subprocess test failing on a missing stub. Stubbing it in
+the subprocess would have made the test pass and left the real problem in place. When a test
+fails for an environmental reason, check whether the environment is telling you something.
+
+## Augmentation belongs where the embedding is computed
+
+The diffusion stages bake shuffled caption variants into the embedding cache because the
+embedding is computed once; changing the setting needs `--regenerate_cache`. Distillation
+re-embeds every step, so it augments per sample instead and each epoch sees a fresh draw. Same
+setting names, two correct implementations — decided by where the cache boundary is, not by
+preference.
+
+Related: tag dropout must never empty a caption. The empty string is the *unconditional*
+embedding, which the trainer already produces deliberately at `UNCOND_FRACTION`; producing more
+by accident shifts the conditioning ratio with no config change to explain it.
+
 ## Git
 
 Commits carry no Claude attribution: no `Co-Authored-By: Claude ...`, no `Claude-Session:`

@@ -33,6 +33,91 @@
 <p class="meta">A running log of decisions taken outside the spec, forced changes, tradeoffs, and
 anything else the maintainer needs to know. Newest entry first.</p>
 
+<h2>2026-08-31 — Caption corpus, tag dropout, multiline .txt captions</h2>
+
+<p><strong>Request.</strong> A script that flattens every caption in a <code>dataset.toml</code>
+into one file, so distillation can be pointed at that file instead of the dataset. Plus tag
+dropout, and multi-line <code>.txt</code> sidecars.</p>
+
+<h3>A premise worth correcting first</h3>
+
+<p>The request was framed as recovering captions the pipeline drops: "if an image has multiple
+captions, the current flow only picks one." It does not. <code>SizeBucketDataset.cache_latents</code>
+expands <em>every</em> caption of every image into its own entry in <code>iteration_order</code>
+— an image with three captions is three training samples, and <code>enumerate_captions</code>
+already extended the whole list. With <code>captions.json</code>, nothing was ever being lost.</p>
+
+<p>What <em>is</em> lost is narrower and real: a <code>.txt</code> sidecar is read as
+<code>[f.read().strip()]</code>, so a file with three lines is one caption containing two
+newlines. That is the only place captions actually go missing.</p>
+
+<p>So the corpus tool's value is not "recover dropped captions" — it is that distillation trains
+only the text frontend, and pointing it at a <code>dataset.toml</code> makes it walk every media
+file and open every tar purely to discover which captions exist. At three million images that is
+worth doing once. The corpus is a cache of that walk, not a second source of truth. Worth saying
+plainly, because a tool built on a wrong premise gets used for the wrong thing.</p>
+
+<h3>Decisions</h3>
+
+<ul>
+  <li><strong>The corpus is faithful, not preprocessed.</strong> Captions are written exactly as
+  the dataset holds them, tag marker included, shuffling not baked in. One corpus then serves
+  runs configured differently, and every epoch can draw a fresh variant. <code>caption_prefix</code>
+  is the one exception — a fixed string with no random component, so it is applied at export.</li>
+
+  <li><strong>Marker stripped at train time, not at export.</strong> Stripping it at export would
+  be cleaner-looking and would destroy the only signal saying which captions are tag lists. A
+  plain <code>.txt</code> corpus has nowhere to put a replacement flag, so that choice would have
+  quietly made the tag/prose distinction unrepresentable in one of the three formats.</li>
+
+  <li><strong>Dropout never empties a caption.</strong> An all-dropped caption is the empty
+  string, which is the <em>unconditional</em> embedding — the trainer already mints those
+  deliberately at <code>UNCOND_FRACTION</code>. Silently producing more would shift the
+  conditioning ratio with no config change to explain it. With two tags at rate 0.5 that is a
+  1-in-4 event, not a corner case. At least one tag always survives.</li>
+
+  <li><strong><code>multiline_captions</code> is opt-in.</strong> Turning it on changes how many
+  training samples every existing dataset with wrapped <code>.txt</code> files produces. That is
+  a silent retraining-scope change for models unrelated to this branch, so it defaults off and
+  needs <code>--regenerate_cache</code>, matching how <code>cache_shuffle_num</code> already
+  behaves.</li>
+
+  <li><strong>Distillation augments per sample; the diffusion stages cannot.</strong> The
+  diffusion stages bake <code>cache_shuffle_num</code> variants into the embedding cache, because
+  the embedding is computed once. Distillation re-embeds every step, so freezing a fixed variant
+  set there would be a pure loss. It reads its settings from the <code>dataset.toml</code>'s top
+  level when that is the source, so a run matches the diffusion stages without restating them —
+  top-level keys only, since a flat batch of captions has no directory to attach an override to.</li>
+
+  <li><strong>Case-insensitive marker matching, requested mid-implementation.</strong> A marker is
+  a hand-written annotation spread over millions of files; <code>"Special:"</code>,
+  <code>"special:"</code> and <code>"SPECIAL: "</code> have to mean the same thing. Only the first
+  <code>len(marker)</code> characters are casefolded — this runs per sample and captions are
+  long. The body is stripped afterwards, so <code>"SPECIAL:   a, b"</code> does not train as
+  <code>" a, b"</code> and tokenize differently from its neighbours for no reason.</li>
+</ul>
+
+<h3>A test failure that was worth listening to</h3>
+
+<p>Seven exporter tests failed with <code>ModuleNotFoundError: No module named 'comfy_aimdo'</code>.
+The tests run the script as a subprocess, which does not get <code>conftest.py</code>'s stub. The
+easy fix was to stub it in the subprocess too.</p>
+
+<p>The failure was pointing at something real: a tool that reads text files was importing torch,
+DeepSpeed and ComfyUI, because <code>enumerate_captions</code> happened to live in
+<code>utils/dataset.py</code>. Caption resolution needs nothing but the standard library. It moved
+to <code>utils/captions.py</code>, re-exported from <code>utils/dataset.py</code> so no existing
+caller changed. The tests went from 52s to 0.5s — that number <em>is</em> the import cost, paid on
+every invocation of the exporter, for nothing.</p>
+
+<div class="flag">
+<p><strong>Not verified.</strong> Still no training run, no multi-GPU run, no image. The corpus
+round-trip, the augmentation semantics and the exporter are covered by 56 CPU tests including
+newline/backslash/unicode round-trips through all three formats, but no corpus has been built
+from a real multi-million-image dataset, and the claim that reading a corpus is meaningfully
+faster than walking a dataset is reasoning about I/O, not a measurement.</p>
+</div>
+
 <h2>2026-08-30 — Anima Refiner: replacing Anima's LLMAdapter text frontend</h2>
 
 <p><strong>Request.</strong> Add an architecture that swaps Anima's <code>LLMAdapter</code> for the
