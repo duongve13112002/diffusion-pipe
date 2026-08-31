@@ -131,31 +131,6 @@ def read_caption_file(path: Path, multiline_captions: bool = False) -> list[str]
     return [line for line in (l.strip() for l in text.splitlines()) if line]
 
 
-def bucket_suffix(key):
-    if len(key) == 2:
-        # AR, frames
-        return f'{key[0]:.{ROUND_DECIMAL_DIGITS}f}_{key[1]}'
-    elif len(key) == 3:
-        # width, height, frames
-        return f'{key[0]}x{key[1]}x{key[2]}'
-    elif len(key) == 4:
-        # AR, width, height, frames
-        return f'{key[0]:.{ROUND_DECIMAL_DIGITS}f}x{key[1]}x{key[2]}x{key[3]}'
-    else:
-        raise RuntimeError(f'Unexpected bucket: {key}')
-
-
-def dedup_and_sort(values):
-    values = set(round(x, ROUND_DECIMAL_DIGITS) for x in values)
-    values = list(values)
-    values.sort()
-    return np.array(values)
-
-
-def seed_from_hash(item):
-    return int(hashlib.md5(str.encode(str(item))).hexdigest(), 16) % int(1e9)
-
-
 # Extensions DirectoryDataset skips when enumerating media files.
 NON_MEDIA_SUFFIXES = ('.txt', '.npz', '.json', '.parquet', '.bak', '.db')
 

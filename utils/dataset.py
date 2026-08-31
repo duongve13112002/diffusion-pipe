@@ -55,6 +55,31 @@ from utils.captions import (
 )
 
 
+def bucket_suffix(key):
+    if len(key) == 2:
+        # AR, frames
+        return f'{key[0]:.{ROUND_DECIMAL_DIGITS}f}_{key[1]}'
+    elif len(key) == 3:
+        # width, height, frames
+        return f'{key[0]}x{key[1]}x{key[2]}'
+    elif len(key) == 4:
+        # AR, width, height, frames
+        return f'{key[0]:.{ROUND_DECIMAL_DIGITS}f}x{key[1]}x{key[2]}x{key[3]}'
+    else:
+        raise RuntimeError(f'Unexpected bucket: {key}')
+
+
+def dedup_and_sort(values):
+    values = set(round(x, ROUND_DECIMAL_DIGITS) for x in values)
+    values = list(values)
+    values.sort()
+    return np.array(values)
+
+
+def seed_from_hash(item):
+    return int(hashlib.md5(str.encode(str(item))).hexdigest(), 16) % int(1e9)
+
+
 def _map_and_cache(dataset, map_fn, cache_dir, cache_file_prefix='', new_fingerprint_args=None, regenerate_cache=False, caching_batch_size=1):
     new_fingerprint_args = [] if new_fingerprint_args is None else new_fingerprint_args
     new_fingerprint_args.append(dataset._fingerprint)
