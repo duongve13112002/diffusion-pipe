@@ -6,7 +6,9 @@ Lumina 2 and Z-Image use.
 
 **New here?** [training.md](./training.md) is the step-by-step path from a stock Anima
 checkpoint to a sampled image. This file is the architecture and the config reference;
-[lessons.md](./lessons.md) is the rules the mistakes on this branch turned into.
+[design-notes.md](./design-notes.md) explains why the distillation stage is shaped the way it is
+and where its numbers came from; [lessons.md](./lessons.md) is the rules the mistakes on this
+branch turned into.
 
 ## Why
 
@@ -250,6 +252,24 @@ make the live Llama3 caption and the frozen CLIP/T5 embeddings describe differen
 The trap with `online_captions`: it re-reads the caption at access time, but for a model with
 cached embeddings that text is never used. Editing `captions.json` changes nothing until the
 cache is regenerated.
+
+## Reusing a VAE cache from before this branch
+
+Measured against a worktree at `ca42315`, building the same dataset under both versions:
+
+| Config | `ca42315` | this branch | Reused? |
+|---|---|---|---|
+| no caption augmentation | `8ece84e163add6d5` | `8ece84e163add6d5` | **yes, identical** |
+| `cache_shuffle_num = 4` | `3729f9e1…` then `f1bf7489…` | `88981148…` then `88981148…` | there was never a cache to reuse |
+
+The latent cache is keyed by the metadata dataset's fingerprint, and the captions are a column of
+that dataset. With no caption augmentation the captions are byte-identical to what `ca42315`
+produced, so the fingerprint matches and existing latents are picked up unchanged.
+
+With `cache_shuffle_num` the old code drew unseeded: the fingerprint differed **on every launch**,
+so the VAE cache was wiped and the whole dataset re-encoded every single run. Nothing is lost by
+the new value being different, because the old one was never stable enough to hit. It is stable
+now.
 
 ## Caching
 
