@@ -34,7 +34,6 @@ transformer_path = '/data/output/anima_refiner_refiner_crossattn/<run>/model.saf
 vae_path = '/data2/imagegen_models/comfyui-models/qwen_image_vae.safetensors'
 llm_path = '/data2/imagegen_models/Qwen3.5-2B-Base'
 dtype = 'bfloat16'
-transformer_dtype = 'float8_e5m2'  # e4m3fn does NOT work well on this model family
 
 llm_hidden_layer = -1
 # n_refiner_layers is omitted: transformer_path already carries a refiner, and its layer
