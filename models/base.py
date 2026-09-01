@@ -252,6 +252,15 @@ class CommonPipeline:
                 te = te.to('cpu')
             else:
                 model_management.unload_all_models()
+        if not hasattr(self, 'get_conds'):
+            # Only a couple of models implement it, and without it this line raises a bare
+            # AttributeError partway through setup -- after the text encoders have already been
+            # loaded and run. Say which flag is unsupported instead.
+            raise RuntimeError(
+                f'--test_sample is not supported for {type(self).__name__}: it needs a '
+                'get_conds() implementation, which this model does not provide. Sample with '
+                'the model in ComfyUI or another inference tool instead.'
+            )
         self.conds = tuple(tensor.cuda() for tensor in self.get_conds(inputs))
         if cfg > 1:
             self.unconds = tuple(tensor.cuda() for tensor in self.get_conds(inputs_uncond))

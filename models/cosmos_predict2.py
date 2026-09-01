@@ -455,11 +455,19 @@ class CosmosPredict2Pipeline(BasePipeline):
             # anima_refiner deliberately shares this name with anima. The name selects the whole
             # cache tree, latents included, and the two use the same VAE -- so a separate name
             # would throw away latents that are still perfectly valid, which is the expensive
-            # half to recompute. What actually differs between them is the text encoder, and
-            # that is handled precisely by text_encoder_cache_key() feeding the text embedding
-            # fingerprint. Note the consequence: pointing anima_refiner at a *different* VAE
-            # than the anima run that filled this cache would reuse the wrong latents, because
-            # latents are not fingerprinted by VAE. Pass --regenerate_cache when changing VAE.
+            # half to recompute.
+            #
+            # What differs is the text encoder, and text_encoder_cache_key() puts that in the
+            # text embedding fingerprint. That prevents one model from READING the other's
+            # embeddings -- it does not let both keep a copy: the two write to the same
+            # text_embeddings_N directory, so alternating between an anima run and an
+            # anima_refiner run on one dataset rebuilds that half each time. The latents, which
+            # are the expensive half, survive either way. Give the two runs separate dataset
+            # directories if you need both cached at once.
+            #
+            # The latents themselves are not fingerprinted by VAE, but vae_config_keys records
+            # which VAE produced them, so pointing this at a different VAE is now detected and
+            # rebuilt rather than silently reused.
             self.name = 'anima'
         else:
             raise RuntimeError('Missing text encoder path')

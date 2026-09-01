@@ -45,8 +45,10 @@ warmup_steps = 100
 # Block swapping only works for LoRA training, and requires pipeline_stages=1.
 #blocks_to_swap = 20
 
-# Use pseudo Huber loss with constant c. Only works on models that use the default loss function.
-#pseudo_huber_c = 0.5
+# Use Huber loss instead of MSE, with this delta. Only works on models that use the default loss
+# function. Named to match torch.nn.functional.huber_loss, which is what it is passed to.
+# (This replaced pseudo_huber_c, which nothing has read since the loss was aligned with PyTorch's.)
+#huber_delta = 0.5
 
 # eval settings
 
@@ -59,8 +61,11 @@ eval_before_first_step = true
 # Each size bucket of images/videos is rounded down to the nearest multiple of the global batch size, so higher global batch size means
 # more dropped images. Usually doesn't matter for training but the eval set is much smaller so it can matter.
 eval_micro_batch_size_per_gpu = 1
-# Batch size for images when doing mixed image / video training. Will be micro_batch_size_per_gpu if not set.
-#image_eval_micro_batch_size_per_gpu = 4
+# For mixed image / video training, eval_micro_batch_size_per_gpu also accepts a table keyed by
+# size bucket, which is how a different batch size for images is expressed now. A bare integer
+# applies to every bucket.
+# (This replaced image_eval_micro_batch_size_per_gpu, which nothing has read since.)
+#eval_micro_batch_size_per_gpu = { 512 = 4, 1024 = 1 }
 eval_gradient_accumulation_steps = 1
 # If using block swap, you can disable it for eval. Eval uses less memory, so depending on block swapping amount you can maybe get away with
 # doing this, and then eval is much faster.
