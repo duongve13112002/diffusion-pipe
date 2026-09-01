@@ -206,11 +206,18 @@ n_refiner_layers = 6
 # Pixel resolution the latent is sized from. Must be a multiple of 16: the VAE downsamples by
 # 8 and the DiT patches by 2. 256 gives a 32x32 latent, 256 tokens after patching.
 #resolution = 256
-# Classifier-free guidance during the rollout. 0 disables it and only the conditional branch
+# Classifier-free guidance during the rollout. Must be 0 (disabled) or above 1: between the two
+# the formula weights the UNconditional branch more heavily. 0 disables it and only the
+# conditional branch
 # is evaluated. Above 0 also evaluates the unconditional branch on both sides, which doubles
 # the DiT forwards but covers the branch every CFG sample actually uses -- and that branch is
 # fed by an empty caption, so it is worth covering. The paper samples 2-5.
 #guidance_scale = 0.0
+# Warps the trajectory's timesteps the way training and sampling warp them
+# (t <- t*shift / (1 + (shift-1)*t)). Should match [model] shift in the config you will train
+# with; 1.0 walks a uniform schedule. flux_shift is not supported here -- it derives its warp
+# from the image resolution, and the rollout's latent size is a config value, not a real image.
+#shift = 1.0
 
 [probe]
 # Fixed random queries pushed through the DiT's frozen cross-attention. The loss is measured

@@ -980,7 +980,7 @@ class TestDenoisingRollout:
         # t = 1 is pure noise and t = 0 is clean, which is the rectified-flow convention this
         # DiT was trained with -- not DDPM's, where the paper's Eq. 3 lives.
         _, visited = self._trajectory(self._dit(), steps=4)
-        schedule = [round(float(t[0, 0]), 4) for _, t in visited]
+        schedule = [round(float(t[0, 0]), 4) for _, t, _ in visited]
         assert schedule == [1.0, 0.75, 0.5, 0.25], schedule
 
     def test_the_trajectory_carries_no_gradient(self):
@@ -988,7 +988,7 @@ class TestDenoisingRollout:
         # the cost of `steps` stops being inference-only and the two knobs stop being
         # independent.
         _, visited = self._trajectory(self._dit(), steps=4)
-        assert not any(x.requires_grad for x, _ in visited)
+        assert not any(x.requires_grad for x, _, _ in visited)
 
     def test_identical_features_cost_nothing(self):
         from tools.distill_refiner import rollout_loss
@@ -1029,8 +1029,38 @@ class TestDenoisingRollout:
         dit.forward = counting
         rollout_loss(dit, visited, teacher, student, None, None, 0.0, 3, random.Random(0))
         dit.forward = original
-        # Three points, teacher and student at each.
-        assert len(calls) == 6, len(calls)
+        # Three points, STUDENT only. The teacher's velocity at each point was already computed
+        # while walking the trajectory and is carried in the triple, so recomputing it here
+        # would be a full redundant DiT forward per point.
+        assert len(calls) == 3, len(calls)
+
+    def test_the_teacher_velocity_is_reused_not_recomputed(self):
+        # The regression guard for that: the target must be the value teacher_trajectory
+        # produced, bit for bit, not a fresh forward that merely agrees with it.
+        from tools.distill_refiner import rollout_loss
+        import random
+        dit = self._dit()
+        teacher, visited = self._trajectory(dit, steps=4)
+        student = torch.randn_like(teacher)
+
+        captured = []
+        original = F.mse_loss
+
+        def capturing(prediction, target, **kwargs):
+            captured.append(target)
+            return original(prediction, target, **kwargs)
+
+        F.mse_loss = capturing
+        try:
+            rollout_loss(dit, visited, teacher, student, None, None, 0.0, 2, random.Random(0))
+        finally:
+            F.mse_loss = original
+
+        cached = {id(v) for _, _, v in visited}
+        assert captured, 'no loss term was computed'
+        assert all(id(t) in cached for t in captured), (
+            'the target must BE the trajectory velocity object, not an equal-valued recompute'
+        )
 
     def test_more_points_than_the_trajectory_has_is_not_an_error(self):
         from tools.distill_refiner import rollout_loss
@@ -1073,7 +1103,20 @@ class TestDenoisingRollout:
         rollout_loss(dit, visited, teacher, student, torch.randn_like(teacher),
                      torch.randn_like(teacher), 0.0, 2, random.Random(0))
         dit.forward = original
-        assert len(calls) == 4, f'expected 2 points x 2 models, got {len(calls)}'
+        assert len(calls) == 2, f'expected 2 points, student only, got {len(calls)}'
+
+    def test_guiding_one_side_only_is_refused(self):
+        # _velocity drops guidance when its uncond argument is None, so a caller that supplies
+        # one side and not the other would get a silently biased comparison: the teacher guided,
+        # the student not.
+        from tools.distill_refiner import rollout_loss
+        import random
+        dit = self._dit()
+        teacher, visited = self._trajectory(dit, steps=2)
+        student = torch.randn_like(teacher)
+        with pytest.raises(RuntimeError, match='both sides or neither'):
+            rollout_loss(dit, visited, teacher, student, torch.randn_like(teacher), None,
+                         3.0, 1, random.Random(0))
 
 
 class TestRolloutIsOffByDefault:
@@ -1092,3 +1135,253 @@ class TestRolloutIsOffByDefault:
         body = source[source.index('def build_teacher'):source.index('def build_student')]
         assert "rollout_config.get('loss_weight', 0.0) > 0" in body
         assert 'dit.blocks = None' in body, 'the off path must still throw the DiT away'
+
+
+class TestEveryShippedDistillKeyIsRead:
+    """A key in the wrong table is invisible, and a matching default hides it completely.
+
+    relational_loss_weight shipped inside [student] while the code reads it from
+    config['distill']. It was therefore ignored, and only the fact that its default was also 1.0
+    kept behaviour correct -- anyone who changed it would have seen no effect at all. Checking
+    that a key merely appears somewhere in the source would not have caught that. This checks
+    the TABLE each key is read from.
+    """
+
+    CONFIGS = ('distill.toml', 'distill_rollout.toml')
+    # [optimizer] is forwarded wholesale to the optimizer constructor, so its keys are named by
+    # the optimizer rather than by this script.
+    SKIP_TABLES = {'optimizer'}
+
+    @staticmethod
+    def _reads_by_table():
+        """Extract which (table, key) pairs tools/distill_refiner.py actually reads.
+
+        Recognises the four shapes the script uses:
+            config['distill'].get('steps', ...)
+            config['teacher']['llm_path']
+            config.get('probe', {}).get('num_queries', ...)
+            rollout_config.get('steps', ...)      # via `rollout_config = config.get('rollout', {})`
+        """
+        import ast as ast_module
+        source = (REPO / 'tools/distill_refiner.py').read_text(encoding='utf-8')
+        tree = ast_module.parse(source)
+
+        def table_of(node):
+            """The config table `node` evaluates to, if it plainly is one."""
+            # config['distill']
+            if (isinstance(node, ast_module.Subscript)
+                    and isinstance(node.value, ast_module.Name) and node.value.id == 'config'
+                    and isinstance(node.slice, ast_module.Constant)):
+                return node.slice.value
+            # config.get('probe', {})
+            if (isinstance(node, ast_module.Call)
+                    and isinstance(node.func, ast_module.Attribute) and node.func.attr == 'get'
+                    and isinstance(node.func.value, ast_module.Name)
+                    and node.func.value.id == 'config'
+                    and node.args and isinstance(node.args[0], ast_module.Constant)):
+                return node.args[0].value
+            return None
+
+        # Names bound to a config table, e.g. rollout_config = config.get('rollout', {}).
+        aliases = {}
+        for node in ast_module.walk(tree):
+            if isinstance(node, ast_module.Assign) and len(node.targets) == 1:
+                target = node.targets[0]
+                table = table_of(node.value)
+                if table is not None and isinstance(target, ast_module.Name):
+                    aliases[target.id] = table
+
+        reads = {}
+        for node in ast_module.walk(tree):
+            table = key = None
+            # <table>.get('key', ...)
+            if (isinstance(node, ast_module.Call)
+                    and isinstance(node.func, ast_module.Attribute) and node.func.attr == 'get'
+                    and node.args and isinstance(node.args[0], ast_module.Constant)):
+                key = node.args[0].value
+                base = node.func.value
+                table = table_of(base)
+                if table is None and isinstance(base, ast_module.Name):
+                    table = aliases.get(base.id)
+            # config['teacher']['llm_path'], and distill_config['dataset'] where
+            # distill_config was bound to config['distill'] earlier.
+            elif isinstance(node, ast_module.Subscript) and isinstance(node.slice, ast_module.Constant):
+                table = table_of(node.value)
+                if table is None and isinstance(node.value, ast_module.Name):
+                    table = aliases.get(node.value.id)
+                key = node.slice.value
+            if table and isinstance(key, str):
+                reads.setdefault(table, set()).add(key)
+        return reads
+
+    def test_the_extractor_finds_the_known_reads(self):
+        # If this ever comes back empty the test below would pass vacuously.
+        reads = self._reads_by_table()
+        assert 'steps' in reads.get('distill', set())
+        assert 'llm_path' in reads.get('teacher', set())
+        assert 'num_blocks' in reads.get('probe', set())
+        assert 'loss_weight' in reads.get('rollout', set()), (
+            'the alias tracking for rollout_config = config.get("rollout", {}) broke'
+        )
+        assert 'dataset' in reads.get('distill', set()), (
+            'the alias tracking for distill_config = config["distill"] broke'
+        )
+
+    @pytest.mark.parametrize('filename', CONFIGS)
+    def test_every_key_is_read_from_the_table_it_sits_in(self, filename):
+        import toml
+        config = toml.load(REPO / 'examples/anima_refiner' / filename)
+        reads = self._reads_by_table()
+
+        unread = []
+        for table, values in config.items():
+            if table in self.SKIP_TABLES or not isinstance(values, dict):
+                continue
+            for key in values:
+                if key not in reads.get(table, set()):
+                    unread.append(f'[{table}] {key}')
+        assert not unread, (
+            f'{filename} sets keys that tools/distill_refiner.py never reads from that table: '
+            f'{unread}. Either the key is in the wrong table, or it does nothing.'
+        )
+
+
+class _AttrDict(dict):
+    """Stands in for BatchEncoding, which supports both d['k'] and d.k."""
+
+    def __getattr__(self, name):
+        try:
+            return self[name]
+        except KeyError as exc:
+            raise AttributeError(name) from exc
+
+
+class TestUnconditionalSetup:
+    """The guidance branch was the least-tested surface in the feature.
+
+    Nothing exercised the empty-caption tokenization through both frontends, the asymmetry
+    between them, or that the frozen LLM's hidden state is produced once. Extracting
+    build_unconditional_features from main() is what made any of it reachable.
+    """
+
+    class _Tok:
+        """A tokenizer whose '' is an all-padding row, like Qwen's."""
+
+        def __init__(self, real_tokens=0):
+            self.real_tokens = real_tokens
+
+        def __call__(self, prompts, **kwargs):
+            length = kwargs['max_length']
+            mask = torch.zeros(len(prompts), length, dtype=torch.long)
+            for i, prompt in enumerate(prompts):
+                n = self.real_tokens if prompt == '' else 3
+                mask[i, :n] = 1
+            out = {'input_ids': torch.zeros(len(prompts), length, dtype=torch.long),
+                   'attention_mask': mask}
+            return _AttrDict(out)
+
+    @staticmethod
+    def _build(monkeypatch, teacher_real_tokens=1):
+        import tools.distill_refiner as module
+
+        # encode() would run a real LLM; the identity of the hidden state is not what is under
+        # test here, only that it is produced once and carries the right mask.
+        monkeypatch.setattr(module, 'encode',
+                            lambda llm, ids, mask, layer: torch.ones(ids.shape[0], ids.shape[1], 4))
+
+        def adapter(source_hidden_states, target_input_ids, target_attention_mask,
+                    source_attention_mask):
+            return torch.ones(target_input_ids.shape[0], target_input_ids.shape[1], 5)
+
+        return module.build_unconditional_features(
+            teacher_tok=TestUnconditionalSetup._Tok(real_tokens=0),
+            t5_tokenizer=TestUnconditionalSetup._Tok(real_tokens=teacher_real_tokens),
+            teacher_llm=None, llm_adapter=adapter,
+            student_tok=TestUnconditionalSetup._Tok(real_tokens=0),
+            student_llm=None, max_text_length=8, device=torch.device('cpu'),
+            llm_hidden_layer=None,
+        )
+
+    def test_the_student_gets_one_real_token_for_an_empty_caption(self, monkeypatch):
+        # Without this the refiner emits zeros and the frozen DiT sees a context its original
+        # T5 training never produced -- and the sample delivers no gradient at all.
+        _, _, student_mask, _ = self._build(monkeypatch)
+        assert student_mask.sum().item() == 1
+        assert student_mask[0, 0].item() == 1
+
+    def test_the_teacher_is_deliberately_not_given_one(self, monkeypatch):
+        # The teacher's query sequence is old T5's, which already yields </s> for ''. Adding a
+        # token there would change what the LLMAdapter path has always produced.
+        teacher_uncond, _, _, _ = self._build(monkeypatch, teacher_real_tokens=1)
+        # The adapter output is masked by the T5 mask; one real T5 token means one live row.
+        live = (teacher_uncond.abs().sum(dim=-1) > 0).sum().item()
+        assert live == 1, f'expected the T5 </s> row only, got {live}'
+
+    def test_padded_positions_of_the_teacher_feature_are_zeroed(self, monkeypatch):
+        teacher_uncond, _, _, _ = self._build(monkeypatch, teacher_real_tokens=2)
+        assert torch.equal(teacher_uncond[0, 2:], torch.zeros_like(teacher_uncond[0, 2:]))
+
+    def test_everything_comes_back_with_batch_one(self, monkeypatch):
+        # The caller expands to the real batch; returning anything else would silently broadcast.
+        teacher_uncond, ids, mask, hidden = self._build(monkeypatch)
+        assert teacher_uncond.shape[0] == 1
+        assert ids.shape[0] == 1 and mask.shape[0] == 1 and hidden.shape[0] == 1
+
+    def test_the_student_hidden_state_is_produced_once(self, monkeypatch):
+        import tools.distill_refiner as module
+        calls = []
+        monkeypatch.setattr(module, 'encode', lambda llm, ids, mask, layer: (
+            calls.append(1), torch.ones(ids.shape[0], ids.shape[1], 4))[1])
+        module.build_unconditional_features(
+            teacher_tok=self._Tok(0), t5_tokenizer=self._Tok(1), teacher_llm=None,
+            llm_adapter=lambda **kw: torch.ones(1, 8, 5),
+            student_tok=self._Tok(0), student_llm=None, max_text_length=8,
+            device=torch.device('cpu'), llm_hidden_layer=None,
+        )
+        # Once for the teacher LLM, once for the student LLM. Not once per micro-batch.
+        assert len(calls) == 2, len(calls)
+
+    def test_it_runs_under_no_grad(self, monkeypatch):
+        # A frozen constant must not drag an autograd graph into every step.
+        _, _, _, hidden = self._build(monkeypatch)
+        assert not hidden.requires_grad
+
+
+class TestShiftedSchedule:
+    """The trajectory has to be warped the way training and sampling warp t, or the x_t it
+    visits are not where the model is actually asked to predict."""
+
+    def test_shift_one_leaves_it_uniform(self):
+        from tools.distill_refiner import shifted_schedule
+        schedule = shifted_schedule(4, 1.0, torch.device('cpu'))
+        assert torch.allclose(schedule, torch.tensor([1.0, 0.75, 0.5, 0.25, 0.0]))
+
+    def test_the_endpoints_are_fixed(self):
+        # t=1 must stay pure noise and t=0 must stay clean for any shift.
+        from tools.distill_refiner import shifted_schedule
+        for shift in (0.5, 1.0, 3.0, 7.0):
+            schedule = shifted_schedule(6, shift, torch.device('cpu'))
+            assert abs(float(schedule[0]) - 1.0) < 1e-6, shift
+            assert abs(float(schedule[-1])) < 1e-6, shift
+
+    def test_it_stays_monotonically_decreasing(self):
+        from tools.distill_refiner import shifted_schedule
+        for shift in (0.5, 1.0, 3.0, 7.0):
+            schedule = shifted_schedule(8, shift, torch.device('cpu'))
+            assert all(a > b for a, b in zip(schedule, schedule[1:])), shift
+
+    def test_a_shift_above_one_concentrates_steps_at_the_noisy_end(self):
+        # Which is the whole point: it matches prepare_inputs' t*shift / (1 + (shift-1)*t).
+        from tools.distill_refiner import shifted_schedule
+        uniform = shifted_schedule(8, 1.0, torch.device('cpu'))
+        shifted = shifted_schedule(8, 3.0, torch.device('cpu'))
+        assert float(shifted[4]) > float(uniform[4])
+
+    def test_it_matches_the_training_transform(self):
+        # The same formula prepare_inputs applies (models/cosmos_predict2.py).
+        from tools.distill_refiner import shifted_schedule
+        shift = 3.0
+        schedule = shifted_schedule(5, shift, torch.device('cpu'))
+        uniform = torch.linspace(1.0, 0.0, 6)
+        expected = (uniform * shift) / (1 + (shift - 1) * uniform)
+        assert torch.allclose(schedule, expected, atol=1e-6)

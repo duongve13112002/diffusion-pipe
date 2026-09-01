@@ -83,7 +83,10 @@ loss_points = 2
 # a realistic sequence length at a fraction of the cost of 512.
 resolution = 256
 
-# Classifier-free guidance during the rollout. 0 evaluates only the conditional branch, which is
+# Classifier-free guidance during the rollout. Must be 0 (disabled) or above 1 -- between the
+# two the formula weights the UNconditional branch more heavily, which is not what the setting
+# is for, and at exactly 1 the extra forward has no effect. 0 evaluates only the conditional
+# branch, which is
 # what this file ships with because it halves the DiT forwards.
 #
 # Set it to 3.0 if you specifically care about CFG sampling quality: above 0 the unconditional
@@ -91,3 +94,8 @@ resolution = 256
 # caption feeds -- the single input where the refiner path diverges most from the T5-native DiT
 # it has to satisfy. It doubles the rollout's cost.
 guidance_scale = 0.0
+# Warps the trajectory's timesteps the way training and sampling warp them
+# (t <- t*shift / (1 + (shift-1)*t)). Should match [model] shift in the config you will train
+# with; 1.0 walks a uniform schedule. flux_shift is not supported here -- it derives its warp
+# from the image resolution, and the rollout's latent size is a config value, not a real image.
+shift = 1.0

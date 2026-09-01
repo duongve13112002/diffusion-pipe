@@ -98,7 +98,8 @@ renamed, removed, or given a new meaning.
 | `steps` | `8` | Points along the trajectory. Cheap — the walk is `no_grad`. |
 | `loss_points` | `2` | How many of them the loss is measured at. The expensive knob. |
 | `resolution` | `256` | Pixel resolution the latent is sized from. Must be a multiple of 16. |
-| `guidance_scale` | `0.0` | Classifier-free guidance during the rollout. 0 evaluates only the conditional branch. |
+| `guidance_scale` | `0.0` | Classifier-free guidance during the rollout. 0 disables it; otherwise it must be greater than 1. |
+| `shift` | `1.0` | Warps the trajectory's timesteps the way training and sampling warp them. Should match `[model] shift`. |
 
 ```toml
 [rollout]
@@ -132,11 +133,21 @@ validated at startup rather than failing inside the first forward.
 
 ### `guidance_scale`
 
-Above 0, the unconditional branch is evaluated on both sides, doubling the DiT forwards. It is
+Above 1, the unconditional branch is evaluated on both sides, doubling the DiT forwards. It is
 worth the cost when you care about CFG sampling specifically: the unconditional branch is fed by
 an empty caption, and an empty caption is the one input where the refiner path diverges most
-from the T5-native DiT it feeds. The student's unconditional features are recomputed with
-gradient every step, because they depend on the refiner too.
+from the T5-native DiT it feeds.
+
+**0 is a disable switch, not a scale.** The guidance formula is
+`v = (1-g)·v_uncond + g·v_cond`, guarded by `if guidance_scale > 0`, so the value is
+discontinuous at the bottom: 0 short-circuits to the pure conditional prediction, while 0.001
+would be very nearly the pure *unconditional* one, and 1.0 is the conditional prediction again
+while paying a second DiT forward that contributes exactly zero gradient. Values between 0 and 1
+are refused at startup for that reason. Use 0, or something above 1.
+
+The student's unconditional features are recomputed with gradient every step, because they
+depend on the refiner. The frozen LLM's hidden state for the empty caption is *not* — it is a
+constant, computed once at setup.
 
 The paper samples guidance between 2 and 5. A fixed value is used here; sweeping it is not
 implemented.
@@ -149,6 +160,17 @@ stage from about 6 GB to **10–12 GB**, plus activations for the forwards.
 
 That is the entire reason it is opt-in. The ~6 GB figure is what makes this stage runnable on
 modest hardware, and it should not quietly stop being true.
+
+**Activations scale with `loss_points`, and that is what will OOM you.** The losses at each
+chosen point are summed and backward runs once, so every student forward's graph stays alive
+until then: `loss_points` full-DiT backward graphs at once, doubled again when guidance is on.
+The resident-weights figure above is a floor, not the peak. Raise `loss_points` one step at a
+time.
+
+Two things are deliberately *not* recomputed, because they cannot change: the teacher's velocity
+at each visited point is carried out of the trajectory rather than evaluated a second time in
+the loss, and the frozen LLM's hidden state for the unconditional caption is computed once at
+setup rather than per micro-batch.
 
 ## Single-GPU and multi-GPU
 
@@ -177,3 +199,13 @@ the refiner file and `distill_state.pt` are unaffected either way.
 - **`steps` interacts with nothing else.** Longer trajectories reach lower `t` (cleaner
   latents); with `steps = 8` the lowest point visited is `t = 0.125`, so the model is never
   compared very close to `t = 0`. Raise `steps` if the late trajectory matters for your use.
+- **`flux_shift` is not supported**, only `shift`. `flux_shift` derives its warp from the image
+  resolution, and the rollout's latent size is a config value rather than a real image. Set
+  `[rollout] shift` to match `[model] shift`; leaving it at 1.0 walks a uniform schedule, which
+  is a coarser stand-in for the sampler's real path but does not bias the loss — teacher and
+  student see the same `t` either way.
+- **The rollout term's magnitude relative to the other terms is unmeasured.** The probe loss is
+  an MSE over cross-attention outputs; the rollout loss is an MSE over velocities, whose
+  variance is roughly 2. `loss_weight = 1.0` is a starting point, not a calibrated value. Only
+  the summed loss is logged, so if the rollout dominates you will not see it directly — watch
+  whether `spread` and the probe behaviour still move.

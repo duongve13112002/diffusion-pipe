@@ -33,6 +33,140 @@
 <p class="meta">A running log of decisions taken outside the spec, forced changes, tradeoffs, and
 anything else the maintainer needs to know. Newest entry first.</p>
 
+<h2>2026-09-01 &mdash; Denoising rollout, and cache reuse that depends on compatibility</h2>
+
+<p><strong>Request.</strong> Two things, both settled by design review before any code was
+written: make cache reuse depend on whether the cache is actually compatible rather than on a
+flag, and add the denoising rollout objective from the CVPR 2025 text-encoder distillation paper
+as an optional distillation mode.</p>
+
+<p><strong>The research changed the design.</strong> "Rollout" usually implies a student rolling
+out its own predictions, which brings exposure bias and error accumulation with it. Algorithm 1
+of <em>Scaling Down Text Encoders of Text-to-Image Diffusion Models</em> does not do that. The
+trajectory is advanced by the <strong>teacher</strong>, both models are evaluated at the
+<strong>same</strong> x_t, and the student never sees its own output as input. None of the
+exposure-bias literature applies, and the whole walk can therefore run under
+<code>no_grad</code> &mdash; which is what makes <code>steps</code> an inference cost and
+<code>loss_points</code> a backward cost, independent of each other.</p>
+
+<p><strong>One adaptation was required, and it is the part most likely to be wrong.</strong> The
+paper is written for DDPM; Anima is rectified flow. Its DiT predicts a velocity and its training
+target is <code>noise - x0</code> with <code>x_t = (1-t)*x0 + t*noise</code>, so
+<code>dx/dt = v</code> exactly and the DDPM posterior update does not carry over. Verified
+numerically rather than reasoned about: with an exact velocity the Euler step
+<code>x &larr; x - (t - t')*v</code> lands on the true x_t' to 2.4e-07, a full walk from t=1
+lands on x0 to 4.2e-07, and the opposite sign is off by 1.61.</p>
+
+<p><strong>Why a rollout rather than random noisy latents.</strong> This stage has no images, so
+there is no x0 and no way to build <code>x_t = (1-t)*x0 + t*noise</code> the way training
+normally would. The trajectory is the only source of x_t that lie where the model will actually
+be asked to predict. That, rather than fidelity to the paper, is the justification.</p>
+
+<p><strong>Decision: off by default, and off means off.</strong> Enabling it keeps the DiT
+resident &mdash; roughly 3.5-4 GB in bf16 for Anima, taking this stage from about 6 GB to 10-12
+GB. The ~6 GB figure is what makes distillation runnable on modest hardware, so at
+<code>loss_weight = 0</code> <code>build_teacher</code> still throws the DiT away and nothing is
+allocated. A test asserts that discard path is still there.</p>
+
+<p><strong>Measured before choosing a default.</strong> Forward plus backward on a reduced-scale
+replica at 1 / 2 / 4 / 8 loss points: 26 / 49 / 97 / 197 ms, linear as expected, with the 8-step
+trajectory a fixed 78 ms &mdash; about three loss points' worth. Adjacent trajectory points give
+correlated signal, which is the same argument <code>[probe] num_blocks</code> rests on, so the
+default is 2.</p>
+
+<p><strong>Classifier-free guidance is configurable rather than assumed.</strong> Above 0 it
+evaluates the unconditional branch on both sides, doubling the DiT forwards. It is worth having
+because that branch is fed by an empty caption, which is exactly where the refiner path diverges
+most from the T5-native DiT &mdash; the same divergence an earlier commit fixed in
+<code>_tokenize</code>. The student's unconditional features are recomputed with gradient every
+step, because they depend on the refiner too.</p>
+
+<p><strong>Cache compatibility: recorded, not fingerprinted.</strong>
+<code>keep_latent_cache</code> had shipped as a hard override that reused the cache whenever the
+fingerprint moved, with no idea whether the contents still belonged to this model. It now means
+"do not recache unnecessarily", and an incompatible cache is rebuilt regardless &mdash; reusing
+latents produced by a different VAE is training on silently wrong data, and no flag should ask
+for that.</p>
+
+<p>Compatibility lives in a <code>cache_manifest.json</code> beside each cache rather than in the
+fingerprint. Folding it into the fingerprint would be simpler and would rebuild every existing
+cache once; recording it costs existing installs nothing, because a cache with no manifest
+predates the check and is treated as compatible.</p>
+
+<div class="flag">
+  <p><strong>There is no config key that names the VAE across models.</strong> It is
+  <code>vae_path</code> for seven of them, <code>diffusers_path</code> for seven,
+  <code>ckpt_path</code> for two, <code>checkpoint_path</code> for one, and <code>vae</code> /
+  <code>audio_vae</code> elsewhere. A generic "any key naming a file" rule is wrong in the other
+  direction: <code>transformer_path</code> names a file that affects neither latents nor text
+  embeddings, so including it would rebuild the cache on every DiT change &mdash; exactly what
+  <code>anima</code> and <code>anima_refiner</code> sharing a cache tree exists to avoid. So
+  identity is declared per model through <code>vae_config_keys</code>, empty by default, filled
+  in for 15 models. Empty means no identity is recorded and every existing cache stays valid.</p>
+</div>
+
+<p><strong><code>keep_text_embedding_cache</code> did not exist before this.</strong> An earlier
+commit had grown a <code>keep_on_fingerprint_change</code> parameter on
+<code>_cache_text_embeddings</code> with no config key wired to it &mdash; a dead argument.
+Relatedly, <code>text_encoder_cache_key</code> was implemented by exactly one model out of 23
+and every other model fell through a lambda returning <code>''</code>. It is now a real method
+on <code>BasePipeline</code> with that same empty default, so the behaviour is consistent by
+construction rather than by accident.</p>
+
+<p><strong>Two independent QA passes, and what they found.</strong> An Opus reviewer for deep
+algorithmic and distributed correctness, a Sonnet reviewer for config, docs and edge cases, both
+read-only and independent of the implementation. The headline is what Opus did <em>not</em>
+find: nothing that makes training silently produce a wrong result. The Euler step and its sign,
+the t range, dtype handling, teacher/student symmetry, gradient isolation, the empty-caption
+convention and DDP behaviour all checked out, several verified by execution rather than reading.</p>
+
+<p>What they did find was cost and memory, and all of it is fixed. The teacher's velocity at each
+trajectory point was recomputed in the loss after being discarded by the walk that produced it
+&mdash; two redundant full-DiT forwards per micro-batch at the shipped settings, four with
+guidance. The frozen student LLM was re-run every micro-batch to produce an unconditional hidden
+state that is a constant. <code>del state_dict</code> ran after the device transfer, so the
+checkpoint and the CPU-side DiT were both resident at once, roughly 8 GB of host RAM.
+<code>MiniTrainDIT</code> assigns <code>crossattn_emb</code> onto itself every forward, harmless
+while the DiT was discarded and now pinning the last student feature tensor and its autograd
+graph across step boundaries.</p>
+
+<p><strong>Two API problems worth naming.</strong> <code>guidance_scale</code> was discontinuous
+at the bottom: the formula is <code>(1-g)*v_uncond + g*v_cond</code> guarded by
+<code>if g &gt; 0</code>, so 0 short-circuits to the pure conditional prediction while 0.001 is
+nearly the pure unconditional one &mdash; the opposite &mdash; and 1.0 pays a second forward that
+contributes exactly zero gradient. Values between 0 and 1 are now refused with that explanation.
+And a second call into a DeepSpeed engine within one backward builds a second hook manager and
+fires <code>_backward_prologue</code> twice, leaking <code>_backward_active_depth</code> every
+micro-batch; the unconditional forward now goes through the raw refiner rather than the engine.</p>
+
+<div class="flag">
+  <p><strong>The process finding is the one worth keeping.</strong> Nothing tested whether a key
+  in a shipped config is actually read <em>from the table it sits in</em> &mdash; which is
+  exactly the bug found by hand an hour earlier, where <code>relational_loss_weight</code> sat in
+  <code>[student]</code> while the code read it from <code>config['distill']</code>: ignored, and
+  masked by a matching default. There is now a test that extracts every
+  <code>(table, key)</code> the script reads via AST, including through aliases like
+  <code>rollout_config = config.get('rollout', {})</code>, and compares that against every
+  shipped distill config. Putting the key back in <code>[student]</code> makes it fail with the
+  exact diagnosis, which was checked rather than assumed.</p>
+</div>
+
+<ul>
+  <li><strong>Tests.</strong> 387 passed, 1 skipped. The rollout arrived at 371; the QA round
+    added 16 more.</li>
+  <li><strong>Verified by execution, not assertion.</strong> The DDPM-to-rectified-flow
+    adaptation &mdash; with an exact velocity the Euler step lands on the true x_t' to 2.4e-07
+    and a full walk returns x0 to 4.2e-07, while the opposite sign is off by 1.61; all four
+    precision modes; and a real two-rank gloo run confirming the DiT sits outside the DDP module,
+    holds no gradient, that each rank walks a different trajectory, and that the refiner's
+    gradients all-reduce to identical values. That last one lives in
+    <code>tools/test_rollout_multirank.py</code>.</li>
+  <li><strong>Still not verified.</strong> No GPU run, no full-size run, no image. The
+    ~3.5-4 GB resident-DiT figure is derived from the model's shape, not measured. The rollout
+    term's magnitude relative to the probe term is uncalibrated &mdash; each term is now logged
+    separately so that becomes visible rather than buried in the sum.</li>
+</ul>
+
 <h2>2026-09-01 &mdash; Three-agent audit: a silent ZeRO bug, a fifth path bug, and one fix that was wrong</h2>
 
 <p><strong>Request.</strong> A full architecture / QA / adversarial audit of the branch from
