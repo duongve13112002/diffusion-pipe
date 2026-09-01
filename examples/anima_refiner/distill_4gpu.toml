@@ -9,7 +9,26 @@
 # Fill in the four paths below and it runs. Everything else is set to what you asked for.
 
 [distill]
-dataset = 'examples/dataset.toml'
+# The caption source. A corpus from tools/export_caption_corpus.py, not a dataset.toml: this
+# phase never touches images, so a flat caption file is both the honest input and much faster to
+# resolve than walking the dataset tree. The format is inferred from the .jsonl extension;
+# caption_corpus_format states it anyway so a renamed file cannot change how it is read.
+caption_corpus = '/data/anime_dataset/captions.jsonl'
+caption_corpus_format = 'jsonl'
+
+# Caption augmentation. A dataset.toml would supply these and distillation would inherit them;
+# a corpus carries no dataset config, so anything not restated here silently defaults to OFF --
+# and training the refiner on a distribution the diffusion stages never see is the failure that
+# would cause. Restate them to match the dataset the corpus came from.
+#
+# prefix_tag_caption is the marker separating a caption's prefix from its tags. It must match
+# the dataset, because the marker is stripped before augmentation and re-applied after: without
+# it the marker itself gets trained as though it were a tag. export_caption_corpus.py prints the
+# exact line to paste here.
+prefix_tag_caption = 'Special: '
+shuffle_tags = true
+cache_shuffle_delimiter = ', '
+tag_dropout_rate = 0.1
 output_dir = '/data/output/anima_refiner_distill'
 
 # 20 passes over the caption set. One epoch is one pass over EVERY caption, sharded across the
@@ -31,6 +50,21 @@ precision = 'bf16-full'
 dtype = 'bfloat16'
 
 max_grad_norm = 1.0
+
+# Warmup, in optimizer steps. Read the arithmetic before keeping 500: an epoch-driven run's
+# length follows the CORPUS SIZE, and the global batch here is large (48 x 8 x 4 = 1536), so an
+# epoch is len(captions) / 1536 steps and the whole run is twenty times that.
+#
+#   captions    steps/epoch    20 epochs    500 warmup is
+#     50,000         32           640          78% of the run
+#    100,000         65         1,300          38%
+#    500,000        325         6,500           8%
+#  1,000,000        651        13,020           4%
+#
+# 500 was chosen against the 20,000-step default run in distill.toml, where it is 2.5%. About 5%
+# of the run is the usual choice. The script prints a warning at startup naming the number it
+# would suggest for your corpus, so run it once and read the first few lines before leaving it
+# overnight.
 warmup_steps = 500
 max_text_length = 512
 seed = 42

@@ -231,6 +231,31 @@ def resolve_schedule(epochs, steps, captions, batch_size, grad_accum, rank, worl
     return sampler, steps, description
 
 
+def warmup_advice(warmup_steps, steps):
+    """What to say about a warmup that is too long for the run, or None if it is fine.
+
+    A separate function so it can be tested, and because it is about the same trap
+    resolve_schedule exists for: with `epochs` the step count is derived from the corpus size
+    rather than written down, so the default 500 -- chosen against a 20,000-step run, where it is
+    2.5% -- silently becomes a third of the schedule on a smaller corpus.
+    """
+    if warmup_steps >= steps:
+        return (
+            f'WARNING: warmup_steps ({warmup_steps}) is not shorter than the run ({steps} '
+            'steps). SequentialLR never reaches its milestone, so the learning rate ramps for '
+            'the whole run and the decay phase never starts. Lower warmup_steps, or raise '
+            'epochs/steps.'
+        )
+    if warmup_steps > steps // 4:
+        return (
+            f'WARNING: warmup_steps ({warmup_steps}) is {100 * warmup_steps / steps:.0f}% of '
+            f'this {steps}-step run. The default of 500 assumes a 20,000-step run; with '
+            '`epochs` the step count follows the corpus size. Roughly 5% is the usual choice, '
+            f'so about {max(1, steps // 20)} here.'
+        )
+    return None
+
+
 def caption_augment_config(config):
     """Resolve the caption augmentation applied to each sampled batch.
 
@@ -1308,13 +1333,9 @@ def main():
     # With `epochs`, the step count is derived rather than written down, so a warmup longer than
     # the whole run is easy to arrive at without noticing. SequentialLR never reaches its
     # milestone in that case: the LR ramps for the entire run and the decay phase never starts.
-    warmup_steps = config['distill'].get('warmup_steps', 500)
-    if warmup_steps >= steps and is_main:
-        print(
-            f'WARNING: warmup_steps ({warmup_steps}) is not shorter than the run ({steps} '
-            'steps). The learning rate will ramp for the whole run and never decay. Lower '
-            'warmup_steps, or raise epochs/steps.'
-        )
+    advice = warmup_advice(config['distill'].get('warmup_steps', 500), steps)
+    if advice and is_main:
+        print(advice)
 
     if is_main:
         print('Building teacher...')

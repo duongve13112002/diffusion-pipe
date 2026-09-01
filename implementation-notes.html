@@ -33,6 +33,52 @@
 <p class="meta">A running log of decisions taken outside the spec, forced changes, tradeoffs, and
 anything else the maintainer needs to know. Newest entry first.</p>
 
+<h2>2026-09-01 &mdash; The 4-GPU configs move to a caption corpus</h2>
+
+<p><strong>Request.</strong> This phase does not use a dataset.toml. Point the two 4-GPU configs
+at a JSONL corpus and restate the caption settings under <code>[distill]</code>.</p>
+
+<p>The switch itself is two keys. What it changes is where caption augmentation comes from: with a
+dataset.toml, <code>caption_augment_config</code> falls back to the dataset&rsquo;s own settings, so
+distillation augments the way the diffusion stages do without restating anything. A corpus carries
+no dataset config, so every unstated setting silently defaults to off &mdash; and the refiner then
+learns a caption distribution the diffusion stages never see. The script already warns about this;
+the configs now restate <code>prefix_tag_caption</code>, <code>shuffle_tags</code>,
+<code>cache_shuffle_delimiter</code> and <code>tag_dropout_rate</code> so the warning does not
+fire and the behaviour is visible in the file.</p>
+
+<div class=flag>
+  <p><strong>The table guard had a blind spot exactly the size of this change.</strong> Adding
+  those four keys made <code>test_every_key_is_read_from_the_table_it_sits_in</code> fail, claiming
+  the script never reads them &mdash; while a direct call to <code>caption_augment_config</code> on
+  the same file resolved all four correctly. The extractor recognises
+  <code>config[table].get(key)</code> and friends, but <code>caption_augment_config</code> reads
+  through a closure, <code>setting(key, default)</code>, which indexes the table with a variable.
+  So the whole caption-augmentation family was invisible, and the guard&rsquo;s first act on
+  meeting them was a false alarm on the documented way to configure a corpus run. The extractor
+  now understands <code>setting()</code>, and <code>test_the_extractor_finds_the_known_reads</code>
+  pins one of those keys so the extension cannot rot silently.</p>
+</div>
+
+<ul>
+  <li><strong>A warmup that is fine at 20,000 steps is not fine at 1,300.</strong> The global batch
+    here is 48 x 8 x 4 = 1536, so an epoch is <code>len(captions) / 1536</code> steps and the run
+    is twenty of those. At 100,000 captions that is 1,300 optimizer steps, where the default
+    <code>warmup_steps = 500</code> is 38% of the schedule &mdash; nothing errors, the run just
+    spends a third of itself ramping. <code>warmup_advice()</code> now says so at startup and names
+    the number it would use, and both configs carry the arithmetic as a table. Extracted rather
+    than left inline in <code>main()</code>, for the same reason <code>resolve_schedule</code> was:
+    a thing that only runs inside a 500-line function is a thing that only gets tested by running
+    a 500-line function.</li>
+  <li><strong>A documentation ambiguity worth naming.</strong> denoising-rollout.md said adjacent
+    trajectory points give correlated signal, &ldquo;the same argument <code>[probe] num_blocks</code>
+    rests on&rdquo;. That reads as though the probe&rsquo;s block count affects the rollout. It does
+    not: <code>num_blocks</code> selects which frozen cross-attention blocks objective 1 measures
+    through, and the rollout calls the whole DiT because it needs the velocity the model actually
+    predicts. Said explicitly now.</li>
+  <li><strong>Tests.</strong> 469 passed, 1 skipped.</li>
+</ul>
+
 <h2>2026-09-01 &mdash; Six defects in the epochs and checkpoint-retention round</h2>
 
 <p><strong>Context.</strong> The previous entry shipped epochs, retention, tagged checkpoints and

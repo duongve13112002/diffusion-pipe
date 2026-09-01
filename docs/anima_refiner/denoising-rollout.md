@@ -123,7 +123,13 @@ Measured on a reduced-scale replica (2-block DiT, 16×16 latent, CPU), forward p
 
 The 8-step trajectory itself costs 78 ms, a fixed price roughly equal to three loss points. Cost
 in `loss_points` is linear, and adjacent trajectory points give correlated signal — the same
-argument `[probe] num_blocks` rests on. Two is the knee.
+*argument* `[probe] num_blocks` rests on, applied to a different axis. Two is the knee.
+
+To be explicit, since the sentence above invites the reading: `[probe] num_blocks` has no effect
+on the rollout. It selects how many of the DiT's frozen cross-attention blocks objective 1
+measures through, and nothing else reads it. The rollout calls the whole DiT — every block, every
+layer — because it needs the velocity the model actually predicts, not a sample of intermediate
+attention outputs.
 
 ### `resolution`
 

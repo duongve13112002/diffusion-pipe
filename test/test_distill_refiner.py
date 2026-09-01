@@ -1163,6 +1163,7 @@ class TestEveryShippedDistillKeyIsRead:
             config['teacher']['llm_path']
             config.get('probe', {}).get('num_queries', ...)
             rollout_config.get('steps', ...)      # via `rollout_config = config.get('rollout', {})`
+            setting('shuffle_tags', ...)          # caption_augment_config's [distill]-first helper
         """
         import ast as ast_module
         source = (REPO / 'tools/distill_refiner.py').read_text(encoding='utf-8')
@@ -1212,6 +1213,15 @@ class TestEveryShippedDistillKeyIsRead:
                 if table is None and isinstance(node.value, ast_module.Name):
                     table = aliases.get(node.value.id)
                 key = node.slice.value
+            # caption_augment_config reads its keys through a closure, `setting(key, default)`,
+            # which indexes distill_config with a variable -- invisible to the shapes above. That
+            # blind spot covered the whole caption-augmentation family, so a corpus-driven config
+            # restating them under [distill], which is the documented thing to do, read as four
+            # keys the script never touches.
+            if (table is None and isinstance(node, ast_module.Call)
+                    and isinstance(node.func, ast_module.Name) and node.func.id == 'setting'
+                    and node.args and isinstance(node.args[0], ast_module.Constant)):
+                table, key = 'distill', node.args[0].value
             if table and isinstance(key, str):
                 reads.setdefault(table, set()).add(key)
         return reads
@@ -1224,6 +1234,9 @@ class TestEveryShippedDistillKeyIsRead:
         assert 'num_blocks' in reads.get('probe', set())
         assert 'loss_weight' in reads.get('rollout', set()), (
             'the alias tracking for rollout_config = config.get("rollout", {}) broke'
+        )
+        assert 'shuffle_tags' in reads.get('distill', set()), (
+            "the setting() tracking for caption_augment_config's keys broke"
         )
         assert 'dataset' in reads.get('distill', set()), (
             'the alias tracking for distill_config = config["distill"] broke'
@@ -1984,3 +1997,30 @@ class TestResumeStateCompleteness:
         fresh_sched = create_lr_scheduler(fresh_opt, 'cosine', total_steps=1000, warmup_steps=100)
         load_training_state(path, fresh_opt, fresh_sched, is_main=False)
         assert fresh_opt.param_groups[0]['lr'] == pytest.approx(expected)
+
+
+class TestWarmupAdvice:
+    """The default warmup was chosen for a 20,000-step run; `epochs` derives the run length."""
+
+    def test_a_warmup_longer_than_the_run_is_called_out(self):
+        from tools.distill_refiner import warmup_advice
+        message = warmup_advice(500, 400)
+        assert message and 'never starts' in message
+
+    def test_a_warmup_equal_to_the_run_is_still_broken(self):
+        # SequentialLR's milestone is reached only by stepping past it, so equality is the
+        # boundary case where the decay phase gets exactly zero steps.
+        from tools.distill_refiner import warmup_advice
+        assert warmup_advice(500, 500) is not None
+
+    def test_a_large_fraction_is_called_out_with_a_number_to_use(self):
+        # 20 epochs over 100k captions at a global batch of 1536 is 1300 steps, where the
+        # default 500 is 38% of the schedule. Nothing errors; the run just spends a third of
+        # itself ramping.
+        from tools.distill_refiner import warmup_advice
+        message = warmup_advice(500, 1300)
+        assert message and '38%' in message and '65' in message
+
+    def test_a_normal_warmup_says_nothing(self):
+        from tools.distill_refiner import warmup_advice
+        assert warmup_advice(500, 20000) is None
