@@ -1546,3 +1546,154 @@ class TestCaptionsAreResolvedOncePerJob:
         monkeypatch.setattr(module.dist, 'broadcast_object_list', lambda payload, src=0: None)
         with pytest.raises(RuntimeError, match='received no captions'):
             module.load_captions_once({}, rank=2, world_size=4, is_main=False)
+
+
+class TestEpochSampler:
+    """An epoch has to mean one pass over every caption, or the word is decoration.
+
+    The loop used to draw random.sample(captions, batch_size) per micro batch -- sampling with
+    replacement across steps, so some captions appear many times before others appear once.
+    """
+
+    CAPTIONS = [f'caption {i}' for i in range(100)]
+
+    def _samplers(self, world_size=4, batch_size=2, grad_accum=2, seed=42):
+        from tools.distill_refiner import EpochSampler
+        return [EpochSampler(self.CAPTIONS, batch_size, grad_accum, rank, world_size, seed)
+                for rank in range(world_size)]
+
+    def test_steps_per_epoch_drops_the_partial_tail(self):
+        # Same rounding SizeBucketDataset does. Every rank must run the same number of steps or
+        # a collective waits forever on one that finished early.
+        samplers = self._samplers()
+        assert samplers[0].global_batch == 16
+        assert samplers[0].steps_per_epoch == 6      # 100 // 16, the last 4 dropped
+
+    def test_the_ranks_do_not_overlap(self):
+        shards = [s.epoch_order(0) for s in self._samplers()]
+        flat = [caption for shard in shards for caption in shard]
+        assert len(set(flat)) == len(flat), 'a caption appeared on two ranks in one epoch'
+
+    def test_together_they_cover_the_usable_captions(self):
+        shards = [s.epoch_order(0) for s in self._samplers()]
+        flat = {caption for shard in shards for caption in shard}
+        assert len(flat) == 6 * 16, 'an epoch must be one pass over every usable caption'
+
+    def test_the_shards_are_equal_sized(self):
+        shards = [s.epoch_order(0) for s in self._samplers()]
+        assert len({len(shard) for shard in shards}) == 1, [len(s) for s in shards]
+
+    def test_a_later_epoch_reshuffles(self):
+        # Sharding a fixed order would pin each rank to the same captions forever, which is the
+        # reason the shuffle happens before the shard rather than after.
+        sampler = self._samplers()[0]
+        assert sampler.epoch_order(0) != sampler.epoch_order(1)
+
+    def test_every_rank_sees_new_captions_in_a_later_epoch(self):
+        first = set(self._samplers()[2].epoch_order(0))
+        second = set(self._samplers()[2].epoch_order(1))
+        assert first != second, 'rank 2 got the same captions in both epochs'
+
+    def test_it_is_deterministic(self):
+        # Resuming mid-epoch relies on the order being a pure function of (seed, epoch) rather
+        # than of how many draws have happened, so nothing about it needs saving.
+        assert self._samplers()[1].epoch_order(3) == self._samplers()[1].epoch_order(3)
+
+    def test_a_different_seed_gives_a_different_order(self):
+        assert self._samplers(seed=42)[0].epoch_order(0) != self._samplers(seed=43)[0].epoch_order(0)
+
+    def test_a_single_process_uses_everything_it_can(self):
+        sampler = self._samplers(world_size=1, batch_size=10, grad_accum=1)[0]
+        assert sampler.steps_per_epoch == 10
+        assert len(sampler.epoch_order(0)) == 100
+
+    def test_too_few_captions_is_refused_with_the_arithmetic(self):
+        from tools.distill_refiner import EpochSampler
+        with pytest.raises(RuntimeError, match='cannot fill one global batch'):
+            EpochSampler(['only', 'three', 'captions'], batch_size=8, grad_accum=4,
+                         rank=0, world_size=2, seed=0)
+
+
+class TestEpochsAndStepsAreAlternatives:
+    """Both are ways of saying how long to train. Setting both is a question with no answer."""
+
+    def test_the_shipped_4gpu_configs_use_epochs(self):
+        import toml
+        for name in ('distill_4gpu.toml', 'distill_rollout_4gpu.toml'):
+            config = toml.load(REPO / 'examples/anima_refiner' / name)['distill']
+            assert 'epochs' in config, name
+            assert 'steps' not in config, f'{name} sets both epochs and steps'
+
+    def test_the_older_configs_still_use_steps(self):
+        # Backward compatibility is the point: configs written before epochs existed must run
+        # unchanged.
+        import toml
+        for name in ('distill.toml', 'distill_rollout.toml'):
+            config = toml.load(REPO / 'examples/anima_refiner' / name)['distill']
+            assert 'steps' in config, name
+            assert 'epochs' not in config, name
+
+    def test_setting_both_is_refused(self):
+        source = (REPO / 'tools/distill_refiner.py').read_text(encoding='utf-8')
+        assert 'sets both epochs and steps' in source
+
+    def test_neither_still_defaults_to_steps(self):
+        # A config predating this feature sets neither explicitly in some cases; it must not
+        # start training for zero steps.
+        source = (REPO / 'tools/distill_refiner.py').read_text(encoding='utf-8')
+        assert 'if epochs is None and steps is None:' in source
+        assert 'steps = 20000' in source
+
+
+class TestResumeRestoresTheAugmentationStream:
+    """The optimizer came back; the RNG did not, so a resumed run saw different augmentations."""
+
+    @staticmethod
+    def _optimizer():
+        model = torch.nn.Linear(2, 2)
+        opt = torch.optim.AdamW(model.parameters(), lr=0.1)
+        return opt, torch.optim.lr_scheduler.LambdaLR(opt, lambda s: 1.0)
+
+    def test_the_python_stream_continues_where_it_left_off(self, tmp_path):
+        import random as py_random
+        from tools.distill_refiner import save_training_state, load_training_state
+
+        opt, sched = self._optimizer()
+        py_random.seed(7)
+        [py_random.random() for _ in range(5)]
+        expected = [py_random.random() for _ in range(3)]
+
+        py_random.seed(7)
+        [py_random.random() for _ in range(5)]
+        save_training_state(tmp_path / 'context_refiner.safetensors', opt, sched, 10)
+
+        [py_random.random() for _ in range(100)]        # drift the stream
+        fresh_opt, fresh_sched = self._optimizer()
+        load_training_state(tmp_path / 'context_refiner.safetensors', fresh_opt, fresh_sched,
+                            is_main=False)
+        assert [py_random.random() for _ in range(3)] == expected
+
+    def test_the_torch_stream_continues_too(self, tmp_path):
+        from tools.distill_refiner import save_training_state, load_training_state
+        opt, sched = self._optimizer()
+        torch.manual_seed(11)
+        expected = torch.randn(4)
+
+        torch.manual_seed(11)
+        save_training_state(tmp_path / 'context_refiner.safetensors', opt, sched, 10)
+        torch.randn(100)
+        fresh_opt, fresh_sched = self._optimizer()
+        load_training_state(tmp_path / 'context_refiner.safetensors', fresh_opt, fresh_sched,
+                            is_main=False)
+        assert torch.equal(torch.randn(4), expected)
+
+    def test_a_checkpoint_without_rng_state_still_resumes(self, tmp_path):
+        # Written before the RNG was recorded. It cannot reproduce the augmentation, but it must
+        # not refuse to load.
+        from tools.distill_refiner import load_training_state, training_state_path
+        opt, sched = self._optimizer()
+        path = tmp_path / 'context_refiner.safetensors'
+        torch.save({'step': 42, 'optimizer': opt.state_dict(), 'scheduler': sched.state_dict()},
+                   training_state_path(path))
+        fresh_opt, fresh_sched = self._optimizer()
+        assert load_training_state(path, fresh_opt, fresh_sched, is_main=False) == 42

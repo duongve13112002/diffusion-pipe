@@ -7,8 +7,10 @@ Lumina 2 and Z-Image use.
 **New here?** [training.md](./training.md) is the step-by-step path from a stock Anima
 checkpoint to a sampled image. This file is the architecture and the config reference;
 [design-notes.md](./design-notes.md) explains why the distillation stage is shaped the way it is
-and where its numbers came from; [denoising-rollout.md](./denoising-rollout.md) documents the
-optional distillation objective that compares the frozen DiT's predictions rather than its
+and where its numbers came from; [distillation-methods.md](./distillation-methods.md) compares the four
+distillation objectives -- what each can and cannot see, and what it costs;
+[denoising-rollout.md](./denoising-rollout.md) documents the
+optional one that compares the frozen DiT's predictions rather than its
 cross-attention outputs; [lessons.md](./lessons.md) is the rules the mistakes on this branch
 turned into.
 
