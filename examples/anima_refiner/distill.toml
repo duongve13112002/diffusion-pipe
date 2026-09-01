@@ -133,6 +133,11 @@ dtype = 'bfloat16'
 #precision = 'bf16-mixed'
 seed = 42
 
+# Overrides where everything runs. Unset it and the script picks cuda:LOCAL_RANK when CUDA is
+# available and cpu otherwise, which is what you want for a real run. It exists so the stage can
+# be smoke-tested on a machine with no GPU.
+#device = 'cpu'
+
 save_every = 2000
 log_every = 50
 # Weight on the auxiliary masked-mean term. Also permutation invariant, and it gives a useful

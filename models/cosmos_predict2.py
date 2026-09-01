@@ -208,7 +208,19 @@ def _tokenize(tokenizer, prompts, max_length=512, keep_one_real_token=False):
             mask[empty_rows, 0] = 1
     return batch_encoding
 
-def _compute_text_embeddings(text_encoder, input_ids, attn_mask, is_generic_llm=False, hidden_layer=None):
+def normalise_hidden_layer(hidden_layer):
+    """-1 means the last hidden state, which is what None already asks for.
+
+    Asking for a specific index takes the output_hidden_states=True branch, which materialises
+    every layer's output -- 25 tensors for a 24-layer model -- and then indexes one. At -1 that
+    tensor IS last_hidden_state, so the whole allocation is wasted: measured at roughly 420 MB
+    per forward for B=8, L=512, d=2048 in bf16, on the caching path and the on-the-fly path
+    alike. Every shipped anima_refiner config uses -1.
+    """
+    return None if hidden_layer == -1 else hidden_layer
+
+
+def _compute_text_embeddings(text_encoder, input_ids, attn_mask, hidden_layer=None):
     input_ids = input_ids.to(text_encoder.device)
     attn_mask = attn_mask.to(text_encoder.device)
 
@@ -336,7 +348,8 @@ class CosmosPredict2Pipeline(BasePipeline):
         self.cap_feat_dim = None
         if self.use_context_refiner:
             self.max_text_length = self.model_config.get('max_text_length', 512)
-            self.llm_hidden_layer = self.model_config.get('llm_hidden_layer', None)
+            self.llm_hidden_layer = normalise_hidden_layer(
+                self.model_config.get('llm_hidden_layer', None))
             # 'TransformerBlock' would match the LLMAdapter blocks, which this architecture
             # doesn't build. ContextRefiner takes its place -- and it, not RefinerBlock, because
             # get_target_modules walks the matched module's own Linears: cap_embedder and
@@ -885,7 +898,7 @@ class CosmosPredict2Pipeline(BasePipeline):
         transformer = self.transformer
         text_encoder = None if self.cache_text_embeddings else self.text_encoder
         layers = [
-            InitialLayer(transformer, text_encoder, self.is_generic_llm, self.use_context_refiner, self.llm_hidden_layer),
+            InitialLayer(transformer, text_encoder, self.use_context_refiner, self.llm_hidden_layer),
         ]
         if self.use_context_refiner:
             layers.append(ContextRefinerLayer(transformer.context_refiner))
@@ -1020,7 +1033,7 @@ class CosmosPredict2Pipeline(BasePipeline):
 
 
 class InitialLayer(nn.Module):
-    def __init__(self, model, text_encoder, is_generic_llm, use_context_refiner=False, llm_hidden_layer=None):
+    def __init__(self, model, text_encoder, use_context_refiner=False, llm_hidden_layer=None):
         super().__init__()
         self.x_embedder = model.x_embedder
         self.pos_embedder = model.pos_embedder
@@ -1030,7 +1043,6 @@ class InitialLayer(nn.Module):
         self.t_embedding_norm = model.t_embedding_norm
         self.text_encoder = text_encoder
         self.model = [model]
-        self.is_generic_llm = is_generic_llm
         self.use_context_refiner = use_context_refiner
         self.llm_hidden_layer = llm_hidden_layer
 
@@ -1054,7 +1066,7 @@ class InitialLayer(nn.Module):
                     input_ids, attn_mask, t5_input_ids, t5_attn_mask = prompt_embeds_or_batch_encoding
                 crossattn_emb = _compute_text_embeddings(
                     self.text_encoder, input_ids, attn_mask,
-                    is_generic_llm=self.is_generic_llm, hidden_layer=self.llm_hidden_layer,
+                    hidden_layer=self.llm_hidden_layer,
                 )
 
         padding_mask = torch.zeros(x_B_C_T_H_W.shape[0], 1, x_B_C_T_H_W.shape[3], x_B_C_T_H_W.shape[4], dtype=x_B_C_T_H_W.dtype, device=x_B_C_T_H_W.device)

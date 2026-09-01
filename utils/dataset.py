@@ -756,7 +756,6 @@ class DirectoryDataset:
             not caches_text_embeddings and (self.shuffle > 0 or self.tag_dropout_rate > 0)
         )
         self.directory_config['augment_at_runtime'] = self.augment_at_runtime
-        self.directory_config['caption_prefix'] = self.directory_config.get('caption_prefix', '')
         self.directory_config['caption_cache_suffix'] = self.caption_cache_suffix
         # SizeBucketDataset needs these at __getitem__ time for the online_captions path.
         self.directory_config['prefix_tag_caption'] = self.prefix_tag_caption

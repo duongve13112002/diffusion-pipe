@@ -61,7 +61,9 @@ def build_dit(num_blocks=2, n_refiner_layers=2, seed=0):
 def build_layers(dit):
     """Mirrors CosmosPredict2Pipeline.to_layers() for the refiner architecture."""
     layers = [
-        InitialLayer(dit, None, True, True, None),
+        # (model, text_encoder, use_context_refiner, llm_hidden_layer). The is_generic_llm
+        # argument was accepted and never used; it is gone.
+        InitialLayer(dit, None, True, None),
         ContextRefinerLayer(dit.context_refiner),
     ]
     for i, block in enumerate(dit.blocks):

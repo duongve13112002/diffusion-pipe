@@ -1385,3 +1385,162 @@ class TestShiftedSchedule:
         uniform = torch.linspace(1.0, 0.0, 6)
         expected = (uniform * shift) / (1 + (shift - 1) * uniform)
         assert torch.allclose(schedule, expected, atol=1e-6)
+
+
+class TestHiddenLayerMinusOneIsNormalised:
+    """-1 asks for the last hidden state, which is what None already means.
+
+    Asking by index takes the output_hidden_states branch, which materialises every layer's
+    output -- 25 tensors for a 24-layer model -- and then indexes one. At -1 that tensor IS
+    last_hidden_state, so the whole allocation is thrown away: roughly 420 MB per forward at
+    B=8, L=512, d=2048 in bf16. Every shipped anima_refiner config uses -1.
+    """
+
+    def test_minus_one_becomes_none(self):
+        from models.cosmos_predict2 import normalise_hidden_layer
+        assert normalise_hidden_layer(-1) is None
+
+    def test_none_stays_none(self):
+        from models.cosmos_predict2 import normalise_hidden_layer
+        assert normalise_hidden_layer(None) is None
+
+    def test_a_real_index_is_left_alone(self):
+        # 20 is the other candidate the docs suggest sweeping, and it is a genuinely different
+        # tensor -- a raw residual-stream value rather than a post-final-RMSNorm one.
+        from models.cosmos_predict2 import normalise_hidden_layer
+        assert normalise_hidden_layer(20) == 20
+        assert normalise_hidden_layer(-2) == -2
+
+    def test_the_expensive_branch_is_skipped(self):
+        # The behavioural half: with the normalised value, _compute_text_embeddings must not ask
+        # for hidden states at all.
+        from models.cosmos_predict2 import _compute_text_embeddings, normalise_hidden_layer
+
+        seen = {}
+
+        class Encoder:
+            device = torch.device('cpu')
+
+            def __call__(self, input_ids=None, attention_mask=None, **kwargs):
+                seen['output_hidden_states'] = kwargs.get('output_hidden_states', False)
+                hidden = torch.ones(input_ids.shape[0], input_ids.shape[1], 4)
+                return type('Out', (), {'last_hidden_state': hidden,
+                                        'hidden_states': [hidden] * 25})()
+
+        ids = torch.zeros(1, 4, dtype=torch.long)
+        mask = torch.ones(1, 4, dtype=torch.long)
+        _compute_text_embeddings(Encoder(), ids, mask,
+                                 hidden_layer=normalise_hidden_layer(-1))
+        assert seen['output_hidden_states'] is False, (
+            'llm_hidden_layer = -1 must not materialise every hidden state to index the last one'
+        )
+
+
+class TestConfigIsRefusedBeforeAnythingExpensive:
+    """Every refusal used to fire after the dataset walk and three models were loaded.
+
+    A typo in `precision` cost minutes and tens of GB of I/O per rank before being reported. The
+    checks are pure config, so they run first now.
+    """
+
+    @staticmethod
+    def _config(**distill):
+        base = {'output_dir': '/tmp/out'}
+        base.update(distill)
+        return {'distill': base}
+
+    def test_an_unknown_strategy_is_refused(self):
+        from tools.distill_refiner import validate_config_early
+        with pytest.raises(RuntimeError, match='distributed_strategy'):
+            validate_config_early(self._config(distributed_strategy='zero9'), 2, False)
+
+    def test_zero_on_one_rank_is_refused(self):
+        from tools.distill_refiner import validate_config_early
+        with pytest.raises(RuntimeError, match='world_size=1'):
+            validate_config_early(self._config(distributed_strategy='zero1'), 1, False)
+
+    def test_an_unknown_precision_is_refused(self):
+        from tools.distill_refiner import validate_config_early
+        with pytest.raises(RuntimeError, match='precision'):
+            validate_config_early(self._config(precision='bf8'), 1, False)
+
+    def test_fp16_full_is_refused(self):
+        from tools.distill_refiner import validate_config_early
+        with pytest.raises(RuntimeError, match='fp16-full'):
+            validate_config_early(self._config(precision='fp16-full'), 1, False)
+
+    def test_the_optimizer_table_conflicting_with_flat_keys_is_refused(self):
+        from tools.distill_refiner import validate_config_early
+        config = self._config(lr=1e-4)
+        config['optimizer'] = {'type': 'adamw', 'lr': 1e-4}
+        with pytest.raises(RuntimeError, match='alternative'):
+            validate_config_early(config, 1, False)
+
+    def test_gradient_release_is_refused(self):
+        from tools.distill_refiner import validate_config_early
+        config = self._config()
+        config['optimizer'] = {'type': 'adamw', 'gradient_release': True}
+        with pytest.raises(RuntimeError, match='gradient_release'):
+            validate_config_early(config, 1, False)
+
+    def test_offload_with_the_weight_decay_split_is_refused(self):
+        # CPUOffloadOptimizer takes its inner class positionally and does not accept parameter
+        # groups, which is exactly what no_weight_decay_on_1d produces.
+        from tools.distill_refiner import validate_config_early
+        config = self._config(no_weight_decay_on_1d=True)
+        config['optimizer'] = {'type': 'offload'}
+        with pytest.raises(RuntimeError, match='offload'):
+            validate_config_early(config, 1, False)
+
+    def test_a_valid_config_returns_the_precision(self):
+        from tools.distill_refiner import validate_config_early
+        precision = validate_config_early(self._config(precision='bf16-full'), 1, False)
+        assert precision.name == 'bf16-full'
+
+    def test_it_runs_before_the_captions_are_loaded(self):
+        # The ordering is the entire point; a later refactor could undo it silently.
+        source = (REPO / 'tools/distill_refiner.py').read_text(encoding='utf-8')
+        body = source[source.index('def main('):]
+        assert body.index('validate_config_early(') < body.index('load_captions_once('), (
+            'validation must come before the dataset walk'
+        )
+        assert body.index('validate_config_early(') < body.index('build_teacher('), (
+            'validation must come before the teacher is loaded'
+        )
+
+
+class TestCaptionsAreResolvedOncePerJob:
+    """Eight ranks walking the same tree at startup is eight clients hammering one filesystem."""
+
+    def test_a_single_process_does_not_broadcast(self, monkeypatch):
+        import tools.distill_refiner as module
+        called = []
+        monkeypatch.setattr(module, 'load_captions', lambda config: ['a', 'b'])
+        monkeypatch.setattr(module.dist, 'broadcast_object_list',
+                            lambda *a, **k: called.append(1))
+        assert module.load_captions_once({}, rank=0, world_size=1, is_main=True) == ['a', 'b']
+        assert not called, 'a single process has nobody to broadcast to'
+
+    def test_only_rank_zero_resolves_them(self, monkeypatch):
+        import tools.distill_refiner as module
+        walks = []
+
+        def fake_load(config):
+            walks.append(1)
+            return ['a', 'b']
+
+        def fake_broadcast(payload, src=0):
+            payload[0] = ['a', 'b']       # what rank 0 sent
+
+        monkeypatch.setattr(module, 'load_captions', fake_load)
+        monkeypatch.setattr(module.dist, 'broadcast_object_list', fake_broadcast)
+
+        assert module.load_captions_once({}, rank=1, world_size=4, is_main=False) == ['a', 'b']
+        assert not walks, 'a non-zero rank must not walk the dataset itself'
+
+    def test_a_failed_broadcast_is_reported_rather_than_returning_nothing(self, monkeypatch):
+        import tools.distill_refiner as module
+        monkeypatch.setattr(module, 'load_captions', lambda config: ['a'])
+        monkeypatch.setattr(module.dist, 'broadcast_object_list', lambda payload, src=0: None)
+        with pytest.raises(RuntimeError, match='received no captions'):
+            module.load_captions_once({}, rank=2, world_size=4, is_main=False)

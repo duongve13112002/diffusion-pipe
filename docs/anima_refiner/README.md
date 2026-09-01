@@ -695,15 +695,40 @@ Every key below is read only when `type = 'anima_refiner'`.
 | `max_text_length` | `512` | padded token length |
 | `context_refiner_path` | — | separate refiner file; overrides the checkpoint's, with a warning |
 | `cache_text_embeddings` | `true` | cache to disk, or run the encoder inline |
-| `base_lr` | optimizer `lr` | lr for otherwise unmatched parameters |
+| `base_lr` | optimizer `lr` | lr for otherwise unmatched parameters: `x_embedder`, `t_embedder`, positional embeddings, `final_layer` |
+| `self_attn_lr` | `base_lr` | lr for the DiT's self-attention |
+| `cross_attn_lr` | `base_lr` | lr for the DiT's cross-attention. What `refiner_crossattn` raises off zero |
+| `mlp_lr` | `base_lr` | lr for the DiT's MLPs |
+| `mod_lr` | `base_lr` | lr for the AdaLN modulation |
+| `llm_adapter_lr` | `base_lr` | lr for Anima's `LLMAdapter`. Not built by `anima_refiner` |
 | `refiner_lr` | `base_lr` | lr for the refiner |
 | `train_context_refiner` | `false` | in `[adapter]`: train the refiner densely |
+
+A group whose lr is 0 is frozen, not merely unlearning: `get_param_groups` calls
+`requires_grad_(False)` on it. That is how `refiner_only` works, and it is why that mode needs
+`pipeline_stages = 1` — a stage holding no refiner would have no trainable parameters at all,
+and the optimizer says so by name rather than raising `optimizer got an empty parameter list`.
 
 ### Distillation config (`[distill]`)
 
 | Key | Default | Meaning |
 |---|---|---|
 | `dataset` | — | a `dataset.toml`; captions read through the training rules |
+| `device` | auto | overrides where everything runs. Unset picks `cuda:LOCAL_RANK`, or cpu with no CUDA |
+| `steps` | `20000` | optimizer steps |
+| `seed` | `42` | model seed; the caption and rollout streams are rank-offset from it |
+| `dtype` | `bfloat16` | the **frozen** modules. The trainable refiner follows `precision` |
+| `precision` | `fp32` | refiner precision: `fp32`, `bf16-mixed`, `fp16-mixed`, `bf16-full` |
+| `distributed_strategy` | `ddp` | `ddp`, `zero1` or `zero2`. ZeRO needs 2+ ranks |
+| `max_grad_norm` | `1.0` | gradient clipping |
+| `warmup_steps` | `500` | LR warmup |
+| `lr_scheduler` | `cosine` | shares `utils/lr_schedule.py` with `train.py` |
+| `save_every` | `2000` | checkpoint interval, in steps. Must be >= 1 |
+| `log_every` | `50` | progress-bar update interval. Must be >= 1 |
+| `pooled_loss_weight` | `0.1` | weight of the length-normalised mean term |
+| `relational_loss_weight` | `1.0` | weight of the pairwise-structure term that prices mode collapse |
+| `save_full_model` | `false` | also write a complete `model.safetensors` |
+| `no_weight_decay_on_1d` | `false` | exclude 1-d parameters from weight decay |
 | `caption_corpus` | — | a file from `tools/export_caption_corpus.py` |
 | `caption_corpus_format` | from extension | `jsonl`, `csv` or `txt` |
 | `captions` | — | bare file of one caption per line, or a directory of `.txt` |

@@ -32,6 +32,7 @@ build_strategy and docs/anima_refiner/README.md for why DDP is the default here.
 """
 
 import argparse
+import datetime
 import contextlib
 import os
 import random
@@ -52,7 +53,8 @@ from torch import nn
 from tqdm import tqdm
 from transformers import AutoTokenizer, T5TokenizerFast
 
-from models.cosmos_predict2 import get_dit_config, _tokenize as cosmos_tokenize
+from models.cosmos_predict2 import (get_dit_config, _tokenize as cosmos_tokenize,
+                                    normalise_hidden_layer)
 from models.cosmos_predict2_modeling import MiniTrainDIT
 from models.text_refiner import ContextRefiner, extract_refiner_state_dict
 from utils.common import iterate_safetensors, load_state_dict
@@ -125,6 +127,34 @@ def load_captions(config):
             if (text := txt.read_text(encoding='utf-8').strip())
         ]
     return [line.strip() for line in path.read_text(encoding='utf-8').splitlines() if line.strip()]
+
+
+def load_captions_once(config, rank, world_size, is_main):
+    """Resolve the captions on rank 0 and hand them to everyone else.
+
+    load_captions walks every directory and opens every tar when the source is a dataset.toml --
+    its own docstring quotes about three minutes for three million captions. Every rank was
+    doing that walk independently against the same tree, which on a network filesystem is the
+    difference between one client and eight hammering it at startup.
+
+    The corpus source (tools/export_caption_corpus.py) is cheap enough that broadcasting is
+    roughly a wash, but it costs nothing to take the same path, and one code path is easier to
+    reason about than two.
+
+    Single process: no broadcast, no serialisation, exactly what it did before.
+    """
+    if world_size < 2:
+        return load_captions(config)
+
+    payload = [load_captions(config) if is_main else None]
+    dist.broadcast_object_list(payload, src=0)
+    captions = payload[0]
+    if captions is None:
+        raise RuntimeError(
+            f'rank {rank} received no captions from rank 0. The broadcast failed, or rank 0 '
+            'raised while resolving them.'
+        )
+    return captions
 
 
 def caption_augment_config(config):
@@ -580,7 +610,12 @@ def setup_distributed():
     local_rank = int(os.environ.get('LOCAL_RANK', rank))
     backend = 'nccl' if torch.cuda.is_available() else 'gloo'
     if not dist.is_initialized():
-        dist.init_process_group(backend=backend, rank=rank, world_size=world_size)
+        # A generous timeout, because the final barrier waits on rank 0 writing a full
+        # model checkpoint: save_full_model re-reads the entire teacher and writes a multi-GB
+        # file, which on networked storage can exceed the 10-minute default and abort a job
+        # that had already finished training.
+        dist.init_process_group(backend=backend, rank=rank, world_size=world_size,
+                                timeout=datetime.timedelta(hours=1))
     if torch.cuda.is_available():
         torch.cuda.set_device(local_rank)
     return rank, world_size, local_rank
@@ -960,6 +995,73 @@ class DeepSpeedZeROStrategy:
         return self.scheduler.get_last_lr()[0]
 
 
+def validate_config_early(config, world_size, is_main):
+    """Refuse an unusable config before anything expensive happens.
+
+    Every refusal in this script used to fire after load_captions had walked the whole dataset
+    and both LLMs plus the teacher DiT were resident -- minutes and tens of GB of I/O per rank
+    before being told about a typo in `precision`. The checks themselves are pure config, so
+    there is no reason for them to wait.
+
+    Returns the resolved Precision, since resolving it is most of the work.
+    """
+    strategy = str(config['distill'].get('distributed_strategy', 'ddp')).lower()
+    if strategy not in DISTRIBUTED_STRATEGIES:
+        raise RuntimeError(
+            f'distributed_strategy={strategy!r} under [distill] is not one of '
+            f'{DISTRIBUTED_STRATEGIES}.'
+        )
+    if strategy != 'ddp':
+        stage = int(strategy[-1])
+        if stage not in (1, 2):
+            raise RuntimeError(
+                f'distributed_strategy asks for ZeRO stage {stage}; only 1 and 2 are supported. '
+                'See docs/anima_refiner/README.md.'
+            )
+        if world_size < 2:
+            raise RuntimeError(
+                f'distributed_strategy asks for ZeRO but world_size={world_size}. ZeRO shards '
+                'optimizer state across ranks, so on a single process it costs a dependency and '
+                'saves nothing. Launch with `deepspeed --num_gpus=N` (N > 1), or leave '
+                'distributed_strategy at its default of ddp.'
+            )
+
+    # Raises on an unknown name and on fp16-full.
+    precision = resolve_precision(config)
+
+    # The optimizer table's shape, without building anything.
+    optim_config = config.get('optimizer', None)
+    if optim_config is not None:
+        flat = [k for k in ('lr', 'betas', 'weight_decay') if k in config['distill']]
+        if flat:
+            raise RuntimeError(
+                f'[optimizer] is an alternative to the flat {flat} under [distill], not an '
+                'addition to them. Remove one or the other.'
+            )
+        if optim_config.get('gradient_release', False):
+            raise RuntimeError(
+                'gradient_release is refused here: it needs pipeline machinery only train.py '
+                'builds.'
+            )
+        if str(optim_config.get('type', '')).lower() == 'genericoptim':
+            raise RuntimeError(
+                'genericoptim is refused here: it needs the 2-d/other parameter split only '
+                'train.py builds.'
+            )
+        if (str(optim_config.get('type', '')).lower() == 'offload'
+                and config['distill'].get('no_weight_decay_on_1d', False)):
+            # CPUOffloadOptimizer takes the inner class positionally and historically rejects
+            # parameter groups, which is exactly what the weight-decay split produces.
+            raise RuntimeError(
+                "optimizer type 'offload' cannot be combined with no_weight_decay_on_1d: the "
+                'weight-decay split passes parameter groups, which CPUOffloadOptimizer does not '
+                'accept. Use one or the other.'
+            )
+    if is_main:
+        print(f'Config validated: strategy={strategy}, precision={precision.name}')
+    return precision
+
+
 def build_strategy(config, refiner, world_size, local_rank, device, batch_size, grad_accum,
                    optimizer, scheduler, precision):
     """Pick the parallelism strategy. DDP unless the config asks for ZeRO.
@@ -1084,7 +1186,10 @@ def main():
             f'{batch_size * grad_accum * world_size} captions per optimizer step.'
         )
 
-    captions = load_captions(config)
+    # Before load_captions walks the dataset and before any model is loaded.
+    precision = validate_config_early(config, world_size, is_main)
+
+    captions = load_captions_once(config, rank, world_size, is_main)
     if not captions:
         raise RuntimeError('No captions found. Check the dataset / captions path under [distill].')
     if is_main:
@@ -1112,10 +1217,15 @@ def main():
     if is_main:
         print(f'Student LLM hidden size: {cap_feat_dim}')
 
+    # -1 asks for the last hidden state, which is what None already means -- and asking by
+    # index takes the output_hidden_states branch, materialising every layer's output to then
+    # throw all but one away. Every shipped anima_refiner config uses -1.
+    student_hidden_layer = normalise_hidden_layer(
+        config['student'].get('llm_hidden_layer', None))
+
     # Resolved and applied BEFORE the optimizer is built. AdamW allocates its exp_avg and
     # exp_avg_sq to match each parameter's dtype at construction time, so casting the refiner
     # afterwards would leave the optimizer holding state of the wrong dtype.
-    precision = resolve_precision(config)
     if precision.param_dtype != torch.float32:
         refiner.to(dtype=precision.param_dtype)
     if is_main:
@@ -1182,7 +1292,7 @@ def main():
                 build_unconditional_features(
                     teacher_tok, t5_tokenizer, teacher_llm, llm_adapter,
                     student_tok, student_llm, max_text_length, device,
-                    config['student'].get('llm_hidden_layer', None),
+                    student_hidden_layer,
                 )
             )
 
@@ -1263,7 +1373,7 @@ def main():
                 s_mask = s_enc['attention_mask'].to(device)
                 student_hidden = encode(
                     student_llm, s_enc['input_ids'].to(device), s_mask,
-                    config['student'].get('llm_hidden_layer', None)
+                    student_hidden_layer
                 )
 
             # Whether this micro batch synchronises gradients is the strategy's business: DDP
