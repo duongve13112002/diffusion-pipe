@@ -33,6 +33,67 @@
 <p class="meta">A running log of decisions taken outside the spec, forced changes, tradeoffs, and
 anything else the maintainer needs to know. Newest entry first.</p>
 
+<h2>2026-09-01 &mdash; Closing the audit list, and one finding that was wrong</h2>
+
+<p><strong>Request.</strong> Fix everything the QA reports raised, skipping nothing. That covered
+the two rollout reviews and also the earlier three-agent audit, whose findings had been recorded
+as &ldquo;not fixed, reported&rdquo; and left there.</p>
+
+<p><strong>The expensive one was invisible.</strong> <code>llm_hidden_layer = -1</code> asks for
+the last hidden state, which is what <code>None</code> already means &mdash; but asking by index
+takes the <code>output_hidden_states=True</code> branch, materialises every layer's output (25
+tensors for a 24-layer model) and then indexes the one that IS <code>last_hidden_state</code>.
+Roughly 420 MB per forward at B=8, L=512, d=2048 in bf16, on the caching path and the on-the-fly
+path alike, and every shipped anima_refiner config uses -1.
+<code>normalise_hidden_layer</code> folds it where the config is read, so all three consumers
+benefit. A test asserts the expensive branch is not taken.</p>
+
+<p><strong>Failing fast.</strong> Every refusal in the distillation script fired after
+<code>load_captions</code> had walked the whole dataset and both LLMs plus the teacher DiT were
+resident &mdash; a typo in <code>precision</code> cost minutes and tens of GB of I/O per rank
+before being reported. The checks are pure config, so <code>validate_config_early</code> runs
+them first, and a test asserts the ordering because a refactor could undo it silently.</p>
+
+<p><strong>One walk per job, not per rank.</strong> <code>load_captions</code> opens every
+directory and every tar &mdash; its own docstring quotes three minutes for three million captions
+&mdash; and every rank was doing it against the same tree. Rank 0 resolves and broadcasts; a
+single process takes the old path with no serialisation at all. The process group also gets an
+hour instead of NCCL's ten-minute default, because the final barrier waits on rank 0 writing a
+multi-GB checkpoint when <code>save_full_model</code> is set.</p>
+
+<div class="flag">
+  <p><strong>One reported finding was wrong, and checking mattered.</strong> The audit listed
+  three config keys as declared-but-never-read: <code>pseudo_huber_c</code>,
+  <code>image_eval_micro_batch_size_per_gpu</code> and <code>stabilize</code>. The first two are
+  genuinely stale &mdash; replaced by <code>huber_delta</code> and by
+  <code>eval_micro_batch_size_per_gpu</code>'s table form &mdash; and both now document what the
+  code reads plus what they replaced, so an old config points somewhere. <code>stabilize</code>
+  is a <strong>false positive</strong>: it is a real parameter of
+  <code>optimizers/adamw_8bit.py</code>'s <code>AdamW8bitKahan</code>, and the scan that reported
+  it had not covered <code>optimizers/</code>. Confirmed by constructing the optimizer with it.
+  Removing it would have broken a working setting on the strength of a report.</p>
+</div>
+
+<ul>
+  <li><strong>Also fixed.</strong> <code>--test_sample</code> raised a bare
+    <code>AttributeError</code> on <code>get_conds</code> for most models, and only after the
+    text encoders had been loaded and run; it now names the flag and the model.
+    <code>_compute_text_embeddings</code> accepted an <code>is_generic_llm</code> argument it
+    never referenced, passed down from <code>InitialLayer</code>; removed from both. A no-op line
+    in <code>utils/dataset.py</code> re-read the <code>caption_prefix</code> key it had just
+    written. The README config reference was missing the five per-group learning rates that
+    <code>refiner_only</code> depends on to work at all, and listed 13 of roughly 30
+    <code>[distill]</code> keys.</li>
+  <li><strong>A comment that claimed too much.</strong> <code>models/cosmos_predict2.py</code>
+    said anima and anima_refiner sharing a cache name was safe because
+    <code>text_encoder_cache_key</code> handles the difference. It stops one model READING the
+    other's embeddings; it does not let both keep a copy, because they write to the same
+    directory. The latents, the expensive half, survive either way &mdash; and
+    <code>vae_config_keys</code> now means a different VAE is detected rather than silently
+    reused.</li>
+  <li><strong>Tests.</strong> 403 passed, 1 skipped. The rollout QA round ended at 387.</li>
+</ul>
+
 <h2>2026-09-01 &mdash; Denoising rollout, and cache reuse that depends on compatibility</h2>
 
 <p><strong>Request.</strong> Two things, both settled by design review before any code was
