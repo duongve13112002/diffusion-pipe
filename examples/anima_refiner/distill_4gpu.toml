@@ -58,11 +58,6 @@ save_full_model = true
 pooled_loss_weight = 0.1
 relational_loss_weight = 1.0
 
-# Resume from an interrupted run. Point it at a refiner checkpoint and the optimizer moments,
-# the LR schedule position, the step counter and the augmentation RNG all come back from the
-# distill_state file beside it.
-#resume_from = '/data/output/anima_refiner_distill/context_refiner_epoch7.safetensors'
-
 [teacher]
 llm_path = '/data2/imagegen_models/comfyui-models/qwen_3_06b_base.safetensors'
 transformer_path = '/data2/imagegen_models/comfyui-models/anima-preview.safetensors'
@@ -71,6 +66,11 @@ transformer_path = '/data2/imagegen_models/comfyui-models/anima-preview.safetens
 llm_path = '/data2/imagegen_models/Qwen3.5-2B-Base'
 llm_hidden_layer = -1
 n_refiner_layers = 6
+
+# Resume from an interrupted run. Point it at a refiner checkpoint and the optimizer moments,
+# the LR schedule position, the step counter and the augmentation RNG all come back from the
+# distill_state file beside it. This key is read from [student], not [distill].
+#resume_from = '/data/output/anima_refiner_distill/context_refiner_epoch7.safetensors'
 
 # An ALTERNATIVE to flat lr / betas / weight_decay under [distill], never an addition -- setting
 # both is refused at startup, before anything is loaded.

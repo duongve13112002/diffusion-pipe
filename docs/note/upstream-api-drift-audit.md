@@ -77,6 +77,7 @@ of this audit.
 | `torch` | `utils/reduction.py` | A copy of `torch/multiprocessing/reductions.py` with `multiprocessing` swapped for the third-party `multiprocess` library, so HF Datasets workers can pass CUDA tensors over queues. Reaches into private symbols (`torch._utils._rebuild_tensor`, `torch._storage_classes`, `torch._nested_view_from_buffer_copy`, ...). |
 | `torch` | `utils/patches.py` | `torch._inductor.runtime.triton_heuristics`, plus it registers the reductions above. |
 | `bitsandbytes` | `optimizers/adamw_8bit.py` | A re-implementation of `Optimizer2State.update_step` that adds Kahan summation, so it depends on the exact keys of `get_config()` and on the positional order of `functional.optimizer_update_32bit` / `optimizer_update_8bit_blockwise`. |
+| `deepspeed` | `tools/distill_refiner.py` (`save_training_state`, `load_training_state`, `ZeroStrategy`) | No import of a private symbol, but a hard dependency on a **behaviour**: `deepspeed.initialize` mutates the client optimizer in place, replacing each param group's parameter list with one flat rank-local fp32 partition (`deepspeed/runtime/zero/stage_1_and_2.py`, the `param_group['params'] = [self.single_partition_of_fp32_groups[i]]` assignment). The whole per-rank shard design follows from that. Also depends on `set_gradient_accumulation_boundary` driving the accumulation window, and on `get_global_grad_norm` returning `None` before the first boundary. |
 
 Re-derive this map with:
 
@@ -94,6 +95,26 @@ It checks every private torch symbol `utils/reduction.py` needs, that the module
 and the bitsandbytes surface `adamw_8bit.py` re-implements (including the positional order of the
 two update kernels). The bitsandbytes half is skipped rather than failed when it is not installed,
 so the torch half still runs on the CPU-only dev box.
+
+### The deepspeed behaviour dependency cannot be checked on a CPU box
+
+`tools/check_vendored_apis.py` covers torch and bitsandbytes by importing them and comparing
+signatures. It cannot cover the deepspeed row above, because the claim is about what
+`deepspeed.initialize` *does*, and `initialize` JIT-builds `deepspeed_shm_comm` — it does not run
+on a machine without a compiler, and the CPU-only development box is one.
+
+`tools/test_zero_resume_gpu.py` is that check. Run it on a two-rank GPU box after any deepspeed
+upgrade:
+
+```
+deepspeed --num_gpus=2 tools/test_zero_resume_gpu.py
+```
+
+Its first assertion is the premise itself — that each param group holds exactly one tensor after
+`initialize`, and that the ranks' partitions differ. If deepspeed ever stops partitioning the
+client optimizer this way, that assertion fails first and names the reason, rather than the
+failure surfacing as a silently unloadable checkpoint hours into a run. Which is how it surfaced
+the first time.
 
 ## Procedure (run on every submodule pin change or dependency upgrade)
 

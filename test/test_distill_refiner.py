@@ -1247,6 +1247,45 @@ class TestEveryShippedDistillKeyIsRead:
             f'{unread}. Either the key is in the wrong table, or it does nothing.'
         )
 
+    @pytest.mark.parametrize('filename', CONFIGS)
+    def test_commented_out_keys_are_in_the_right_table_too(self, filename):
+        """A commented key is an instruction to the reader, and it can point at the wrong table.
+
+        The guard above cannot see one: toml.load discards comments, so `#resume_from = ...`
+        sitting under [distill] passes it while inviting the user to uncomment a line the code
+        reads from [student]. Uncommenting it then starts from a random refiner at step 0, with
+        no warning, and the interrupted run's checkpoints get overwritten by the fresh one.
+        This repo has shipped a key in the wrong table twice; both 4-GPU configs shipped this
+        one commented.
+        """
+        import re
+        reads = self._reads_by_table()
+        table = None
+        misplaced = []
+        for line in (REPO / 'examples/anima_refiner' / filename).read_text(
+                encoding='utf-8').splitlines():
+            stripped = line.strip()
+            # A commented header opens a commented table: distill.toml documents the whole
+            # optional [rollout] and [optimizer] tables that way. Without following it, every
+            # key inside gets attributed to the last real table and the guard cries wolf.
+            header = re.fullmatch(r'#?\s*\[([a-z_.]+)\]', stripped)
+            if header:
+                table = header.group(1)
+                continue
+            commented = re.match(r'#\s*([a-z_][a-z0-9_]*)\s*=', stripped)
+            if not commented or table in self.SKIP_TABLES or table is None:
+                continue
+            key = commented.group(1)
+            # Only flag a key this script reads from somewhere: a commented key naming nothing
+            # the code knows is prose, not a misplacement.
+            known = {t for t, keys in reads.items() if key in keys}
+            if known and table not in known:
+                misplaced.append(f'[{table}] #{key} -- read from {sorted(known)}')
+        assert not misplaced, (
+            f'{filename} has commented-out keys under the wrong table: {misplaced}. '
+            'Uncommenting one would silently do nothing.'
+        )
+
 
 class _AttrDict(dict):
     """Stands in for BatchEncoding, which supports both d['k'] and d.k."""
@@ -1697,3 +1736,251 @@ class TestResumeRestoresTheAugmentationStream:
                    training_state_path(path))
         fresh_opt, fresh_sched = self._optimizer()
         assert load_training_state(path, fresh_opt, fresh_sched, is_main=False) == 42
+
+
+class TestResolveSchedule:
+    """The step count and the sampler are one decision, and reading one without the other broke.
+
+    The derivation used to sit inline in main() below the optimizer, so the LR scheduler was
+    built holding total_steps=None whenever `epochs` was used. It constructed without complaint
+    and raised TypeError at the end of warmup -- 500 steps into a four-GPU run.
+    """
+
+    CAPTIONS = [f'caption {i}' for i in range(1000)]
+
+    def _resolve(self, epochs, steps, world_size=4, batch_size=2, grad_accum=2):
+        from tools.distill_refiner import resolve_schedule
+        return resolve_schedule(epochs, steps, self.CAPTIONS, batch_size, grad_accum,
+                                rank=0, world_size=world_size, seed=42)
+
+    def test_epochs_produces_an_integer_step_count(self):
+        # The regression itself: with epochs set, `steps` must come back a usable number, never
+        # the None it was passed in as.
+        sampler, steps, _ = self._resolve(epochs=20, steps=None)
+        assert isinstance(steps, int)
+        assert steps == 20 * sampler.steps_per_epoch
+
+    def test_the_step_count_it_returns_builds_a_working_scheduler(self):
+        # The end the bug was actually felt at. total_steps=None survives construction, so
+        # asserting the scheduler exists proves nothing -- it has to be stepped past warmup.
+        import torch
+        from utils.lr_schedule import create_lr_scheduler
+        _, steps, _ = self._resolve(epochs=20, steps=None)
+        model = torch.nn.Linear(2, 2)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+        warmup = 10
+        scheduler = create_lr_scheduler(optimizer, 'cosine', total_steps=steps,
+                                        warmup_steps=warmup)
+        for _ in range(warmup + 5):
+            optimizer.step()
+            scheduler.step()
+        assert optimizer.param_groups[0]['lr'] > 0
+
+    def test_steps_passes_straight_through(self):
+        _, steps, _ = self._resolve(epochs=None, steps=12345)
+        assert steps == 12345
+
+    def test_it_reports_the_conversion_both_ways(self):
+        _, _, from_epochs = self._resolve(epochs=20, steps=None)
+        assert 'epochs' in from_epochs and 'steps' in from_epochs
+        _, _, from_steps = self._resolve(epochs=None, steps=12345)
+        assert 'epochs' in from_steps and '12345' in from_steps
+
+    def test_it_refuses_a_caption_set_that_cannot_fill_a_batch(self):
+        from tools.distill_refiner import resolve_schedule
+        with pytest.raises(RuntimeError, match='cannot fill one global batch'):
+            resolve_schedule(20, None, ['one', 'two'], batch_size=8, grad_accum=4,
+                             rank=0, world_size=2, seed=0)
+
+
+class TestShardedTrainingState:
+    """ZeRO partitions optimizer state across ranks, so rank 0's copy is not the state.
+
+    deepspeed.initialize replaces the client optimizer's param_groups with one flat fp32
+    partition per group (stage_1_and_2.py:473). Saving only rank 0's view wrote a file that
+    looked valid and cost nothing, and the resume failed hours later with a torch ValueError
+    about mismatched parameter groups.
+    """
+
+    @staticmethod
+    def _optimizer():
+        model = torch.nn.Linear(2, 2)
+        opt = torch.optim.AdamW(model.parameters(), lr=0.1)
+        return opt, torch.optim.lr_scheduler.LambdaLR(opt, lambda s: 1.0)
+
+    def test_a_shard_is_named_apart_from_whole_state(self):
+        from tools.distill_refiner import training_state_path
+        weights = Path('/out/context_refiner_epoch7.safetensors')
+        assert training_state_path(weights).name == 'distill_state_epoch7.pt'
+        assert training_state_path(weights, rank=3).name == 'distill_state_epoch7_rank3.pt'
+
+    def test_a_shard_round_trips(self, tmp_path):
+        from tools.distill_refiner import save_training_state, load_training_state
+        opt, sched = self._optimizer()
+        path = tmp_path / 'context_refiner_epoch1.safetensors'
+        save_training_state(path, opt, sched, 40, rank=2, world_size=4)
+        assert (tmp_path / 'distill_state_epoch1_rank2.pt').exists()
+        fresh_opt, fresh_sched = self._optimizer()
+        assert load_training_state(path, fresh_opt, fresh_sched, is_main=False,
+                                   rank=2, world_size=4) == 40
+
+    def test_resuming_into_a_different_world_size_is_refused(self, tmp_path):
+        # A shard describes one partition of a particular world. Loading it into a job of
+        # another size pairs Adam's moments with the wrong parameters, and nothing downstream
+        # would notice.
+        from tools.distill_refiner import save_training_state, load_training_state
+        opt, sched = self._optimizer()
+        path = tmp_path / 'context_refiner_epoch1.safetensors'
+        save_training_state(path, opt, sched, 40, rank=0, world_size=4)
+        fresh_opt, fresh_sched = self._optimizer()
+        with pytest.raises(RuntimeError, match='4-rank job'):
+            load_training_state(path, fresh_opt, fresh_sched, is_main=False,
+                                rank=0, world_size=8)
+
+    def test_a_ddp_state_file_is_not_loaded_by_a_zero_resume(self, tmp_path):
+        # Switching distributed_strategy between runs must not silently feed whole state to a
+        # sharded optimizer; it resumes the weights only and says so.
+        from tools.distill_refiner import save_training_state, load_training_state
+        opt, sched = self._optimizer()
+        path = tmp_path / 'context_refiner_epoch1.safetensors'
+        save_training_state(path, opt, sched, 40)
+        fresh_opt, fresh_sched = self._optimizer()
+        assert load_training_state(path, fresh_opt, fresh_sched, is_main=False,
+                                   rank=0, world_size=4) == 0
+
+    def test_ddp_state_is_unchanged(self, tmp_path):
+        # Backward compatibility: rank=None must produce exactly the old filename and content.
+        from tools.distill_refiner import save_training_state, load_training_state
+        opt, sched = self._optimizer()
+        path = tmp_path / 'context_refiner.safetensors'
+        save_training_state(path, opt, sched, 7)
+        assert (tmp_path / 'distill_state.pt').exists()
+        fresh_opt, fresh_sched = self._optimizer()
+        assert load_training_state(path, fresh_opt, fresh_sched, is_main=False) == 7
+
+
+class TestResumeStateCompleteness:
+    """Everything a resumed run needs that is not the weights, and the pairings that got it wrong."""
+
+    @staticmethod
+    def _optimizer(lr=0.1):
+        model = torch.nn.Linear(2, 2)
+        opt = torch.optim.AdamW(model.parameters(), lr=lr)
+        return opt, torch.optim.lr_scheduler.LambdaLR(opt, lambda s: 1.0)
+
+    def test_a_tagged_full_model_finds_its_own_state_file(self):
+        # save_full_model writes model_epoch7.safetensors and the docs offer it as a rollback
+        # target. Matching only 'context_refiner' sent it to the untagged distill_state.pt --
+        # epoch-7 weights paired with the newest moments and the newest step counter, silently.
+        from tools.distill_refiner import training_state_path
+        assert training_state_path(Path('/out/model_epoch7.safetensors')).name == \
+            'distill_state_epoch7.pt'
+        assert training_state_path(Path('/out/model_step900.safetensors')).name == \
+            'distill_state_step900.pt'
+        assert training_state_path(Path('/out/model.safetensors')).name == 'distill_state.pt'
+
+    def test_the_tag_just_written_is_never_pruned(self, tmp_path):
+        # Tag numbers only increase within one uninterrupted run. A second run into the same
+        # output_dir, or a resume onto fewer ranks, can write a lower number than what is there
+        # -- and the prune then deleted the checkpoint the run had just written, announcing it
+        # as a routine eviction.
+        from tools.distill_refiner import prune_distill_checkpoints
+        for n in (4, 5, 6, 7):
+            (tmp_path / f'context_refiner_epoch{n}.safetensors').write_bytes(b'w')
+            (tmp_path / f'distill_state_epoch{n}.pt').write_bytes(b's')
+        removed = [p.name for p in prune_distill_checkpoints(tmp_path, 3, protect_tag='_epoch4')]
+        assert 'context_refiner_epoch4.safetensors' not in removed
+        assert (tmp_path / 'context_refiner_epoch4.safetensors').exists()
+
+    def test_without_the_guard_the_lowest_tag_still_goes(self, tmp_path):
+        # The protection is scoped to the current tag, not a blanket "never prune the lowest".
+        from tools.distill_refiner import prune_distill_checkpoints
+        for n in (4, 5, 6, 7):
+            (tmp_path / f'context_refiner_epoch{n}.safetensors').write_bytes(b'w')
+        removed = [p.name for p in prune_distill_checkpoints(tmp_path, 3, protect_tag='_epoch7')]
+        assert 'context_refiner_epoch4.safetensors' in removed
+
+    def test_a_ddp_resume_does_not_push_rank0s_stream_onto_every_rank(self, tmp_path):
+        # main() seeds random.seed(seed + rank) so the ranks draw different caption
+        # augmentations. Only rank 0 writes a DDP state file; restoring it everywhere would
+        # collapse that offset and correlate the augmentation noise for the rest of the run.
+        import random as py_random
+        from tools.distill_refiner import save_training_state, load_training_state
+        opt, sched = self._optimizer()
+        path = tmp_path / 'context_refiner.safetensors'
+        py_random.seed(0)
+        save_training_state(path, opt, sched, 10)
+
+        py_random.seed(999)                       # stand in for a non-zero rank's stream
+        mine = py_random.getstate()
+        fresh_opt, fresh_sched = self._optimizer()
+        load_training_state(path, fresh_opt, fresh_sched, is_main=False, own_python_rng=False)
+        assert py_random.getstate() == mine, 'rank 0 stream overwrote this rank'
+
+    def test_the_owning_rank_still_gets_its_stream_back(self, tmp_path):
+        import random as py_random
+        from tools.distill_refiner import save_training_state, load_training_state
+        opt, sched = self._optimizer()
+        path = tmp_path / 'context_refiner.safetensors'
+        py_random.seed(0)
+        expected = [py_random.random() for _ in range(3)]
+        py_random.seed(0)
+        save_training_state(path, opt, sched, 10)
+        py_random.seed(12345)
+        fresh_opt, fresh_sched = self._optimizer()
+        load_training_state(path, fresh_opt, fresh_sched, is_main=False, own_python_rng=True)
+        assert [py_random.random() for _ in range(3)] == expected
+
+    def test_the_rollout_streams_come_back(self, tmp_path):
+        # Both are seeded apart from the global stream so that enabling the rollout does not
+        # shift the caption augmentation; they need saving for the same reason it does.
+        import random as py_random
+        from tools.distill_refiner import save_training_state, load_training_state
+        opt, sched = self._optimizer()
+        generator = torch.Generator(device='cpu').manual_seed(7)
+        rng = py_random.Random(11)
+        path = tmp_path / 'context_refiner.safetensors'
+        save_training_state(path, opt, sched, 10, rollout_generator=generator, rollout_rng=rng)
+        expected_noise = torch.randn(4, generator=generator)
+        expected_draw = rng.random()
+
+        generator.manual_seed(999)
+        drifted = py_random.Random(999)
+        fresh_opt, fresh_sched = self._optimizer()
+        load_training_state(path, fresh_opt, fresh_sched, is_main=False,
+                            rollout_generator=generator, rollout_rng=drifted)
+        assert torch.equal(torch.randn(4, generator=generator), expected_noise)
+        assert drifted.random() == expected_draw
+
+    def test_the_fp16_loss_scaler_comes_back(self, tmp_path):
+        from tools.distill_refiner import save_training_state, load_training_state
+        opt, sched = self._optimizer()
+        scaler = torch.amp.GradScaler('cpu', enabled=True, init_scale=1024.0)
+        path = tmp_path / 'context_refiner.safetensors'
+        save_training_state(path, opt, sched, 10, scaler=scaler)
+        fresh = torch.amp.GradScaler('cpu', enabled=True, init_scale=65536.0)
+        fresh_opt, fresh_sched = self._optimizer()
+        load_training_state(path, fresh_opt, fresh_sched, is_main=False, scaler=fresh)
+        assert fresh.get_scale() == 1024.0
+
+    def test_the_restored_learning_rate_is_live_immediately(self, tmp_path):
+        # load_state_dict restores the schedule's position but leaves the optimizer holding the
+        # LR it was built with until the next step() -- one step at the start of a warmup, which
+        # is near zero.
+        from utils.lr_schedule import create_lr_scheduler
+        from tools.distill_refiner import save_training_state, load_training_state
+        model = torch.nn.Linear(2, 2)
+        opt = torch.optim.AdamW(model.parameters(), lr=5e-5)
+        sched = create_lr_scheduler(opt, 'cosine', total_steps=1000, warmup_steps=100)
+        for _ in range(300):
+            opt.step()
+            sched.step()
+        expected = opt.param_groups[0]['lr']
+        path = tmp_path / 'context_refiner.safetensors'
+        save_training_state(path, opt, sched, 300)
+
+        fresh_model = torch.nn.Linear(2, 2)
+        fresh_opt = torch.optim.AdamW(fresh_model.parameters(), lr=5e-5)
+        fresh_sched = create_lr_scheduler(fresh_opt, 'cosine', total_steps=1000, warmup_steps=100)
+        load_training_state(path, fresh_opt, fresh_sched, is_main=False)
+        assert fresh_opt.param_groups[0]['lr'] == pytest.approx(expected)

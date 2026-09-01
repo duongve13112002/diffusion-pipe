@@ -171,7 +171,7 @@ None of these is specific to one objective. Changing them changes all four.
 | `save_every_n_epochs` / `save_every`, `keep_last_n_checkpoints`, `save_full_model` | Checkpointing |
 | `log_every` | Progress-bar interval |
 | `seed` | Model seed; the caption and rollout streams are rank-offset from it |
-| `resume_from` | Restores weights, optimizer, scheduler, step and the augmentation RNG |
+| `[student] resume_from` | Restores weights, optimizer, scheduler, step and the RNG streams. Read from `[student]`, not `[distill]` |
 | `max_text_length` | Padded token length. **Should stay 512** — see design-notes.md |
 | `dataset` / `caption_corpus` / `captions` | Caption source. Alternatives |
 

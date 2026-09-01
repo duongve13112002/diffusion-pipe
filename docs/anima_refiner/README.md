@@ -396,8 +396,22 @@ Two configurations are refused rather than half-supported:
 | Stage 3 | Shards the parameters, so `refiner.state_dict()` holds shards, not weights, and the save path would need a gather that buys nothing. Plus the all-gather-per-forward cost above. |
 | A single rank | Sharding across one rank shards nothing. Left to DeepSpeed this fails on `No module named 'mpi4py'` from its MPI discovery path, which says nothing about the real problem. |
 
-Checkpointing is unaffected either way: ZeRO 1 and 2 shard optimizer state and gradients but
-never the parameters, so every rank still holds the full refiner and rank 0 writes it as before.
+**Weight** checkpointing is unaffected either way: ZeRO 1 and 2 shard optimizer state and
+gradients but never the parameters, so every rank still holds the full refiner and rank 0 writes
+it as before. **Optimizer** state is the opposite case, and it is what a resume needs.
+`deepspeed.initialize` replaces the optimizer's parameter groups with this rank's flat fp32
+partition, so under ZeRO each rank holds a different piece of Adam's moments and rank 0's copy is
+not the state. Every rank therefore writes its own `distill_state_<tag>_rank<N>.pt`, and a resume
+reads the shard matching its rank, after the engine exists rather than before. Two consequences
+worth knowing:
+
+- A ZeRO checkpoint resumes only into a job of the same size. A shard describes one partition of
+  a particular world, so resuming four ranks' shards onto eight is refused with a message naming
+  the size it needs rather than loading the wrong moments.
+- Optimizer state does not carry across a change of `distributed_strategy`. The two layouts are
+  named apart on disk, so switching resumes the weights only and says so, instead of loading
+  whole state into a sharded optimizer, which used to succeed silently and then crash at the
+  next save.
 
 ### Precision
 
@@ -725,15 +739,21 @@ distill_state.pt
 model.safetensors
 ```
 
+Under `zero1` or `zero2` the single `distill_state_epoch7.pt` becomes one file per rank —
+`distill_state_epoch7_rank0.pt` and so on — for the reason given under Parallelism above. Nothing
+else about the layout changes.
+
 Point `context_refiner_path` at the untagged name and it always picks up the latest, which is
-what every config written before tagging existed already does. Point `resume_from` at a tagged
-one to go back to it: the state file beside it carries that checkpoint's optimizer moments, not
-the newest ones.
+what every config written before tagging existed already does. Point `resume_from` (in the
+`[student]` table, not `[distill]`) at a tagged one to go back to it: the state file beside it
+carries that checkpoint's optimizer moments, not the newest ones. That pairing holds for the
+tagged `model_<tag>.safetensors` too, so rolling back to a full checkpoint is the same move.
 
 `keep_last_n_checkpoints` prunes the tagged sets, counting **each kind separately** — N
 epoch-tagged and N step-tagged — because the two are produced by different triggers at different
-rates. All three files of a pruned tag go together, so a surviving tag is always complete, and
-the untagged names are never pruned.
+rates. Every file of a pruned tag goes together, rank shards included, so a surviving tag is
+always complete; the untagged names are never pruned, and neither is the tag the current save
+just wrote.
 
 An epoch is one pass over every caption, sharded across ranks: no caption is seen twice in an
 epoch, and each rank gets `1/world_size` of them. The tail that cannot fill a whole global batch

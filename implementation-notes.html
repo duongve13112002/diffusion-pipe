@@ -33,6 +33,138 @@
 <p class="meta">A running log of decisions taken outside the spec, forced changes, tradeoffs, and
 anything else the maintainer needs to know. Newest entry first.</p>
 
+<h2>2026-09-01 &mdash; Six defects in the epochs and checkpoint-retention round</h2>
+
+<p><strong>Context.</strong> The previous entry shipped epochs, retention, tagged checkpoints and
+resume, and recorded that the tests arrived a commit late. An audit of that work found six real
+defects, two of them blockers on the exact configuration a four-GPU box would run. Two were found
+by reading the code here, four by an independent adversarial reviewer given the same brief. All
+six are fixed below.</p>
+
+<div class="flag">
+  <p><strong>The two blockers were both in code written the day before, and both had been
+  reported as verified.</strong> That is the finding worth keeping. &ldquo;Verified&rdquo; had
+  meant a throwaway script exercising the happy path of one function; neither blocker is visible
+  from that vantage point, because both are about the <em>order</em> in which a 500-line
+  <code>main()</code> reads its own variables and about what a library does to an object it is
+  handed. Neither is reachable without either running the real thing or reading the whole
+  function as a sequence.</p>
+</div>
+
+<h3>1. The step count was read before it was known (blocker)</h3>
+
+<p>With <code>[distill] epochs</code> set, <code>steps</code> stays <code>None</code> until it is
+derived from the sampler. The sampler was built below the optimizer, so
+<code>build_lr_scheduler</code> received <code>total_steps=None</code>.
+<code>CosineAnnealingLR(T_max=None)</code> constructs without complaint and
+<code>SequentialLR</code> hands over to it at the warmup milestone, so the failure is a
+<code>TypeError</code> from inside torch at <em>scheduler step 500</em> &mdash; roughly 500
+optimizer steps at a global batch of 1536, with a traceback pointing nowhere near the config.
+Both shipped four-GPU configs use <code>epochs = 20</code> with the default
+<code>warmup_steps = 500</code>, so both died. Setting <code>resume_from</code> on an epochs
+config raised <code>TypeError</code> at startup instead, from the resume guard comparing an int
+against None.</p>
+
+<p><strong>Fixed structurally rather than by moving two lines.</strong> The sampler and the step
+count are one decision, so <code>resolve_schedule()</code> now returns both together and is
+called immediately after the captions load. Reading one without the other is no longer possible
+to express. It also means the &ldquo;too few captions&rdquo; refusal fires before ~7 GB of
+teacher and student weights are resident, which is what <code>validate_config_early</code>
+exists to achieve. A warning was added for <code>warmup_steps &gt;= steps</code>: with
+<code>epochs</code> the step count is derived rather than written down, so a warmup longer than
+the whole run is easy to arrive at without noticing, and it silently disables the decay phase.</p>
+
+<h3>2. ZeRO wrote optimizer state it could not read back (blocker)</h3>
+
+<p><code>deepspeed.initialize</code> mutates the client optimizer in place:
+<code>stage_1_and_2.py:473</code> replaces each param group's parameter list with a single flat
+rank-local fp32 partition. So under <code>zero1</code>/<code>zero2</code>, rank 0's
+<code>state_dict()</code> is a shard, not the state, and the other ranks' shards were never
+written at all. Three failure modes, all reproduced against the installed torch and deepspeed:
+the file is written without error; resuming it raises <em>&ldquo;loaded state dict contains a
+parameter group that does not match the size of optimizer's group&rdquo;</em>; and resuming a
+DDP-written file under ZeRO loads successfully, then has its state orphaned by
+<code>initialize</code> and blows up with a <code>KeyError</code> in
+<code>Optimizer.state_dict</code> at the next save &mdash; hours later.</p>
+
+<p>Every rank now writes <code>distill_state_&lt;tag&gt;_rank&lt;N&gt;.pt</code>, and the load
+moved to <em>after</em> <code>build_strategy</code> so the optimizer has the shape the shard was
+written in. DDP could load on either side of the wrap; it moved too, so there is one order to
+reason about and so the fp16 <code>GradScaler</code> exists to be restored as well. The two
+layouts are named apart on disk, which is what stops a DDP file from being fed to a sharded
+optimizer, and <code>world_size</code> is recorded so a resume into a differently sized job is
+refused rather than loading another rank's partition.</p>
+
+<div class="flag">
+  <p><strong>This fix is unit-tested but not hardware-tested.</strong>
+  <code>deepspeed.initialize</code> does not run on this machine &mdash; it JIT-builds
+  <code>deepspeed_shm_comm</code> and needs MSVC. The file-level behaviour is covered in the
+  suite against a plain torch optimizer; the premise it rests on was confirmed by reading the
+  installed deepspeed source, not by running it. <code>tools/test_zero_resume_gpu.py</code>
+  checks all five claims on a real two-rank GPU box and should be run before anyone trusts ZeRO
+  resume. The default and the shipped configs are <code>ddp</code>, which is fully covered.</p>
+</div>
+
+<h3>3. A commented key in the wrong table (serious)</h3>
+
+<p>Both four-GPU configs put <code>#resume_from</code> under <code>[distill]</code>; the code
+reads it from <code>[student]</code>. Uncommenting it starts from a randomly initialised refiner
+at step 0, silently, and the fresh run's checkpoints then overwrite the interrupted one's. The
+existing guard, <code>test_every_key_is_read_from_the_table_it_sits_in</code>, is exactly the
+right shape for this bug class and cannot see it: <code>toml.load</code> discards comments. A
+companion test now scans commented <code>#key =</code> lines, following commented table headers
+so that the fully commented <code>#[rollout]</code> block in <code>distill.toml</code> does not
+read as a hundred misplacements. It was checked against the buggy version of the config before
+being kept, so it is known not to pass vacuously. This repo has now shipped a key in the wrong
+table three times.</p>
+
+<h3>4. A tagged full model found the wrong state file (serious)</h3>
+
+<p><code>training_state_path</code> matched only the <code>context_refiner</code> stem, so
+<code>model_epoch7.safetensors</code> &mdash; documented as a first-class rollback target &mdash;
+resolved to the untagged <code>distill_state.pt</code>: epoch-7 weights paired with the newest
+moments and the newest step counter. That is precisely the mispairing the function's own
+docstring says it exists to prevent. It now matches both prefixes a save writes.</p>
+
+<h3>5. Retention could delete the checkpoint it had just written (minor)</h3>
+
+<p>Tags are ordered by their number, which only increases within one uninterrupted run. Reusing
+an <code>output_dir</code>, or resuming onto fewer ranks (which raises
+<code>steps_per_epoch</code> and lowers the epoch number), writes a lower tag than what is
+already there &mdash; and the prune then removed the fresh checkpoint, announcing it as a routine
+eviction. The current tag is now protected. Rank shards are pruned with their tag as well, globbed
+on the <code>_rank</code> separator rather than on the number: a bare
+<code>distill_state_epoch1*</code> also matches <code>distill_state_epoch10.pt</code>.</p>
+
+<h3>6. A resume correlated the augmentation noise across ranks (minor)</h3>
+
+<p><code>main()</code> offsets the global random seed by rank so the ranks draw different caption
+augmentations. Only rank 0 writes a DDP state file, and restoring it on every rank collapsed that
+offset for the rest of the run. The captions still differ &mdash; <code>EpochSampler</code>
+shards them &mdash; so this was correlation in the noise, not duplicated training data. The
+stream is now restored only by the rank that owns it; the others re-offset. The torch stream is
+rank-uniform by construction and is still restored everywhere, which is what an uninterrupted run
+would have had.</p>
+
+<ul>
+  <li><strong>Also carried in resume state now:</strong> the rollout's two RNG streams (seeded
+    apart from the global one so that enabling the rollout does not shift the caption
+    augmentation), and the fp16 <code>GradScaler</code>. And the restored learning rate is pushed
+    into the optimizer immediately: <code>load_state_dict</code> restores the schedule's position
+    but leaves the optimizer on its construction-time LR until the next <code>step()</code>,
+    which is one step near zero at the start of a warmup.</li>
+  <li><strong>Verified correct under audit, worth recording because it was doubted:</strong>
+    mid-epoch resume walks the right caption stream. The offset derives from the absolute step
+    and <code>epoch_order</code> is a pure function of <code>(seed, epoch)</code>, so position is
+    reconstructed rather than remembered. Also: 8-bit optimizer state survives the round trip
+    &mdash; bitsandbytes overrides <code>load_state_dict</code> with a <code>uint8</code> guard,
+    so torch's dtype-casting policy does not corrupt the quantisation blocks under
+    <code>bf16-full</code>, which is the pairing the four-GPU config ships.</li>
+  <li><strong>Documentation.</strong> The README claimed &ldquo;checkpointing is unaffected
+    either way&rdquo; under ZeRO. True when checkpointing was weights-only; optimizer state is
+    exactly what ZeRO shards.</li>
+</ul>
+
 <h2>2026-09-01 &mdash; Epochs for distillation, and checkpoint retention for both trainers</h2>
 
 <p><strong>Request.</strong> Describe a distillation run in epochs the way the rest of the repo

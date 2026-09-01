@@ -202,6 +202,35 @@ class EpochSampler:
         return order[self.rank:usable:self.world_size]
 
 
+def resolve_schedule(epochs, steps, captions, batch_size, grad_accum, rank, world_size, seed):
+    """Build the sampler and settle the final step count in one place.
+
+    They are one decision rather than two: with `epochs` the step count is a property of the
+    sampler, so every consumer of `steps` -- the LR scheduler's total, the resume guard, the
+    progress bar -- reads a wrong value if it runs before this does. That is not hypothetical.
+    The derivation used to sit inline in main() below the optimizer, and the LR scheduler was
+    built one screen too early holding total_steps=None: it constructed fine and raised
+    TypeError the moment warmup ended, 500 steps into a four-GPU run. Returning both together
+    is what makes reading one without the other impossible.
+
+    Returns (sampler, steps, description) -- the description is the line worth printing.
+    """
+    sampler = EpochSampler(captions, batch_size, grad_accum, rank, world_size, seed)
+    if epochs is not None:
+        steps = epochs * sampler.steps_per_epoch
+        description = (
+            f'{epochs} epochs over {len(captions)} captions = {steps} steps '
+            f'({sampler.steps_per_epoch} steps/epoch at a global batch of {sampler.global_batch})'
+        )
+    else:
+        description = (
+            f'{steps} steps over {len(captions)} captions '
+            f'({steps / max(sampler.steps_per_epoch, 1):.2f} epochs at a global batch of '
+            f'{sampler.global_batch})'
+        )
+    return sampler, steps, description
+
+
 def caption_augment_config(config):
     """Resolve the caption augmentation applied to each sampled batch.
 
@@ -667,6 +696,12 @@ def setup_distributed():
 
 
 DISTRIBUTED_STRATEGIES = ('ddp', 'zero1', 'zero2')
+
+# ZeRO 1 and 2 partition the optimizer state across ranks: deepspeed.initialize replaces the
+# client optimizer's param_groups with this rank's flat fp32 partition, so optimizer.state_dict()
+# afterwards describes a shard, not the whole thing. DDP never touches the optimizer, so rank 0's
+# copy is complete and is the only one worth writing.
+SHARDED_STATE_STRATEGIES = ('zero1', 'zero2')
 
 def build_optimizer(config, refiner, is_main):
     """Build the optimizer from an [optimizer] table, or from the legacy flat [distill] keys.
@@ -1260,6 +1295,27 @@ def main():
             f"prefix_tag_caption={augment['prefix_tag_caption']!r}"
         )
 
+    # The sampler and the final step count both have to exist before the optimizer does. The LR
+    # scheduler is built from `steps`, and with `epochs` set `steps` is not known until the
+    # sampler has worked out how many steps an epoch takes. Deriving it after the scheduler was
+    # built left it holding total_steps=None, which survives construction and then raises
+    # TypeError the moment warmup ends -- 500 steps into a multi-GPU run.
+    sampler, steps, schedule_description = resolve_schedule(
+        epochs, steps, captions, batch_size, grad_accum, rank, world_size, seed)
+    if is_main:
+        print(schedule_description)
+
+    # With `epochs`, the step count is derived rather than written down, so a warmup longer than
+    # the whole run is easy to arrive at without noticing. SequentialLR never reaches its
+    # milestone in that case: the LR ramps for the entire run and the decay phase never starts.
+    warmup_steps = config['distill'].get('warmup_steps', 500)
+    if warmup_steps >= steps and is_main:
+        print(
+            f'WARNING: warmup_steps ({warmup_steps}) is not shorter than the run ({steps} '
+            'steps). The learning rate will ramp for the whole run and never decay. Lower '
+            'warmup_steps, or raise epochs/steps.'
+        )
+
     if is_main:
         print('Building teacher...')
     t5_tokenizer = T5TokenizerFast(
@@ -1362,17 +1418,14 @@ def main():
         print(f'Optimizer: {type(optimizer).__name__} | '
               f"lr_scheduler: {config['distill'].get('lr_scheduler', 'cosine')}")
 
-    # Resume the rest of the training state now that the optimizer and scheduler exist, and
-    # before the strategy wraps them -- ZeRO takes ownership of both.
-    start_step = 0
+    # ZeRO partitions the optimizer state across ranks: deepspeed.initialize replaces the client
+    # optimizer's param_groups with this rank's flat fp32 partition, so its state_dict describes
+    # a shard and only has that shape once the engine exists. DDP leaves the optimizer alone and
+    # could restore on either side of the wrap; both restore after it, so there is one order to
+    # reason about and so the fp16 GradScaler exists to be restored along with everything else.
+    sharded_state = config['distill'].get('distributed_strategy', 'ddp').lower() in         SHARDED_STATE_STRATEGIES
+    state_rank = rank if sharded_state else None
     resume_path = config['student'].get('resume_from', None)
-    if resume_path:
-        start_step = load_training_state(resume_path, optimizer, scheduler, is_main)
-        if start_step >= steps:
-            raise RuntimeError(
-                f'{resume_path} was already trained for {start_step} steps and this config asks '
-                f'for {steps}. Raise steps, or point resume_from at an earlier checkpoint.'
-            )
 
     # Built after the optimizer and scheduler: ZeRO wraps both, so they have to exist first.
     strategy = build_strategy(config, refiner, world_size, local_rank, device, batch_size,
@@ -1380,6 +1433,26 @@ def main():
     train_module = strategy.module
     if is_main and strategy.name != 'ddp':
         print(f'Parallelism: DeepSpeed ZeRO stage {strategy.stage} (optimizer state sharded).')
+
+    start_step = 0
+    if resume_path:
+        start_step = load_training_state(
+            resume_path, optimizer, scheduler, is_main,
+            rank=state_rank, world_size=world_size,
+            own_python_rng=sharded_state or is_main,
+            rollout_generator=rollout_generator, rollout_rng=rollout_rng,
+            scaler=getattr(strategy, 'scaler', None),
+        )
+        if start_step >= steps:
+            raise RuntimeError(
+                f'{resume_path} was already trained for {start_step} steps and this config asks '
+                f'for {steps}. Raise steps, or point resume_from at an earlier checkpoint.'
+            )
+        if not (sharded_state or is_main):
+            # A DDP checkpoint carries rank 0's `random` stream only. Re-offset the other ranks
+            # rather than leaving them all on rank 0's, which would correlate the caption
+            # augmentation across the job for the rest of the run.
+            random.seed(seed + rank + start_step)
 
     save_every = config['distill'].get('save_every', 2000)
     log_every = config['distill'].get('log_every', 50)
@@ -1392,22 +1465,6 @@ def main():
                 f'[distill] {key} must be >= 1, got {value}. To effectively disable it, set it '
                 'larger than `steps`.'
             )
-    sampler = EpochSampler(captions, batch_size, grad_accum, rank, world_size, seed)
-    if epochs is not None:
-        steps = epochs * sampler.steps_per_epoch
-        if is_main:
-            print(
-                f'{epochs} epochs over {len(captions)} captions = {steps} steps '
-                f'({sampler.steps_per_epoch} steps/epoch at a global batch of '
-                f'{sampler.global_batch})'
-            )
-    elif is_main:
-        print(
-            f'{steps} steps over {len(captions)} captions '
-            f'({steps / max(sampler.steps_per_epoch, 1):.2f} epochs at a global batch of '
-            f'{sampler.global_batch})'
-        )
-
     save_full_model_enabled = config['distill'].get('save_full_model', False)
     keep_last_n = config['distill'].get('keep_last_n_checkpoints', None)
     if keep_last_n is not None and keep_last_n < 1:
@@ -1587,25 +1644,23 @@ def main():
             running = 0.0
 
         if (step + 1) % save_every == 0 or step + 1 == steps:
-            # Every rank holds the full, identical weights -- DDP all-reduces them, and ZeRO
-            # 1/2 shard optimizer state and gradients but never the parameters. Only one writes.
-            if is_main:
-                # Tagged by whichever unit drives the saving, so the two kinds are countable
-                # apart the way train.py's epoch<N>/ and step<N>/ are.
-                if save_every_n_epochs is not None:
-                    tag = f'_epoch{step // sampler.steps_per_epoch + 1}'
-                else:
-                    tag = f'_step{step + 1}'
-                tagged_path = output_dir / f'context_refiner{tag}.safetensors'
-                save_refiner(refiner, tagged_path, dtype, metadata=provenance)
-                save_training_state(tagged_path, optimizer, scheduler, step + 1)
+            # Tagged by whichever unit drives the saving, so the two kinds are countable apart
+            # the way train.py's epoch<N>/ and step<N>/ are. Computed outside the rank guards
+            # because under ZeRO every rank writes its own piece of this checkpoint.
+            if save_every_n_epochs is not None:
+                tag = f'_epoch{step // sampler.steps_per_epoch + 1}'
+            else:
+                tag = f'_step{step + 1}'
+            tagged_path = output_dir / f'context_refiner{tag}.safetensors'
+            refiner_path = output_dir / 'context_refiner.safetensors'
 
+            # Weights: every rank holds the full, identical set -- DDP all-reduces them, and
+            # ZeRO 1/2 shard optimizer state and gradients but never the parameters. One writer.
+            if is_main:
+                save_refiner(refiner, tagged_path, dtype, metadata=provenance)
                 # And the stable name, so every config that points at
                 # context_refiner.safetensors keeps working without knowing about tags.
-                refiner_path = output_dir / 'context_refiner.safetensors'
                 shutil.copy2(tagged_path, refiner_path)
-                shutil.copy2(training_state_path(tagged_path),
-                             training_state_path(refiner_path))
 
                 if save_full_model_enabled:
                     # A complete anima_refiner checkpoint per save, not only at the end: the
@@ -1616,10 +1671,26 @@ def main():
                                     full_path, dtype)
                     shutil.copy2(full_path, output_dir / 'model.safetensors')
 
-                for gone in prune_distill_checkpoints(output_dir, keep_last_n):
-                    print(f'keep_last_n_checkpoints: removed {gone.name}')
+            # Optimizer state: whole on rank 0 under DDP, one shard per rank under ZeRO. Writing
+            # only rank 0's shard produced a file that looked valid, cost nothing to write, and
+            # could not be resumed -- the failure landed hours later, on the resume.
+            if is_main or sharded_state:
+                save_training_state(tagged_path, optimizer, scheduler, step + 1,
+                                    rank=state_rank, world_size=world_size,
+                                    rollout_generator=rollout_generator,
+                                    rollout_rng=rollout_rng,
+                                    scaler=getattr(strategy, 'scaler', None))
+                shutil.copy2(training_state_path(tagged_path, state_rank),
+                             training_state_path(refiner_path, state_rank))
+
             if world_size > 1:
+                # Before the prune, so no rank is still writing a shard of an older tag when
+                # rank 0 starts deleting the files that belong to it.
                 dist.barrier()
+            if is_main:
+                for gone in prune_distill_checkpoints(output_dir, keep_last_n,
+                                                      protect_tag=tag):
+                    print(f'keep_last_n_checkpoints: removed {gone.name}')
 
     if is_main:
         # The loop's `step + 1 == steps` branch already wrote this file; no need to write the
@@ -1705,20 +1776,37 @@ def save_refiner(refiner, path, dtype, metadata=None):
     _save_file_atomically(state_dict, path, metadata or {'format': 'pt'})
 
 
-def training_state_path(refiner_path):
+def training_state_path(refiner_path, rank=None):
     """The training state that belongs to this particular weights file.
 
     Derived from the weights filename rather than fixed, so a tagged checkpoint carries its own
     optimizer state: context_refiner_epoch5.safetensors pairs with distill_state_epoch5.pt.
     Resuming from an older tag would otherwise pick up the newest state and pair mismatched
     moments with older weights.
+
+    `rank` names one shard of a ZeRO run's optimizer state, which is rank-local and has to be
+    written by every rank. The unsuffixed name means whole state, which is what DDP produces.
+    Keeping the two apart by filename is what stops a DDP checkpoint from being fed to a ZeRO
+    resume, where the shapes differ and the failure is a confusing ValueError deep in torch.
     """
     path = Path(refiner_path)
-    suffix = path.stem[len('context_refiner'):] if path.stem.startswith('context_refiner') else ''
-    return path.with_name(f'distill_state{suffix}.pt')
+    # Both names a save writes carry the same tag, and `model_epoch7.safetensors` is documented
+    # as a first-class rollback target. Matching only 'context_refiner' sent it to the untagged
+    # distill_state.pt -- epoch-7 weights paired with the newest moments and the newest step
+    # counter, silently, which is the exact mispairing this function exists to prevent.
+    for prefix in ('context_refiner', 'model'):
+        if path.stem.startswith(prefix):
+            suffix = path.stem[len(prefix):]
+            break
+    else:
+        # A name this script never wrote. There is no state file to find; the untagged name is
+        # the honest guess, and load_training_state reports the miss rather than inventing one.
+        suffix = ''
+    shard = '' if rank is None else f'_rank{rank}'
+    return path.with_name(f'distill_state{suffix}{shard}.pt')
 
 
-def prune_distill_checkpoints(output_dir, keep):
+def prune_distill_checkpoints(output_dir, keep, protect_tag=None):
     """Keep the newest `keep` tagged checkpoints of each kind, with everything that belongs to them.
 
     Counted separately per kind, matching train.py: N epoch-tagged and N step-tagged, because the
@@ -1727,6 +1815,12 @@ def prune_distill_checkpoints(output_dir, keep):
     are removed together, so a surviving tag is always complete.
 
     The untagged names are never pruned. They are the stable ones every config points at.
+
+    `protect_tag` is the tag this save just wrote. Tags are ordered by their number, which only
+    increases within one uninterrupted run -- but not across runs sharing an output_dir, and not
+    when a resume onto fewer ranks raises steps_per_epoch and lowers the epoch number. Without
+    this, a second run writing epoch1 into a directory holding epoch18/19/20 deletes its own
+    fresh checkpoint and announces it as a pruned one.
     """
     if not keep or keep < 1:
         return []
@@ -1740,11 +1834,18 @@ def prune_distill_checkpoints(output_dir, keep):
                 tagged.append((int(number), number, path))
         tagged.sort(key=lambda triple: triple[0])
         for _, number, path in tagged[:-keep] if len(tagged) > keep else []:
-            companions = (
+            if protect_tag is not None and f'_{kind}{number}' == protect_tag:
+                continue
+            companions = [
                 path,
                 training_state_path(path),
                 output_dir / f'model_{kind}{number}.safetensors',
-            )
+            ]
+            # A ZeRO run writes one state shard per rank, so the tag owns N of them rather than
+            # one. Globbed on the '_rank' separator rather than on the number alone: a bare
+            # 'distill_state_epoch1*' would also match distill_state_epoch10.pt and delete a
+            # checkpoint nine epochs newer than the one being pruned.
+            companions.extend(sorted(output_dir.glob(f'distill_state_{kind}{number}_rank*.pt')))
             for victim in companions:
                 if victim.exists():
                     victim.unlink()
@@ -1752,18 +1853,24 @@ def prune_distill_checkpoints(output_dir, keep):
     return removed
 
 
-def save_training_state(refiner_path, optimizer, scheduler, step):
+def save_training_state(refiner_path, optimizer, scheduler, step, rank=None, world_size=1,
+                        rollout_generator=None, rollout_rng=None, scaler=None):
     """Save what a resume needs beyond the weights.
 
     Without this, resume_from restarted Adam's moments at zero and rebuilt the LR schedule from
     step 0, so a run resumed at 15,000 of 20,000 steps re-ran its warmup at peak LR and then the
     whole cosine again. That regresses the model visibly and costs more than the interruption
     did. train.py checkpoints full state for every other mode; this brings distillation in line.
+
+    Under ZeRO every rank calls this with its own `rank`, because each holds a different shard of
+    the moments and rank 0's alone is not the state. `world_size` is recorded so that a resume
+    into a differently sized job is refused rather than silently loading another rank's shard.
     """
-    path = training_state_path(refiner_path)
+    path = training_state_path(refiner_path, rank)
     tmp = path.with_name(path.name + '.tmp')
-    torch.save({
+    payload = {
         'step': step,
+        'world_size': world_size,
         'optimizer': optimizer.state_dict(),
         'scheduler': scheduler.state_dict(),
         # The caption order does not need saving -- EpochSampler is a pure function of
@@ -1773,34 +1880,89 @@ def save_training_state(refiner_path, optimizer, scheduler, step):
         # uninterrupted one would have.
         'python_rng': random.getstate(),
         'torch_rng': torch.get_rng_state(),
-    }, tmp)
+    }
+    # The rollout draws its timesteps and its initial noise from streams of their own, seeded
+    # apart from the global one so that turning the rollout on does not shift the caption
+    # augmentation. They need saving for the same reason the global stream does.
+    if rollout_generator is not None:
+        payload['rollout_generator'] = rollout_generator.get_state()
+    if rollout_rng is not None:
+        payload['rollout_rng'] = rollout_rng.getstate()
+    # Only fp16-mixed has one. Restarting it at init_scale costs a handful of skipped steps
+    # after every resume, which is small but is also entirely avoidable.
+    if scaler is not None and scaler.is_enabled():
+        payload['scaler'] = scaler.state_dict()
+    torch.save(payload, tmp)
     os.replace(tmp, path)
 
 
-def load_training_state(refiner_path, optimizer, scheduler, is_main):
+def load_training_state(refiner_path, optimizer, scheduler, is_main, rank=None, world_size=1,
+                        own_python_rng=True, rollout_generator=None, rollout_rng=None,
+                        scaler=None):
     """Restore optimizer, scheduler and step. Returns the step to resume from.
 
     A missing file is not an error: it is a refiner distilled before this existed, or one
     produced by another mode. Say so and start the schedule from zero, rather than pretending.
+
+    Under ZeRO, `rank` selects this rank's shard and the file must have come from a job of the
+    same size -- a shard describes one partition of a particular world, and loading a shard from
+    a differently sized job pairs moments with the wrong parameters.
+
+    `own_python_rng` says whether this file's `random` stream belongs to this rank. It does under
+    ZeRO, where every rank writes its own; under DDP only rank 0 writes, and pushing rank 0's
+    stream onto every rank would undo the `random.seed(seed + rank)` offset that keeps the ranks
+    drawing different caption augmentations. The caller re-offsets instead.
     """
-    path = training_state_path(refiner_path)
+    path = training_state_path(refiner_path, rank)
     if not path.exists():
         if is_main:
+            # Naming the other layout explicitly, because switching distributed_strategy between
+            # runs is the ordinary way to arrive here and "no file" alone does not point at it.
+            other = training_state_path(refiner_path, None if rank is not None else 0)
+            switched = (
+                f' A {other.name} is there instead, which is a '
+                + ('DDP' if rank is not None else 'ZeRO')
+                + ' checkpoint; optimizer state does not carry across that switch.'
+                if other.exists() else ''
+            )
             print(
-                f'No {path.name} beside {Path(refiner_path).name}: resuming the weights only. '
-                'The optimizer moments restart at zero and the LR schedule restarts from step 0, '
-                'so expect a visible bump in the loss.'
+                f'No {path.name} beside {Path(refiner_path).name}: resuming the weights only.'
+                + switched +
+                ' The optimizer moments restart at zero and the LR schedule restarts from step '
+                '0, so expect a visible bump in the loss.'
             )
         return 0
     state = torch.load(path, map_location='cpu', weights_only=False)
+    saved_world = state.get('world_size', 1)
+    if rank is not None and saved_world != world_size:
+        raise RuntimeError(
+            f'{path.name} was written by a {saved_world}-rank job and this one has {world_size} '
+            'ranks. ZeRO optimizer state is partitioned across ranks, so a shard from a '
+            'differently sized job describes the wrong parameters. Resume with '
+            f'--num_gpus={saved_world}, or drop the distill_state files to resume the weights '
+            'only.'
+        )
     optimizer.load_state_dict(state['optimizer'])
     scheduler.load_state_dict(state['scheduler'])
+    # load_state_dict restores the schedule's position but leaves the optimizer holding whatever
+    # learning rate it was constructed with until the next step(). That is one step at the
+    # initial LR -- at the start of a warmup, near zero. Push the restored value through now.
+    for group, lr in zip(optimizer.param_groups, scheduler.get_last_lr()):
+        group['lr'] = lr
     # Absent in checkpoints written before the RNG was recorded; those still resume, they just
     # cannot reproduce the augmentation stream.
-    if 'python_rng' in state:
+    if 'python_rng' in state and own_python_rng:
         random.setstate(state['python_rng'])
     if 'torch_rng' in state:
+        # Rank-uniform by construction (torch.manual_seed(seed), no rank offset), so restoring
+        # one rank's copy everywhere is what an uninterrupted run would have had.
         torch.set_rng_state(state['torch_rng'])
+    if rollout_generator is not None and 'rollout_generator' in state:
+        rollout_generator.set_state(state['rollout_generator'])
+    if rollout_rng is not None and 'rollout_rng' in state:
+        rollout_rng.setstate(state['rollout_rng'])
+    if scaler is not None and 'scaler' in state:
+        scaler.load_state_dict(state['scaler'])
     if is_main:
         print(f'Resumed optimizer and LR schedule from {path} at step {state["step"]}')
     return int(state['step'])

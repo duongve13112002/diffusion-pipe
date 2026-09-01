@@ -177,3 +177,34 @@ class TestDistillCheckpointRetention:
             'distill_state_step900.pt'
         assert training_state_path(tmp_path / 'context_refiner.safetensors').name == \
             'distill_state.pt'
+
+
+class TestDistillRetentionWithShardedState:
+    """A ZeRO run's tag owns one state file per rank, not one in total."""
+
+    @staticmethod
+    def _populate(directory, kind, numbers, ranks):
+        for n in numbers:
+            (directory / f'context_refiner_{kind}{n}.safetensors').write_bytes(b'w')
+            for r in range(ranks):
+                (directory / f'distill_state_{kind}{n}_rank{r}.pt').write_bytes(b's')
+
+    def test_every_rank_shard_of_a_pruned_tag_goes_with_it(self, tmp_path):
+        # Leaving shards behind would grow the output directory without bound, which is the one
+        # thing keep_last_n_checkpoints exists to stop.
+        from tools.distill_refiner import prune_distill_checkpoints
+        self._populate(tmp_path, 'epoch', (1, 2, 3), ranks=4)
+        prune_distill_checkpoints(tmp_path, 2)
+        assert sorted(p.name for p in tmp_path.glob('distill_state_epoch1*')) == []
+        assert len(list(tmp_path.glob('distill_state_epoch3_rank*.pt'))) == 4
+
+    def test_pruning_epoch1_does_not_delete_epoch10(self, tmp_path):
+        # The reason the shard glob keys on the '_rank' separator: 'distill_state_epoch1*' also
+        # matches distill_state_epoch10.pt, so the obvious glob deletes a checkpoint nine
+        # epochs newer than the one being pruned.
+        from tools.distill_refiner import prune_distill_checkpoints
+        self._populate(tmp_path, 'epoch', (1, 10, 11), ranks=2)
+        prune_distill_checkpoints(tmp_path, 2)
+        assert not list(tmp_path.glob('distill_state_epoch1_rank*.pt'))
+        assert len(list(tmp_path.glob('distill_state_epoch10_rank*.pt'))) == 2
+        assert len(list(tmp_path.glob('distill_state_epoch11_rank*.pt'))) == 2
