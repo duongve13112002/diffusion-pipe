@@ -711,13 +711,42 @@ A group whose lr is 0 is frozen, not merely unlearning: `get_param_groups` calls
 `pipeline_stages = 1` — a stage holding no refiner would have no trainable parameters at all,
 and the optimizer says so by name rather than raising `optimizer got an empty parameter list`.
 
+### Checkpoints, and what a run leaves on disk
+
+Each save writes a tagged set and then copies it to the stable, untagged names:
+
+```
+context_refiner_epoch7.safetensors    the weights at that point
+distill_state_epoch7.pt               its optimizer, scheduler, step and RNG state
+model_epoch7.safetensors              a complete checkpoint, when save_full_model is on
+
+context_refiner.safetensors           always the newest of the above
+distill_state.pt
+model.safetensors
+```
+
+Point `context_refiner_path` at the untagged name and it always picks up the latest, which is
+what every config written before tagging existed already does. Point `resume_from` at a tagged
+one to go back to it: the state file beside it carries that checkpoint's optimizer moments, not
+the newest ones.
+
+`keep_last_n_checkpoints` prunes the tagged sets, counting **each kind separately** — N
+epoch-tagged and N step-tagged — because the two are produced by different triggers at different
+rates. All three files of a pruned tag go together, so a surviving tag is always complete, and
+the untagged names are never pruned.
+
+An epoch is one pass over every caption, sharded across ranks: no caption is seen twice in an
+epoch, and each rank gets `1/world_size` of them. The tail that cannot fill a whole global batch
+is dropped, the same rounding the image datasets do, so every rank runs the same number of steps.
+
 ### Distillation config (`[distill]`)
 
 | Key | Default | Meaning |
 |---|---|---|
 | `dataset` | — | a `dataset.toml`; captions read through the training rules |
 | `device` | auto | overrides where everything runs. Unset picks `cuda:LOCAL_RANK`, or cpu with no CUDA |
-| `steps` | `20000` | optimizer steps |
+| `epochs` | — | passes over the caption set. An alternative to `steps`, not an addition; setting both is refused |
+| `steps` | `20000` | optimizer steps. Used when `epochs` is unset |
 | `seed` | `42` | model seed; the caption and rollout streams are rank-offset from it |
 | `dtype` | `bfloat16` | the **frozen** modules. The trainable refiner follows `precision` |
 | `precision` | `fp32` | refiner precision: `fp32`, `bf16-mixed`, `fp16-mixed`, `bf16-full` |
@@ -726,6 +755,8 @@ and the optimizer says so by name rather than raising `optimizer got an empty pa
 | `warmup_steps` | `500` | LR warmup |
 | `lr_scheduler` | `cosine` | shares `utils/lr_schedule.py` with `train.py` |
 | `save_every` | `2000` | checkpoint interval, in steps. Must be >= 1 |
+| `save_every_n_epochs` | — | checkpoint interval in epochs. Overrides `save_every` when set |
+| `keep_last_n_checkpoints` | — | keep this many tagged checkpoints of each kind, deleting older ones. Unset keeps everything |
 | `log_every` | `50` | progress-bar update interval. Must be >= 1 |
 | `pooled_loss_weight` | `0.1` | weight of the length-normalised mean term |
 | `relational_loss_weight` | `1.0` | weight of the pairwise-structure term that prices mode collapse |

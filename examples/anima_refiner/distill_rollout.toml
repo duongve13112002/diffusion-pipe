@@ -43,6 +43,22 @@ seed = 42
 save_every = 2000
 log_every = 50
 
+# How long to train. `epochs` counts passes over the caption set -- one epoch is one pass over
+# EVERY caption, sharded across ranks -- and is an ALTERNATIVE to `steps`, not an addition:
+# setting both is refused at startup. This file uses steps; uncomment epochs and delete steps to
+# switch. See examples/anima_refiner/distill_4gpu.toml for an epoch-driven configuration.
+#epochs = 20
+
+# Checkpoint every N epochs instead of every N steps. Overrides save_every when set.
+#save_every_n_epochs = 1
+
+# Keep only this many tagged checkpoints of each kind, deleting older ones as new ones arrive.
+# Counted separately per kind, so 3 means three epoch-tagged AND three step-tagged. All of a
+# pruned tag's files go together -- weights, optimizer state, and the full model if
+# save_full_model is on -- and the untagged context_refiner.safetensors is never pruned.
+# Unset keeps everything, which is what this did before the option existed.
+#keep_last_n_checkpoints = 3
+
 pooled_loss_weight = 0.1
 relational_loss_weight = 1.0
 

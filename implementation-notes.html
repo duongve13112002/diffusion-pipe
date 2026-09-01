@@ -33,6 +33,86 @@
 <p class="meta">A running log of decisions taken outside the spec, forced changes, tradeoffs, and
 anything else the maintainer needs to know. Newest entry first.</p>
 
+<h2>2026-09-01 &mdash; Epochs for distillation, and checkpoint retention for both trainers</h2>
+
+<p><strong>Request.</strong> Describe a distillation run in epochs the way the rest of the repo
+does, keep only the last N checkpoints, and produce ready-to-run 4-GPU configs with and without
+the rollout.</p>
+
+<p><strong>I got the first one wrong before getting it right.</strong> Asked for &ldquo;20
+epochs&rdquo;, I reported that the distillation script has no epoch concept and asked how many
+captions there were so I could convert to steps. That was accurate about the code and useless as
+an answer: the request was to <em>add</em> epochs, not to work around their absence. Worth
+recording, because the failure mode is subtle &mdash; a true statement about the current state
+delivered instead of the work.</p>
+
+<p><strong>What an epoch had to mean.</strong> The loop drew
+<code>random.sample(captions, batch_size)</code> per micro batch, which samples with replacement
+across steps: some captions appear many times before others appear once. <code>EpochSampler</code>
+shuffles the full list with a seed derived from the epoch number &mdash; identical on every rank
+&mdash; and then takes this rank's stride. Shuffling <em>before</em> sharding is the part that
+matters: sharding a fixed order would pin each rank to the same captions for the whole run.
+Verified with four ranks that the shards do not overlap, together cover every usable caption, are
+equal sized, differ between epochs, and are deterministic.</p>
+
+<p>That determinism is why resuming mid-epoch stores nothing about position: the order is a pure
+function of <code>(seed, epoch)</code>, so the resumed run lands on the right captions by
+construction. It is a better property than a saved dataloader cursor, not a missing one.</p>
+
+<div class="flag">
+  <p><strong>keep_last_n_checkpoints is the only feature here that deletes data the user did not
+  ask it to delete</strong>, so its edges are pinned by tests rather than by care. Counted
+  separately per kind &mdash; <code>epoch&lt;N&gt;/</code>, <code>step&lt;N&gt;/</code> and
+  <code>global_step&lt;N&gt;/</code> in train.py &mdash; because the three are produced by
+  different triggers at different rates and pruning them as one pool would let a fast trigger
+  evict a slow one. The newest of each is never removed: DeepSpeed's <code>latest</code> file
+  names the <code>global_step</code> it will resume from, and pruning that one turns a cache into
+  an unrecoverable run. Ordered by the number in the name, not lexicographically
+  (<code>step9</code> must not outlive <code>step100</code>) and not by mtime, because a resumed
+  run rewrites older directories' timestamps.</p>
+</div>
+
+<p><strong>Distillation had nothing to keep N of.</strong> It overwrote a single
+<code>context_refiner.safetensors</code>. It now writes a tagged set per save and copies it to the
+untagged names, so every config pointing at the stable name keeps working and gets the newest.
+<code>training_state_path</code> derives from the weights filename rather than being fixed, so a
+tagged checkpoint carries its own optimizer state &mdash; resuming from an older tag would
+otherwise pair the newest moments with older weights. <code>save_full_model</code> moved from
+once-at-the-end to once-per-checkpoint for the same reason: the point of keeping N checkpoints is
+being able to go back to one, and a refiner without the model it belongs in is half a
+checkpoint.</p>
+
+<p><strong>Resume was missing a piece.</strong> It restored the optimizer, the scheduler and the
+step counter, but not the RNG &mdash; and caption shuffling and <code>tag_dropout_rate</code> pull
+from the global <code>random</code> stream, so a resumed run saw different augmentations than an
+uninterrupted one would have. Both the Python and torch states are saved now, and a checkpoint
+written before this still resumes; it simply cannot reproduce the augmentation.</p>
+
+<div class="flag">
+  <p><strong>The tests came a commit late, which is the thing to avoid next time.</strong> All
+  four features above shipped verified by throwaway scripts and with nothing in the suite, then
+  were covered in the following commit. This branch has already been burned twice by exactly that
+  gap &mdash; 182 tests passing while every training run was broken, and a step-0
+  <code>NameError</code> surviving because the tests matched source text instead of importing the
+  module. Verified is not covered.</p>
+</div>
+
+<ul>
+  <li><strong>Two ready-to-run 4-GPU configs.</strong>
+    <code>examples/anima_refiner/distill_4gpu.toml</code> and
+    <code>distill_rollout_4gpu.toml</code> differ only in the <code>[rollout]</code> table, so the
+    two runs are comparable: 20 epochs, a global batch of 1536 (48 &times; 8 &times; 4),
+    bf16-full with AdamW8bitKahan at 5e-5, <code>save_every_n_epochs = 1</code>,
+    <code>keep_last_n_checkpoints = 3</code>, <code>log_every = 5</code>. The rollout one carries
+    an ordered list of what to reduce first if it runs out of memory.</li>
+  <li><strong>A documentation gap that was purely conversational.</strong> The comparison of the
+    four distillation objectives &mdash; what each can and cannot see, and what each costs
+    &mdash; existed only in chat. <code>docs/anima_refiner/distillation-methods.md</code> records
+    it, including that the pooled term is nearly useless at the shipped settings, with the
+    measurements that say so.</li>
+  <li><strong>Tests.</strong> 441 passed, 1 skipped.</li>
+</ul>
+
 <h2>2026-09-01 &mdash; Closing the audit list, and one finding that was wrong</h2>
 
 <p><strong>Request.</strong> Fix everything the QA reports raised, skipping nothing. That covered
