@@ -1,0 +1,90 @@
+# Distillation, 4 GPUs, WITHOUT the denoising rollout.
+#
+#   deepspeed --num_gpus=4 -m tools.distill_refiner --config examples/anima_refiner/distill_4gpu.toml
+#
+# The three cheap objectives only: the cross-attention probe, the pooled mean, and the
+# relational term. This is the configuration to start from; see distill_rollout_4gpu.toml for
+# the same run with the expensive fourth objective turned on.
+#
+# Fill in the four paths below and it runs. Everything else is set to what you asked for.
+
+[distill]
+dataset = 'examples/dataset.toml'
+output_dir = '/data/output/anima_refiner_distill'
+
+# 20 passes over the caption set. One epoch is one pass over EVERY caption, sharded across the
+# four ranks, so no caption is seen twice in an epoch and each rank gets a quarter of them.
+# `steps` is the alternative to this, not an addition -- setting both is refused.
+epochs = 20
+
+# Per rank, per micro batch. The global batch is 48 x 8 x 4 = 1536 captions per optimizer step.
+batch_size = 48
+gradient_accumulation_steps = 8
+
+# The refiner's parameters are bf16 themselves, not fp32 masters with bf16 compute. This is what
+# makes AdamW8bitKahan the right pairing below: Kahan summation is what keeps small updates from
+# vanishing into bf16's 8 mantissa bits.
+precision = 'bf16-full'
+
+# The FROZEN modules: both LLMs, the LLMAdapter, the probe cross-attention blocks. Independent of
+# `precision`, which governs the trainable refiner.
+dtype = 'bfloat16'
+
+max_grad_norm = 1.0
+warmup_steps = 500
+max_text_length = 512
+seed = 42
+
+# 4 GPUs. ddp rather than zero1: the refiner is 77.64M parameters, so sharding its optimizer
+# state saves under a gigabyte per rank, and 8-bit optimizer states (below) already cut that
+# further. DDP has no extra moving parts.
+distributed_strategy = 'ddp'
+
+# One checkpoint per epoch, keeping the three most recent. Counted separately per kind, so if a
+# step-tagged save ever runs alongside these it keeps three of those too.
+save_every_n_epochs = 1
+keep_last_n_checkpoints = 3
+
+# Every 5 optimizer steps. Each update prints the loss, the gradient norm, the learning rate,
+# the epoch, the collapse diagnostic, and each loss term on its own.
+log_every = 5
+
+# Also write a complete anima_refiner checkpoint next to every refiner checkpoint, so a
+# checkpoint you roll back to is directly usable as transformer_path. Costs disk: this is a
+# multi-GB file per save, and keep_last_n_checkpoints prunes them with the rest.
+save_full_model = true
+
+# Loss term weights. The probe objective is the base and has no weight of its own.
+pooled_loss_weight = 0.1
+relational_loss_weight = 1.0
+
+# Resume from an interrupted run. Point it at a refiner checkpoint and the optimizer moments,
+# the LR schedule position, the step counter and the augmentation RNG all come back from the
+# distill_state file beside it.
+#resume_from = '/data/output/anima_refiner_distill/context_refiner_epoch7.safetensors'
+
+[teacher]
+llm_path = '/data2/imagegen_models/comfyui-models/qwen_3_06b_base.safetensors'
+transformer_path = '/data2/imagegen_models/comfyui-models/anima-preview.safetensors'
+
+[student]
+llm_path = '/data2/imagegen_models/Qwen3.5-2B-Base'
+llm_hidden_layer = -1
+n_refiner_layers = 6
+
+# An ALTERNATIVE to flat lr / betas / weight_decay under [distill], never an addition -- setting
+# both is refused at startup, before anything is loaded.
+#
+# AdamW8bitKahan is the pairing for precision = 'bf16-full'. The refiner is 77.64M parameters,
+# so AdamW's two fp32 moments are 592 MB; the 8-bit variant is 148 MB, on every rank. Kahan
+# summation is what makes it safe with bf16 parameters.
+[optimizer]
+type = 'AdamW8bitKahan'
+lr = 5e-5
+betas = [0.9, 0.99]
+weight_decay = 0.01
+
+[probe]
+# Fixed random queries pushed through the DiT's frozen cross-attention. num_queries defaults to
+# 2 x head_dim, which is 256 for Anima. Do not lower num_blocks below 4.
+num_blocks = 8

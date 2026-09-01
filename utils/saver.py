@@ -16,6 +16,61 @@ def convert_state_dict_dtype(state_dict, dtype):
         state_dict[key] = v.to(device='cpu', dtype=dtype)
 
 
+def prune_old_checkpoints(save_root, prefix, keep, dry_run=False):
+    """Keep the `keep` highest-numbered `<prefix><N>` directories under save_root, delete the rest.
+
+    Each kind is counted on its own, so keep=3 means three epoch* AND three step* AND three
+    global_step*, not three in total. They are produced by different triggers at different rates
+    and pruning them together would let a fast trigger evict a slow one.
+
+    Ordered by the number in the name, not by mtime: a resumed run rewrites older directories'
+    timestamps, and the number is what actually says which checkpoint is later.
+
+    The newest is never deleted. That matters most for global_step*, where DeepSpeed's `latest`
+    file names the tag it will resume from -- deleting that one turns a prunable cache into an
+    unrecoverable run.
+
+    Returns the paths removed (or that would be, under dry_run).
+    """
+    if not keep or keep < 1:
+        return []
+    save_root = Path(save_root)
+    if not save_root.is_dir():
+        return []
+
+    numbered = []
+    for path in save_root.iterdir():
+        if not path.is_dir() or not path.name.startswith(prefix):
+            continue
+        suffix = path.name[len(prefix):]
+        if suffix.isdigit():
+            numbered.append((int(suffix), path))
+
+    numbered.sort(key=lambda pair: pair[0])
+    doomed = [path for _, path in numbered[:-keep]] if len(numbered) > keep else []
+    if not dry_run:
+        for path in doomed:
+            logger.info(f'keep_last_n_checkpoints: removing {path.name}')
+            shutil.rmtree(path, ignore_errors=True)
+    return doomed
+
+
+# 'step' must come after 'global_step' would match it, so the prefixes are checked as exact
+# names: a directory called global_step500 must not be counted as a step* checkpoint too.
+CHECKPOINT_PREFIXES = ('epoch', 'step', 'global_step')
+
+
+def prune_all_checkpoint_kinds(config, save_root):
+    """Apply keep_last_n_checkpoints to every kind that accumulates, each counted separately."""
+    keep = config.get('keep_last_n_checkpoints', None)
+    if not keep:
+        return
+    if not is_main_process():
+        return
+    for prefix in CHECKPOINT_PREFIXES:
+        prune_old_checkpoints(save_root, prefix, keep)
+
+
 last_checkpoint_time = None
 def need_to_checkpoint(config, epoch=None):
     global last_checkpoint_time
@@ -136,6 +191,10 @@ class Saver:
             if 'save_every_n_epochs' in self.config and epoch % self.config['save_every_n_epochs'] == 0:
                 self.save_model(f'epoch{epoch}')
                 saved = True
+            if checkpointed or saved:
+                # After both possible writes for this epoch, so a checkpoint and a model saved
+                # on the same epoch are pruned in one pass.
+                prune_all_checkpoint_kinds(self.config, self.save_root)
             epoch = self.train_dataloader.epoch
             if epoch > self.config['epochs']:
                 return None, checkpointed, saved
@@ -169,6 +228,9 @@ class Saver:
         if need_to_checkpoint(self.config) or should_manually_save:
             self.save_checkpoint(step, examples)
             checkpointed = True
+
+        if checkpointed or saved:
+            prune_all_checkpoint_kinds(self.config, self.save_root)
 
         if should_manually_quit:
             print('Manually quitting')

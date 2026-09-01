@@ -36,6 +36,7 @@ import datetime
 import contextlib
 import os
 import random
+import shutil
 import sys
 from pathlib import Path
 
@@ -155,6 +156,50 @@ def load_captions_once(config, rank, world_size, is_main):
             'raised while resolving them.'
         )
     return captions
+
+
+class EpochSampler:
+    """One epoch is one pass over every caption, sharded across ranks.
+
+    The loop used to draw `random.sample(captions, batch_size)` per micro batch, which samples
+    with replacement across steps: some captions appear many times before others appear once,
+    and "epoch" has no meaning. train.py has always been epoch-driven, and a distillation run
+    should be describable the same way.
+
+    Each epoch shuffles the FULL list with a seed derived from the epoch number -- identical on
+    every rank -- and then takes this rank's stride. Shuffling before sharding is what makes the
+    shards differ between epochs; sharding a fixed order would pin each rank to the same
+    captions forever. Every caption is seen exactly once per epoch across the job, which is the
+    property that makes the word mean anything.
+
+    The tail that does not fill a whole global batch is dropped, the same rounding
+    SizeBucketDataset does, so every rank runs the same number of steps and no collective is
+    left waiting on a rank that finished early.
+    """
+
+    def __init__(self, captions, batch_size, grad_accum, rank, world_size, seed):
+        self.captions = captions
+        self.batch_size = batch_size
+        self.grad_accum = grad_accum
+        self.rank = rank
+        self.world_size = world_size
+        self.seed = seed
+        self.global_batch = batch_size * grad_accum * world_size
+        self.steps_per_epoch = len(captions) // self.global_batch
+        if self.steps_per_epoch < 1:
+            raise RuntimeError(
+                f'{len(captions)} captions cannot fill one global batch of '
+                f'{self.global_batch} (batch_size {batch_size} x '
+                f'gradient_accumulation_steps {grad_accum} x world_size {world_size}). '
+                'Lower batch_size or gradient_accumulation_steps.'
+            )
+
+    def epoch_order(self, epoch):
+        """This rank's captions for `epoch`, already shuffled and sharded."""
+        order = list(self.captions)
+        random.Random(self.seed + epoch).shuffle(order)
+        usable = self.steps_per_epoch * self.global_batch
+        return order[self.rank:usable:self.world_size]
 
 
 def caption_augment_config(config):
@@ -1119,7 +1164,20 @@ def main():
         )
     batch_size = config['distill'].get('batch_size', 8)
     grad_accum = max(1, config['distill'].get('gradient_accumulation_steps', 1))
-    steps = config['distill'].get('steps', 20000)
+    # epochs and steps are alternatives. epochs is what train.py uses and what a run is
+    # normally described in; steps is kept because every config written before this used it.
+    epochs = config['distill'].get('epochs', None)
+    steps = config['distill'].get('steps', None)
+    if epochs is not None and steps is not None:
+        raise RuntimeError(
+            '[distill] sets both epochs and steps. They are alternative ways of saying how long '
+            'to train: epochs counts passes over the caption set, steps counts optimizer '
+            'updates. Set one.'
+        )
+    if epochs is not None and epochs < 1:
+        raise RuntimeError(f'[distill] epochs must be >= 1, got {epochs}')
+    if epochs is None and steps is None:
+        steps = 20000
     seed = config['distill'].get('seed', 42)
     pooled_weight = config['distill'].get('pooled_loss_weight', 0.1)
     relational_weight = config['distill'].get('relational_loss_weight', 1.0)
@@ -1334,6 +1392,39 @@ def main():
                 f'[distill] {key} must be >= 1, got {value}. To effectively disable it, set it '
                 'larger than `steps`.'
             )
+    sampler = EpochSampler(captions, batch_size, grad_accum, rank, world_size, seed)
+    if epochs is not None:
+        steps = epochs * sampler.steps_per_epoch
+        if is_main:
+            print(
+                f'{epochs} epochs over {len(captions)} captions = {steps} steps '
+                f'({sampler.steps_per_epoch} steps/epoch at a global batch of '
+                f'{sampler.global_batch})'
+            )
+    elif is_main:
+        print(
+            f'{steps} steps over {len(captions)} captions '
+            f'({steps / max(sampler.steps_per_epoch, 1):.2f} epochs at a global batch of '
+            f'{sampler.global_batch})'
+        )
+
+    save_full_model_enabled = config['distill'].get('save_full_model', False)
+    keep_last_n = config['distill'].get('keep_last_n_checkpoints', None)
+    if keep_last_n is not None and keep_last_n < 1:
+        raise RuntimeError(
+            f'[distill] keep_last_n_checkpoints must be >= 1, got {keep_last_n}. Omit it to keep '
+            'every checkpoint.'
+        )
+
+    save_every_n_epochs = config['distill'].get('save_every_n_epochs', None)
+    if save_every_n_epochs is not None:
+        if save_every_n_epochs < 1:
+            raise RuntimeError(
+                f'[distill] save_every_n_epochs must be >= 1, got {save_every_n_epochs}')
+        save_every = save_every_n_epochs * sampler.steps_per_epoch
+        if is_main:
+            print(f'Saving every {save_every_n_epochs} epoch(s) = every {save_every} steps')
+
     running = 0.0
     last_spread = last_teacher_spread = 0.0
     last_terms = {}
@@ -1341,13 +1432,24 @@ def main():
                         desc='distill', disable=not is_main)
 
     strategy.zero_grad()
+    # Resuming mid-epoch resumes at the right point in the right epoch's shuffle, because the
+    # order is a pure function of (seed, epoch) rather than of how many draws have happened.
+    current_epoch = start_step // sampler.steps_per_epoch
+    epoch_captions = sampler.epoch_order(current_epoch)
     for step in progress_bar:
+        epoch = step // sampler.steps_per_epoch
+        if epoch != current_epoch:
+            current_epoch = epoch
+            epoch_captions = sampler.epoch_order(epoch)
+        offset = (step % sampler.steps_per_epoch) * grad_accum * batch_size
+
         accum_loss = 0.0
         strategy.zero_grad()
         for micro in range(grad_accum):
+            start = offset + micro * batch_size
             batch = [
                 preprocess_caption(c, **augment)
-                for c in random.sample(captions, min(batch_size, len(captions)))
+                for c in epoch_captions[start:start + batch_size]
             ]
 
             with torch.no_grad():
@@ -1477,6 +1579,7 @@ def main():
                 # spread is the mean pairwise cosine distance between captions in the batch.
                 # It should track the teacher's. Falling toward 0 means collapse: distinct
                 # captions are being mapped to the same feature.
+                'ep': f'{step // sampler.steps_per_epoch + 1}',
                 'spread': f'{last_spread:.3f}/{last_teacher_spread:.3f}',
                 # Each weighted term, so a dominant one is visible rather than buried in the sum.
                 **{name: f'{value:.4f}' for name, value in last_terms.items()},
@@ -1487,9 +1590,34 @@ def main():
             # Every rank holds the full, identical weights -- DDP all-reduces them, and ZeRO
             # 1/2 shard optimizer state and gradients but never the parameters. Only one writes.
             if is_main:
+                # Tagged by whichever unit drives the saving, so the two kinds are countable
+                # apart the way train.py's epoch<N>/ and step<N>/ are.
+                if save_every_n_epochs is not None:
+                    tag = f'_epoch{step // sampler.steps_per_epoch + 1}'
+                else:
+                    tag = f'_step{step + 1}'
+                tagged_path = output_dir / f'context_refiner{tag}.safetensors'
+                save_refiner(refiner, tagged_path, dtype, metadata=provenance)
+                save_training_state(tagged_path, optimizer, scheduler, step + 1)
+
+                # And the stable name, so every config that points at
+                # context_refiner.safetensors keeps working without knowing about tags.
                 refiner_path = output_dir / 'context_refiner.safetensors'
-                save_refiner(refiner, refiner_path, dtype, metadata=provenance)
-                save_training_state(refiner_path, optimizer, scheduler, step + 1)
+                shutil.copy2(tagged_path, refiner_path)
+                shutil.copy2(training_state_path(tagged_path),
+                             training_state_path(refiner_path))
+
+                if save_full_model_enabled:
+                    # A complete anima_refiner checkpoint per save, not only at the end: the
+                    # point of keeping N checkpoints is being able to go back to one, and going
+                    # back to a refiner without the model it belongs in is half a checkpoint.
+                    full_path = output_dir / f'model{tag}.safetensors'
+                    save_full_model(config['teacher']['transformer_path'], refiner,
+                                    full_path, dtype)
+                    shutil.copy2(full_path, output_dir / 'model.safetensors')
+
+                for gone in prune_distill_checkpoints(output_dir, keep_last_n):
+                    print(f'keep_last_n_checkpoints: removed {gone.name}')
             if world_size > 1:
                 dist.barrier()
 
@@ -1498,9 +1626,10 @@ def main():
         # same tensors again, just say where they are.
         print(f'Done. Point context_refiner_path at {output_dir / "context_refiner.safetensors"}')
 
-    if is_main and config['distill'].get('save_full_model', False):
+    if is_main and save_full_model_enabled:
+        # The loop's final save already wrote this; say where it is rather than rebuilding a
+        # multi-GB file that is already on disk.
         path = output_dir / 'model.safetensors'
-        save_full_model(config['teacher']['transformer_path'], refiner, path, dtype)
         print(f'Also wrote a full anima_refiner checkpoint to {path}. Use it as transformer_path.')
 
     if world_size > 1:
@@ -1577,7 +1706,50 @@ def save_refiner(refiner, path, dtype, metadata=None):
 
 
 def training_state_path(refiner_path):
-    return Path(refiner_path).with_name('distill_state.pt')
+    """The training state that belongs to this particular weights file.
+
+    Derived from the weights filename rather than fixed, so a tagged checkpoint carries its own
+    optimizer state: context_refiner_epoch5.safetensors pairs with distill_state_epoch5.pt.
+    Resuming from an older tag would otherwise pick up the newest state and pair mismatched
+    moments with older weights.
+    """
+    path = Path(refiner_path)
+    suffix = path.stem[len('context_refiner'):] if path.stem.startswith('context_refiner') else ''
+    return path.with_name(f'distill_state{suffix}.pt')
+
+
+def prune_distill_checkpoints(output_dir, keep):
+    """Keep the newest `keep` tagged checkpoints of each kind, with everything that belongs to them.
+
+    Counted separately per kind, matching train.py: N epoch-tagged and N step-tagged, because the
+    two are produced by different triggers at different rates. Each tag owns three files -- the
+    refiner weights, its optimizer state, and the full model if save_full_model is on -- and they
+    are removed together, so a surviving tag is always complete.
+
+    The untagged names are never pruned. They are the stable ones every config points at.
+    """
+    if not keep or keep < 1:
+        return []
+    output_dir = Path(output_dir)
+    removed = []
+    for kind in ('epoch', 'step'):
+        tagged = []
+        for path in output_dir.glob(f'context_refiner_{kind}*.safetensors'):
+            number = path.stem[len(f'context_refiner_{kind}'):]
+            if number.isdigit():
+                tagged.append((int(number), number, path))
+        tagged.sort(key=lambda triple: triple[0])
+        for _, number, path in tagged[:-keep] if len(tagged) > keep else []:
+            companions = (
+                path,
+                training_state_path(path),
+                output_dir / f'model_{kind}{number}.safetensors',
+            )
+            for victim in companions:
+                if victim.exists():
+                    victim.unlink()
+                    removed.append(victim)
+    return removed
 
 
 def save_training_state(refiner_path, optimizer, scheduler, step):
@@ -1594,6 +1766,13 @@ def save_training_state(refiner_path, optimizer, scheduler, step):
         'step': step,
         'optimizer': optimizer.state_dict(),
         'scheduler': scheduler.state_dict(),
+        # The caption order does not need saving -- EpochSampler is a pure function of
+        # (seed, epoch), so resuming lands on the right captions by construction. The
+        # augmentation draws do: caption shuffling and tag_dropout_rate pull from the global
+        # `random` stream, so without this a resumed run sees different variants than an
+        # uninterrupted one would have.
+        'python_rng': random.getstate(),
+        'torch_rng': torch.get_rng_state(),
     }, tmp)
     os.replace(tmp, path)
 
@@ -1616,6 +1795,12 @@ def load_training_state(refiner_path, optimizer, scheduler, is_main):
     state = torch.load(path, map_location='cpu', weights_only=False)
     optimizer.load_state_dict(state['optimizer'])
     scheduler.load_state_dict(state['scheduler'])
+    # Absent in checkpoints written before the RNG was recorded; those still resume, they just
+    # cannot reproduce the augmentation stream.
+    if 'python_rng' in state:
+        random.setstate(state['python_rng'])
+    if 'torch_rng' in state:
+        torch.set_rng_state(state['torch_rng'])
     if is_main:
         print(f'Resumed optimizer and LR schedule from {path} at step {state["step"]}')
     return int(state['step'])

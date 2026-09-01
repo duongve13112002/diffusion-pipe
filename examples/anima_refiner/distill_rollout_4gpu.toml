@@ -1,0 +1,128 @@
+# Distillation, 4 GPUs, WITH the denoising rollout.
+#
+#   deepspeed --num_gpus=4 -m tools.distill_refiner --config examples/anima_refiner/distill_rollout_4gpu.toml
+#
+# Identical to distill_4gpu.toml apart from the [rollout] table at the bottom. Every training
+# setting -- epochs, batch size, precision, optimizer, learning rate, checkpointing -- is the
+# same, so the two runs are comparable.
+#
+# READ THE MEMORY NOTE at the bottom before launching: the rollout keeps the whole DiT resident
+# and holds one full backward graph per loss point, and batch_size 48 is large for that.
+
+[distill]
+dataset = 'examples/dataset.toml'
+output_dir = '/data/output/anima_refiner_distill_rollout'
+
+# 20 passes over the caption set. One epoch is one pass over EVERY caption, sharded across the
+# four ranks, so no caption is seen twice in an epoch and each rank gets a quarter of them.
+# `steps` is the alternative to this, not an addition -- setting both is refused.
+epochs = 20
+
+# Per rank, per micro batch. The global batch is 48 x 8 x 4 = 1536 captions per optimizer step.
+batch_size = 48
+gradient_accumulation_steps = 8
+
+# The refiner's parameters are bf16 themselves, not fp32 masters with bf16 compute. This is what
+# makes AdamW8bitKahan the right pairing below: Kahan summation is what keeps small updates from
+# vanishing into bf16's 8 mantissa bits.
+precision = 'bf16-full'
+
+# The FROZEN modules: both LLMs, the LLMAdapter, the probe cross-attention blocks. Independent of
+# `precision`, which governs the trainable refiner.
+dtype = 'bfloat16'
+
+max_grad_norm = 1.0
+warmup_steps = 500
+max_text_length = 512
+seed = 42
+
+# 4 GPUs. ddp rather than zero1: the refiner is 77.64M parameters, so sharding its optimizer
+# state saves under a gigabyte per rank, and 8-bit optimizer states (below) already cut that
+# further. DDP has no extra moving parts.
+distributed_strategy = 'ddp'
+
+# One checkpoint per epoch, keeping the three most recent. Counted separately per kind, so if a
+# step-tagged save ever runs alongside these it keeps three of those too.
+save_every_n_epochs = 1
+keep_last_n_checkpoints = 3
+
+# Every 5 optimizer steps. Each update prints the loss, the gradient norm, the learning rate,
+# the epoch, the collapse diagnostic, and each loss term on its own.
+log_every = 5
+
+# Also write a complete anima_refiner checkpoint next to every refiner checkpoint, so a
+# checkpoint you roll back to is directly usable as transformer_path. Costs disk: this is a
+# multi-GB file per save, and keep_last_n_checkpoints prunes them with the rest.
+save_full_model = true
+
+# Loss term weights. The probe objective is the base and has no weight of its own.
+pooled_loss_weight = 0.1
+relational_loss_weight = 1.0
+
+# Resume from an interrupted run. Point it at a refiner checkpoint and the optimizer moments,
+# the LR schedule position, the step counter and the augmentation RNG all come back from the
+# distill_state file beside it.
+#resume_from = '/data/output/anima_refiner_distill_rollout/context_refiner_epoch7.safetensors'
+
+[teacher]
+llm_path = '/data2/imagegen_models/comfyui-models/qwen_3_06b_base.safetensors'
+transformer_path = '/data2/imagegen_models/comfyui-models/anima-preview.safetensors'
+
+[student]
+llm_path = '/data2/imagegen_models/Qwen3.5-2B-Base'
+llm_hidden_layer = -1
+n_refiner_layers = 6
+
+# An ALTERNATIVE to flat lr / betas / weight_decay under [distill], never an addition -- setting
+# both is refused at startup, before anything is loaded.
+#
+# AdamW8bitKahan is the pairing for precision = 'bf16-full'. The refiner is 77.64M parameters,
+# so AdamW's two fp32 moments are 592 MB; the 8-bit variant is 148 MB, on every rank. Kahan
+# summation is what makes it safe with bf16 parameters.
+[optimizer]
+type = 'AdamW8bitKahan'
+lr = 5e-5
+betas = [0.9, 0.99]
+weight_decay = 0.01
+
+[probe]
+# Fixed random queries pushed through the DiT's frozen cross-attention. num_queries defaults to
+# 2 x head_dim, which is 256 for Anima. Do not lower num_blocks below 4.
+num_blocks = 8
+
+[rollout]
+# The fourth objective, and the only one that is off by default elsewhere. It walks the frozen
+# DiT from pure noise toward clean -- driven by the TEACHER's prediction -- and compares what the
+# DiT predicts from the teacher's text features against what it predicts from the student's.
+# Still no images and no VAE. See docs/anima_refiner/denoising-rollout.md.
+loss_weight = 1.0
+
+# Points on the trajectory. Cheap: the walk is teacher-driven and runs under no_grad, so it costs
+# inference only, not backward.
+steps = 8
+
+# Where the loss is measured along that trajectory. THE EXPENSIVE KNOB, and the one that decides
+# whether this fits in memory: the losses are summed and backward runs once, so this many full
+# DiT backward graphs are alive at the same time. Measured cost 1.0x / 1.9x / 3.7x / 7.6x for
+# 1 / 2 / 4 / 8. Raise it one step at a time.
+loss_points = 2
+
+# Pixel resolution the noise latent is sized from. Must be a multiple of 16 (VAE /8, DiT patch 2).
+# 256 gives a 32x32 latent, 256 tokens after patching.
+resolution = 256
+
+# 0 disables classifier-free guidance and evaluates only the conditional branch, which halves the
+# DiT forwards. Must be 0 or above 1 -- between them the formula weights the unconditional branch
+# more heavily, which is not what the setting is for. Set 3.0 if you specifically care about CFG
+# sampling quality; it doubles this table's cost.
+guidance_scale = 0.0
+
+# Warps the trajectory's timesteps the way training and sampling warp them. Should match
+# [model] shift in the config you will train the DiT with. 1.0 walks a uniform schedule.
+shift = 1.0
+
+# MEMORY. Turning this on keeps the whole DiT resident, roughly 3.5-4 GB in bf16 for Anima, and
+# holds loss_points full backward graphs at batch_size 48. That is a lot more than the ~6 GB this
+# stage needs without it. If you OOM, in this order: drop loss_points to 1, drop resolution to
+# 128, then halve batch_size and double gradient_accumulation_steps to keep the global batch at
+# 1536.

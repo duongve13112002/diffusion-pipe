@@ -81,6 +81,13 @@ save_every_n_epochs = 2
 # Can checkpoint the training state every n number of epochs or minutes. Set only one of these. You can resume from checkpoints using the --resume_from_checkpoint flag.
 #checkpoint_every_n_epochs = 1
 checkpoint_every_n_minutes = 120
+
+# Keep only this many of each kind of checkpoint, deleting older ones as new ones are written.
+# Counted SEPARATELY per kind: 3 means three epoch<N>/ model saves AND three step<N>/ model saves
+# AND three global_step<N>/ resume checkpoints, because the three are produced by different
+# triggers at different rates. The newest of each is never deleted -- DeepSpeed's `latest` file
+# names the global_step it resumes from. Unset keeps everything, which is what it did before.
+#keep_last_n_checkpoints = 3
 # Always set to true unless you have a huge amount of VRAM.
 # This can also be 'unsloth' to reduce VRAM even more, with a slight performance hit.
 activation_checkpointing = true

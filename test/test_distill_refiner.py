@@ -1147,7 +1147,9 @@ class TestEveryShippedDistillKeyIsRead:
     the TABLE each key is read from.
     """
 
-    CONFIGS = ('distill.toml', 'distill_rollout.toml')
+    # Every shipped distillation config, so a new one cannot arrive unprotected.
+    CONFIGS = ('distill.toml', 'distill_rollout.toml',
+               'distill_4gpu.toml', 'distill_rollout_4gpu.toml')
     # [optimizer] is forwarded wholesale to the optimizer constructor, so its keys are named by
     # the optimizer rather than by this script.
     SKIP_TABLES = {'optimizer'}
