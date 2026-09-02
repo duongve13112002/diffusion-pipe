@@ -182,10 +182,18 @@ class TestCheckpointPrefixes:
         pipeline_strips = set(re.findall(r"re\.sub\(r'\^([a-z_\\.]+)'", source))
         pipeline_strips = {p.replace('\\.', '.') for p in pipeline_strips}
         known = {p.rstrip('.') + '.' for p in _CHECKPOINT_PREFIXES}
+        assert pipeline_strips, 'the regex found nothing; it stopped matching the source'
         missing = {p for p in pipeline_strips if p not in known}
         assert not missing, (
             f'load_diffusion_model strips {missing} but extract_refiner_state_dict does not. '
             f'Add them to _CHECKPOINT_PREFIXES.'
+        )
+        # The other direction matters too. A prefix here that the pipeline does not strip means
+        # extract_refiner_state_dict accepts a layout the pipeline would reject, so a file that
+        # loads as context_refiner_path fails as transformer_path -- the same drift, mirrored.
+        extra = {p for p in known if p not in pipeline_strips}
+        assert not extra, (
+            f'_CHECKPOINT_PREFIXES carries {extra}, which load_diffusion_model does not strip.'
         )
 
 
@@ -1162,3 +1170,38 @@ class TestRefinerSurvivesInitFromExisting:
 
         with pytest.raises(RuntimeError, match='no parameter for'):
             pipeline.load_adapter_weights(tmp_path)
+
+
+class TestAnimaRecordsItsEncoderIdentity:
+    """anima keeps its text encoder out of the FINGERPRINT, but must still record it.
+
+    Returning '' from text_encoder_cache_key is deliberate: putting the key in the fingerprint
+    would move the cache path of every existing anima install. The side effect was that nothing
+    distinguished two anima runs with different llm_path, so their text embeddings were shared
+    silently. The manifest is not part of the fingerprint, so declaring an identity there costs
+    no existing cache anything.
+    """
+
+    @staticmethod
+    def pipeline(model_type, **config):
+        from models.cosmos_predict2 import CosmosPredict2Pipeline
+        p = object.__new__(CosmosPredict2Pipeline)
+        p.model_config = {'type': model_type, **config}
+        p.use_context_refiner = model_type == 'anima_refiner'
+        return p
+
+    def test_anima_still_fingerprints_nothing(self):
+        p = self.pipeline('anima', llm_path='/models/qwen-a')
+        assert p.text_encoder_cache_key(0) == '', 'changing this moves every existing cache path'
+
+    def test_anima_records_which_llm_produced_the_embeddings(self):
+        a = self.pipeline('anima', llm_path='/models/qwen-a')
+        b = self.pipeline('anima', llm_path='/models/qwen-b')
+        assert a.text_encoder_identity(0) != b.text_encoder_identity(0)
+        assert a.text_encoder_identity(0) == self.pipeline('anima', llm_path='/models/qwen-a').text_encoder_identity(0)
+
+    def test_the_default_identity_is_the_fingerprint_key(self):
+        """A model that declares nothing keeps behaving exactly as it did."""
+        from models.base import BasePipeline
+        p = object.__new__(BasePipeline)
+        assert p.text_encoder_identity(0) == p.text_encoder_cache_key(0) == ''

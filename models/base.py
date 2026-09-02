@@ -407,6 +407,17 @@ class BasePipeline(CommonPipeline):
         """
         return ''
 
+    def text_encoder_identity(self, i):
+        """Identity of text encoder `i` for the manifest, when it differs from the fingerprint.
+
+        The two answer different questions. The fingerprint decides whether to rebuild, so
+        adding to it moves the cache path of every existing install. The manifest only records
+        whose contents these are, and a cache with no manifest is treated as compatible -- so a
+        model can declare an identity here that it deliberately keeps out of its fingerprint.
+        Defaults to the fingerprint key, which is the right answer whenever they agree.
+        """
+        return self.text_encoder_cache_key(i)
+
     def load_adapter_weights(self, adapter_path):
         if is_main_process():
             print(f'Loading adapter weights from path {adapter_path}')

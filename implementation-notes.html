@@ -33,6 +33,56 @@
 <p class="meta">A running log of decisions taken outside the spec, forced changes, tradeoffs, and
 anything else the maintainer needs to know. Newest entry first.</p>
 
+<h2>2026-09-02 &mdash; Audit follow-up: anima's own cache identity, and two tests that could not fail</h2>
+
+<p><strong>Request.</strong> Same session as the entry below, second pass: close the findings that
+were classed as pre-existing or as test-quality rather than as defects, so nothing from the audit
+is left open.</p>
+
+<p><strong>anima shared text embeddings between different LLMs.</strong> The audit filed this as
+pre-existing and out of scope, which it is, but it is the same silent-reuse class as the text cache
+fix below and it had a free fix. <code>text_encoder_cache_key</code> returns <code>''</code> for
+<code>anima</code> deliberately &mdash; putting the key in the fingerprint would move the cache path
+of every existing anima install. The side effect was that nothing distinguished two anima runs with
+different <code>llm_path</code>, so one run silently reused the other's embeddings.</p>
+
+<p>The fix separates the two questions the one string was answering. The fingerprint decides
+whether to rebuild, so adding to it is expensive; the manifest only records whose contents these
+are, and a cache with no manifest is already treated as compatible. So <code>BasePipeline</code>
+gains <code>text_encoder_identity</code>, defaulting to the fingerprint key so every other model is
+unchanged, and cosmos_predict2 overrides it to name the LLM for <code>anima</code> as well as
+<code>anima_refiner</code>. No existing cache moves and none is invalidated; new ones make a claim
+that a later mismatch can be caught against. This is the same recorded-not-fingerprinted shape
+<code>vae_cache_key</code> already uses for latents.</p>
+
+<p><strong>Two tests asserted text that could not fail.</strong> The audit's most useful test
+finding was not a missing test but a passing one: a test that would still pass if the behaviour it
+covers were inverted.</p>
+
+<ul>
+  <li><code>test_ddp_no_sync_wraps_all_but_the_last_micro_batch</code> asserted that two string
+    literals appear somewhere in <code>distill_refiner.py</code>. Inverting the condition to
+    <code>not is_last</code> leaves both literals intact, so the test could not tell the
+    accumulation boundary from its opposite &mdash; while the equivalent ZeRO logic next to it is
+    exercised against a real engine. Added <code>TestNoSyncBoundaryBehaviour</code>, which runs
+    <code>micro_batch_context</code> and checks which context comes back, including that world
+    size 1 never touches <code>no_sync</code> (it only exists on a DDP-wrapped module).</li>
+  <li><code>test_the_two_prefix_lists_agree</code> checked only that the pipeline's prefixes are a
+    subset of <code>_CHECKPOINT_PREFIXES</code>. The other direction is the mirrored bug: a prefix
+    the extractor knows and the pipeline does not means a file that loads as
+    <code>context_refiner_path</code> fails as <code>transformer_path</code>. Both directions are
+    now asserted, plus that the regex still matches anything at all &mdash; a regex that silently
+    stops matching turns this into a test of nothing.</li>
+</ul>
+
+<p>The prefix check passed in the new direction immediately, so the lists did agree; the point is
+that nothing was checking.</p>
+
+<p><strong>Not changed.</strong> The remaining <code>TestScriptStructure</code> cases still assert
+on source text. That is the right tool for some of them &mdash; "the launcher sets this env var",
+"this import exists" &mdash; and rewriting them wholesale was not worth the churn. The two fixed
+here are the ones where a real behaviour with a real inversion sat behind the string.</p>
+
 <h2>2026-09-02 &mdash; Five-agent adversarial audit: a stale text cache, an unguarded teacher, and a drift-guard hole</h2>
 
 <p><strong>Request.</strong> A full adversarial audit of the branch against baseline

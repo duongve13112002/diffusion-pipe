@@ -4,6 +4,7 @@ The script does not go through train.py, so it inherits none of DeepSpeed's mach
 cover the two things that machinery would otherwise have given it for free.
 """
 
+import contextlib
 import os
 import subprocess
 import sys
@@ -2126,3 +2127,47 @@ class TestResumeReportsScheduleDrift:
     def test_a_changed_precision_warns(self, tmp_path, capsys):
         _, out = self._round_trip(tmp_path, self.BASE, {**self.BASE, 'precision': 'fp32'}, capsys)
         assert "'bf16-mixed'" in out and "'fp32'" in out
+
+
+class TestNoSyncBoundaryBehaviour:
+    """Exercise the accumulation boundary rather than grepping for it.
+
+    TestScriptStructure asserts the two literals appear in the file, which cannot tell
+    `is_last` from `not is_last` -- inverting the condition keeps both strings intact and
+    would turn every micro batch into an all-reduce (or, worse, skip the one that matters).
+    """
+
+    class _Module:
+        def __init__(self):
+            self.no_sync_calls = 0
+
+        def no_sync(self):
+            self.no_sync_calls += 1
+            return contextlib.nullcontext('no_sync')
+
+    def _strategy(self, world_size):
+        from tools.distill_refiner import DDPStrategy
+        strategy = object.__new__(DDPStrategy)
+        strategy.world_size = world_size
+        strategy.module = self._Module()
+        return strategy
+
+    def test_the_last_micro_batch_syncs(self):
+        strategy = self._strategy(2)
+        with strategy.micro_batch_context(is_last=True) as marker:
+            assert marker is None, 'the last micro batch must all-reduce, not be wrapped'
+        assert strategy.module.no_sync_calls == 0
+
+    def test_every_earlier_micro_batch_does_not_sync(self):
+        strategy = self._strategy(2)
+        with strategy.micro_batch_context(is_last=False) as marker:
+            assert marker == 'no_sync', 'accumulating micro batches must skip the all-reduce'
+        assert strategy.module.no_sync_calls == 1
+
+    def test_a_single_process_never_calls_no_sync(self):
+        """no_sync only exists on a DDP-wrapped module, and world size 1 leaves it unwrapped."""
+        strategy = self._strategy(1)
+        for is_last in (True, False):
+            with strategy.micro_batch_context(is_last=is_last) as marker:
+                assert marker is None
+        assert strategy.module.no_sync_calls == 0

@@ -497,6 +497,26 @@ class CosmosPredict2Pipeline(BasePipeline):
             self.cap_feat_dim,
         ))
 
+    def text_encoder_identity(self, i):
+        """Which encoder actually produced these embeddings, for the manifest.
+
+        anima returns '' from text_encoder_cache_key on purpose, so that adding that key never
+        moved an existing install's cache path. The side effect is that nothing distinguishes
+        two anima runs whose llm_path differs, and their embeddings are not interchangeable --
+        the same silent reuse anima_refiner is protected from. Recording it here fixes that for
+        free: the manifest is not part of the fingerprint, so no existing cache moves, and one
+        with no manifest still claims nothing.
+        """
+        return '|'.join(str(x) for x in (
+            self.model_config.get('llm_path', ''),
+            self.model_config.get('llm_config_path', ''),
+            self.model_config.get('llm_repo_id', ''),
+            self.model_config.get('t5_path', ''),
+            getattr(self, 'llm_hidden_layer', ''),
+            getattr(self, 'max_text_length', ''),
+            getattr(self, 'cap_feat_dim', ''),
+        ))
+
     def _warn_on_refiner_provenance(self, path):
         """Compare what a refiner file says it was distilled against with what this run provides.
 

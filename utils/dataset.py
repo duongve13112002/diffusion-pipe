@@ -1439,14 +1439,17 @@ class Dataset:
 
     def cache_text_embeddings(self, map_fn, i, regenerate_cache=False, caching_batch_size=1):
         text_encoder_key = getattr(self.model, 'text_encoder_cache_key', lambda _i: '')(i)
+        text_encoder_identity = getattr(
+            self.model, 'text_encoder_identity', lambda _i: text_encoder_key)(i)
         for ds in self.directory_datasets:
             ds.cache_text_embeddings(
                 map_fn, i, regenerate_cache=regenerate_cache,
                 caching_batch_size=caching_batch_size, text_encoder_key=text_encoder_key,
-                # The same string identifies the encoder in the fingerprint and in the
-                # manifest: the fingerprint catches a change the cache must react to, the
-                # manifest says whose contents these are.
-                identity=text_encoder_key,
+                # Two different questions, so two calls. The fingerprint catches a change the
+                # cache must react to by rebuilding; the manifest only says whose contents
+                # these are. A model that keeps something out of its fingerprint, to avoid
+                # moving every existing install's cache path, can still declare it here.
+                identity=text_encoder_identity,
             )
         # some techniques need access to the uncond
         self.model.uncond_dict = self.directory_datasets[0].uncond_dict
