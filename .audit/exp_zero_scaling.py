@@ -1,3 +1,18 @@
+"""Audit evidence: DeepSpeed's 1/N accumulation scaling follows the engine forward.
+
+    PYTHONPATH=test/childenv python .audit/exp_zero_scaling.py
+
+Measures, on a real ZeRO engine at gradient_accumulation_steps=4, the gradient reaching a
+parameter through three paths, as a ratio to one un-accumulated batch:
+
+  - through engine(x)               -> 1.0x  (correctly averaged)
+  - through the bare module         -> 4.0x  (no scaling: the bug)
+  - bare module + the /N hook       -> 1.0x  (the fix)
+
+The scaling is applied by a hook DeepSpeed registers on the output of its own forward, not inside
+backward(), which is why a forward that bypasses the engine bypasses the scaling.
+tools/test_zero_side_branch_multirank.py is the two-rank version of this.
+"""
 import os, torch, torch.distributed as dist, deepspeed, deepspeed.ops
 
 for name in list(deepspeed.ops.__compatible_ops__):

@@ -1778,7 +1778,8 @@ def main():
                                     rollout_rng=rollout_rng,
                                     scaler=getattr(strategy, 'scaler', None),
                                     batch_size=batch_size, grad_accum=grad_accum,
-                                    precision_name=precision.name)
+                                    precision_name=precision.name,
+                                    master_weights=sharded_state and bool(precision.deepspeed_section))
                 _copy_atomically(training_state_path(tagged_path, state_rank),
                                  training_state_path(refiner_path, state_rank))
 
@@ -1998,7 +1999,8 @@ def prune_distill_checkpoints(output_dir, keep, protect_tag=None, protect_tags=(
 
 def save_training_state(refiner_path, optimizer, scheduler, step, rank=None, world_size=1,
                         rollout_generator=None, rollout_rng=None, scaler=None,
-                        batch_size=None, grad_accum=None, precision_name=None):
+                        batch_size=None, grad_accum=None, precision_name=None,
+                        master_weights=False):
     """Save what a resume needs beyond the weights.
 
     Without this, resume_from restarted Adam's moments at zero and rebuilt the LR schedule from
@@ -2027,6 +2029,17 @@ def save_training_state(refiner_path, optimizer, scheduler, step, rank=None, wor
         'precision': precision_name,
         'optimizer': optimizer.state_dict(),
         'scheduler': scheduler.state_dict(),
+        # Under ZeRO the engine casts the module to bf16/fp16 and keeps the only full-precision
+        # copy of the weights in the optimizer's flat fp32 partition -- which deepspeed.initialize
+        # installed as this optimizer's param_groups. save_refiner writes the MODULE, so it writes
+        # the bit16 view; optimizer.state_dict() carries the moments but never the parameter
+        # values. Without this a resumed bf16-full run restarts its masters from 8-mantissa-bit
+        # values and silently discards every sub-bf16 increment since the last save.
+        'master_weights': (
+            [p.detach().float().cpu().clone()
+             for group in optimizer.param_groups for p in group['params']]
+            if master_weights else None
+        ),
         # The caption order does not need saving -- EpochSampler is a pure function of
         # (seed, epoch), so resuming lands on the right captions by construction. The
         # augmentation draws do: caption shuffling and tag_dropout_rate pull from the global
@@ -2148,8 +2161,46 @@ def load_training_state(refiner_path, optimizer, scheduler, is_main, rank=None, 
         scaler.load_state_dict(state['scaler'])
     if is_main:
         print(f'Resumed optimizer and LR schedule from {path} at step {state["step"]}')
+    _restore_master_weights(state, optimizer, is_main)
     _check_weights_match_training_state(refiner_path, int(state['step']))
     return int(state['step'])
+
+
+def _restore_master_weights(state, optimizer, is_main):
+    """Put the fp32 masters back, for the modes where the module alone does not hold them.
+
+    Only ZeRO with a bit16 section writes these. Copied in place rather than assigned, because
+    deepspeed.initialize already installed these exact tensors as the optimizer's param_groups
+    and the engine holds references to them.
+    """
+    masters = state.get('master_weights', None)
+    if not masters:
+        return
+    live = [p for group in optimizer.param_groups for p in group['params']]
+    if len(live) != len(masters):
+        if is_main:
+            print(
+                f'WARNING: the checkpoint holds {len(masters)} fp32 master tensors but this run '
+                f'has {len(live)}. Skipping the master restore; training continues from the '
+                'bit16 weights, which loses precision accumulated since the last save.'
+            )
+        return
+    # Every shape checked before anything is written: bailing out halfway would leave some
+    # partitions restored and the rest not, which is worse than not restoring at all.
+    mismatched = [i for i, (live_tensor, saved) in enumerate(zip(live, masters))
+                  if live_tensor.shape != saved.shape]
+    if mismatched:
+        if is_main:
+            print(
+                f'WARNING: fp32 master shape mismatch at partition {mismatched[0]} on resume. '
+                'Skipping the restore; training continues from the bit16 weights.'
+            )
+        return
+    with torch.no_grad():
+        for live_tensor, saved in zip(live, masters):
+            live_tensor.copy_(saved.to(live_tensor.dtype))
+    if is_main:
+        print(f'Restored {len(masters)} fp32 master weight tensors.')
 
 
 def _check_weights_match_training_state(refiner_path, state_step):

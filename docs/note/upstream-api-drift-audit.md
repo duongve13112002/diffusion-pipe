@@ -101,15 +101,47 @@ text encoder depends on, including two behavioural checks that no import test wo
 and that `init_empty_weights` still leaves buffers off the meta device. Each dependency's half is
 skipped rather than failed when it is not installed, so the torch half still runs anywhere.
 
-### The deepspeed behaviour dependency cannot be checked on a CPU box
+### Most of the deepspeed behaviour dependency *can* be checked on a CPU box
 
 `tools/check_vendored_apis.py` covers torch and bitsandbytes by importing them and comparing
 signatures. It cannot cover the deepspeed row above, because the claim is about what
-`deepspeed.initialize` *does*, and `initialize` JIT-builds `deepspeed_shm_comm` — it does not run
-on a machine without a compiler, and the CPU-only development box is one.
+`deepspeed.initialize` *does* rather than what it accepts.
 
-`tools/test_zero_resume_gpu.py` is that check. Run it on a two-rank GPU box after any deepspeed
-upgrade:
+This section used to say that could not be checked without a GPU, on the grounds that
+`initialize` JIT-builds `deepspeed_shm_comm` and needs a compiler. That is only true of the
+default path. Marking the shm op incompatible before calling `initialize` is the supported way to
+skip it:
+
+```python
+for name in list(deepspeed.ops.__compatible_ops__):
+    if 'shm' in name.lower():
+        deepspeed.ops.__compatible_ops__[name] = False
+```
+
+With that, a real engine runs on CPU over gloo, at one rank or two. The claim was load-bearing in
+the wrong direction: it is what made three separate checks get deferred as "needs hardware" when
+they did not. What actually needs a GPU is narrower than it looked — anything about CUDA kernels,
+fused attention numerics, or real device memory.
+
+Two CPU checks now exist and are worth running after a deepspeed upgrade:
+
+```
+PYTHONPATH=test/childenv python tools/test_zero_side_branch_multirank.py
+```
+
+Two gloo ranks and a real ZeRO engine. It asserts the property
+`DeepSpeedZeROStrategy.scale_side_branch` exists for: deepspeed applies its
+`1/gradient_accumulation_steps` scaling through a hook on the output of its *own* forward and
+never inside `backward()`, so a forward that bypasses the engine bypasses the scaling and
+contributes `gradient_accumulation_steps` times its intended gradient. If a future deepspeed moves
+the division into `backward()`, the "bypassing path is NOT scaled" check fails and names it —
+at which point the hook would be double-scaling and must be removed.
+
+`test/test_distill_refiner.py::TestZeROAccumulationBoundaryForReal` is the other, covering stages
+1 and 2 against a real engine inside the normal suite.
+
+`tools/test_zero_resume_gpu.py` remains for the genuinely device-bound part. Run it on a two-rank
+GPU box after any deepspeed upgrade:
 
 ```
 deepspeed --num_gpus=2 tools/test_zero_resume_gpu.py

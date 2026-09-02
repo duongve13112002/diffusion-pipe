@@ -719,7 +719,7 @@ class TestZeROAccumulationBoundaryForReal:
     """
 
     @staticmethod
-    def _init_engine(gas):
+    def _init_engine(gas, stage=1):
         import torch.distributed as dist
         import deepspeed
         import deepspeed.ops
@@ -749,7 +749,7 @@ class TestZeROAccumulationBoundaryForReal:
             'gradient_accumulation_steps': gas,
             'gradient_clipping': 1.0,
             'zero_optimization': {
-                'stage': 1, 'contiguous_gradients': True, 'overlap_comm': True,
+                'stage': stage, 'contiguous_gradients': True, 'overlap_comm': True,
                 # Small on purpose: DeepSpeed's 5e8-element default would allocate 2 GB here.
                 'reduce_bucket_size': 4096, 'allgather_bucket_size': 4096,
             },
@@ -763,8 +763,8 @@ class TestZeROAccumulationBoundaryForReal:
         )
         return engine, model
 
-    def _count_updates(self, gas, outer_steps, set_boundary):
-        engine, model = self._init_engine(gas)
+    def _count_updates(self, gas, outer_steps, set_boundary, stage=1):
+        engine, model = self._init_engine(gas, stage)
         torch.manual_seed(1234)
         previous = model.weight.detach().clone()
         updates = 0
@@ -781,20 +781,24 @@ class TestZeROAccumulationBoundaryForReal:
             previous = model.weight.detach().clone()
         return updates
 
-    def test_the_boundary_must_be_set_or_most_updates_are_skipped(self):
+    @pytest.mark.parametrize('stage', [1, 2])
+    def test_the_boundary_must_be_set_or_most_updates_are_skipped(self, stage):
         """The regression itself: without the boundary call the engine skips updates."""
         pytest.importorskip('deepspeed')
         gas, outer = 4, 6
-        assert self._count_updates(gas, outer, set_boundary=False) < outer, (
+        assert self._count_updates(gas, outer, set_boundary=False, stage=stage) < outer, (
             'Expected the unfixed call pattern to skip optimizer updates. If this now passes, '
             'DeepSpeed changed how it derives the accumulation boundary and '
             'DeepSpeedZeROStrategy.micro_batch_context should be re-checked against it.'
         )
 
-    def test_setting_the_boundary_gives_one_update_per_outer_step(self):
+    @pytest.mark.parametrize('stage', [1, 2])
+    def test_setting_the_boundary_gives_one_update_per_outer_step(self, stage):
+        """Stage 2 takes a different backward path -- it reduces on every micro batch rather
+        than only at the boundary -- so the boundary contract has to be checked against both."""
         pytest.importorskip('deepspeed')
         gas, outer = 4, 6
-        assert self._count_updates(gas, outer, set_boundary=True) == outer
+        assert self._count_updates(gas, outer, set_boundary=True, stage=stage) == outer
 
     def test_the_strategy_sets_the_boundary_on_every_micro_batch(self, monkeypatch):
         """The strategy must be the thing that calls it, not just the test."""
@@ -2211,6 +2215,81 @@ class TestCorpusCaptionSettingsWarning:
         dataset_toml.write_text('resolutions = [512]\n', encoding='utf-8')
         out = self._warn({'dataset': str(dataset_toml)}, capsys)
         assert 'WARNING' not in out
+
+
+class TestZeROMasterWeightsSurviveAResume:
+    """Under ZeRO the module is bit16 and the only full-precision weights are the optimizer's.
+
+    deepspeed.initialize casts the module to bf16 and keeps fp32 masters in the flat partition it
+    installs as the client optimizer's param_groups. save_refiner writes the module, so it writes
+    the bit16 view, and optimizer.state_dict() carries the moments but never the parameter values.
+    Without the masters in the payload a resumed bf16-full run silently restarts them from
+    8-mantissa-bit values.
+    """
+
+    def test_the_masters_are_written_and_put_back(self, tmp_path):
+        pytest.importorskip('deepspeed')
+        from tools.distill_refiner import save_training_state, _restore_master_weights
+
+        # Stand in for the optimizer deepspeed hands back: param_groups holding fp32 masters.
+        master = torch.tensor([1.0000001, 2.0000002, 3.0000003], dtype=torch.float32)
+        optimizer = torch.optim.SGD([torch.nn.Parameter(master.clone())], lr=0.1)
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda s: 1.0)
+
+        refiner_path = tmp_path / 'context_refiner.safetensors'
+        save_training_state(refiner_path, optimizer, scheduler, step=10, rank=0, world_size=1,
+                            master_weights=True)
+
+        state = torch.load(str(_state_file(tmp_path)), weights_only=False)
+        assert state['master_weights'] is not None, 'the masters must be in the payload'
+
+        # A fresh run: masters rebuilt from a bf16 round trip, which is what losing them costs.
+        degraded = master.to(torch.bfloat16).to(torch.float32)
+        assert not torch.equal(degraded, master), 'bf16 must actually lose bits here'
+        optimizer.param_groups[0]['params'][0].data = degraded.clone()
+
+        _restore_master_weights(state, optimizer, is_main=True)
+        restored = optimizer.param_groups[0]['params'][0].detach()
+        assert torch.equal(restored, master), (
+            f'the fp32 masters were not restored: {restored.tolist()} != {master.tolist()}'
+        )
+
+    def test_a_checkpoint_without_masters_resumes_unchanged(self, tmp_path):
+        """DDP and fp32 runs write nothing here, and must not be disturbed by the restore."""
+        from tools.distill_refiner import _restore_master_weights
+        value = torch.tensor([5.0, 6.0])
+        optimizer = torch.optim.SGD([torch.nn.Parameter(value.clone())], lr=0.1)
+        _restore_master_weights({'master_weights': None}, optimizer, is_main=True)
+        assert torch.equal(optimizer.param_groups[0]['params'][0].detach(), value)
+
+    def test_a_master_count_mismatch_warns_instead_of_corrupting(self, tmp_path, capsys):
+        from tools.distill_refiner import _restore_master_weights
+        optimizer = torch.optim.SGD([torch.nn.Parameter(torch.zeros(2))], lr=0.1)
+        _restore_master_weights({'master_weights': [torch.zeros(2), torch.zeros(2)]},
+                                optimizer, is_main=True)
+        assert 'WARNING' in capsys.readouterr().out
+
+    def test_a_shape_mismatch_restores_nothing_at_all(self, capsys):
+        """Partially restoring is worse than not restoring: some partitions would be from one
+        step and the rest from another, with no error."""
+        from tools.distill_refiner import _restore_master_weights
+        first = torch.nn.Parameter(torch.zeros(2))
+        second = torch.nn.Parameter(torch.zeros(3))
+        optimizer = torch.optim.SGD([first, second], lr=0.1)
+        # The first tensor matches and the second does not.
+        _restore_master_weights({'master_weights': [torch.ones(2), torch.ones(9)]},
+                                optimizer, is_main=True)
+        assert 'WARNING' in capsys.readouterr().out
+        assert torch.equal(first.detach(), torch.zeros(2)), (
+            'the matching partition was written before the mismatch was noticed'
+        )
+
+
+def _state_file(directory):
+    """The single distill_state_*.pt a rank-0 save writes into `directory`."""
+    matches = sorted(directory.glob('distill_state*.pt'))
+    assert len(matches) == 1, f'expected one state file, found {[p.name for p in matches]}'
+    return matches[0]
 
 
 class TestCheckpointHalvesStayTogether:

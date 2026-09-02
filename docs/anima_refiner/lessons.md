@@ -136,7 +136,29 @@ the real multiprocess path.
 DeepSpeed itself does install on Windows CPU, which makes the stub inert. The sdist omits
 `bin/deepspeed.bat`, which its own `setup.py` lists for win32, so unpack the sdist, add that file
 and `bin/ds_report.bat`, then `DS_BUILD_OPS=0 pip install . --no-build-isolation`.
-`deepspeed.initialize` still does not run: it JIT-builds an op and needs MSVC `cl.exe`.
+
+## "This cannot be checked without hardware" is a claim, and it needs checking too
+
+This section used to end by saying `deepspeed.initialize` does not run here, because it JIT-builds
+`deepspeed_shm_comm` and needs MSVC `cl.exe`. That is true only of the default path. Marking the
+op incompatible first is the supported way to skip it, and then a real ZeRO engine runs on gloo at
+one rank or two:
+
+```python
+for name in list(deepspeed.ops.__compatible_ops__):
+    if 'shm' in name.lower():
+        deepspeed.ops.__compatible_ops__[name] = False
+```
+
+The cost of the wrong version was not one missing test. An audit found three defects in the ZeRO
+paths — fp32 master weights never checkpointed, no stage-2 coverage, and an unverified accumulation
+fix — and filed all three as "needs a GPU" on the strength of that sentence. They were closed on
+this machine in an afternoon once someone tried. A wrong *cannot* is more expensive than a missing
+check, because a missing check invites someone to write it and a wrong cannot tells them not to
+bother.
+
+**Rule:** an impossibility claim is load-bearing in the direction that stops work, so it earns the
+same scrutiny as a correctness claim. Before writing "X requires hardware we do not have", run X.
 
 ## Check the premise before building on it
 

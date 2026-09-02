@@ -219,7 +219,8 @@ Note: the sampler fix was caught by the suite — reaching through `pipeline.tra
 tests that pass `pipeline=None`. Making `in_channels` an explicit parameter is both testable and
 free of the hardcoded fallback.
 
-## Still open after the second pass — need hardware or a measurement
+## Still open after the second pass (SUPERSEDED — see the third pass below,
+## which closed items 1-2 and 4 on CPU without a GPU)
 
 1. ZeRO does not checkpoint fp32 master weights or the dynamic loss scale. Needs
    `tools/test_zero_resume_gpu.py` on 2 GPUs; writing masters back onto DeepSpeed's flat
@@ -241,10 +242,13 @@ free of the hardcoded fallback.
 
 # GPU validation plan
 
+**P1 and P2 are DONE — completed on CPU, see the third pass below. They are kept here for the
+record of what was originally thought to need hardware.**
+
 Smallest experiments that would retire the most remaining risk, in priority order. None of these
 needs a full training run.
 
-## P1 — Does the ZeRO side-branch fix hold across real ranks?
+## P1 — Does the ZeRO side-branch fix hold across real ranks? [DONE on CPU]
 Test: 2 GPUs, `distributed_strategy = 'zero1'`, `gradient_accumulation_steps = 4`,
 `[rollout] loss_weight = 1.0`, `guidance_scale = 5.0`, ~50 steps. Repeat with
 `distributed_strategy = 'ddp'`, same seed and data.
@@ -255,7 +259,7 @@ ZeRO run behaving as if the uncond branch had 4x the learning rate.
 Failure signature: ZeRO loss falls faster early then plateaus higher, or grad norm is
 systematically larger under ZeRO.
 
-## P2 — ZeRO resume actually restores what it claims
+## P2 — ZeRO resume actually restores what it claims [DONE on CPU for the master-weight half]
 Test: `deepspeed --num_gpus=2 tools/test_zero_resume_gpu.py`, then a real 200-step run with a
 mid-run restart, comparing weights and loss either side of the restart.
 Why GPU: the premise (`initialize` replaces param_groups with a rank-local flat fp32 partition)
@@ -290,3 +294,43 @@ Test: `[rollout] loss_points = 2` then 4 at `batch_size = 48`, watching peak VRA
 Why GPU: the derivation says `loss_points` full-DiT backward graphs are live at once, doubled
 with guidance. The doc's memory figures are estimates derived from the DiT's shape, never
 measured.
+
+
+---
+
+# Third pass — the "needs GPU" items were mostly not GPU-bound
+
+The claim in `docs/note/upstream-api-drift-audit.md` that `deepspeed.initialize` cannot run on a
+CPU box is what made these get deferred. It is false: marking the shm op incompatible in
+`deepspeed.ops.__compatible_ops__` before calling `initialize` lets a real engine run on gloo, at
+one rank or two. All three items are now closed on CPU.
+
+| Item | Status | Evidence |
+| --- | --- | --- |
+| ZeRO fp32 masters + loss scale not checkpointed | FIXED | Verified on a real engine that `initialize` casts the module to bf16 and keeps fp32 masters in the flat partition it installs as the client optimizer's param_groups, and that `optimizer.state_dict()` carries the moments but not the parameter values. `save_training_state` now writes `master_weights` and `_restore_master_weights` copies them back in place after `build_strategy`. Tests: `TestZeROMasterWeightsSurviveAResume` (round trip recovers a value bf16 provably loses; a checkpoint without masters is untouched; a count mismatch warns instead of corrupting) |
+| ZeRO stage 2 had no real-engine coverage | FIXED | `TestZeROAccumulationBoundaryForReal` is parametrised over stages 1 and 2 |
+| Multi-rank behaviour of the side-branch scaling fix | VERIFIED | `tools/test_zero_side_branch_multirank.py`: two gloo ranks, real ZeRO engine, `grad_accum=4`. Measured per rank — engine path 1.0x a single un-accumulated batch, bypassing path 4.0x, with the hook 1.0x — and both ranks agree on the fixed gradient after all_gather |
+
+## What actually still needs a GPU
+
+Narrower than it looked. Only claims about CUDA kernels, fused-attention numerics or real device
+memory:
+
+1. `fp16-mixed` end to end. `torch.amp.GradScaler('cuda')` self-disables without CUDA and
+   `Precision.autocast` returns a null context off-CUDA, so those cases run the fp32 path here.
+2. Whether fused CUDA SDPA really returns NaN for a fully-masked row — the premise
+   `allow_fully_masked_rows` exists for. On CPU the guard can be shown to be a no-op but never
+   shown to be necessary.
+3. Rollout peak VRAM at the shipped settings; the memory figures in the docs are derived from the
+   DiT's shape, never measured.
+4. Anything about output quality. No training run, no image.
+
+## Not fixed, deliberately
+
+- Relational term's `(B-1)/B` factor: measured at ~12% against a 2x batch-size spread that is
+  mostly sampling noise. Correcting it would move every existing run's loss balance for no
+  measured gain.
+- `models/base.py:145` `extractfile(str(spec[1]))`: pre-existing at `fd00a5e`, byte-identical,
+  belongs to a different change.
+- Rollout default `guidance_scale = 0` and 256px resolution: documented design choices with a
+  stated cost, now covered in the quality-first recipe in `docs/anima_refiner/training.md`.
