@@ -12,6 +12,7 @@ import pytest
 import torch
 from torch import nn
 
+from models.llm_adapter import Attention, LLMAdapter, allow_fully_masked_rows
 from models.text_refiner import ContextRefiner, RefinerBlock, extract_refiner_state_dict
 
 
@@ -813,6 +814,55 @@ class TestFullyMaskedRow:
         out = refiner(torch.randn(2, 8, CAP_FEAT_DIM), torch.zeros(2, 8, dtype=torch.long))
         assert torch.isfinite(out).all()
         assert out.abs().max() == 0
+
+
+class TestTeacherAdapterFullyMaskedRow:
+    """The same guard, on the path the refiner is distilled against.
+
+    The teacher tokenizes '' without keep_one_real_token, deliberately, because its query
+    sequence is old T5's and that always yields </s>. But that argument is about the queries.
+    source_attention_mask is a different mask, built from the teacher LLM's own tokenizer, and
+    for '' it is entirely zero -- so every query row attends over a fully masked key set. The
+    guard used to live in ContextRefiner alone, which left this path exposed.
+    """
+
+    @staticmethod
+    def adapter():
+        return LLMAdapter(source_dim=24, target_dim=32, model_dim=32, num_layers=1, num_heads=4)
+
+    def test_the_helper_widens_only_fully_masked_rows(self):
+        mask = torch.tensor([[True, False, False], [False, False, False]])
+        widened = allow_fully_masked_rows(mask)
+        torch.testing.assert_close(widened[0], mask[0], msg='a row with a key is untouched')
+        assert widened[1].all(), 'a row with no key is allowed to attend freely'
+
+    def test_zero_context_still_contributes_exactly_nothing(self):
+        """_compute_text_embeddings zeroes every masked position, so '' gives a zero context.
+
+        k_proj and v_proj carry no bias, so the values are zero whatever the attention weights
+        are. Letting the row attend therefore returns the same 0 the masked softmax was meant
+        to produce -- which is why this guard cannot change what `anima` already computes.
+        """
+        attn = Attention(query_dim=32, context_dim=32, n_heads=4, head_dim=8)
+        out = attn(
+            torch.randn(2, 5, 32),
+            mask=torch.zeros(2, 1, 1, 7, dtype=torch.bool),
+            context=torch.zeros(2, 7, 32),
+        )
+        assert torch.isfinite(out).all()
+        assert out.abs().max() == 0
+
+    def test_empty_caption_through_the_adapter_is_finite(self):
+        adapter = self.adapter()
+        target_mask = torch.zeros(1, 6, dtype=torch.long)
+        target_mask[0, 0] = 1  # old T5 always yields </s> for ''
+        out = adapter(
+            source_hidden_states=torch.zeros(1, 6, 24),
+            target_input_ids=torch.zeros(1, 6, dtype=torch.long),
+            target_attention_mask=target_mask,
+            source_attention_mask=torch.zeros(1, 6, dtype=torch.long),
+        )
+        assert torch.isfinite(out).all(), 'an all-padding source mask must not produce NaN'
 
 
 class TestExtractRefinerStateDict:

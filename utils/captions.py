@@ -147,7 +147,11 @@ def read_caption_file(path: Path, multiline_captions: bool = False) -> list[str]
     captions.json already allows. It is opt-in because flipping it changes the number of
     training samples for every existing dataset whose .txt files happen to wrap.
     """
-    text = path.read_text(encoding='utf-8')
+    # utf-8-sig, not utf-8: a caption file saved by a Windows editor starts with a BOM,
+    # and str.strip() does not remove U+FEFF -- it is not whitespace. The stray codepoint
+    # would ride into the tokenizer on the first caption only, so the damage is silent and
+    # uneven. utf-8-sig reads a BOM-less file identically.
+    text = path.read_text(encoding='utf-8-sig')
     if not multiline_captions:
         return [text.strip()]
     return [line for line in (l.strip() for l in text.splitlines()) if line]
@@ -244,7 +248,7 @@ def enumerate_captions(dataset_config, apply_num_repeats=False, apply_shuffle=Tr
             # encoding='utf-8' for the same reason read_caption_file passes it: open() would
             # otherwise use the locale encoding, and on Windows that silently mojibakes a
             # UTF-8 captions.json instead of failing.
-            with open(captions_json, encoding='utf-8') as f:
+            with open(captions_json, encoding='utf-8-sig') as f:
                 caption_data = json.load(f)
 
         files = sorted(path.glob('*'))

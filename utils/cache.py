@@ -10,12 +10,18 @@ import torch
 
 class Cache:
     def __init__(self, path: str, fingerprint: str, shard_size_gb=1,
-                 keep_on_fingerprint_change=False, identity=None):
+                 keep_on_fingerprint_change=False, identity=None, content_digest=None):
         self.keep_on_fingerprint_change = keep_on_fingerprint_change
         # What produced this cache's contents -- the VAE for latents, the text encoder
         # for embeddings. None means the caller supplies no identity, which is the
         # behaviour every model had before this existed.
         self.identity = identity
+        # Digest of the INPUT these contents were computed from, for caches whose input is
+        # cheap to hash. identity answers "who produced this"; this answers "from what".
+        # keep_on_fingerprint_change deliberately tolerates a moved fingerprint, and for the
+        # text embedding cache the caption text is essentially the whole fingerprint -- so
+        # without this, keeping is exactly the same thing as ignoring an edit to the captions.
+        self.content_digest = content_digest
         self.path = Path(path)
         self.fingerprint = fingerprint
         self.metadata_db = self.path / 'metadata.db'
@@ -131,14 +137,34 @@ class Cache:
             'contents do not belong to this model.'
         )
 
+    def recorded_content_digest(self):
+        """The content digest this cache was last completed with, or None if unknown.
+
+        None covers a cache written before this existed as well as one with no manifest at
+        all. Both mean nothing is claimed about the input, so the caller must not treat a
+        mismatch it cannot see as proof of anything.
+        """
+        if not self.manifest_file.exists():
+            return None
+        try:
+            with open(self.manifest_file, encoding='utf-8') as f:
+                return json.load(f).get('content_digest', None)
+        except (OSError, ValueError):
+            return None
+
     def write_manifest(self):
-        """Record what produced this cache. Called once the contents are complete."""
-        if not self.identity:
+        """Record what produced this cache, and from what. Called once contents are complete."""
+        if not self.identity and not self.content_digest:
             return
         os.makedirs(self.path, exist_ok=True)
+        record = {'schema': 2}
+        if self.identity:
+            record['identity'] = self.identity
+        if self.content_digest:
+            record['content_digest'] = self.content_digest
         tmp = self.manifest_file.with_name(self.manifest_file.name + '.tmp')
         with open(tmp, 'w', encoding='utf-8') as f:
-            json.dump({'schema': 1, 'identity': self.identity}, f, sort_keys=True)
+            json.dump(record, f, sort_keys=True)
         os.replace(tmp, self.manifest_file)
 
     def clear(self):

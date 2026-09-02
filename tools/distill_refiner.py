@@ -125,9 +125,9 @@ def load_captions(config):
     if path.is_dir():
         return [
             text for txt in sorted(path.rglob('*.txt'))
-            if (text := txt.read_text(encoding='utf-8').strip())
+            if (text := txt.read_text(encoding='utf-8-sig').strip())
         ]
-    return [line.strip() for line in path.read_text(encoding='utf-8').splitlines() if line.strip()]
+    return [line.strip() for line in path.read_text(encoding='utf-8-sig').splitlines() if line.strip()]
 
 
 def load_captions_once(config, rank, world_size, is_main):
@@ -294,9 +294,9 @@ def caption_augment_config(config):
         # A corpus or a bare caption file carries no dataset config to fall back on, so
         # anything not restated under [distill] silently defaults to off. Say so, rather than
         # quietly training on a distribution that differs from the diffusion stages'.
-        missing = [k for k in ('prefix_tag_caption', 'caption_prefix', 'cache_shuffle_num',
-                               'shuffle_tags', 'tag_dropout_rate') if k in distill_config]
-        if not missing:
+        restated = [k for k in ('prefix_tag_caption', 'caption_prefix', 'cache_shuffle_num',
+                                'shuffle_tags', 'tag_dropout_rate') if k in distill_config]
+        if not restated:
             print(
                 'WARNING: the caption source is not a dataset.toml, so no caption settings can '
                 'be inherited. Tag shuffling, tag dropout, caption_prefix and prefix_tag_caption '
@@ -595,9 +595,14 @@ def build_unconditional_features(teacher_tok, t5_tokenizer, teacher_llm, llm_ada
     The two sides tokenize differently on purpose. The student path passes
     keep_one_real_token=True, because Qwen pads with its own eos and adds no bos, so '' becomes
     an all-padding row -- the refiner would emit zeros and hand the frozen DiT a context its
-    original training never produced. The teacher path does not, because its query sequence is
+    original training never produced. The teacher path does not, because its QUERY sequence is
     old T5's, which already yields </s> for '' and needs no help. That asymmetry mirrors
     _tokenize(keep_one_real_token=self.use_context_refiner) in models/cosmos_predict2.py.
+
+    That argument covers target_attention_mask only. source_attention_mask is a different mask,
+    built from the teacher LLM's own tokenizer, and for '' it is entirely zero -- so every query
+    attends over a fully masked key set. What keeps that finite is allow_fully_masked_rows in
+    models/llm_adapter.py, not anything here.
 
     Returns (teacher_uncond, student_ids, student_mask, student_hidden), each with batch size 1;
     the caller expands to the real batch.
@@ -963,9 +968,16 @@ class DDPStrategy:
         if self.scaler.is_enabled():
             self.scaler.unscale_(self.optimizer)
         grad_norm = torch.nn.utils.clip_grad_norm_(self.refiner.parameters(), self.max_grad_norm)
+        scale_before = self.scaler.get_scale()
         self.scaler.step(self.optimizer)
         self.scaler.update()
-        self.scheduler.step()
+        # GradScaler.step() skips the update when it finds inf or nan in the gradients, and
+        # update() lowers the scale when it does. Advancing the schedule anyway would walk the
+        # LR curve further than the number of updates that actually happened. DeepSpeed gates
+        # its own scheduler on exactly this condition, so leaving it ungated here made the two
+        # strategies disagree under the same `precision` setting.
+        if not self.scaler.is_enabled() or self.scaler.get_scale() >= scale_before:
+            self.scheduler.step()
         self.optimizer.zero_grad(set_to_none=True)
         return float(grad_norm)
 
@@ -1463,6 +1475,7 @@ def main():
             own_python_rng=sharded_state or is_main,
             rollout_generator=rollout_generator, rollout_rng=rollout_rng,
             scaler=getattr(strategy, 'scaler', None),
+            batch_size=batch_size, grad_accum=grad_accum, precision_name=precision.name,
         )
         if start_step >= steps:
             raise RuntimeError(
@@ -1700,7 +1713,9 @@ def main():
                                     rank=state_rank, world_size=world_size,
                                     rollout_generator=rollout_generator,
                                     rollout_rng=rollout_rng,
-                                    scaler=getattr(strategy, 'scaler', None))
+                                    scaler=getattr(strategy, 'scaler', None),
+                                    batch_size=batch_size, grad_accum=grad_accum,
+                                    precision_name=precision.name)
                 shutil.copy2(training_state_path(tagged_path, state_rank),
                              training_state_path(refiner_path, state_rank))
 
@@ -1875,7 +1890,8 @@ def prune_distill_checkpoints(output_dir, keep, protect_tag=None):
 
 
 def save_training_state(refiner_path, optimizer, scheduler, step, rank=None, world_size=1,
-                        rollout_generator=None, rollout_rng=None, scaler=None):
+                        rollout_generator=None, rollout_rng=None, scaler=None,
+                        batch_size=None, grad_accum=None, precision_name=None):
     """Save what a resume needs beyond the weights.
 
     Without this, resume_from restarted Adam's moments at zero and rebuilt the LR schedule from
@@ -1892,6 +1908,16 @@ def save_training_state(refiner_path, optimizer, scheduler, step, rank=None, wor
     payload = {
         'step': step,
         'world_size': world_size,
+        # Recorded so a resume can say when it will not line up with the run it continues.
+        # EpochSampler.steps_per_epoch divides by batch_size * grad_accum * world_size, so
+        # changing any of them moves the epoch boundary the saved `step` is counted against,
+        # and with `epochs` it also moves the LR schedule's total. None means a checkpoint
+        # written before this was recorded; nothing is claimed about those.
+        'batch_size': batch_size,
+        'grad_accum': grad_accum,
+        # AdamW allocates exp_avg/exp_avg_sq to match the parameter dtype at construction, so
+        # moments saved under one precision are the wrong dtype for another.
+        'precision': precision_name,
         'optimizer': optimizer.state_dict(),
         'scheduler': scheduler.state_dict(),
         # The caption order does not need saving -- EpochSampler is a pure function of
@@ -1919,7 +1945,7 @@ def save_training_state(refiner_path, optimizer, scheduler, step, rank=None, wor
 
 def load_training_state(refiner_path, optimizer, scheduler, is_main, rank=None, world_size=1,
                         own_python_rng=True, rollout_generator=None, rollout_rng=None,
-                        scaler=None):
+                        scaler=None, batch_size=None, grad_accum=None, precision_name=None):
     """Restore optimizer, scheduler and step. Returns the step to resume from.
 
     A missing file is not an error: it is a refiner distilled before this existed, or one
@@ -1963,6 +1989,35 @@ def load_training_state(refiner_path, optimizer, scheduler, is_main, rank=None, 
             f'--num_gpus={saved_world}, or drop the distill_state files to resume the weights '
             'only.'
         )
+    if is_main:
+        # Not refused: DDP replicates the optimizer state rather than partitioning it, so it
+        # loads correctly at any world size, and resuming onto a different number of GPUs is an
+        # ordinary thing to want. What does not carry across is the alignment -- the saved step
+        # counts global batches, so a different global batch puts it at a different point in the
+        # corpus, and under `epochs` the schedule's total moves with it. Say so and continue.
+        drifted = [
+            (name, state.get(key, None), current)
+            for name, key, current in (('world_size', 'world_size', world_size),
+                                       ('batch_size', 'batch_size', batch_size),
+                                       ('gradient_accumulation_steps', 'grad_accum', grad_accum))
+            if state.get(key, None) is not None and current is not None and state[key] != current
+        ]
+        if drifted:
+            changes = ', '.join(f'{name} {was} -> {now}' for name, was, now in drifted)
+            print(
+                f'WARNING: {path.name} was written with {changes}. The optimizer state still '
+                'loads, but the global batch changed, so the resumed step lands at a different '
+                'point in the corpus than it did in the interrupted run, and with `epochs` the '
+                'LR schedule is rebuilt against a different total. Match the original values to '
+                'continue the same schedule.'
+            )
+        saved_precision = state.get('precision', None)
+        if saved_precision is not None and precision_name is not None and saved_precision != precision_name:
+            print(
+                f'WARNING: {path.name} was written under precision {saved_precision!r} and this '
+                f'run is {precision_name!r}. Adam moments were allocated in the old parameter '
+                'dtype and are being loaded into an optimizer expecting the new one.'
+            )
     optimizer.load_state_dict(state['optimizer'])
     scheduler.load_state_dict(state['scheduler'])
     # load_state_dict restores the schedule's position but leaves the optimizer holding whatever

@@ -33,6 +33,107 @@
 <p class="meta">A running log of decisions taken outside the spec, forced changes, tradeoffs, and
 anything else the maintainer needs to know. Newest entry first.</p>
 
+<h2>2026-09-02 &mdash; Five-agent adversarial audit: a stale text cache, an unguarded teacher, and a drift-guard hole</h2>
+
+<p><strong>Request.</strong> A full adversarial audit of the branch against baseline
+<code>fd00a5e</code>, then fix everything it found. Four specialists covered architecture,
+objective mathematics, distributed/numerical behaviour, and tests/cache/upstream; the two
+headline findings were re-verified at source level before anything was changed.</p>
+
+<p><strong>What the audit did not find is worth stating first.</strong> Every distillation
+objective held up. The CFG formula is algebraically the textbook one, the rollout timestep
+schedule and Euler sign are identical across the trainer, <code>models/cosmos_predict2.py</code>
+and the sampler, the rollout is teacher-driven and fully inside <code>no_grad</code> with
+gradient reaching only the refiner, <code>ContextRefiner.init_weights</code> covers all 28
+parameters on all four construction paths, and the ZeRO accumulation boundary is correct against
+DeepSpeed 0.18.4's own source. The relational loss's deviation from textbook RKD was re-derived
+and is provably the right call: per-side normalisation cancels a uniform collapse factor exactly,
+so the textbook form cannot see the failure it is meant to price.</p>
+
+<p><strong>The text embedding cache could serve embeddings for captions that no longer exist.</strong>
+<code>keep_text_embedding_cache</code> was new on this branch, undocumented, and mapped straight
+onto <code>keep_on_fingerprint_change</code>. It was added to mirror <code>keep_latent_cache</code>,
+but the two are not symmetric. Captions were deliberately removed from the <em>latent</em>
+fingerprint, so that flag has almost nothing left to suppress. For the <em>text</em> cache the
+caption text is essentially the whole fingerprint &mdash; so the flag's only reachable effect was
+to ignore an edit to the captions and pair old embeddings with new text by index, with correct
+shapes, a correct count, and no error. That contradicts the contract the introducing commit wrote
+down for itself: keep_* means "do not recache unnecessarily", and a caption edit is a necessary
+recache.</p>
+
+<p>Fixed by recording a digest of the input in the cache manifest beside the producer identity
+&mdash; <code>identity</code> answers "who produced this", <code>content_digest</code> answers
+"from what". On reuse, the first <em>N</em> current captions are re-hashed against it. Appending
+rows still reuses what is cached, which is the case the flag exists for and the reason it was kept
+rather than deleted; editing a row that is already cached rebuilds. A cache with no recorded digest
+claims nothing and is still reused, so existing installs are unaffected. The manifest is now
+schema 2, and both fields are optional in it.</p>
+
+<p><strong>The teacher had no guard for the fully-masked row the student got one for.</strong>
+<code>ContextRefiner.forward</code> widens an all-padding attention mask so the row attends freely,
+because the fused CUDA backends can return NaN for a fully-masked softmax and NaN times zero is
+still NaN. <code>LLMAdapter</code> &mdash; the teacher the refiner is distilled against &mdash; had
+no such guard, and <code>build_unconditional_features</code> hands it an all-zero
+<code>source_attention_mask</code> on every guided-rollout micro-batch. The docstring explaining
+why the teacher "needs no help" is about <code>target_attention_mask</code>, the T5 query sequence;
+<code>source_attention_mask</code> is a different mask and is genuinely all zero for an empty
+caption. The root is pre-existing and reaches plain <code>anima</code> too; what is new is that the
+rollout exercises it every step rather than on unlucky caption-dropout draws.</p>
+
+<p>The guard moved into <code>Attention</code> itself as <code>allow_fully_masked_rows</code>, so
+both consumers get it from one place &mdash; the duplication is what let them drift apart. This is
+provably not a behaviour change for <code>anima</code>: <code>_compute_text_embeddings</code> zeroes
+every masked position, and <code>k_proj</code>/<code>v_proj</code> carry no bias, so the values are
+zero and attending freely returns the same exact <code>0.0</code> the masked softmax was meant to
+produce. That is asserted directly in the new tests rather than argued.</p>
+
+<p><strong>The drift guard did not cover the newest dependency surface.</strong>
+<code>tools/check_vendored_apis.py</code> covered torch and bitsandbytes;
+<code>check_comfy_signatures.py</code> covered ComfyUI. Neither covered the
+<code>transformers</code>/<code>accelerate</code> surface this branch added, which walks concrete
+attribute paths (<code>full_model.model.language_model</code>) and indexes the hidden-states tuple
+by position &mdash; and requirements.txt pins neither. Added both, with two behavioural checks an
+import test could not make: that <code>output_hidden_states</code> still yields
+<code>num_hidden_layers + 1</code> tensors ending in <code>last_hidden_state</code>, and that
+<code>init_empty_weights</code> still leaves buffers off the meta device. Checks went from 34 to
+60.</p>
+
+<div class="note">
+<p><strong>The accelerate check found something on its first run.</strong> It was written to assert
+<code>include_buffers</code> defaults to <code>False</code>. It does not: the default is
+<code>None</code>, resolved from the <code>ACCELERATE_INIT_INCLUDE_BUFFERS</code> environment
+variable. The effective default is still False, so nothing is broken, but the property
+<code>ContextRefiner.init_weights</code> relies on &mdash; that <code>inv_freq</code> stays real
+while every parameter goes to meta &mdash; is environment-controlled rather than fixed. The check
+was rewritten to prove it by construction instead of by reading a signature.</p>
+</div>
+
+<p><strong>Smaller fixes.</strong> DDP resume now records <code>batch_size</code>,
+<code>grad_accum</code>, <code>world_size</code> and <code>precision</code> and warns when they
+drift, rather than only refusing under ZeRO &mdash; a deliberate warn rather than a refusal, since
+DDP replicates optimizer state and resizing is legitimate; what does not carry across is the
+alignment of the saved step and the schedule total. The DDP <code>fp16-mixed</code> path no longer
+advances the LR scheduler on a step <code>GradScaler</code> skipped, which DeepSpeed already gated
+on and this did not. Caption files are read as <code>utf-8-sig</code>: a Windows editor's BOM
+survives <code>str.strip()</code>, so it rode into the tokenizer on the first caption of a file and
+nowhere else. Files this repo writes itself keep plain utf-8.</p>
+
+<p><strong>Documentation.</strong> <code>keep_text_embedding_cache</code> is now documented in
+<code>examples/dataset.toml</code>, including what it is not for. The design note claiming the
+denoising rollout was unimplemented was written before the rollout landed and now points at it.
+A comment in <code>utils/saver.py</code> warned of a <code>step</code>/<code>global_step</code>
+prefix collision that <code>startswith</code> cannot produce; a local named <code>missing</code>
+held the keys that were present. Both corrected.</p>
+
+<p><strong>Left deliberately unfixed.</strong> Nothing found requires a redesign, and no defect
+reachable from a shipped example config silently corrupts a default run. What remains is that
+nothing on this branch has ever executed on a GPU. Three experiments should run before serious
+compute: one GPU with <code>rollout.guidance_scale &gt; 0</code> asserting a finite loss (this
+settles the teacher-mask finding, which cannot be reproduced on CPU because the CPU math backend
+returns zeros where the fused kernels return NaN); two GPUs at
+<code>gradient_accumulation_steps=3</code> confirming three real optimizer updates in nine steps;
+and one distil-save-sample round trip, because no image has been produced from this branch.</p>
+
 <h2>2026-09-01 &mdash; The 4-GPU configs move to a caption corpus</h2>
 
 <p><strong>Request.</strong> This phase does not use a dataset.toml. Point the two 4-GPU configs

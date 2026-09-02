@@ -16,6 +16,7 @@ from pathlib import Path
 
 import pytest
 import toml
+import torch
 from PIL import Image
 
 REPO = Path(__file__).resolve().parent.parent
@@ -846,3 +847,54 @@ class TestVaeCacheKeyIsDeclaredPerModel:
                     )
                 checked += 1
         assert checked >= 10, f'expected the declarations to still be there, found {checked}'
+
+
+class TestTextEmbeddingCacheFollowsTheCaptions:
+    """keep_text_embedding_cache must not survive an edit to a caption it already cached.
+
+    The flag means "do not recache unnecessarily". For the text embedding cache the caption
+    text is essentially the whole fingerprint, so without a content check the flag's only
+    reachable effect is to serve embeddings of captions that no longer exist -- correct shapes,
+    correct count, wrong text, no error. Appending rows stays valid, which is the case the flag
+    exists for: the entries already cached still line up index for index.
+    """
+
+    @staticmethod
+    def _embed(example, rank):
+        # Stands in for the text encoder. Derived from the caption so a stale entry is visible.
+        return {'embedding': [torch.tensor([float(len(c))]) for c in example['caption']]}
+
+    def _run(self, tmp_path, captions, keep):
+        import datasets as hf_datasets
+        from utils.dataset import _map_and_cache
+        ds = hf_datasets.Dataset.from_dict({'caption': captions})
+        cache = _map_and_cache(
+            ds, self._embed, tmp_path / 'cache', cache_file_prefix='text_embeddings_0_',
+            keep_on_fingerprint_change=keep, content_column='caption',
+        )
+        values = [float(cache[i]['embedding'][0]) for i in range(len(cache))]
+        cache.con.close()  # Windows will not delete a sqlite file another handle holds open.
+        return values
+
+    def test_an_edited_caption_is_re_embedded(self, tmp_path):
+        assert self._run(tmp_path, ['aaa', 'bbbb'], keep=True) == [3.0, 4.0]
+        # Same count, different text: the stale entries would still be 3.0 and 4.0.
+        assert self._run(tmp_path, ['aa', 'bbbb'], keep=True) == [2.0, 4.0]
+
+    def test_appending_reuses_what_is_already_cached(self, tmp_path):
+        assert self._run(tmp_path, ['aaa', 'bbbb'], keep=True) == [3.0, 4.0]
+        assert self._run(tmp_path, ['aaa', 'bbbb', 'ccccc'], keep=True) == [3.0, 4.0, 5.0]
+
+    def test_a_cache_with_no_recorded_digest_is_still_reused(self, tmp_path):
+        """Caches written before this existed claim nothing, so nothing may be inferred."""
+        import json
+        self._run(tmp_path, ['aaa', 'bbbb'], keep=True)
+        manifest = tmp_path / 'cache' / 'text_embeddings_0' / 'cache_manifest.json'
+        record = json.loads(manifest.read_text(encoding='utf-8'))
+        del record['content_digest']
+        manifest.write_text(json.dumps(record), encoding='utf-8')
+        assert self._run(tmp_path, ['aa', 'bbbb'], keep=True) == [3.0, 4.0]
+
+    def test_without_keep_a_changed_caption_rebuilds_as_it_always_did(self, tmp_path):
+        assert self._run(tmp_path, ['aaa', 'bbbb'], keep=False) == [3.0, 4.0]
+        assert self._run(tmp_path, ['aa', 'bbbb'], keep=False) == [2.0, 4.0]

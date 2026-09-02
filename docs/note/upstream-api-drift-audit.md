@@ -78,6 +78,8 @@ of this audit.
 | `torch` | `utils/patches.py` | `torch._inductor.runtime.triton_heuristics`, plus it registers the reductions above. |
 | `bitsandbytes` | `optimizers/adamw_8bit.py` | A re-implementation of `Optimizer2State.update_step` that adds Kahan summation, so it depends on the exact keys of `get_config()` and on the positional order of `functional.optimizer_update_32bit` / `optimizer_update_8bit_blockwise`. |
 | `deepspeed` | `tools/distill_refiner.py` (`save_training_state`, `load_training_state`, `ZeroStrategy`) | No import of a private symbol, but a hard dependency on a **behaviour**: `deepspeed.initialize` mutates the client optimizer in place, replacing each param group's parameter list with one flat rank-local fp32 partition (`deepspeed/runtime/zero/stage_1_and_2.py`, the `param_group['params'] = [self.single_partition_of_fp32_groups[i]]` assignment). The whole per-rank shard design follows from that. Also depends on `set_gradient_accumulation_boundary` driving the accumulation window, and on `get_global_grad_norm` returning `None` before the first boundary. |
+| `transformers` | `models/cosmos_predict2.py` (`_compute_text_embeddings`, `_load_llm_from_single_file`, the `llm_path` branches), `tools/distill_refiner.py` (`build_teacher`, `build_student`) | Not a vendored copy, but not a stable contract either: concrete attribute paths (`full_model.model.language_model`, `llm_config.text_config.hidden_size`), direct indexing of the `output_hidden_states` tuple (`llm_hidden_layer` selects a layer by position), and architecture-specific classes (`Qwen3Config`, `Qwen3ForCausalLM`, `AutoModelForImageTextToText`). A wrong hidden-states length or ordering picks the wrong layer instead of raising. |
+| `accelerate` | every model using `init_empty_weights`, especially `models/text_refiner.py` | `ContextRefiner.init_weights` materialises every parameter by hand because they arrive on the meta device, and deliberately does **not** materialise `RotaryEmbedding.inv_freq`, because `init_empty_weights` leaves buffers real. That default is resolved from `ACCELERATE_INIT_INCLUDE_BUFFERS` rather than written in the signature, so it is checked by construction. Also `set_module_tensor_to_device(device=, dtype=, value=)`. |
 
 Re-derive this map with:
 
@@ -93,8 +95,11 @@ python tools/check_vendored_apis.py
 
 It checks every private torch symbol `utils/reduction.py` needs, that the module still imports,
 and the bitsandbytes surface `adamw_8bit.py` re-implements (including the positional order of the
-two update kernels). The bitsandbytes half is skipped rather than failed when it is not installed,
-so the torch half still runs on the CPU-only dev box.
+two update kernels). It also covers the `transformers` and `accelerate` surface the anima_refiner
+text encoder depends on, including two behavioural checks that no import test would catch: that
+`output_hidden_states` still yields `num_hidden_layers + 1` tensors ending in `last_hidden_state`,
+and that `init_empty_weights` still leaves buffers off the meta device. Each dependency's half is
+skipped rather than failed when it is not installed, so the torch half still runs anywhere.
 
 ### The deepspeed behaviour dependency cannot be checked on a CPU box
 

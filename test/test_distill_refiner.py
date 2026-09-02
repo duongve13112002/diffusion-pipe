@@ -2024,3 +2024,105 @@ class TestWarmupAdvice:
     def test_a_normal_warmup_says_nothing(self):
         from tools.distill_refiner import warmup_advice
         assert warmup_advice(500, 20000) is None
+
+
+class TestSchedulerFollowsRealUpdates:
+    """An overflowed fp16 step updates nothing, so it must not advance the LR schedule.
+
+    GradScaler.step() silently skips the optimizer when it finds inf or nan, and update() lowers
+    the loss scale when that happens. DeepSpeed gates its own scheduler on exactly this
+    condition, so leaving the DDP path ungated made the two strategies walk different LR curves
+    under the same `precision` setting.
+
+    The scaler is stubbed because a real one disables itself without CUDA, which would make the
+    skip path unreachable here. What is under test is this code's decision, not torch's.
+    """
+
+    class _Scaler:
+        def __init__(self, scales):
+            self.scales = list(scales)
+            self.stepped = 0
+
+        def is_enabled(self):
+            return True
+
+        def get_scale(self):
+            return self.scales[0]
+
+        def unscale_(self, optimizer):
+            pass
+
+        def step(self, optimizer):
+            self.stepped += 1
+
+        def update(self):
+            # A real scaler backs the scale off when it skipped; mimic that by advancing.
+            if len(self.scales) > 1:
+                self.scales.pop(0)
+
+    def _strategy(self, scales):
+        from tools.distill_refiner import DDPStrategy
+        model = torch.nn.Linear(4, 4)
+        model(torch.randn(2, 4)).sum().backward()
+        opt = torch.optim.SGD(model.parameters(), lr=0.1)
+        sched = torch.optim.lr_scheduler.StepLR(opt, step_size=1, gamma=0.5)
+        strategy = object.__new__(DDPStrategy)
+        strategy.refiner = model
+        strategy.optimizer = opt
+        strategy.scheduler = sched
+        strategy.max_grad_norm = 1.0
+        strategy.scaler = self._Scaler(scales)
+        return strategy, sched
+
+    def test_a_skipped_step_does_not_advance_the_schedule(self):
+        strategy, sched = self._strategy([65536.0, 32768.0])  # scale backed off: step was skipped
+        strategy.step()
+        assert sched.last_epoch == 0, 'the LR schedule advanced past a step that did not happen'
+
+    def test_a_normal_step_still_advances_the_schedule(self):
+        strategy, sched = self._strategy([65536.0])  # scale unchanged: step was applied
+        strategy.step()
+        assert sched.last_epoch == 1
+
+
+class TestResumeReportsScheduleDrift:
+    """DDP resume at a different global batch loads fine but does not line up. Say so.
+
+    The optimizer state is replicated under DDP, so it loads correctly at any world size and
+    refusing would block a legitimate resize. What does not carry across is the alignment: the
+    saved step counts global batches, so a different global batch puts it elsewhere in the
+    corpus, and under `epochs` the schedule's total moves with it.
+    """
+
+    def _round_trip(self, tmp_path, saved, current, capsys):
+        from tools.distill_refiner import load_training_state, save_training_state
+        model = torch.nn.Linear(4, 4)
+        opt = torch.optim.SGD(model.parameters(), lr=0.1)
+        sched = torch.optim.lr_scheduler.StepLR(opt, step_size=1)
+        refiner_path = tmp_path / 'context_refiner.safetensors'
+        save_training_state(refiner_path, opt, sched, 10, world_size=saved['world_size'],
+                            batch_size=saved['batch_size'], grad_accum=saved['grad_accum'],
+                            precision_name=saved['precision'])
+        capsys.readouterr()
+        step = load_training_state(refiner_path, opt, sched, is_main=True,
+                                   world_size=current['world_size'],
+                                   batch_size=current['batch_size'],
+                                   grad_accum=current['grad_accum'],
+                                   precision_name=current['precision'])
+        return step, capsys.readouterr().out
+
+    BASE = {'world_size': 2, 'batch_size': 8, 'grad_accum': 1, 'precision': 'bf16-mixed'}
+
+    def test_an_unchanged_resume_says_nothing(self, tmp_path, capsys):
+        step, out = self._round_trip(tmp_path, self.BASE, self.BASE, capsys)
+        assert step == 10
+        assert 'WARNING' not in out
+
+    def test_a_changed_global_batch_warns_but_still_resumes(self, tmp_path, capsys):
+        step, out = self._round_trip(tmp_path, self.BASE, {**self.BASE, 'world_size': 4}, capsys)
+        assert step == 10, 'DDP state is replicated, so it must still load'
+        assert 'world_size 2 -> 4' in out
+
+    def test_a_changed_precision_warns(self, tmp_path, capsys):
+        _, out = self._round_trip(tmp_path, self.BASE, {**self.BASE, 'precision': 'fp32'}, capsys)
+        assert "'bf16-mixed'" in out and "'fp32'" in out

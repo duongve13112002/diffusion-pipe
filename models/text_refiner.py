@@ -198,14 +198,10 @@ class ContextRefiner(nn.Module):
             sdpa_mask = attention_mask
             if sdpa_mask.ndim == 2:
                 sdpa_mask = sdpa_mask.unsqueeze(1).unsqueeze(1)
-            # An empty caption tokenizes to an all-padding row, and that is not a corner case:
-            # it is exactly the unconditional embedding every CFG run needs. A row with no
-            # unmasked key makes the attention softmax degenerate; the CPU math backend returns
-            # zeros, but the fused CUDA backends can return NaN, and NaN * 0 is still NaN, so
-            # zeroing the padded output afterwards would not contain it -- it would poison the
-            # gradients instead. Let such a row attend freely; its output is discarded anyway.
-            empty_rows = ~sdpa_mask.any(dim=-1, keepdim=True)
-            sdpa_mask = sdpa_mask | empty_rows
+            # The all-padding row an empty caption produces is handled by
+            # allow_fully_masked_rows inside Attention, so every module running that attention
+            # gets it. It used to be widened here instead, which left the LLMAdapter -- the
+            # teacher this refiner is distilled against -- without the guard.
 
         x = self.cap_embedder(hidden_states)
 

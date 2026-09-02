@@ -84,9 +84,19 @@ def seed_from_hash(item):
     return int(hashlib.md5(str.encode(str(item))).hexdigest(), 16) % int(1e9)
 
 
+def _content_digest(dataset, column, upto=None):
+    """Hash of the first `upto` values of `column`, or all of them when upto is None.
+
+    list(), not dataset[column], for the same reason the fingerprint code below spells it out:
+    indexing returns a lazy Column holding a reference to its parent dataset.
+    """
+    values = list(dataset[column])
+    return Hasher.hash(values if upto is None else values[:upto])
+
+
 def _map_and_cache(dataset, map_fn, cache_dir, cache_file_prefix='', new_fingerprint_args=None,
                    regenerate_cache=False, caching_batch_size=1, fingerprint_columns=None,
-                   keep_on_fingerprint_change=False, identity=None):
+                   keep_on_fingerprint_change=False, identity=None, content_column=None):
     new_fingerprint_args = [] if new_fingerprint_args is None else list(new_fingerprint_args)
     if fingerprint_columns is None:
         new_fingerprint_args.append(dataset._fingerprint)
@@ -108,7 +118,8 @@ def _map_and_cache(dataset, map_fn, cache_dir, cache_file_prefix='', new_fingerp
         cache_dir = cache_dir / cache_file_prefix.strip('_')
 
     cache = Cache(cache_dir, new_fingerprint, shard_size_gb=10,
-                  keep_on_fingerprint_change=keep_on_fingerprint_change, identity=identity)
+                  keep_on_fingerprint_change=keep_on_fingerprint_change, identity=identity,
+                  content_digest=_content_digest(dataset, content_column) if content_column else None)
 
     if map_fn is None:
         # loading directly from cache without mapping
@@ -122,6 +133,19 @@ def _map_and_cache(dataset, map_fn, cache_dir, cache_file_prefix='', new_fingerp
 
     # Skip existing items
     cache_size = len(cache)
+    if content_column is not None and cache_size:
+        # The entries about to be reused were computed from the caller's input as it was when
+        # this cache was last completed. Appending rows is the case keep_* exists for and stays
+        # valid, because the existing entries still line up index for index. Editing a row that
+        # is already cached does not: the entry is kept and silently paired with the new text.
+        recorded = cache.recorded_content_digest()
+        if recorded is not None and recorded != _content_digest(dataset, content_column, cache_size):
+            print(
+                f'[CACHE] The {content_column} these {cache_size} cached entries were built '
+                'from has changed, so they no longer describe this run. Rebuilding.'
+            )
+            cache.clear()
+            cache_size = len(cache)
     dataset_size = len(dataset)
     assert cache_size <= dataset_size
     if cache_size == dataset_size:
@@ -227,6 +251,10 @@ def _cache_text_embeddings(metadata_dataset, map_fn, i, cache_dir, regenerate_ca
         new_fingerprint_args=[i, text_encoder_key] if text_encoder_key else [i],
         regenerate_cache=regenerate_cache,
         caching_batch_size=caching_batch_size,
+        # keep_text_embedding_cache tolerates a moved fingerprint, and for this cache the
+        # caption text is what the fingerprint is made of. Without this the flag's only
+        # reachable effect would be to reuse embeddings of captions that no longer exist.
+        content_column='caption',
     )
     assert len(te_dataset) == len(flattened_captions)
     return TextEmbeddingDataset(te_dataset, flattened_captions)
@@ -798,7 +826,7 @@ class DirectoryDataset:
             # encoding='utf-8' is not optional: open() defaults to the locale encoding, which
             # on Windows is a codepage that decodes UTF-8 captions into mojibake WITHOUT
             # raising. The corrupted text then reaches the cache and the text encoder.
-            with open(captions_json, encoding='utf-8') as f:
+            with open(captions_json, encoding='utf-8-sig') as f:
                 self.captions_dict = json.load(f)
         else:
             self.captions_dict = None
@@ -1007,7 +1035,7 @@ class DirectoryDataset:
 
             if captions_json.exists():
                 print('Loading captions JSON')
-                with open(captions_json, encoding='utf-8') as f:
+                with open(captions_json, encoding='utf-8-sig') as f:
                     caption_data = json.load(f)
 
                 def add_captions(example):

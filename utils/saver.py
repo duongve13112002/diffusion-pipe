@@ -55,8 +55,9 @@ def prune_old_checkpoints(save_root, prefix, keep, dry_run=False):
     return doomed
 
 
-# 'step' must come after 'global_step' would match it, so the prefixes are checked as exact
-# names: a directory called global_step500 must not be counted as a step* checkpoint too.
+# Each kind is counted separately, so a directory belongs to exactly one of these. The names
+# do not collide despite the shared word: startswith is applied to the whole prefix, and
+# 'global_step500' does not start with 'step'. Order here carries no meaning.
 CHECKPOINT_PREFIXES = ('epoch', 'step', 'global_step')
 
 

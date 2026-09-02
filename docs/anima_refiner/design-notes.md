@@ -177,15 +177,20 @@ while leaving shrinkage visible: 0.0277 at 25% collapsed, 0.1106 at 50%, 0.4396 
 the batch's student features, against the teacher's. It should track the teacher's number.
 Falling toward zero is collapse, and it is the only cheap way to see it happening.
 
-### What is still not addressed
+### The published remedy, since implemented
 
 The published remedy goes further: push both feature sets through the frozen diffusion model and
 compare its *predictions*, over a short denoising trajectory started from pure noise. That keeps
 distillation image-free -- no VAE, no dataset of images -- which is why it fits here in
-principle. It is not implemented, because `build_teacher` deliberately discards the DiT after
-taking its cross-attention modules (`dit.blocks = None`), and keeping the whole DiT resident
-would cost several GB and undo the ~6 GB figure this stage advertises. It is the right next step
-if the relational term and the spread diagnostic show collapse is still happening.
+principle.
+
+This section used to say it was not implemented, because `build_teacher` discarded the DiT after
+taking its cross-attention modules (`dit.blocks = None`). It is implemented now, as the denoising
+rollout: `build_teacher` keeps the DiT only when `[rollout] loss_weight > 0`, so the ~6 GB figure
+this stage advertises still holds whenever the rollout is off, which is the default. See
+[denoising-rollout.md](denoising-rollout.md).
+
+### What is still not addressed
 
 There is also an irreducible floor, measured at roughly 0.3 relative RMS, that comes purely from
 the teacher and student having different token counts: a student sequence cannot reproduce a
@@ -215,8 +220,8 @@ already has the property.
 
 ## What is verified, and what is still not
 
-Measured 2026-08-31 on Windows 11, Python 3.12.10, torch 2.13.0+cpu, no GPU. The suite is 320
-passed / 1 skipped there.
+Measured on Windows 11, Python 3.12.10, torch 2.13.0+cpu, no GPU. The suite is green there;
+see CLAUDE.md for the current count rather than repeating it in two places.
 
 ### Verified since this section was first written
 
@@ -228,8 +233,8 @@ drives the real thing with a stub in place of the VAE — the only genuinely GPU
 covering `_map_and_cache`, the sqlite cache and the iteration-order directory, including that a
 second trusting pass lands on the same directory name.
 
-Both drift guards run and pass here: 34/34 vendored-API checks against torch 2.13.0 and
-bitsandbytes 0.50.0, and 26/26 ComfyUI signature checks. The ComfyUI one needs
+Both drift guards run and pass here: 60/60 vendored-API checks against torch 2.13.0,
+bitsandbytes 0.50.0, transformers and accelerate, and 26/26 ComfyUI signature checks. The ComfyUI one needs
 `PYTHONPATH=test/childenv` so the submodule can import without a CUDA device.
 
 ### Still unverified, and why

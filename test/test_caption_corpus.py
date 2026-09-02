@@ -435,3 +435,29 @@ class TestCountValidation:
         path = tmp_path / 'c.csv'
         write_corpus(path, [{'caption': 'a'}])
         assert 'num_repeats' not in path.read_text().splitlines()[0]
+
+
+class TestByteOrderMark:
+    """A caption file saved by a Windows editor starts with U+FEFF.
+
+    str.strip() does not remove it -- it is not whitespace -- so the codepoint would ride into
+    the tokenizer on the first caption of the file and nowhere else, which is exactly the kind
+    of uneven, silent difference that never gets noticed. This is the encoding half of the
+    same Windows-authoring bug class as the path-separator fixes.
+    """
+
+    def test_a_bom_is_stripped_from_a_txt_caption(self, tmp_path):
+        path = tmp_path / 'a.txt'
+        path.write_text('a cat, sitting', encoding='utf-8-sig')
+        assert path.read_bytes().startswith(b'\xef\xbb\xbf'), 'the fixture must really have a BOM'
+        assert read_caption_file(path) == ['a cat, sitting']
+
+    def test_a_file_without_a_bom_is_unchanged(self, tmp_path):
+        path = tmp_path / 'b.txt'
+        path.write_text('a dog, running', encoding='utf-8')
+        assert read_caption_file(path) == ['a dog, running']
+
+    def test_a_bom_is_stripped_from_a_corpus_file(self, tmp_path):
+        path = tmp_path / 'c.jsonl'
+        path.write_text('{"caption": "a bird"}\n', encoding='utf-8-sig')
+        assert read_corpus(path) == ['a bird']

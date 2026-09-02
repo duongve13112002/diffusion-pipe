@@ -141,7 +141,9 @@ def read_corpus(path, fmt=None, apply_count=True):
                 )
         captions.extend([caption] * reps)
 
-    with open(path, encoding='utf-8', newline='') as f:
+    # utf-8-sig: a corpus file is an interchange format people hand-edit, and an editor's
+    # BOM would otherwise land inside the first caption.
+    with open(path, encoding='utf-8-sig', newline='') as f:
         if fmt == 'jsonl':
             for lineno, line in enumerate(f, 1):
                 location[0] = lineno

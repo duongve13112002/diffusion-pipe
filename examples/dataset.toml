@@ -115,3 +115,12 @@ num_repeats = 1
 # images, the VAE and the bucketing are unchanged -- nothing verifies that, and reusing latents
 # from a different VAE trains on silently wrong data. It prints a warning every time.
 #keep_latent_cache = true
+
+# Reuse the text embedding cache even when its fingerprint no longer matches. Off by default.
+# The one case it is for is adding captions to a dataset: the entries already cached still line
+# up index for index, so only the new tail is embedded. It is NOT a way to skip re-embedding
+# after editing captions -- the cache records a digest of the captions it was built from, and
+# an edit to any caption it already holds rebuilds it rather than pairing an old embedding with
+# new text. Settings that rewrite caption text (caption_prefix, cache_shuffle_num,
+# cache_shuffle_delimiter, skip_empty_caption) count as edits for this purpose.
+#keep_text_embedding_cache = true

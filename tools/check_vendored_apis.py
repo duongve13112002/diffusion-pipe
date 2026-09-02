@@ -178,6 +178,100 @@ def check_bitsandbytes(record):
            ctor_has_bw == func_has_8bit)
 
 
+def check_transformers(record):
+    """The transformers surface the anima_refiner text encoder depends on.
+
+    None of this is vendored, but it is not a stable public contract either: the code walks
+    concrete attribute paths (``full_model.model.language_model``), indexes the hidden-states
+    tuple, and names architecture-specific classes. requirements.txt does not pin transformers,
+    so a routine upgrade moves all of it silently, and the failure lands on a caching run.
+    """
+    import transformers
+
+    for name in ('AutoTokenizer', 'AutoConfig', 'AutoModel', 'AutoModelForCausalLM',
+                 'AutoModelForImageTextToText', 'Qwen3Config', 'Qwen3ForCausalLM',
+                 'T5TokenizerFast', 'T5EncoderModel'):
+        record(f'transformers.{name} exists', getattr(transformers, name, None) is not None)
+
+    record('AutoModel.from_config is callable',
+           callable(getattr(transformers.AutoModel, 'from_config', None)))
+    for cls in ('AutoTokenizer', 'AutoConfig', 'AutoModelForCausalLM'):
+        loader = getattr(getattr(transformers, cls), 'from_pretrained', None)
+        record(f'{cls}.from_pretrained accepts local_files_only',
+               callable(loader) and accepts(loader, 'local_files_only'))
+    record('AutoModelForCausalLM.from_pretrained accepts dtype',
+           accepts(transformers.AutoModelForCausalLM.from_pretrained, 'dtype'))
+
+    # Behavioural, not just structural: _compute_text_embeddings selects between
+    # outputs.last_hidden_state and outputs.hidden_states[i], and llm_hidden_layer indexes that
+    # tuple directly. A change to its length or ordering would pick the wrong layer rather than
+    # raise, which no import check would ever notice.
+    try:
+        config = transformers.Qwen3Config(
+            vocab_size=64, hidden_size=32, intermediate_size=64, num_hidden_layers=2,
+            num_attention_heads=4, num_key_value_heads=2, max_position_embeddings=32,
+        )
+        model = transformers.Qwen3ForCausalLM(config).eval()
+        record('Qwen3ForCausalLM exposes .model (the _LLM_KEY_PREFIXES path)',
+               getattr(model, 'model', None) is not None)
+        import torch
+        ids = torch.zeros(1, 4, dtype=torch.long)
+        mask = torch.ones(1, 4, dtype=torch.long)
+        with torch.no_grad():
+            base = model.model(input_ids=ids, attention_mask=mask)
+            deep = model.model(input_ids=ids, attention_mask=mask, output_hidden_states=True)
+        record('base model output has last_hidden_state',
+               getattr(base, 'last_hidden_state', None) is not None)
+        hidden = getattr(deep, 'hidden_states', None)
+        record('output_hidden_states yields num_hidden_layers + 1 tensors',
+               hidden is not None and len(hidden) == config.num_hidden_layers + 1)
+        record('hidden_states[-1] is last_hidden_state',
+               hidden is not None and torch.equal(hidden[-1], deep.last_hidden_state))
+    except Exception as e:
+        record(f'Qwen3 hidden-state contract check ran ({type(e).__name__}: {e})', False)
+
+
+def check_accelerate(record):
+    """init_empty_weights leaving buffers alone is load-bearing, not incidental.
+
+    ContextRefiner.init_weights materialises every parameter by hand because they arrive on the
+    meta device. It does NOT materialise RotaryEmbedding's inv_freq, because with the default
+    include_buffers=False that buffer is real, already computed by __init__. If the default ever
+    flips, inv_freq becomes a meta tensor and the refiner's rotary embeddings break.
+    """
+    import accelerate
+    from accelerate.utils import set_module_tensor_to_device
+
+    init_empty = getattr(accelerate, 'init_empty_weights', None)
+    record('accelerate.init_empty_weights exists', callable(init_empty))
+    if callable(init_empty):
+        record('init_empty_weights still takes include_buffers',
+               'include_buffers' in inspect.signature(init_empty).parameters)
+        # Checked by construction rather than by reading the signature default, which is None:
+        # accelerate resolves it from ACCELERATE_INIT_INCLUDE_BUFFERS, defaulting to False. So
+        # the property is real but environment-controlled, and only running it proves anything.
+        import torch
+        from torch import nn
+
+        class _WithBuffer(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.linear = nn.Linear(2, 2)
+                self.register_buffer('probe', torch.ones(2), persistent=False)
+
+        with init_empty():
+            probe = _WithBuffer()
+        record('init_empty_weights puts parameters on meta', probe.linear.weight.is_meta)
+        record('init_empty_weights leaves buffers real (inv_freq depends on this)',
+               not probe.probe.is_meta)
+
+    record('set_module_tensor_to_device exists', callable(set_module_tensor_to_device))
+    if callable(set_module_tensor_to_device):
+        for kwarg in ('device', 'dtype', 'value'):
+            record(f'set_module_tensor_to_device accepts {kwarg}',
+                   accepts(set_module_tensor_to_device, kwarg))
+
+
 def run_checks():
     """Return (results, skipped) where results is a list of (description, ok)."""
     results = []
@@ -188,12 +282,15 @@ def run_checks():
         return condition
 
     check_torch(record)
-    try:
-        import bitsandbytes  # noqa: F401
-    except Exception as e:
-        skipped.append(f'bitsandbytes checks skipped, import failed: {e}')
-    else:
-        check_bitsandbytes(record)
+    for module, checker in (('bitsandbytes', check_bitsandbytes),
+                            ('transformers', check_transformers),
+                            ('accelerate', check_accelerate)):
+        try:
+            importlib.import_module(module)
+        except Exception as e:
+            skipped.append(f'{module} checks skipped, import failed: {e}')
+        else:
+            checker(record)
 
     return results, skipped
 
