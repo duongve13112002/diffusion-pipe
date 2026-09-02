@@ -57,7 +57,7 @@ for a fraction of the compute. The script takes 8 blocks evenly strided across t
 it if you suspect later blocks read the text differently from earlier ones; lower it to trade
 signal for speed.
 
-### `num_queries = 64` (`[probe]`)
+### `num_queries` (`[probe]`)
 
 This one is a genuine judgement call, so here is the reasoning rather than a citation.
 
@@ -70,10 +70,12 @@ So the script uses a **fixed set of random query vectors** as a measuring stick:
 - **Fixed** (seeded once, reused every step) because a resampled probe would make the objective
   non-stationary — the loss would move when the probe moved, not only when the student
   improved.
-- **64** because matching the output for many independent random queries is a strong proxy for
-  matching the key/value content itself, and 64 is enough independent directions to make
-  accidental agreement unlikely while staying cheap. It is a hyperparameter, not a derived
-  quantity: raise it if the loss looks too easy to satisfy.
+- **`2 * head_dim`** (256 for Anima, whose `head_dim` is `2048 // 16`) because matching the
+  output for many independent random queries is a strong proxy for matching the key/value
+  content itself. The count is tied to `head_dim` rather than fixed: within one attention head
+  the probe only constrains the span of its own projected queries, so fewer queries than
+  `head_dim` leaves directions of the key space the student can fill with anything. Raise it if
+  the loss looks too easy to satisfy.
 
 An auxiliary term compares the length-normalised mean of the two feature sets directly. It uses
 `padded_mean` — normalising by the same padded length the attention softmax does — because a

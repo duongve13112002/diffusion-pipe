@@ -109,9 +109,15 @@ n_refiner_layers = 6
 # An ALTERNATIVE to flat lr / betas / weight_decay under [distill], never an addition -- setting
 # both is refused at startup, before anything is loaded.
 #
-# AdamW8bitKahan is the pairing for precision = 'bf16-full'. The refiner is 77.64M parameters,
-# so AdamW's two fp32 moments are 592 MB; the 8-bit variant is 148 MB, on every rank. Kahan
-# summation is what makes it safe with bf16 parameters.
+# AdamW8bitKahan is the pairing for precision = 'bf16-full', and the Kahan half is not optional.
+# The refiner is 77.64M parameters, so AdamW's two fp32 moments are 592 MB; the 8-bit variant is
+# 148 MB, on every rank. That saving comes from quantising the moments, and plain 'adamw8bit'
+# gives exactly the same saving -- but bf16-full also makes the parameters bf16, and bf16 has 8
+# mantissa bits, so an update below roughly 2^-9 relative to the weight rounds away entirely.
+# Kahan summation keeps a per-parameter `shift` buffer holding that lost remainder and adds it
+# back on the next step, which is the only reason bf16 parameters train at this learning rate.
+# Swap this for 'adamw8bit' and the run still completes, with the loss barely moving and nothing
+# saying why.
 [optimizer]
 type = 'AdamW8bitKahan'
 lr = 5e-5

@@ -8,7 +8,10 @@ The modes are configurations, not a pipeline the code enforces — any one's out
 other, in any order. The order below is recommended because of *results*, not because anything
 breaks otherwise. Where a step can be skipped, it says so.
 
-See [README.md](./README.md) for the architecture and the full config reference.
+See [README.md](./README.md) for the architecture and the full config reference. If compute is not
+your constraint and you want the best result rather than the quickest one, read
+[Going for maximum quality](#going-for-maximum-quality) before you start — it changes the settings
+in step 1, not the order of the steps.
 
 ## What you need before starting
 
@@ -194,6 +197,115 @@ pipeline class training uses, so there is no second copy of the loading logic to
 
 Point `--config` at whichever step's config matches the checkpoint you want to sample. For a LoRA
 run, the adapter is applied on top of that config's `transformer_path`.
+
+## Going for maximum quality
+
+The path above is the balanced one. This section is the same path with every dial turned toward
+quality and away from cost, for when compute is not the constraint.
+
+**Read this first.** These are reasoned settings, not measured ones. Nothing on this branch has
+been validated by a real training run — no multi-GPU run and no image, which
+[design-notes.md](./design-notes.md) states plainly. The reasoning behind each dial is given so
+you can disagree with it, and the "how to know it is working" check in each step still decides
+whether it worked.
+
+### Step 1: turn on the denoising rollout
+
+This is the single biggest lever, and it is the one the balanced path leaves off.
+
+The probe objective compares the two text frontends by pushing both through the frozen
+cross-attention with a fixed set of *random* query vectors. That is a fair measuring stick and it
+is cheap, but the queries are synthetic. The rollout instead compares them at the DiT's own
+velocity prediction, on latents taken from a real sampling trajectory — so it optimises the
+quantity the model actually consumes, for queries the model itself produced. Everything else in
+the loss is a proxy for this.
+
+```toml
+[rollout]
+loss_weight = 1.0
+steps = 24           # the walk is no_grad, so this is inference cost only
+loss_points = 4      # the expensive knob: this many full backward graphs are live at once
+guidance_scale = 5.0 # match the --cfg you intend to sample at
+shift = 1.0          # match [model] shift
+resolution = 256
+```
+
+Why each one:
+
+- **`steps`** is cheap. The whole trajectory runs under `no_grad`, so raising it costs teacher
+  forwards and a little memory for the stored latents, never backward work. It also buys
+  *reach*: the schedule runs from `t = 1` toward `0` in `steps` increments, so `steps = 8` never
+  visits below `t = 0.125` and the model is never compared near the clean end. `steps = 24`
+  reaches `t ≈ 0.042`.
+- **`loss_points`** is the one that will OOM you. The losses at each chosen point are summed and
+  backward runs once, so every student forward's graph stays alive until then — `loss_points`
+  full-DiT backward graphs simultaneously, *doubled* when guidance is on. Raise it one step at a
+  time. The points are drawn at random from the visited trajectory each step, so across a run
+  every point gets covered regardless.
+- **`guidance_scale`** is the fidelity argument. At the default of `0` the trajectory follows the
+  pure conditional velocity, while sampling at `--cfg 5` follows a guided one — so the latents
+  the refiner is tuned against are not the latents it will meet at inference. Setting it to your
+  sampling CFG closes that gap. It costs a second teacher and student forward at every point.
+  It must be `0` or greater than `1`; the band in between weights the *unconditional* branch more
+  heavily and is refused at startup.
+- **`resolution`** trades against `loss_points` for the same memory. 256 gives a 16×16 patch grid
+  while sampling at 1024 gives 64×64, which is a different operating point for the DiT's
+  positional embedding. Raising it is a real fidelity gain and an expensive one; raise
+  `loss_points` first.
+
+### Step 1: the rest of the settings
+
+| Setting | Quality-first | Why |
+|---|---|---|
+| `precision` | `'fp32'` (the default) | Nothing rounds. `bf16-mixed` is the first thing to give up if you need activation memory — it keeps fp32 parameters. Do not reach for `bf16-full` here unless VRAM-bound, and if you do, pair it with `adamw8bitkahan` |
+| `[optimizer] type` | `'adamw'` | fp32 moments. The 8-bit variants exist to save memory, and 8-bit optimizers are mostly validated on fine-tuning while this refiner trains from a random init |
+| `epochs` | set it, rather than `steps` | Every caption gets seen the same number of times |
+| caption source | the largest corpus you have | Distillation never opens an image, so captions are nearly free. Use `export_caption_corpus.py` and point `caption_corpus` at it |
+| `pooled_loss_weight` | `0.1` (default) | Leave it |
+| `relational_loss_weight` | `1.0` (default) | This is what prices collapse — a student that maps every caption to the same features. Do not lower it |
+| `[probe] num_blocks` | `8` (default), raise toward the DiT's block count | More blocks means more independent projections of the same features, so agreement is harder to fake |
+| `[probe] num_queries` | `2 * head_dim` (default; 256 for Anima) | Raise it if the probe loss falls to near zero early — that means the objective is too easy to satisfy |
+| `save_full_model` | `true` | Step 2 then takes a single `transformer_path` with no pairing to get wrong |
+| `distributed_strategy` | `'ddp'` | ZeRO only shards optimizer state. At 77.64M parameters that is not usually the binding constraint, and combining it with an 8-bit optimizer is unverified |
+
+Run step 1 for longer than feels necessary. It is the cheapest stage — no images, no VAE — and
+everything after it inherits whatever the refiner has learned.
+
+### Steps 2 and 3: do not skip either
+
+The temptation with lots of compute is to jump straight to unfreezing everything. That is the one
+shortcut that reliably costs quality here, and the reason is in step 2's own note: loss is highest
+at the start, so gradients are largest exactly when the refiner's output is least meaningful.
+Unfreezing the DiT at that moment is what causes catastrophic forgetting.
+
+Run **step 2** (`refiner_only`) until the loss flattens, then **step 3** (`refiner_crossattn`).
+Sample after each. Two cheap, one-way adaptations before anything bidirectional is the whole point
+of the ordering.
+
+### Step 4: full fine-tune, with the caveat
+
+With compute no object, `full_finetune.toml` has the most capacity. Two things worth knowing:
+
+- A full fine-tune moves every DiT parameter, so the base model's general ability is at stake in a
+  way a LoRA's is not. Use an eval dataset and watch held-out loss, not just training loss.
+- If you would rather protect the base model, `lokr.toml` at a high factor is the middle ground,
+  and OPLoRA (`oplora` / `oplora_rank` in `[adapter]`, see [../oplora.md](../oplora.md)) exists
+  for exactly this — it protects the pretrained weights' dominant singular directions. It
+  deliberately skips the refiner, which has no pretrained directions to protect.
+
+### Optional extras
+
+- **Caption robustness.** `cache_shuffle_num` with `caption_sampling = "random_per_epoch"` gives
+  several cached tag orders with a different one per epoch, at no VAE cost. `tag_dropout_rate`
+  wants `cache_text_embeddings = false` (see above) or it becomes one permanent draw.
+- **Held-out eval.** `train.py` supports eval datasets and reports loss across timestep quantiles,
+  which tells you *where* on the schedule the model is weak.
+- **Checkpoint retention.** `keep_last_n_checkpoints` bounds disk without you pruning by hand. The
+  newest of each kind is never deleted.
+- **Resuming.** Step 1 records the step in the refiner's metadata and refuses a resume that pairs
+  it with optimizer state from a different step, so an interrupted long run is safe to continue.
+- **Sampling.** `tools/sample_anima_refiner.py` is the only way to sample this architecture —
+  ComfyUI's `Anima` class has no `context_refiner`. Sample at the same `--shift` as `[model] shift`.
 
 ## Where the refiner lives at each step
 

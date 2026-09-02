@@ -294,8 +294,9 @@ def caption_augment_config(config):
         # A corpus or a bare caption file carries no dataset config to fall back on, so
         # anything not restated under [distill] silently defaults to off. Say so, rather than
         # quietly training on a distribution that differs from the diffusion stages'.
-        restated = [k for k in ('prefix_tag_caption', 'caption_prefix', 'cache_shuffle_num',
-                                'shuffle_tags', 'tag_dropout_rate') if k in distill_config]
+        settings = ('prefix_tag_caption', 'caption_prefix', 'cache_shuffle_num',
+                    'shuffle_tags', 'tag_dropout_rate')
+        restated = [k for k in settings if k in distill_config]
         if not restated:
             print(
                 'WARNING: the caption source is not a dataset.toml, so no caption settings can '
@@ -303,6 +304,17 @@ def caption_augment_config(config):
                 'are all off. If the dataset uses any of them, restate them under [distill] -- '
                 'export_caption_corpus.py prints the prefix_tag_caption line to use. Without '
                 'prefix_tag_caption the tag marker is trained as if it were a tag.'
+            )
+        elif 'prefix_tag_caption' not in distill_config:
+            # Restating any one setting used to silence the warning entirely, so a config that
+            # set caption_prefix and forgot the marker got no warning at all -- and the marker
+            # is the one whose absence corrupts the caption rather than merely differing from
+            # the diffusion stages.
+            print(
+                'WARNING: the caption source is not a dataset.toml and prefix_tag_caption is not '
+                f'restated under [distill], though {", ".join(restated)} is. If the dataset uses '
+                'a tag marker, the marker is being trained as if it were a tag -- '
+                'export_caption_corpus.py prints the line to use.'
             )
 
     shuffle = setting('cache_shuffle_num', 0) > 0 or setting('shuffle_tags', False)
@@ -962,6 +974,10 @@ class DDPStrategy:
         grad_accum = self.grad_accum
         self.scaler.scale(loss / grad_accum).backward()
 
+    def scale_side_branch(self, tensor):
+        """No-op: dividing the whole loss above already covers every branch of it."""
+        return tensor
+
     def step(self):
         # Unscale before clipping, or max_grad_norm would be compared against a gradient
         # inflated by the loss scale and would effectively never trigger.
@@ -1049,6 +1065,7 @@ class DeepSpeedZeROStrategy:
                 "engine's fp16 config under ZeRO; reaching here means that routing broke."
             )
         self.stage = stage
+        self.grad_accum = grad_accum
         self.precision = precision
         # Size the communication buckets to the model. DeepSpeed defaults both to 5e8
         # ELEMENTS, which contiguous_gradients turns into a 2 GB fp32 buffer and overlap_comm
@@ -1096,6 +1113,22 @@ class DeepSpeedZeROStrategy:
 
     def backward(self, loss):
         self.engine.backward(loss)
+
+    def scale_side_branch(self, tensor):
+        """Apply the 1/N accumulation scaling to a tensor that did not come from the engine.
+
+        DeepSpeed does not divide inside backward(). engine.py:2490 computes gas_scaled_loss
+        only as a return value; the real division is a hook the engine registers on the OUTPUT
+        of its own forward (engine.py:2237-2243 -> _backward_prologue_per_tensor). So a forward
+        that deliberately bypasses the engine -- the unconditional rollout branch, which calls
+        the bare refiner to avoid building a second backward hook manager -- also bypasses the
+        only place the scaling happens, and contributes grad_accum times its intended gradient.
+        Measured on a real engine at grad_accum=4: the engine path lands at 1.0x a single
+        un-accumulated batch, the bypassing path at 4.0x.
+        """
+        if self.grad_accum > 1 and tensor.requires_grad:
+            tensor.register_hook(lambda grad, n=self.grad_accum: grad / n)
+        return tensor
 
     def step(self):
         self.engine.step()
@@ -1173,6 +1206,22 @@ def validate_config_early(config, world_size, is_main):
                 "optimizer type 'offload' cannot be combined with no_weight_decay_on_1d: the "
                 'weight-decay split passes parameter groups, which CPUOffloadOptimizer does not '
                 'accept. Use one or the other.'
+            )
+    if precision.name == 'bf16-full' and strategy == 'ddp' and is_main:
+        # bf16 parameters with no master copy, and -- because the cast happens before the
+        # optimizer is built -- bf16 Adam moments too. That is the same failure fp16-full is
+        # refused for, with fewer mantissa bits (8 against fp16's 11): an update small enough
+        # relative to the weight rounds to nothing, and nothing reports it. Not refused, because
+        # it is a legitimate way to fit a larger batch and the shipped 4-GPU configs use it --
+        # but they pair it with a Kahan-compensated optimizer, which is what makes it safe.
+        optim_type = str((optim_config or {}).get('type', 'adamw')).lower()
+        if 'kahan' not in optim_type:
+            print(
+                f"WARNING: precision='bf16-full' with optimizer type={optim_type!r} keeps the "
+                'refiner parameters AND the Adam moments in bf16 with no fp32 master copy, so '
+                'small updates round away and the loss barely moves. Use '
+                "type = 'adamw8bitkahan' (Kahan summation compensates for exactly this), or "
+                "precision = 'bf16-mixed', which keeps fp32 parameters."
             )
     if is_main:
         print(f'Config validated: strategy={strategy}, precision={precision.name}')
@@ -1390,7 +1439,11 @@ def main():
     # 0.25 -> 2.8x the training-probe error, 0.5 -> 1.63x, 2.0 -> 1.16x. num_blocks recovers
     # most of it (8 blocks bring 0.5 down to 1.14x) because each block projects differently,
     # but more queries are cheap and strictly help.
-    head_dim = model_channels // config.get('probe', {}).get('num_heads', 16)
+    # The head count comes from the checkpoint, not from a literal: get_dit_config derives it
+    # from model_channels (16 at 2048, 40 at 5120, 20 at 1280), so a hardcoded 16 would size
+    # head_dim -- and therefore the default num_queries -- wrongly for anything but Anima.
+    head_dim = model_channels // config.get('probe', {}).get(
+        'num_heads', teacher_dit_config['num_heads'])
     num_queries = config.get('probe', {}).get('num_queries', 2 * head_dim)
     generator = torch.Generator(device='cpu').manual_seed(seed)
     probe = torch.randn(1, num_queries, model_channels, generator=generator).to(device=device, dtype=dtype)
@@ -1466,6 +1519,10 @@ def main():
     train_module = strategy.module
     if is_main and strategy.name != 'ddp':
         print(f'Parallelism: DeepSpeed ZeRO stage {strategy.stage} (optimizer state sharded).')
+
+    # Every tag this process writes, so the prune never deletes one of them. Tags are ordered
+    # by number, which does not increase across runs sharing an output_dir.
+    tags_written_here = set()
 
     start_step = 0
     if resume_path:
@@ -1628,6 +1685,10 @@ def main():
                                 uncond_student_hidden.to(precision.param_dtype),
                                 uncond_student_mask,
                             )
+                        # Bypassing the engine also bypasses the engine's 1/N accumulation
+                        # scaling, so ask the strategy to put it back. No-op under DDP, which
+                        # divides the whole loss instead.
+                        student_uncond = strategy.scale_side_branch(student_uncond)
                         student_uncond = student_uncond.to(dtype).expand(len(batch), -1, -1)
                     visited = teacher_trajectory(
                         teacher_dit, teacher_feats.to(dtype),
@@ -1685,16 +1746,18 @@ def main():
                 tag = f'_epoch{step // sampler.steps_per_epoch + 1}'
             else:
                 tag = f'_step{step + 1}'
+            tags_written_here.add(tag)
             tagged_path = output_dir / f'context_refiner{tag}.safetensors'
             refiner_path = output_dir / 'context_refiner.safetensors'
 
             # Weights: every rank holds the full, identical set -- DDP all-reduces them, and
             # ZeRO 1/2 shard optimizer state and gradients but never the parameters. One writer.
             if is_main:
-                save_refiner(refiner, tagged_path, dtype, metadata=provenance)
+                save_refiner(refiner, tagged_path, dtype,
+                             metadata=dict(provenance, step=str(step + 1)))
                 # And the stable name, so every config that points at
                 # context_refiner.safetensors keeps working without knowing about tags.
-                shutil.copy2(tagged_path, refiner_path)
+                _copy_atomically(tagged_path, refiner_path)
 
                 if save_full_model_enabled:
                     # A complete anima_refiner checkpoint per save, not only at the end: the
@@ -1703,7 +1766,7 @@ def main():
                     full_path = output_dir / f'model{tag}.safetensors'
                     save_full_model(config['teacher']['transformer_path'], refiner,
                                     full_path, dtype)
-                    shutil.copy2(full_path, output_dir / 'model.safetensors')
+                    _copy_atomically(full_path, output_dir / 'model.safetensors')
 
             # Optimizer state: whole on rank 0 under DDP, one shard per rank under ZeRO. Writing
             # only rank 0's shard produced a file that looked valid, cost nothing to write, and
@@ -1716,8 +1779,8 @@ def main():
                                     scaler=getattr(strategy, 'scaler', None),
                                     batch_size=batch_size, grad_accum=grad_accum,
                                     precision_name=precision.name)
-                shutil.copy2(training_state_path(tagged_path, state_rank),
-                             training_state_path(refiner_path, state_rank))
+                _copy_atomically(training_state_path(tagged_path, state_rank),
+                                 training_state_path(refiner_path, state_rank))
 
             if world_size > 1:
                 # Before the prune, so no rank is still writing a shard of an older tag when
@@ -1725,7 +1788,8 @@ def main():
                 dist.barrier()
             if is_main:
                 for gone in prune_distill_checkpoints(output_dir, keep_last_n,
-                                                      protect_tag=tag):
+                                                      protect_tag=tag,
+                                                      protect_tags=tags_written_here):
                     print(f'keep_last_n_checkpoints: removed {gone.name}')
 
     if is_main:
@@ -1762,7 +1826,13 @@ def save_full_model(teacher_transformer_path, refiner, path, dtype):
             continue
         state_dict['net.' + name] = v.to(dtype).cpu().contiguous()
     for k, v in refiner.state_dict().items():
-        state_dict['net.context_refiner.' + k] = v.detach().to(dtype).cpu().contiguous()
+        # fp32 for the refiner, for the reason save_refiner gives: dtype describes the frozen
+        # modules, the trainable refiner is fp32 regardless, and this file is a valid
+        # resume_from source. Rounding it to bf16 here threw away sixteen mantissa bits on
+        # every save and again on every resume from it, while the sibling artefact written in
+        # the same block kept them. Mixed dtypes in one safetensors file are legal, and
+        # load_diffusion_model casts on load anyway.
+        state_dict['net.context_refiner.' + k] = v.detach().float().cpu().contiguous()
     _save_file_atomically(state_dict, path, {'format': 'pt'})
 
 
@@ -1780,7 +1850,21 @@ def _save_file_atomically(state_dict, path, metadata):
     os.replace(tmp, path)
 
 
-def refiner_provenance(config, cap_feat_dim, max_text_length):
+def _copy_atomically(src, dst):
+    """Copy onto a fixed filename without ever leaving it truncated.
+
+    The same hazard _save_file_atomically exists for. shutil.copy2 opens the destination 'wb'
+    and streams, so an interruption partway through a multi-gigabyte model.safetensors leaves
+    the stable name -- the one every shipped config points at -- as a truncated file, while the
+    tagged copy beside it is fine.
+    """
+    dst = Path(dst)
+    tmp = dst.with_name(dst.name + '.tmp')
+    shutil.copy2(src, tmp)
+    os.replace(tmp, dst)
+
+
+def refiner_provenance(config, cap_feat_dim, max_text_length, step=None):
     """What a refiner file has to record about the text encoder it was distilled against.
 
     _resolve_context_refiner can check the layer count and cap_feat_dim from the tensor shapes,
@@ -1789,15 +1873,23 @@ def refiner_provenance(config, cap_feat_dim, max_text_length):
     identical shapes and a completely different input distribution -- the last hidden state is
     post-final-RMSNorm and roughly 50x larger in RMS than a raw residual-stream layer.
 
+    `step` pins these weights to the optimizer state saved alongside them. The two are separate
+    files written by separate calls, so an interruption between them leaves weights from one
+    step beside moments from another, and the resume succeeds silently -- the loss bump reads as
+    ordinary resume noise. Recording it lets load_training_state refuse the mismatch.
+
     Written as safetensors metadata, which is plain string-to-string, so every value is a str.
     """
-    return {
+    metadata = {
         'format': 'pt',
         'llm_path': str(config['student'].get('llm_path', '')),
         'llm_hidden_layer': str(config['student'].get('llm_hidden_layer', '')),
         'cap_feat_dim': str(cap_feat_dim),
         'max_text_length': str(max_text_length),
     }
+    if step is not None:
+        metadata['step'] = str(step)
+    return metadata
 
 
 def save_refiner(refiner, path, dtype, metadata=None):
@@ -1842,7 +1934,7 @@ def training_state_path(refiner_path, rank=None):
     return path.with_name(f'distill_state{suffix}{shard}.pt')
 
 
-def prune_distill_checkpoints(output_dir, keep, protect_tag=None):
+def prune_distill_checkpoints(output_dir, keep, protect_tag=None, protect_tags=()):
     """Keep the newest `keep` tagged checkpoints of each kind, with everything that belongs to them.
 
     Counted separately per kind, matching train.py: N epoch-tagged and N step-tagged, because the
@@ -1852,11 +1944,15 @@ def prune_distill_checkpoints(output_dir, keep, protect_tag=None):
 
     The untagged names are never pruned. They are the stable ones every config points at.
 
-    `protect_tag` is the tag this save just wrote. Tags are ordered by their number, which only
-    increases within one uninterrupted run -- but not across runs sharing an output_dir, and not
-    when a resume onto fewer ranks raises steps_per_epoch and lowers the epoch number. Without
-    this, a second run writing epoch1 into a directory holding epoch18/19/20 deletes its own
-    fresh checkpoint and announces it as a pruned one.
+    `protect_tag` is the tag this save just wrote, and `protect_tags` every tag this process has
+    written. Tags are ordered by their number, which only increases within one uninterrupted run
+    -- but not across runs sharing an output_dir, and not when a resume onto fewer ranks raises
+    steps_per_epoch and lowers the epoch number. Protecting only the newest is not enough: a
+    second run into a directory holding epoch18/19/20 with keep=3 writes epoch1 (protected, so
+    nothing goes), then epoch2 -- at which point epoch1 is the lowest number present and is
+    deleted, and so on. The run would end holding the previous run's three checkpoints and one
+    of its own. Protecting every tag this process wrote prunes the old ones instead, which is
+    what keep_last_n_checkpoints is for.
     """
     if not keep or keep < 1:
         return []
@@ -1868,8 +1964,19 @@ def prune_distill_checkpoints(output_dir, keep, protect_tag=None):
             number = path.stem[len(f'context_refiner_{kind}'):]
             if number.isdigit():
                 tagged.append((int(number), number, path))
-        tagged.sort(key=lambda triple: triple[0])
+        def is_ours(number):
+            tag = f'_{kind}{number}'
+            return tag == protect_tag or tag in protect_tags
+
+        # Anything this process wrote sorts after everything it did not, so the oldest run's
+        # checkpoints are the ones pruned. Within each group the number orders them, which is
+        # correct because numbers only increase inside one run.
+        tagged.sort(key=lambda triple: (is_ours(triple[1]), triple[0]))
         for _, number, path in tagged[:-keep] if len(tagged) > keep else []:
+            # Only the tag just written is exempt outright. This run's OLDER tags are ordinary
+            # prune candidates -- a long run with keep=3 must still drop its own early
+            # checkpoints, which is the whole point of the setting. protect_tags orders them,
+            # it does not immunise them.
             if protect_tag is not None and f'_{kind}{number}' == protect_tag:
                 continue
             companions = [
@@ -2041,7 +2148,34 @@ def load_training_state(refiner_path, optimizer, scheduler, is_main, rank=None, 
         scaler.load_state_dict(state['scaler'])
     if is_main:
         print(f'Resumed optimizer and LR schedule from {path} at step {state["step"]}')
+    _check_weights_match_training_state(refiner_path, int(state['step']))
     return int(state['step'])
+
+
+def _check_weights_match_training_state(refiner_path, state_step):
+    """Refuse weights and optimizer moments that came from different steps.
+
+    They are separate files written by separate calls, so an interruption between the two --
+    or hand-copying one of them -- leaves a pair that loads without complaint and resumes an
+    already-annealed schedule against weights from further ahead. Nothing else would report it.
+
+    A file with no recorded step predates this check, or came from another mode. It claims
+    nothing, so it is accepted, the same way a cache with no manifest is.
+    """
+    try:
+        with safetensors.safe_open(str(refiner_path), framework='pt') as f:
+            recorded = (f.metadata() or {}).get('step', None)
+    except Exception:
+        return
+    if recorded is None:
+        return
+    if int(recorded) != state_step:
+        raise RuntimeError(
+            f'{refiner_path} holds weights from step {recorded}, but the training state beside '
+            f'it is from step {state_step}. These are two halves of different checkpoints: '
+            'resuming would pair optimizer moments with weights they never saw. Point '
+            'resume_from at a tagged checkpoint whose two files agree.'
+        )
 
 
 if __name__ == '__main__':

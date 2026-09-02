@@ -127,6 +127,8 @@ dtype = 'bfloat16'
 #   'bf16-full'   bf16 parameters. Halves refiner parameter and optimizer-state memory, at the
 #                 cost of the fp32 master weights. Under ZeRO the engine keeps fp32 masters
 #                 anyway, so this saves less there -- and is numerically better there.
+#                 Under DDP it needs type = 'adamw8bitkahan' below; see the note there. The
+#                 script warns if you pair it with an optimizer that has no compensation.
 #
 # 'fp16-full' is deliberately not offered: pure fp16 parameters with no fp32 master copy lose
 # most AdamW updates to underflow at this learning rate.
@@ -277,14 +279,27 @@ num_blocks = 8
 # ranks. That is more per-GPU saving than ZeRO-1 reaches here, and it does not need a second
 # GPU to reach it.
 #
+# With precision = 'bf16-full' under DDP, use 'adamw8bitkahan' and not 'adamw8bit'. The two save
+# the same memory -- Kahan is a subclass of AdamW8bit, so the moments are 8-bit either way -- but
+# they solve different problems. 8-bit quantisation shrinks the optimizer moments. bf16-full
+# additionally makes the parameters themselves bf16, and bf16 carries 8 mantissa bits, so an
+# update smaller
+# than about 2^-9 relative to the weight rounds to exactly nothing. That is the same underflow
+# 'fp16-full' is refused for, with three fewer mantissa bits. adamw8bitkahan keeps a per-parameter
+# `shift` buffer (optimizers/adamw_8bit.py) carrying the lost remainder into the next step, which
+# is what makes bf16 parameters trainable at this learning rate. Pair bf16-full with plain
+# 'adamw8bit' and you get the memory saving plus silently discarded updates: the run completes and
+# the loss barely moves, with nothing in the output to explain it.
+#
 # Caveat: 8-bit optimizers are mostly validated on fine-tuning, and this refiner trains from a
-# random init. adamw8bitkahan (optimizers/adamw_8bit.py) uses Kahan summation and is the safer
-# choice if you also set precision = 'bf16-full'.
+# random init -- another reason to prefer the Kahan variant. Combining any 8-bit optimizer with
+# ZeRO is unverified, because ZeRO replaces the param groups with flat fp32 partitions and the
+# quantisation blocks then lie over partitions rather than whole parameters; the script warns.
 #
 # 'genericoptim' and 'gradient_release' are refused here: both need pipeline machinery that
 # only train.py builds.
 #[optimizer]
-#type = 'adamw8bit'
+#type = 'adamw8bitkahan'
 #lr = 1e-4
 #betas = [0.9, 0.99]
 #weight_decay = 0.01

@@ -142,19 +142,34 @@ class TestScriptStructure:
         ({'RANK': '0', 'WORLD_SIZE': '1', 'LOCAL_RANK': '0'}, (0, 1, 0)),
     ])
     def test_setup_distributed_single_process(self, env, expected, monkeypatch):
+        # Both cases assert. The env-set case used to sit behind `if not env:` and therefore
+        # ran no assertion at all, passing whatever setup_distributed returned. The reason for
+        # the guard was real -- with RANK set the function calls init_process_group -- so stub
+        # the collective out instead of skipping the check.
         for k in ('RANK', 'WORLD_SIZE', 'LOCAL_RANK'):
             monkeypatch.delenv(k, raising=False)
         for k, v in env.items():
             monkeypatch.setenv(k, v)
-        from tools.distill_refiner import setup_distributed
-        if not env:
-            assert setup_distributed() == expected
+        import tools.distill_refiner as distill
+        monkeypatch.setattr(distill.dist, 'is_initialized', lambda: True)
+        monkeypatch.setattr(
+            distill.dist, 'init_process_group',
+            lambda *a, **k: pytest.fail('a single-process launch must not build a process group'),
+        )
+        assert distill.setup_distributed() == expected
 
     def test_the_probe_seed_is_not_rank_offset(self):
         # Every rank must measure against the same queries, or the ranks optimise different
         # objectives and the all-reduce averages nonsense.
+        #
+        # Asserted on the probe's own line, not on 'manual_seed(seed)' anywhere in the file:
+        # torch.manual_seed(seed) also appears where the global seed is set, so the looser
+        # substring still matched after the probe generator was given a rank offset -- the
+        # exact inversion this test names was invisible to it.
         src = self.source()
-        assert 'manual_seed(seed)' in src
+        assert "generator = torch.Generator(device='cpu').manual_seed(seed)\n" in src, (
+            'the probe generator must be seeded without a rank offset'
+        )
         assert 'random.seed(seed + rank)' in src, 'only the data stream should differ per rank'
 
 
@@ -2127,6 +2142,209 @@ class TestResumeReportsScheduleDrift:
     def test_a_changed_precision_warns(self, tmp_path, capsys):
         _, out = self._round_trip(tmp_path, self.BASE, {**self.BASE, 'precision': 'fp32'}, capsys)
         assert "'bf16-mixed'" in out and "'fp32'" in out
+
+
+class TestBf16FullNeedsKahan:
+    """bf16 parameters with no master copy need a compensated optimizer, or updates round away.
+
+    Not refused, because it is a legitimate way to fit a larger batch and the shipped 4-GPU
+    configs use it -- but they pair it with adamw8bitkahan, which is what makes it safe.
+    """
+
+    @staticmethod
+    def _warn(distill, optimizer, capsys):
+        from tools.distill_refiner import validate_config_early
+        config = {'distill': dict(distill)}
+        if optimizer is not None:
+            config['optimizer'] = optimizer
+        validate_config_early(config, world_size=1, is_main=True)
+        return capsys.readouterr().out
+
+    def test_bf16_full_with_the_default_optimizer_warns(self, capsys):
+        out = self._warn({'precision': 'bf16-full'}, None, capsys)
+        assert 'adamw8bitkahan' in out and 'WARNING' in out
+
+    def test_bf16_full_with_plain_adamw8bit_warns(self, capsys):
+        """Same memory as the Kahan variant, none of the compensation -- the trap."""
+        out = self._warn({'precision': 'bf16-full'}, {'type': 'adamw8bit'}, capsys)
+        assert 'adamw8bitkahan' in out and 'WARNING' in out
+
+    def test_bf16_full_with_kahan_is_silent(self, capsys):
+        out = self._warn({'precision': 'bf16-full'}, {'type': 'AdamW8bitKahan'}, capsys)
+        assert 'WARNING' not in out
+
+    def test_other_precisions_keep_their_fp32_parameters_and_do_not_warn(self, capsys):
+        for name in ('fp32', 'bf16-mixed'):
+            out = self._warn({'precision': name}, {'type': 'adamw8bit'}, capsys)
+            assert 'WARNING' not in out, f'{name} keeps fp32 parameters; nothing rounds away'
+
+
+class TestCorpusCaptionSettingsWarning:
+    """A corpus inherits nothing, so anything not restated is silently off."""
+
+    @staticmethod
+    def _warn(distill_config, capsys):
+        from tools.distill_refiner import caption_augment_config
+        caption_augment_config({'distill': distill_config})
+        return capsys.readouterr().out
+
+    def test_restating_nothing_warns(self, capsys):
+        out = self._warn({'caption_corpus': '/data/captions.jsonl'}, capsys)
+        assert 'prefix_tag_caption' in out and 'WARNING' in out
+
+    def test_restating_something_else_still_warns_about_the_marker(self, capsys):
+        """The marker is the setting whose absence corrupts the caption, not just changes it."""
+        out = self._warn(
+            {'caption_corpus': '/data/captions.jsonl', 'caption_prefix': 'anime, '}, capsys)
+        assert 'prefix_tag_caption' in out, (
+            'restating one setting silenced the warning entirely, so a config that set '
+            'caption_prefix and forgot the marker trained the marker as a tag with no warning'
+        )
+
+    def test_restating_the_marker_is_silent(self, capsys):
+        out = self._warn(
+            {'caption_corpus': '/data/captions.jsonl', 'prefix_tag_caption': 'Special: '}, capsys)
+        assert 'WARNING' not in out
+
+    def test_a_dataset_source_never_warns(self, capsys, tmp_path):
+        dataset_toml = tmp_path / 'dataset.toml'
+        dataset_toml.write_text('resolutions = [512]\n', encoding='utf-8')
+        out = self._warn({'dataset': str(dataset_toml)}, capsys)
+        assert 'WARNING' not in out
+
+
+class TestCheckpointHalvesStayTogether:
+    """The weights and the optimizer state are two files; they must describe the same step."""
+
+    @staticmethod
+    def _write_refiner(path, step):
+        import safetensors.torch
+        metadata = {'format': 'pt'}
+        if step is not None:
+            metadata['step'] = str(step)
+        safetensors.torch.save_file({'a': torch.zeros(2)}, str(path), metadata=metadata)
+
+    def test_a_step_mismatch_is_refused(self, tmp_path):
+        from tools.distill_refiner import _check_weights_match_training_state
+        path = tmp_path / 'context_refiner.safetensors'
+        self._write_refiner(path, 4000)
+        with pytest.raises(RuntimeError, match='two halves of different checkpoints'):
+            _check_weights_match_training_state(path, 2000)
+
+    def test_matching_steps_are_accepted(self, tmp_path):
+        from tools.distill_refiner import _check_weights_match_training_state
+        path = tmp_path / 'context_refiner.safetensors'
+        self._write_refiner(path, 2000)
+        _check_weights_match_training_state(path, 2000)
+
+    def test_a_file_without_a_recorded_step_claims_nothing(self, tmp_path):
+        """Refiners predating this, and those from other modes, must still resume."""
+        from tools.distill_refiner import _check_weights_match_training_state
+        path = tmp_path / 'context_refiner.safetensors'
+        self._write_refiner(path, None)
+        _check_weights_match_training_state(path, 2000)
+
+    def test_the_provenance_records_the_step_when_given_one(self):
+        from tools.distill_refiner import refiner_provenance
+        config = {'student': {'llm_path': '/llm', 'llm_hidden_layer': -1}}
+        assert 'step' not in refiner_provenance(config, 2048, 512)
+        assert refiner_provenance(config, 2048, 512, step=7)['step'] == '7'
+
+    def test_the_stable_name_is_never_left_truncated(self, tmp_path):
+        """A fixed filename rewritten in place has no fallback if the write is interrupted."""
+        from tools.distill_refiner import _copy_atomically
+        src, dst = tmp_path / 'tagged.bin', tmp_path / 'stable.bin'
+        src.write_bytes(b'x' * 1024)
+        dst.write_bytes(b'old')
+        _copy_atomically(src, dst)
+        assert dst.read_bytes() == b'x' * 1024
+        assert not list(tmp_path.glob('*.tmp')), 'the temporary copy must be renamed, not left'
+
+
+class TestFullModelKeepsTheRefinerInFp32:
+    """Both artefacts a save writes are valid resume_from sources, so both keep the mantissa."""
+
+    def test_the_refiner_inside_the_full_model_is_fp32(self, tmp_path):
+        import safetensors.torch
+        from tools.distill_refiner import save_full_model
+        from models.text_refiner import ContextRefiner
+
+        teacher = tmp_path / 'anima.safetensors'
+        safetensors.torch.save_file(
+            {'net.blocks.0.weight': torch.zeros(2, 2, dtype=torch.float32)},
+            str(teacher), metadata={'format': 'pt'},
+        )
+        refiner = ContextRefiner(cap_feat_dim=8, model_dim=16, num_layers=1, num_heads=2)
+        out = tmp_path / 'model.safetensors'
+        save_full_model(teacher, refiner, out, torch.bfloat16)
+
+        with safetensors.safe_open(str(out), framework='pt') as f:
+            refiner_keys = [k for k in f.keys() if k.startswith('net.context_refiner.')]
+            assert refiner_keys, 'the refiner must be embedded in the full model'
+            for key in refiner_keys:
+                assert f.get_tensor(key).dtype is torch.float32, (
+                    f'{key} was written as {f.get_tensor(key).dtype}; save_refiner keeps the '
+                    'refiner in fp32 for a reason that applies to this file too'
+                )
+            # The frozen DiT half still follows `dtype`.
+            assert f.get_tensor('net.blocks.0.weight').dtype is torch.bfloat16
+
+
+class TestSideBranchAccumulationScaling:
+    """A forward that bypasses the engine must still get the 1/N accumulation scaling.
+
+    DeepSpeed does not divide inside backward(). engine.py computes gas_scaled_loss only as a
+    return value and applies the real division through a hook on the output of its own forward.
+    The unconditional rollout branch calls the bare refiner on purpose -- a second engine
+    forward would build a second backward hook manager -- so it bypasses the only scaling site
+    and contributed grad_accum times its intended gradient. Measured against a real engine at
+    grad_accum=4: engine path 1.0x a single un-accumulated batch, bypassing path 4.0x.
+
+    These assert the values, not the presence of a line, so inverting either one fails.
+    """
+
+    @staticmethod
+    def _grad_after(strategy, grad_accum):
+        x = torch.ones(3, requires_grad=True)
+        y = strategy.scale_side_branch(x * 2.0)
+        # Stand in for grad_accum micro batches all contributing through the same tensor.
+        (y.sum() * grad_accum).backward()
+        return x.grad.clone()
+
+    def test_zero_divides_a_bypassing_branch_by_grad_accum(self):
+        from tools.distill_refiner import DeepSpeedZeROStrategy
+        strategy = object.__new__(DeepSpeedZeROStrategy)
+        strategy.grad_accum = 4
+        grad = self._grad_after(strategy, 4)
+        # Without the hook this would be 2 * 4 = 8 per element.
+        assert torch.allclose(grad, torch.full((3,), 2.0)), (
+            f'expected the side branch to be divided by grad_accum, got {grad.tolist()}'
+        )
+
+    def test_zero_leaves_a_bypassing_branch_alone_without_accumulation(self):
+        from tools.distill_refiner import DeepSpeedZeROStrategy
+        strategy = object.__new__(DeepSpeedZeROStrategy)
+        strategy.grad_accum = 1
+        grad = self._grad_after(strategy, 1)
+        assert torch.allclose(grad, torch.full((3,), 2.0))
+
+    def test_ddp_does_not_scale_the_side_branch_a_second_time(self):
+        from tools.distill_refiner import DDPStrategy
+        strategy = object.__new__(DDPStrategy)
+        strategy.grad_accum = 4
+        grad = self._grad_after(strategy, 4)
+        # DDP divides the whole loss in backward(), so scaling here too would halve it twice.
+        assert torch.allclose(grad, torch.full((3,), 8.0)), (
+            f'DDP must leave the side branch alone, got {grad.tolist()}'
+        )
+
+    def test_both_strategies_expose_the_hook(self):
+        from tools.distill_refiner import DDPStrategy, DeepSpeedZeROStrategy
+        for cls in (DDPStrategy, DeepSpeedZeROStrategy):
+            assert callable(getattr(cls, 'scale_side_branch', None)), (
+                f'{cls.__name__} must answer scale_side_branch; the training loop calls it on '
+                'whichever strategy is active'
+            )
 
 
 class TestNoSyncBoundaryBehaviour:

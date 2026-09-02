@@ -123,11 +123,16 @@ def shifted_timesteps(steps, shift):
 
 
 @torch.no_grad()
-def sample(pipeline, layers, embeds, mask, uncond, uncond_mask, args, device, dtype):
+def sample(pipeline, layers, embeds, mask, uncond, uncond_mask, args, device, dtype,
+           in_channels):
     latent_h = args.height // 8
     latent_w = args.width // 8
     generator = torch.Generator(device='cpu').manual_seed(args.seed)
-    x = torch.randn(args.batch_size, 16, 1, latent_h, latent_w, generator=generator).to(device=device, dtype=torch.float32)
+    # in_channels is passed in rather than assumed: get_dit_config derives it from the
+    # checkpoint's x_embedder, so a checkpoint that is not 16-channel would otherwise fail with
+    # a shape error deep inside the first block. The rollout in tools/distill_refiner.py already
+    # takes it from the config this way.
+    x = torch.randn(args.batch_size, in_channels, 1, latent_h, latent_w, generator=generator).to(device=device, dtype=torch.float32)
 
     timesteps = shifted_timesteps(args.steps, args.shift)
 
@@ -189,7 +194,8 @@ def main():
         layer.to(device).eval()
 
     print(f'Sampling {args.steps} steps at {args.width}x{args.height}, cfg={args.cfg}, shift={args.shift}')
-    latents = sample(pipeline, layers, embeds, mask, uncond, uncond_mask, args, device, dtype)
+    latents = sample(pipeline, layers, embeds, mask, uncond, uncond_mask, args, device, dtype,
+                     in_channels=pipeline.transformer.in_channels)
     images = decode(pipeline, latents, device)
 
     for i, image in enumerate(images):

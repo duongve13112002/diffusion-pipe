@@ -149,6 +149,14 @@ def _map_and_cache(dataset, map_fn, cache_dir, cache_file_prefix='', new_fingerp
     dataset_size = len(dataset)
     assert cache_size <= dataset_size
     if cache_size == dataset_size:
+        # Record the identity here too, not only after a map. A cache that is already complete
+        # never reaches the write below, so without this it never acquires a manifest at all --
+        # and check_identity treats a cache with no manifest as compatible. The protection
+        # would therefore stay permanently inert on exactly the installs it was written for:
+        # one that already has a warm cache, changes llm_path, and gets the old encoder's
+        # embeddings back with no error. The contents are complete at this point, so claiming
+        # them is true; write_manifest records nothing when there is nothing to record.
+        cache.write_manifest()
         return cache
     dataset = dataset.select(range(cache_size, dataset_size), keep_in_memory=True)
 
@@ -1303,6 +1311,12 @@ class DirectoryDataset:
             # output, so it must follow the text encoder rather than the latents. Left at
             # None without a key, preserving the original fingerprint.
             new_fingerprint_args=[text_encoder_key] if text_encoder_key else None,
+            # Same identity as the conditional embeddings: this is the same encoder's output,
+            # and a model whose key is deliberately empty (anima) would otherwise have nothing
+            # distinguishing two runs with different llm_path. Its conditional embeddings would
+            # rebuild while the unconditional one -- the embedding every CFG-dropped sample
+            # trains against -- came back from the old encoder.
+            identity=identity,
             regenerate_cache=regenerate_cache,
         )
         self.uncond_dict = uncond_text_embeddings_ds[0]

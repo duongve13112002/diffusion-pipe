@@ -77,7 +77,7 @@ class TestSamplingMath:
             pipeline=None, layers=[ConstantVelocity()],
             embeds=torch.zeros(1, 4, 8), mask=torch.ones(1, 4, dtype=torch.long),
             uncond=torch.zeros(1, 4, 8), uncond_mask=torch.ones(1, 4, dtype=torch.long),
-            args=args, device=torch.device('cpu'), dtype=torch.float32,
+            args=args, device=torch.device('cpu'), dtype=torch.float32, in_channels=16,
         )
 
     def test_recovers_the_clean_latent(self):
@@ -149,7 +149,7 @@ class TestSamplingUsesTheRealLayerStack:
             embeds=torch.randn(1, 12, training.CAP_FEAT_DIM),
             mask=torch.ones(1, 12, dtype=torch.long),
             uncond=None, uncond_mask=None,
-            args=args, device=torch.device('cpu'), dtype=torch.float32,
+            args=args, device=torch.device('cpu'), dtype=torch.float32, in_channels=16,
         )
         assert result.shape == (1, 16, 1, 16, 16)
         assert torch.isfinite(result).all()

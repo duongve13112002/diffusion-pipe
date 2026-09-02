@@ -744,6 +744,87 @@ class TestCacheCompatibilityManifest:
         assert cache.manifest_file.exists()
         assert self._cache(tmp_path, identity='vae-A').check_identity()[0] is True
 
+    def test_the_unconditional_cache_records_the_same_identity(self, monkeypatch):
+        """The uncond embedding follows the same encoder, so it needs the same identity.
+
+        It is written by its own _map_and_cache call a few lines after the conditional one. That
+        call had no identity, and for a model whose fingerprint key is deliberately empty
+        (anima) the uncond fingerprint is the fingerprint of a constant one-row dataset --
+        identical for every run ever. Swapping llm_path rebuilt the conditional embeddings and
+        went on serving the old encoder's unconditional one, which is the embedding every
+        CFG-dropped sample trains against.
+        """
+        import utils.dataset as dataset_mod
+        from utils.dataset import DirectoryDataset
+
+        seen = []
+
+        class _FakeCache(dict):
+            def __getitem__(self, key):
+                return {}
+
+        def fake_map_and_cache(dataset, map_fn, cache_dir, cache_file_prefix='', **kwargs):
+            seen.append((cache_file_prefix, kwargs.get('identity')))
+            return _FakeCache()
+
+        monkeypatch.setattr(dataset_mod, '_map_and_cache', fake_map_and_cache)
+
+        class _FakeBucket:
+            def __init__(self):
+                self.uncond_text_embeddings = []
+                self.calls = []
+
+            def cache_text_embeddings(self, *args, **kwargs):
+                seen.append((f'text_embeddings_{args[1]}_', kwargs.get('identity')))
+
+        bucket = _FakeBucket()
+        stub = object.__new__(DirectoryDataset)
+        stub.path = 'stub'
+        stub.cache_dir = 'stub-cache'
+        stub.use_size_buckets = True
+        stub.size_bucket_datasets = [bucket]
+        stub.keep_text_embedding_cache = False
+        stub.get_size_bucket_datasets = lambda: [bucket]
+
+        DirectoryDataset.cache_text_embeddings(stub, map_fn=None, i=0, identity='llm-A')
+
+        by_prefix = dict(seen)
+        assert by_prefix['text_embeddings_0_'] == 'llm-A'
+        assert by_prefix['uncond_text_embeddings_0_'] == 'llm-A', (
+            'the unconditional cache was written without an identity, so nothing could detect '
+            'that it came from a different text encoder'
+        )
+
+    def test_an_already_complete_cache_still_acquires_a_manifest(self, tmp_path):
+        """Otherwise the guard is permanently inert on exactly the installs it is for.
+
+        _map_and_cache returns early when the cache already holds every row, which used to skip
+        the manifest write at the end. A user with a warm cache from before this existed would
+        therefore never acquire one, no matter how many times they ran -- so changing the
+        encoder went on being served the old embeddings, with no error, forever.
+        """
+        import datasets as hf_datasets
+        from utils.dataset import _map_and_cache
+
+        def embed(example, rank):
+            return {'embedding': [torch.tensor([float(len(c))]) for c in example['caption']]}
+
+        ds = hf_datasets.Dataset.from_dict({'caption': ['aaa', 'bbbb']})
+        first = _map_and_cache(ds, embed, tmp_path / 'cache',
+                               cache_file_prefix='text_embeddings_0_', identity='llm-A')
+        manifest = first.manifest_file
+        first.con.close()
+        assert manifest.exists(), 'a completed map must record its identity'
+        manifest.unlink()  # a cache built before the manifest mechanism existed
+
+        second = _map_and_cache(ds, embed, tmp_path / 'cache',
+                                cache_file_prefix='text_embeddings_0_', identity='llm-A')
+        second.con.close()
+        assert manifest.exists(), (
+            'a complete cache took the early return and never recorded its identity, so a '
+            'later encoder swap could not be detected'
+        )
+
     def test_a_different_producer_is_incompatible(self, tmp_path):
         # Checked before construction: Cache.__init__ acts on the answer immediately and clears
         # the cache, manifest included, so asking afterwards finds no evidence either way.
@@ -847,6 +928,32 @@ class TestVaeCacheKeyIsDeclaredPerModel:
                     )
                 checked += 1
         assert checked >= 10, f'expected the declarations to still be there, found {checked}'
+
+    def test_every_backend_resolves_the_cache_identity_hooks(self):
+        """Dataset calls these on whatever model it is handed, so both backends must answer.
+
+        The two backends do not share a base beyond CommonPipeline: BasePipeline covers the
+        Diffusers models and ComfyPipeline the ComfyUI ones. These four members lived on
+        BasePipeline while Dataset.__init__ called vae_cache_key() unconditionally, so every
+        ComfyUI-backed model raised AttributeError before training started.
+        """
+        from models.base import CommonPipeline, BasePipeline, ComfyPipeline
+        for cls in (CommonPipeline, BasePipeline, ComfyPipeline):
+            for name in ('vae_config_keys', 'vae_cache_key', 'text_encoder_cache_key',
+                         'text_encoder_identity'):
+                assert hasattr(cls, name), (
+                    f'{cls.__name__} does not resolve {name}. Dataset calls it on every model, '
+                    'so it belongs on CommonPipeline, not on one backend.'
+                )
+
+    def test_a_comfy_backed_model_survives_dataset_construction(self):
+        """The call site, not just the contract. No test built the top-level Dataset before."""
+        from models.base import ComfyPipeline
+        stub = object.__new__(ComfyPipeline)
+        stub.model_config = {'dtype': 'bfloat16'}
+        assert stub.vae_cache_key() == ''
+        assert stub.text_encoder_cache_key(0) == ''
+        assert stub.text_encoder_identity(0) == ''
 
 
 class TestTextEmbeddingCacheFollowsTheCaptions:

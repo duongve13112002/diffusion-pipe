@@ -103,6 +103,17 @@ def set_config_defaults(config):
     if config['activation_checkpointing'] == 'unsloth':
         config['reentrant_activation_checkpointing'] = True
     config.setdefault('warmup_steps', 0)
+    if 'keep_last_n_checkpoints' in config:
+        # Validated here for the same reason tools/distill_refiner.py validates it: unset means
+        # keep everything, but 0 or a negative number reads as "keep none" and is silently
+        # treated as unset by prune_all_checkpoint_kinds. The two trainers share the option, so
+        # they should agree on what a typo does.
+        keep = config['keep_last_n_checkpoints']
+        if not isinstance(keep, int) or isinstance(keep, bool) or keep < 1:
+            raise ValueError(
+                f'keep_last_n_checkpoints must be an integer >= 1, got {keep!r}. Remove the key '
+                'to keep every checkpoint.'
+            )
     if 'save_dtype' in config:
         config['save_dtype'] = DTYPE_MAP[config['save_dtype']]
 

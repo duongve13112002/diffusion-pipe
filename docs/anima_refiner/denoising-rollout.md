@@ -212,6 +212,6 @@ the refiner file and `distill_state.pt` are unaffected either way.
   student see the same `t` either way.
 - **The rollout term's magnitude relative to the other terms is unmeasured.** The probe loss is
   an MSE over cross-attention outputs; the rollout loss is an MSE over velocities, whose
-  variance is roughly 2. `loss_weight = 1.0` is a starting point, not a calibrated value. Only
-  the summed loss is logged, so if the rollout dominates you will not see it directly — watch
-  whether `spread` and the probe behaviour still move.
+  variance is roughly 2. `loss_weight = 1.0` is a starting point, not a calibrated value. Each
+  weighted term is logged separately, so a rollout that dominates is visible directly — compare
+  the `rollout` column against `probe`, and watch whether `spread` still moves.

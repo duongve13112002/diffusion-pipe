@@ -14,6 +14,16 @@ Models supported: SDXL, Flux, LTX-Video, HunyuanVideo (t2v), Cosmos, Lumina Imag
 - Optional OPLoRA (orthogonal projection LoRA) to reduce catastrophic forgetting when training LoRAs
 
 ## Recent changes
+- 2026-09-02
+  - Fix: every ComfyUI-backed model (`z_image`, `flux2`, `krea2`, `ltx2`, `ideogram4`, `ernie_image`, `hunyuan_video_15`, `minimax_h3`) failed at dataset construction with `AttributeError: vae_cache_key`. The cache-identity hooks were added to `BasePipeline` only, and `ComfyPipeline` does not inherit from it; they now live on `CommonPipeline`, which both backends share.
+  - **Upgrading rebuilds the VAE latent cache once.** The latent fingerprint was narrowed to the columns latents actually depend on, so caption settings no longer invalidate them -- but narrowing it changes the fingerprint, so existing caches are re-encoded on the first run after the upgrade. Set `keep_latent_cache = true` for that one run to skip it, if the images, VAE and bucketing are unchanged.
+  - Fix: a cache that was already complete never recorded its identity, so the compatibility check stayed inert on existing installs and an encoder swap silently reused the old embeddings. The unconditional text-embedding cache was missing the identity too.
+  - Fix: `tools/distill_refiner.py` wrote its stable checkpoint names with a non-atomic copy, recorded no step to pair weights with their optimizer state, and rounded the refiner to `dtype` inside `model.safetensors` while `context_refiner.safetensors` kept fp32.
+  - Fix: under ZeRO, the rollout's unconditional branch bypassed the engine forward and so bypassed DeepSpeed's `1/gradient_accumulation_steps` scaling, contributing `grad_accum` times its intended gradient. Only reachable with `distributed_strategy = 'zero1'/'zero2'`, `gradient_accumulation_steps > 1` and `[rollout] guidance_scale > 1`; no shipped config used that combination.
+  - Fix: `keep_last_n_checkpoints` pruned the current run's own checkpoints when it wrote into a directory left by an earlier run, because tags are ordered by number and numbers only increase within one run.
+  - `precision = 'bf16-full'` under DDP now warns unless the optimizer is Kahan-compensated: bf16 parameters *and* bf16 Adam moments put the rounding floor at about `2^-9` relative to the weight. `adamw8bit` and `adamw8bitkahan` save the same memory and only the latter addresses this — see [docs/anima_refiner/README.md](./docs/anima_refiner/README.md).
+  - Add a quality-first recipe to [docs/anima_refiner/training.md](./docs/anima_refiner/training.md) for running the refiner stages when compute is not the constraint.
+  - `keep_last_n_checkpoints` is now validated in `train.py` as it already was in the distiller, and the probe head count and the sampler's latent channel count come from the checkpoint instead of a literal 16.
 - 2026-08-31
   - Add `caption_sampling = "random_per_epoch"`: one training sample per image with the caption drawn at random each access, instead of one sample per caption.
   - Add `tag_dropout_rate`, `prefix_tag_caption` and `multiline_captions` dataset settings. All default off; see [Multi-caption and tag augmentation](#multi-caption-and-tag-augmentation).

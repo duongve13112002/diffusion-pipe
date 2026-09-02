@@ -33,6 +33,198 @@
 <p class="meta">A running log of decisions taken outside the spec, forced changes, tradeoffs, and
 anything else the maintainer needs to know. Newest entry first.</p>
 
+<h2>2026-09-02 &mdash; Full forensic audit: a crash in eight unrelated models, and a ZeRO scaling hole</h2>
+
+<p><strong>Request.</strong> A one-shot forensic audit of the branch against <code>fd00a5e</code>,
+then fix everything it found. Three specialists covered architecture/regression, objective
+mathematics, and distributed/cache/checkpoint/tests; a fourth adversarial pass was started and cut
+short. Every finding below was re-verified at source level, and the two most serious were proved by
+running them.</p>
+
+<p><strong>The worst finding has nothing to do with the refiner.</strong>
+<code>utils/dataset.py</code> called <code>model.vae_cache_key()</code> unconditionally while the
+method was defined on <code>BasePipeline</code> only. <code>ComfyPipeline</code> inherits from
+<code>CommonPipeline</code>, not from <code>BasePipeline</code>, so every ComfyUI-backed model --
+<code>z_image</code>, <code>flux2</code>, <code>krea2</code>, <code>ltx2</code>,
+<code>ideogram4</code>, <code>ernie_image</code>, <code>hunyuan_video_15</code>,
+<code>minimax_h3</code> -- raised <code>AttributeError</code> at dataset construction, before
+training started. Eight of twenty-three model types, none of them related to this branch.</p>
+
+<p>What makes it an oversight rather than a decision is the sibling call ninety-six lines later,
+which reads the text-encoder key through
+<code>getattr(self.model, 'text_encoder_cache_key', lambda _i: '')</code>. The defensive shape was
+already in the file, from an earlier commit; the later one did not follow it. The four members now
+live on <code>CommonPipeline</code>, which both backends share.</p>
+
+<p>It also went unnoticed because <em>no test constructs the top-level <code>Dataset</code></em>.
+Fourteen tests build <code>DirectoryDataset</code> directly and skip the line entirely, so a green
+490-test suite said nothing about it. That is the "a green suite can be evidence of nothing" lesson
+arriving a second time, and the new tests assert the contract on all three classes and exercise the
+call itself.</p>
+
+<p><strong>DeepSpeed does not scale the loss inside <code>backward()</code>.</strong> The class
+docstring said it did, and so did the audit's first reading. It does not:
+<code>engine.py:2490</code> computes <code>gas_scaled_loss</code> and the line above it is commented
+<code># Used only for return value</code>. The real division is a hook DeepSpeed registers on the
+<em>output tensor of its own forward</em>. So the scaling follows the engine forward, not the
+backward call -- and any gradient path that reaches the parameters without passing through
+<code>engine(...)</code> never gets it.</p>
+
+<p>The rollout's unconditional branch is exactly such a path. It calls the bare
+<code>refiner</code> on purpose, because a second engine forward inside one backward builds a
+second hook manager and leaks <code>_backward_active_depth</code>. The comment explaining that
+says "the parameters are shared either way, so the gradients still reduce correctly", which is true
+of the all-reduce and says nothing about the accumulation scaling. Measured against a real engine
+at <code>gradient_accumulation_steps = 4</code>: the engine path lands at 1.0x a single
+un-accumulated batch, the bypassing path at exactly 4.0x.</p>
+
+<p>Fixed with <code>strategy.scale_side_branch()</code> -- a no-op under DDP, which divides the
+whole loss once, and a <code>/N</code> hook under ZeRO. Stating the invariant on the strategy keeps
+it in one place instead of at each call site. The same measurement with the hook applied returns
+1.0x. Worth stating plainly: <strong>no shipped config reached this</strong>, since all four use
+<code>distributed_strategy = 'ddp'</code> and <code>guidance_scale = 0.0</code>. It was a latent
+bug in a supported combination, not a broken default.</p>
+
+<p><strong>Two holes in the cache-identity fix from the entry below.</strong> The first is that
+<code>_map_and_cache</code> returns early when the cache already holds every row, and the manifest
+was only written after the map. A cache that was already complete therefore never acquired one --
+not on the next run, not ever -- so the protection was permanently inert on exactly the installs it
+was written for: someone with a warm cache who changes <code>llm_path</code>. The docstring claimed
+it "gets a manifest the next time it is written in full", which was the property nobody had
+checked. The second is the unconditional embedding cache, written by its own call a few lines
+later, which was never passed the identity at all. For <code>anima</code>, whose fingerprint key is
+deliberately empty, its fingerprint is that of a constant one-row dataset and is identical for
+every run ever -- so a conditional cache would correctly rebuild while the unconditional embedding,
+the one every CFG-dropped sample trains against, came back from the old encoder.</p>
+
+<p><strong>Checkpointing: three things that only bite on the unhappy path.</strong> The stable
+filenames were written with <code>shutil.copy2</code>, which truncates the destination and streams
+-- the precise hazard <code>_save_file_atomically</code> exists to prevent, applied to the tagged
+file but not to the name every shipped config points at. Nothing recorded which step the weights
+came from, so weights and optimizer moments from different saves paired up silently and resumed an
+already-annealed schedule against weights from further ahead. And <code>save_full_model</code>
+rounded the refiner to <code>dtype</code> while <code>save_refiner</code> deliberately kept fp32,
+with a docstring arguing that rounding "threw away sixteen mantissa bits ... on every resume" --
+both files being valid <code>resume_from</code> sources.</p>
+
+<p><strong>Two more tests that could not fail.</strong> The entry below fixed two; these are the
+next two.
+<code>test_setup_distributed_single_process</code> had a parametrisation sitting behind
+<code>if not env:</code>, so the case with <code>RANK</code> set ran zero assertions and passed
+whatever the function returned. The guard's reason was real -- that path calls
+<code>init_process_group</code> -- so the collective is stubbed rather than the check skipped.
+<code>test_the_probe_seed_is_not_rank_offset</code> asserted <code>'manual_seed(seed)' in src</code>,
+which still matches the global seed on another line, so giving the probe generator a rank offset
+left the test green. That is the one invariant whose violation makes every rank optimise a
+different objective. Both now assert on something an inversion breaks, confirmed by mutating the
+probe seed and watching the test go red.</p>
+
+<p><strong>What the audit did not find, stated because it is evidence too.</strong> Every
+distillation objective held up. The CFG formula is the textbook one and matches the sampler, and
+the dangerous <code>0 &lt; g &lt;= 1</code> band is refused. The rollout is teacher-owned, fully
+inside <code>no_grad</code>, evaluates the student at the same <code>(x, t)</code> against the
+stored teacher velocity, has the right Euler sign, and bottoms out at <code>t = 0.125</code> for
+<code>steps = 8</code> exactly as documented. <code>init_weights</code> covers every parameter, and
+the <code>RotaryEmbedding.inv_freq</code> buffer question -- a non-persistent buffer no checkpoint
+would restore -- is already documented and guarded <em>by construction</em> in
+<code>tools/check_vendored_apis.py</code>, which builds a module and checks the property rather
+than reading a signature default. The ZeRO accumulation boundary from the earlier round is correct
+against DeepSpeed 0.18.4's own source. Caption and embedding indices are paired correctly. No
+config key in any shipped distillation config is unread.</p>
+
+<p><strong>One reported finding was wrong, and the experiment is why.</strong> A specialist
+derived that <code>torch.cdist(x, x)</code> switches to a matmul implementation above
+<code>n = 25</code> and that the exactly-zero diagonal would make <code>sqrt</code>'s backward
+produce <code>inf</code>/<code>NaN</code>, breaking <code>relational_loss</code> at the shipped
+<code>batch_size = 48</code>. The implementation does switch -- the <code>grad_fn</code> changes
+and the diagonal stops being exactly zero -- but the gradients are finite at unit scale, at the
+<code>/512</code> scale <code>padded_mean</code> actually produces, and even with the diagonal
+forced to exactly <code>0.0</code>. Reported as refuted rather than fixed. A derivation that
+predicts a number is worth ten seconds of running it.</p>
+
+<p><strong>A second pass closed the findings that had been reported but not yet verified.</strong>
+Each was re-derived before being touched, because the <code>cdist</code> case had already shown
+what fixing on a report rather than on evidence costs.</p>
+
+<ul>
+<li><strong><code>bf16-full</code> under DDP now warns when the optimizer has no Kahan
+compensation.</strong> The cast to bf16 happens before the optimizer is built, so the Adam moments
+become bf16 too, and bf16's 8 mantissa bits put the rounding floor at about <code>2^-9</code>
+relative to the weight. That is the same underflow <code>fp16-full</code> is refused for, with
+three fewer mantissa bits. Not refused, because the shipped 4-GPU configs use it deliberately --
+but they pair it with <code>adamw8bitkahan</code>, and that pairing was documented as "the safer
+pick" rather than as the thing that makes the mode work at all. Worth being explicit, because
+<code>adamw8bit</code> and <code>adamw8bitkahan</code> save <em>the same</em> memory (Kahan is a
+subclass of <code>AdamW8bit</code>, so the moments are 8-bit either way) and only one of them
+addresses the parameter rounding. The example configs and
+<code>docs/anima_refiner/README.md</code> now say which problem each solves.</li>
+
+<li><strong>Checkpoint retention pruned the current run's own checkpoints.</strong> Tags are
+ordered by number, and numbers only increase within one run. A second run into a directory holding
+<code>epoch18/19/20</code> with <code>keep = 3</code> writes <code>epoch1</code> (protected, so
+nothing goes), then <code>epoch2</code> -- at which point <code>epoch1</code> is the lowest number
+present and is deleted. The run ends holding the previous run's three checkpoints and one of its
+own. The obvious fix -- refuse to delete any tag this process wrote -- is worse than the bug, and
+it took two tries to see why. In a single uninterrupted run <em>every</em> tag is one this process
+wrote, so that rule prunes nothing at all and the directory grows without bound, which is the exact
+opposite of what <code>keep_last_n_checkpoints</code> is for. The existing tests did not catch it
+because none of them passes the accumulating set the real save loop passes. What was actually
+needed is an ordering, not an exemption: the sort key puts this run's tags after every tag it did
+not write, so the oldest run is pruned first, while this run's own early checkpoints stay ordinary
+candidates. Only the tag being written right now is exempt outright. There is a test for each half
+-- a second run into a populated directory, and one long run that must still drop its own early
+checkpoints.</li>
+
+<li><strong>Two hardcoded shapes.</strong> The probe's <code>num_heads</code> defaulted to a
+literal 16 while <code>get_dit_config</code> derives the real count from the checkpoint (16 at
+2048 channels, 40 at 5120, 20 at 1280), so <code>head_dim</code> -- and with it the default
+<code>num_queries</code> -- was wrong for anything but Anima. And
+<code>tools/sample_anima_refiner.py</code> allocated its initial latent with a literal 16 channels
+while the rollout in the trainer already took <code>in_channels</code> from the config. Both now
+read the model.</li>
+
+<li><strong>Two stale doc claims.</strong> <code>design-notes.md</code> had a section headed
+<code>num_queries = 64</code> arguing for 64 when the code default has been <code>2 * head_dim</code>
+(256 for Anima) for some time, and <code>denoising-rollout.md</code> said only the summed loss is
+logged when each weighted term has its own column.</li>
+</ul>
+
+<p><strong>Left alone deliberately.</strong> <code>models/base.py</code> takes a tar member name
+with <code>str(spec[1])</code>, which is the "<code>as_posix</code> for archive members" lesson
+again -- but it is byte-identical to <code>fd00a5e</code>, so it belongs to a different change than
+this one, and widening the diff to reach it would make this commit harder to review rather than
+safer.</p>
+
+<p><strong>Not verified.</strong> Still no training run, no multi-GPU run and no image. The ZeRO
+scaling fix is proved on a real single-rank engine on CPU; its behaviour across real ranks is not.
+<code>fp16-mixed</code> remains untestable here, because <code>GradScaler('cuda')</code> disables
+itself without CUDA and <code>Precision.autocast</code> returns a null context off-CUDA, so those
+cases run the fp32 path. Three findings are left open rather than fixed blind, because each needs
+evidence this box cannot produce:</p>
+
+<ul>
+<li><strong>ZeRO does not checkpoint the fp32 master weights or the dynamic loss scale</strong>, so
+a resumed <code>bf16-full</code> or <code>fp16-mixed</code> ZeRO run restarts its masters from
+bit16 values. The code fact is clear; what is not clear is whether writing the masters back
+through <code>load_state_dict</code> onto DeepSpeed's flat partitions rehydrates cleanly, and
+guessing at that is how you turn a resume warning into a resume corruption. Settle it with
+<code>tools/test_zero_resume_gpu.py</code> on two GPUs.</li>
+<li><strong>ZeRO stage 2 has no real-engine coverage</strong> -- the real-engine test hardcodes
+stage 1, and stage 2 takes a different backward path, reducing on every micro batch rather than
+only at the boundary.</li>
+<li><strong>The relational term's magnitude scales as <code>(B-1)/B</code></strong>, because the
+<code>mean</code> reduction spans the whole <code>B x B</code> matrix including the zero diagonal
+and counts each pair twice. Measured rather than assumed, with a constant per-pair disagreement
+held across batch sizes: the raw loss moves about 2x between batch 8 and batch 48, while the
+<code>(B-1)/B</code> factor predicts only 1.12x. So the diagonal is real algebraically but is not
+the dominant batch-size effect -- most of the spread is sampling noise that settles by batch 16.
+Left alone: the correction is worth about 12%, and applying it would move the loss balance of
+every existing run for no measured gain.</li>
+</ul>
+
+<p>All three, with the evidence and the experiment that would settle each, are in
+<code>.audit/FINDINGS.md</code>.</p>
+
 <h2>2026-09-02 &mdash; Audit follow-up: anima's own cache identity, and two tests that could not fail</h2>
 
 <p><strong>Request.</strong> Same session as the entry below, second pass: close the findings that

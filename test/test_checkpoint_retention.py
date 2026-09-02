@@ -131,6 +131,50 @@ class TestDistillCheckpointRetention:
                            'distill_state_epoch1.pt',
                            'model_epoch1.safetensors']
 
+    def test_a_second_run_prunes_the_old_checkpoints_not_its_own(self, tmp_path):
+        """Tags only increase within one run, so the newest number is not the newest file.
+
+        Protecting just the tag being written is not enough over a sequence of saves: the second
+        run writes epoch1 (protected, nothing goes), then epoch2 -- at which point epoch1 is the
+        lowest number present and is deleted. The run would finish holding the previous run's
+        three checkpoints and one of its own.
+        """
+        from tools.distill_refiner import prune_distill_checkpoints
+        self._populate(tmp_path, 'epoch', (18, 19, 20), with_full_model=False)
+
+        written = set()
+        for n in (1, 2, 3):
+            self._populate(tmp_path, 'epoch', (n,), with_full_model=False)
+            written.add(f'_epoch{n}')
+            prune_distill_checkpoints(tmp_path, 3, protect_tag=f'_epoch{n}',
+                                      protect_tags=written)
+
+        survivors = sorted(p.name for p in tmp_path.glob('context_refiner_epoch*.safetensors'))
+        assert survivors == ['context_refiner_epoch1.safetensors',
+                             'context_refiner_epoch2.safetensors',
+                             'context_refiner_epoch3.safetensors'], (
+            f'this run\'s own checkpoints were pruned in favour of the previous run\'s: {survivors}'
+        )
+
+    def test_one_long_run_still_drops_its_own_early_checkpoints(self, tmp_path):
+        """protect_tags orders the candidates; it must not immunise them.
+
+        Every tag in a single run is one this process wrote, so a rule that skipped anything it
+        had written would prune nothing at all and the directory would grow without bound --
+        which is the opposite of what keep_last_n_checkpoints is for.
+        """
+        from tools.distill_refiner import prune_distill_checkpoints
+        written = set()
+        for n in range(1, 8):
+            self._populate(tmp_path, 'epoch', (n,), with_full_model=False)
+            written.add(f'_epoch{n}')
+            prune_distill_checkpoints(tmp_path, 3, protect_tag=f'_epoch{n}',
+                                      protect_tags=written)
+
+        survivors = sorted(int(p.stem[len('context_refiner_epoch'):])
+                           for p in tmp_path.glob('context_refiner_epoch*.safetensors'))
+        assert survivors == [5, 6, 7], f'keep=3 should leave the newest three, got {survivors}'
+
     def test_epoch_and_step_tags_are_counted_apart(self, tmp_path):
         from tools.distill_refiner import prune_distill_checkpoints
         self._populate(tmp_path, 'epoch', (1, 2, 3, 4), with_full_model=False)

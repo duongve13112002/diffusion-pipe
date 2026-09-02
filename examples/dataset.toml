@@ -114,6 +114,13 @@ num_repeats = 1
 # only, so caption settings no longer invalidate them. Turn this on only when you know the
 # images, the VAE and the bucketing are unchanged -- nothing verifies that, and reusing latents
 # from a different VAE trains on silently wrong data. It prints a warning every time.
+#
+# There is one run where it is worth setting: the first one after upgrading past the commit
+# that narrowed the latent fingerprint to those columns. Narrowing it changes the fingerprint
+# itself, so every latent cache built before that upgrade is rebuilt once -- you will see
+# "[CACHE] Fingerprint changed, deleting existing cache files" and the whole dataset will be
+# re-encoded through a VAE that has not changed. Setting this for that single run skips the
+# re-encode, provided the images, the VAE and the bucketing really are unchanged.
 #keep_latent_cache = true
 
 # Reuse the text embedding cache even when its fingerprint no longer matches. Off by default.

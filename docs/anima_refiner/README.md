@@ -440,6 +440,16 @@ Three things worth knowing before switching:
   the forward runs in bf16. It is the safe first step.
 - **`bf16-full` gives up the fp32 master weights.** At 77.64M parameters that is the largest
   saving available, and it is the mode most likely to change results rather than just memory.
+- **`bf16-full` under DDP requires a Kahan-compensated optimizer.** The parameters become bf16,
+  and — because the cast happens before the optimizer is built — so do the Adam moments. bf16
+  carries 8 mantissa bits, so an update smaller than about `2^-9` relative to the weight rounds
+  to exactly nothing. That is the same underflow `fp16-full` is refused for, with three fewer
+  mantissa bits; it is offered anyway because `adamw8bitkahan` fixes it, keeping a per-parameter
+  `shift` buffer that carries the lost remainder into the next step. Note that `adamw8bit` and
+  `adamw8bitkahan` save *the same* memory — Kahan is a subclass of `AdamW8bit`, so the moments
+  are 8-bit either way — and only the Kahan variant addresses the parameter rounding. Pairing
+  `bf16-full` with plain `adamw8bit` (or plain `adamw`) produces a run that completes with the
+  loss barely moving and nothing in the output explaining why, so the script warns.
 - **`bf16-full` under ZeRO is not the same thing as under DDP.** DeepSpeed's bf16 mode keeps
   fp32 master weights in the optimizer, so it saves less than the DDP path and is numerically
   better. The asymmetry is real and deliberate; `resolve_precision` routes the two differently.
@@ -492,8 +502,9 @@ reaches here and needs no second GPU to reach it. If the goal is fitting this st
 VRAM, try the optimizer before the parallelism.
 
 Two honest caveats. 8-bit optimizers are mostly validated on fine-tuning, and this refiner
-trains from a random init — `adamw8bitkahan` uses Kahan summation and is the safer pick,
-especially alongside `precision = 'bf16-full'`. And combining an 8-bit optimizer with ZeRO is
+trains from a random init — `adamw8bitkahan` uses Kahan summation and is the safer pick for that
+reason alone. Alongside `precision = 'bf16-full'` it stops being a preference and becomes a
+requirement, for the parameter-rounding reason given above. And combining an 8-bit optimizer with ZeRO is
 **unverified**: ZeRO replaces the optimizer's param groups with its own flat fp32 partitions, so
 the quantisation blocks end up laid over partitions rather than whole parameters. The script
 prints a warning for that combination.
