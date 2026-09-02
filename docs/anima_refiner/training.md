@@ -195,8 +195,24 @@ ComfyUI's `Anima` class has no `context_refiner`, so a model trained here cannot
 yet. This script reads the `[model]` table of any training config and loads through the same
 pipeline class training uses, so there is no second copy of the loading logic to drift.
 
-Point `--config` at whichever step's config matches the checkpoint you want to sample. For a LoRA
-run, the adapter is applied on top of that config's `transformer_path`.
+Point `--config` at whichever step's config matches the checkpoint you want to sample.
+
+For a step 4 run, add `--lora` with the run's save directory — the one holding
+`adapter_config.json` and `adapter_model.safetensors` — and the adapter is merged on top of
+that config's `transformer_path` before sampling:
+
+```
+python -m tools.sample_anima_refiner \
+    --config examples/anima_refiner/lora.toml \
+    --lora /data/output/anima_refiner_lora/<run>/epoch10 \
+    --lora-strength 0.8 \
+    --prompt '1girl, solo, blue eyes' --output out.png
+```
+
+The same flag reads a LoKr and an OPLoRA run: the format comes from the file, and OPLoRA writes
+an ordinary LoRA. A run with `train_context_refiner = true` brings its densely trained refiner
+along from the same directory. Repeat `--lora` to stack several, one optional `--lora-strength`
+each. See [README.md](./README.md#sampling-with-an-adapter).
 
 ## Going for maximum quality
 
@@ -305,7 +321,8 @@ With compute no object, `full_finetune.toml` has the most capacity. Two things w
 - **Resuming.** Step 1 records the step in the refiner's metadata and refuses a resume that pairs
   it with optimizer state from a different step, so an interrupted long run is safe to continue.
 - **Sampling.** `tools/sample_anima_refiner.py` is the only way to sample this architecture —
-  ComfyUI's `Anima` class has no `context_refiner`. Sample at the same `--shift` as `[model] shift`.
+  ComfyUI's `Anima` class has no `context_refiner`. Sample at the same `--shift` as `[model] shift`,
+  and pass `--lora` for a step 4 checkpoint.
 
 ## Where the refiner lives at each step
 

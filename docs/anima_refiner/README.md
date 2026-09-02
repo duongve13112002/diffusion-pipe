@@ -706,6 +706,42 @@ builds `noisy = (1-t)*clean + t*noise` with target `noise - clean`, so the model
 velocity that is integrated from `t=1` down to `t=0`. `--shift` applies the same
 reparametrisation the training timestep sampling uses, defaulting to the config's `shift`.
 
+### Sampling with an adapter
+
+```
+python -m tools.sample_anima_refiner \
+    --config examples/anima_refiner/lora.toml \
+    --lora /data/output/anima_refiner_lora/<run>/epoch10 \
+    --lora-strength 0.8 \
+    --prompt '1girl, solo, blue eyes' --output out.png
+```
+
+`--lora` takes the run's **save directory**, the one holding `adapter_config.json` and
+`adapter_model.safetensors`, not a path to the file. The adapter's shape comes from that
+`adapter_config.json`, so a sample never depends on the training config's `[adapter]` table
+still matching the run that produced the file — only the `[model]` table is read.
+
+| Trained with | Pass | Because |
+|---|---|---|
+| `lora.toml` | `--lora <save dir>` | |
+| `lokr.toml` | `--lora <save dir>` | The flag names the slot, not the format; the format is read from the file |
+| OPLoRA (`oplora = true`) | `--lora <save dir>` | OPLoRA constrains a LoRA while it trains and writes an ordinary LoRA. Nothing it configures reaches PEFT, so there is no OPLoRA file format and no flag for one |
+| `train_context_refiner = true` | `--lora <save dir>` | The densely trained refiner in that directory's `context_refiner/` is picked up with it, by the same method `init_from_existing` uses |
+
+Repeat `--lora` to stack several; they merge in the order given. `--lora-strength` is optional
+and positional: pass one per `--lora` or none at all. A count that matches neither is refused
+rather than padded with 1.0, and two adapters that each carry a `context_refiner/` are refused
+too — a densely trained refiner replaces the frontend outright rather than adding to it, so
+only one of them can be the one in effect.
+
+Each adapter is merged into the base weights before `to_layers()` runs, so what samples is
+plain `nn.Linear` throughout and strength `1.0` reproduces the training run exactly. Strength
+scales the merged delta linearly for LoRA and LoKr alike.
+
+Pointing `--lora` at a run whose refiner is still freshly initialised is refused, for the same
+reason `configure_adapter` refuses to train that combination: the random base is never saved
+and cannot be reproduced, so it is not the one the adapter was trained against.
+
 ## Config reference
 
 Every key below is read only when `type = 'anima_refiner'`.

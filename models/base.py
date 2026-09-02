@@ -364,6 +364,40 @@ class CommonPipeline:
         #     elif 'lokr_w2.' in name:
         #         nn.init.zeros_(p)
 
+    def load_adapter_weights_into(self, target_model, adapter_path):
+        """Load a saved adapter into target_model, inverting exactly what the saver wrote.
+
+        utils/saver.py stores each trainable parameter under its own name with PEFT's adapter
+        segment ('.default') and '.modules_to_save' removed, so the way back is to build the
+        same mapping from the model's parameters rather than to guess where the segment sat.
+
+        The rule this replaces -- insert '.default' before a trailing '.weight' -- only ever
+        described LoRA. LoKr keeps its factors in ParameterDicts, so its parameters are named
+        '...lokr_w1.default' with no '.weight' anywhere, and every LoKr adapter raised here
+        instead of loading. Both subclasses had their own copy of the rule, which is why one
+        defect existed twice.
+        """
+        if is_main_process():
+            print(f'Loading adapter weights from path {adapter_path}')
+        safetensors_files = list(Path(adapter_path).glob('*.safetensors'))
+        if len(safetensors_files) == 0:
+            raise RuntimeError(f'No safetensors file found in {adapter_path}')
+        if len(safetensors_files) > 1:
+            raise RuntimeError(f'Multiple safetensors files found in {adapter_path}')
+        adapter_state_dict = safetensors.torch.load_file(safetensors_files[0])
+        by_saved_key = {
+            name.replace('.default', '').replace('.modules_to_save', ''): name
+            for name, _ in target_model.named_parameters()
+        }
+        modified_state_dict = {}
+        for k, v in adapter_state_dict.items():
+            # Replace Diffusers or ComfyUI prefix
+            k = re.sub(r'^(transformer|diffusion_model)\.', '', k)
+            if k not in by_saved_key:
+                raise RuntimeError(f'modified_state_dict key {k} is not in the model parameters')
+            modified_state_dict[by_saved_key[k]] = v
+        target_model.load_state_dict(modified_state_dict, strict=False)
+
     @torch.no_grad()
     def sample(self, w=512, h=512):
         x = torch.randn((1, self.channels, h//self.spatial_compression, w//self.spatial_compression), device='cuda')
@@ -419,28 +453,13 @@ class BasePipeline(CommonPipeline):
         raise NotImplementedError()
 
     def load_adapter_weights(self, adapter_path):
-        if is_main_process():
-            print(f'Loading adapter weights from path {adapter_path}')
-        safetensors_files = list(Path(adapter_path).glob('*.safetensors'))
-        if len(safetensors_files) == 0:
-            raise RuntimeError(f'No safetensors file found in {adapter_path}')
-        if len(safetensors_files) > 1:
-            raise RuntimeError(f'Multiple safetensors files found in {adapter_path}')
-        adapter_state_dict = safetensors.torch.load_file(safetensors_files[0])
-        modified_state_dict = {}
-        model_parameters = set(name for name, p in self.transformer.named_parameters())
-        for k, v in adapter_state_dict.items():
-            # Replace Diffusers or ComfyUI prefix
-            k = re.sub(r'^(transformer|diffusion_model)\.', '', k)
-            # Replace weight at end for LoRA format
-            k = re.sub(r'\.weight$', '.default.weight', k)
-            if k not in model_parameters:
-                raise RuntimeError(f'modified_state_dict key {k} is not in the model parameters')
-            modified_state_dict[k] = v
-        self.transformer.load_state_dict(modified_state_dict, strict=False)
+        self.load_adapter_weights_into(self.transformer, adapter_path)
 
     def load_and_fuse_adapter(self, path):
-        peft_config = peft.LoraConfig.from_pretrained(path)
+        # PeftConfig dispatches on the peft_type recorded in adapter_config.json, so this reads
+        # a LoKr run as well as a LoRA one. LoraConfig.from_pretrained happens to dispatch the
+        # same way, but naming LoRA here read as though LoKr were unsupported.
+        peft_config = peft.PeftConfig.from_pretrained(path)
         lora_model = peft.get_peft_model(self.transformer, peft_config)
         self.load_adapter_weights(path)
         lora_model.merge_and_unload()
@@ -761,25 +780,7 @@ class ComfyPipeline(CommonPipeline):
         safetensors.torch.save_file(sd, save_dir / 'adapter_model.safetensors', metadata={'format': 'pt'})
 
     def load_adapter_weights(self, adapter_path):
-        if is_main_process():
-            print(f'Loading adapter weights from path {adapter_path}')
-        safetensors_files = list(Path(adapter_path).glob('*.safetensors'))
-        if len(safetensors_files) == 0:
-            raise RuntimeError(f'No safetensors file found in {adapter_path}')
-        if len(safetensors_files) > 1:
-            raise RuntimeError(f'Multiple safetensors files found in {adapter_path}')
-        adapter_state_dict = safetensors.torch.load_file(safetensors_files[0])
-        modified_state_dict = {}
-        model_parameters = set(name for name, p in self.diffusion_model.named_parameters())
-        for k, v in adapter_state_dict.items():
-            # Replace Diffusers or ComfyUI prefix
-            k = re.sub(r'^(transformer|diffusion_model)\.', '', k)
-            # Replace weight at end for LoRA format
-            k = re.sub(r'\.weight$', '.default.weight', k)
-            if k not in model_parameters:
-                raise RuntimeError(f'modified_state_dict key {k} is not in the model parameters')
-            modified_state_dict[k] = v
-        self.diffusion_model.load_state_dict(modified_state_dict, strict=False)
+        self.load_adapter_weights_into(self.diffusion_model, adapter_path)
 
     def load_and_fuse_adapter(self, path):
         raise NotImplementedError()

@@ -6,6 +6,8 @@ weights this suite does not ship, so the loading path is covered by the training
 (the script deliberately reuses CosmosPredict2Pipeline rather than duplicating it).
 """
 
+from pathlib import Path
+
 import pytest
 import torch
 from torch import nn
@@ -322,3 +324,268 @@ class TestDistillResumeRegression:
         }, str(path))
         with pytest.raises(RuntimeError, match='No context_refiner weights found'):
             extract_refiner_state_dict(load_state_dict(str(path)))
+
+
+class TestAdapterKeyNames:
+    """Why the loader could not use a regex on '.weight'.
+
+    This is the shape of the defect, asserted against the installed peft rather than described
+    in a comment: LoRA's parameters end in '.weight' and LoKr's do not, so a rule that inserts
+    the adapter segment before a trailing '.weight' covers exactly one of the two.
+    """
+
+    @staticmethod
+    def _names(peft_config):
+        import peft
+        model = nn.Sequential(nn.Linear(16, 16, bias=False))
+        peft.get_peft_model(model, peft_config)
+        return [name for name, p in model.named_parameters() if p.requires_grad]
+
+    def test_lora_parameters_end_in_weight(self):
+        import peft
+        names = self._names(peft.LoraConfig(
+            r=4, lora_alpha=4, lora_dropout=0.0, bias='none', target_modules=['0']))
+        assert names and all(n.endswith('.default.weight') for n in names)
+
+    def test_lokr_parameters_do_not(self):
+        import peft
+        names = self._names(peft.LoKrConfig(
+            r=4, decompose_factor=-1, alpha=4, rank_dropout=0.0, target_modules=['0']))
+        assert names and not any(n.endswith('.weight') for n in names)
+        assert all(n.endswith('.default') for n in names)
+
+
+def _adapter_config(adapter_type):
+    if adapter_type == 'lora':
+        return {'type': 'lora', 'rank': 4, 'alpha': 4, 'dropout': 0.0, 'dtype': torch.float32}
+    return {'type': 'lokr', 'rank': 4, 'alpha': 4, 'decompose_factor': -1,
+            'rank_dropout': 0.0, 'dtype': torch.float32}
+
+
+def _refiner_pipeline(dit, monkeypatch):
+    """A CosmosPredict2Pipeline holding `dit`, with only what the adapter paths touch."""
+    import models.base
+    from models.cosmos_predict2 import CosmosPredict2Pipeline
+    monkeypatch.setattr(models.base, 'is_main_process', lambda: True)
+
+    pipeline = object.__new__(CosmosPredict2Pipeline)
+    pipeline.transformer = dit
+    pipeline.use_context_refiner = True
+    pipeline.adapter_target_modules = ['Block', 'ContextRefiner']
+    pipeline.model_config = {'dtype': torch.float32}
+    pipeline._refiner_is_fresh = False
+    return pipeline
+
+
+def _train_and_save(tmp_path, adapter_type, monkeypatch, seed=0):
+    """Run the real adapter path end to end and return (save_dir, merged_state_dict).
+
+    Builds a DiT, configures the adapter exactly as train.py does, gives the adapter non-zero
+    weights, saves it the way utils/saver.py serialises a run, then merges it. The merged
+    weights are what a correct load has to reproduce.
+    """
+    training = pytest.importorskip('test.test_anima_refiner_training')
+    dit = training.build_dit(seed=seed)
+    pipeline = _refiner_pipeline(dit, monkeypatch)
+    pipeline.configure_adapter(_adapter_config(adapter_type))
+
+    # LoRA zeroes lora_B and LoKr zeroes lokr_w1, so an untouched adapter has a zero delta and
+    # a broken load would be indistinguishable from a correct one.
+    torch.manual_seed(100)
+    with torch.no_grad():
+        for name, p in dit.named_parameters():
+            if p.requires_grad:
+                p.copy_(torch.randn_like(p) * 0.1)
+
+    # Exactly what utils/saver.py writes: every trainable parameter under its original name,
+    # with PEFT's adapter segment removed.
+    state_dict = {
+        p.original_name.replace('.default', '').replace('.modules_to_save', ''): p.detach().clone()
+        for _, p in dit.named_parameters() if p.requires_grad
+    }
+    save_dir = tmp_path / adapter_type
+    save_dir.mkdir()
+    pipeline.train_context_refiner = False
+    pipeline.save_adapter(save_dir, state_dict)
+
+    pipeline.lora_model.merge_and_unload()
+    return save_dir, {k: v.detach().clone() for k, v in dit.state_dict().items()}
+
+
+class TestAdapterRoundTrip:
+    """Saving an adapter and merging it back through the sampler must reproduce the run.
+
+    This is the test that fails without the loader fix. It is deliberately not a mock: the
+    LoKr defect lives in how PEFT names its parameters, and a stand-in for PEFT cannot have
+    that property.
+    """
+
+    @pytest.mark.parametrize('adapter_type', ['lora', 'lokr'])
+    def test_merged_weights_match_the_training_run(self, tmp_path, monkeypatch, adapter_type):
+        from tools.sample_anima_refiner import apply_adapters
+        training = pytest.importorskip('test.test_anima_refiner_training')
+
+        save_dir, expected = _train_and_save(tmp_path, adapter_type, monkeypatch)
+
+        # Same seed, so the base weights are identical to the ones the adapter was trained on.
+        fresh = training.build_dit(seed=0)
+        apply_adapters(_refiner_pipeline(fresh, monkeypatch), [(save_dir, 1.0)])
+
+        merged = fresh.state_dict()
+        assert set(merged) == set(expected), 'merge_and_unload must leave the base model shape'
+        for name, value in expected.items():
+            torch.testing.assert_close(merged[name], value, atol=1e-5, rtol=1e-5)
+
+    @pytest.mark.parametrize('adapter_type', ['lora', 'lokr'])
+    def test_the_adapter_actually_moved_the_weights(self, tmp_path, monkeypatch, adapter_type):
+        """Guards the test above: a no-op adapter would satisfy it trivially."""
+        training = pytest.importorskip('test.test_anima_refiner_training')
+        _, merged = _train_and_save(tmp_path, adapter_type, monkeypatch)
+        base = training.build_dit(seed=0).state_dict()
+        moved = [n for n in base if not torch.equal(base[n], merged[n])]
+        assert moved, 'the adapter delta is zero, so this fixture proves nothing'
+
+    @pytest.mark.parametrize('adapter_type', ['lora', 'lokr'])
+    def test_strength_scales_the_delta_linearly(self, tmp_path, monkeypatch, adapter_type):
+        from tools.sample_anima_refiner import apply_adapters
+        training = pytest.importorskip('test.test_anima_refiner_training')
+
+        save_dir, full = _train_and_save(tmp_path, adapter_type, monkeypatch)
+        base = training.build_dit(seed=0).state_dict()
+
+        half_model = training.build_dit(seed=0)
+        apply_adapters(_refiner_pipeline(half_model, monkeypatch), [(save_dir, 0.5)])
+        half = half_model.state_dict()
+
+        checked = 0
+        for name, base_value in base.items():
+            delta = full[name] - base_value
+            if delta.abs().max() < 1e-6:
+                continue
+            torch.testing.assert_close(half[name] - base_value, delta * 0.5,
+                                       atol=1e-5, rtol=1e-4)
+            checked += 1
+        assert checked, 'no parameter moved, so the scaling was never exercised'
+
+    def test_stacking_two_adapters_applies_both(self, tmp_path, monkeypatch):
+        from tools.sample_anima_refiner import apply_adapters
+        training = pytest.importorskip('test.test_anima_refiner_training')
+
+        first, _ = _train_and_save(tmp_path, 'lora', monkeypatch)
+        second, _ = _train_and_save(tmp_path, 'lokr', monkeypatch)
+        base = training.build_dit(seed=0).state_dict()
+
+        both = training.build_dit(seed=0)
+        apply_adapters(_refiner_pipeline(both, monkeypatch), [(first, 1.0), (second, 1.0)])
+        stacked = both.state_dict()
+
+        only_first = training.build_dit(seed=0)
+        apply_adapters(_refiner_pipeline(only_first, monkeypatch), [(first, 1.0)])
+        one = only_first.state_dict()
+
+        moved_by_second = [n for n in base if not torch.equal(stacked[n], one[n])]
+        assert moved_by_second, 'the second adapter was merged into nothing'
+        assert all(torch.isfinite(v).all() for v in stacked.values())
+
+
+class TestAdapterArgumentPairing:
+    """--lora and --lora-strength must never be paired by guesswork."""
+
+    @staticmethod
+    def _dirs(tmp_path, n):
+        made = []
+        for i in range(n):
+            path = tmp_path / f'adapter{i}'
+            path.mkdir()
+            made.append(str(path))
+        return made
+
+    def test_no_adapters_is_the_normal_case(self):
+        from tools.sample_anima_refiner import resolve_adapters
+        assert resolve_adapters(None, None) == []
+
+    def test_strengths_default_to_one(self, tmp_path):
+        from tools.sample_anima_refiner import resolve_adapters
+        adapters = resolve_adapters(self._dirs(tmp_path, 2), None)
+        assert [s for _, s in adapters] == [1.0, 1.0]
+
+    def test_one_strength_per_adapter_is_kept_in_order(self, tmp_path):
+        from tools.sample_anima_refiner import resolve_adapters
+        dirs = self._dirs(tmp_path, 3)
+        adapters = resolve_adapters(dirs, [0.5, 1.0, -0.25])
+        assert [str(p) for p, _ in adapters] == dirs
+        assert [s for _, s in adapters] == [0.5, 1.0, -0.25]
+
+    def test_a_short_strength_list_is_refused(self, tmp_path):
+        from tools.sample_anima_refiner import resolve_adapters
+        with pytest.raises(SystemExit, match='2 --lora but 1 --lora-strength'):
+            resolve_adapters(self._dirs(tmp_path, 2), [0.5])
+
+    def test_strength_without_an_adapter_is_refused(self):
+        from tools.sample_anima_refiner import resolve_adapters
+        with pytest.raises(SystemExit, match='no --lora'):
+            resolve_adapters(None, [0.5])
+
+    def test_a_missing_directory_is_named(self, tmp_path):
+        from tools.sample_anima_refiner import resolve_adapters
+        with pytest.raises(SystemExit, match='is not a directory'):
+            resolve_adapters([str(tmp_path / 'nope')], None)
+
+    def test_two_dense_refiners_are_refused(self, tmp_path):
+        """A densely trained refiner replaces the frontend outright; two cannot both apply."""
+        import safetensors.torch
+        from tools.sample_anima_refiner import resolve_adapters
+        dirs = self._dirs(tmp_path, 2)
+        for d in dirs:
+            refiner_dir = Path(d) / 'context_refiner'
+            refiner_dir.mkdir()
+            safetensors.torch.save_file(
+                {'cap_embedder.1.weight': torch.zeros(4, 4)},
+                str(refiner_dir / 'context_refiner.safetensors'))
+        with pytest.raises(SystemExit, match='densely trained context_refiner'):
+            resolve_adapters(dirs, None)
+
+    def test_one_dense_refiner_is_fine(self, tmp_path):
+        import safetensors.torch
+        from tools.sample_anima_refiner import resolve_adapters
+        dirs = self._dirs(tmp_path, 2)
+        refiner_dir = Path(dirs[0]) / 'context_refiner'
+        refiner_dir.mkdir()
+        safetensors.torch.save_file(
+            {'cap_embedder.1.weight': torch.zeros(4, 4)},
+            str(refiner_dir / 'context_refiner.safetensors'))
+        assert len(resolve_adapters(dirs, None)) == 2
+
+
+class TestOPLoRANeedsNoSamplingFlag:
+    """OPLoRA is a constraint on a LoRA, never a different adapter format.
+
+    It projects the low-rank update away from the base weight's dominant singular directions
+    after each optimizer step. Nothing it configures reaches peft, so what lands on disk is an
+    ordinary LoRA and the sampler reads it as one.
+    """
+
+    def test_oplora_keys_never_reach_the_peft_config(self):
+        import inspect
+        from models.base import CommonPipeline
+        source = inspect.getsource(CommonPipeline.configure_adapter)
+        assert 'oplora' not in source
+
+    def test_peft_has_no_oplora_field_to_carry_it(self):
+        import peft
+        assert not any(k.startswith('oplora') for k in peft.LoraConfig.__dataclass_fields__)
+
+    def test_defaults_land_in_the_toml_table_only(self):
+        from utils.oplora import apply_oplora_config_defaults
+        adapter_config = {'type': 'lora', 'rank': 4, 'alpha': 4, 'dropout': 0.0,
+                          'oplora': True, 'oplora_rank': 2}
+        apply_oplora_config_defaults(adapter_config)
+        assert adapter_config['oplora'] is True
+        assert adapter_config['oplora_rank'] == 2
+
+    def test_a_saved_run_records_peft_type_lora(self, tmp_path, monkeypatch):
+        import json
+        save_dir, _ = _train_and_save(tmp_path, 'lora', monkeypatch)
+        written = json.load(open(save_dir / 'adapter_config.json', encoding='utf-8'))
+        assert written['peft_type'] == 'LORA'
+        assert not any('oplora' in k for k in written)

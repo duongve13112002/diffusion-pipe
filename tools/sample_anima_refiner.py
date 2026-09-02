@@ -16,13 +16,28 @@ Usage:
         --prompt '1girl, solo, blue eyes, looking at viewer' \\
         --steps 30 --cfg 5 --output out.png
 
+Adapters are merged in before sampling, one --lora per save directory and an optional
+--lora-strength each:
+
+    python -m tools.sample_anima_refiner \\
+        --config examples/anima_refiner/lora.toml \\
+        --lora /data/output/anima_refiner_lora/20250101_12-00-00/epoch10 \\
+        --lora-strength 0.8 \\
+        --prompt '1girl, solo, blue eyes' --output out.png
+
+LoRA, LoKr and OPLoRA all land here: OPLoRA constrains a LoRA while it trains and writes an
+ordinary LoRA file, so it needs no separate flag.
+
 The [model] table is read from the config; everything else in it (dataset, optimizer, learning
-rates) is ignored.
+rates) is ignored. The [adapter] table is ignored too -- the adapter's own shape comes from the
+adapter_config.json in its save directory, so a sample never depends on the config still
+matching the run that produced it.
 """
 
 import argparse
 import os
 import sys
+from pathlib import Path
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
@@ -58,10 +73,104 @@ def parse_args():
     parser.add_argument('--batch-size', type=int, default=1)
     parser.add_argument('--device', default='cuda' if torch.cuda.is_available() else 'cpu')
     parser.add_argument('--dtype', default=None, help='Overrides the config dtype.')
+    parser.add_argument('--lora', action='append', metavar='DIR',
+                        help='Save directory of a trained adapter, holding adapter_config.json '
+                             'and adapter_model.safetensors. Repeat to stack several, merged in '
+                             'the order given. LoRA, LoKr and OPLoRA runs are all read from '
+                             'here: OPLoRA constrains a LoRA while it trains and writes an '
+                             'ordinary LoRA, so it needs no flag of its own.')
+    parser.add_argument('--lora-strength', action='append', type=float, metavar='S',
+                        help='Multiplier for the --lora in the same position. Pass one per '
+                             '--lora, or none at all for 1.0 each. 0 disables an adapter, above '
+                             '1 overdrives it.')
     return parser.parse_args()
 
 
-def build_pipeline(config_path, device, dtype_override):
+def resolve_adapters(lora_dirs, strengths):
+    """Pair each --lora with its --lora-strength, or refuse to guess.
+
+    Silently recycling one strength across several adapters, or padding a short list with 1.0,
+    would apply a weight the user did not write. Both spellings a caller is likely to mean are
+    accepted -- no strengths at all, or exactly one per adapter -- and everything else says so.
+    """
+    lora_dirs = lora_dirs or []
+    strengths = strengths or []
+    if not lora_dirs:
+        if strengths:
+            raise SystemExit('--lora-strength was given with no --lora for it to apply to.')
+        return []
+    if not strengths:
+        strengths = [1.0] * len(lora_dirs)
+    elif len(strengths) != len(lora_dirs):
+        raise SystemExit(
+            f'{len(lora_dirs)} --lora but {len(strengths)} --lora-strength. Pass one strength '
+            'per adapter, in the same order, or none at all to use 1.0 for every one.'
+        )
+
+    adapters = []
+    refiner_dirs = []
+    for path, strength in zip(lora_dirs, strengths):
+        path = Path(path)
+        if not path.is_dir():
+            raise SystemExit(
+                f'--lora {path} is not a directory. Point it at a run\'s save directory, the '
+                'one holding adapter_config.json and adapter_model.safetensors.'
+            )
+        if (path / 'context_refiner' / 'context_refiner.safetensors').exists():
+            refiner_dirs.append(path)
+        adapters.append((path, strength))
+
+    if len(refiner_dirs) > 1:
+        # A densely trained refiner is a whole replacement, not an increment, so stacking two
+        # means the last one silently wins and the earlier adapter is left reading a frontend
+        # it was never trained against.
+        raise SystemExit(
+            'More than one --lora carries a densely trained context_refiner:\n'
+            + '\n'.join(f'    {p}' for p in refiner_dirs)
+            + '\n  These replace the refiner outright rather than adding to it, so only one can '
+              'apply. Pass just that one, or point context_refiner_path in the config at the '
+              'refiner you want and use adapters that do not carry their own.'
+        )
+    return adapters
+
+
+def apply_adapters(pipeline, adapters):
+    """Inject, load, scale and merge each adapter into the base weights.
+
+    Everything goes through the pipeline's own loaders rather than a sampling-only copy: peft
+    rebuilds the exact target module list from the adapter_config.json the run wrote, and
+    load_adapter_weights is the same method init_from_existing uses during training, including
+    the part that restores a densely trained context_refiner from the run's context_refiner/
+    subdirectory.
+
+    Merging afterwards leaves plain nn.Linear behind, so to_layers() sees the model it would
+    have seen with no adapter at all, and a second adapter can be injected on top of the first.
+    """
+    # peft reaches this process through models.base either way; importing here keeps the
+    # careful import ordering at the top of this file untouched.
+    import peft
+    from peft.tuners.lora import LoraLayer
+    from peft.tuners.lycoris_utils import LycorisLayer
+
+    for path, strength in adapters:
+        # PeftConfig dispatches on the peft_type in adapter_config.json, so one call covers
+        # LoRA and LoKr, and the target modules are the run's own rather than re-derived here.
+        peft_config = peft.PeftConfig.from_pretrained(str(path))
+        peft_model = peft.get_peft_model(pipeline.transformer, peft_config)
+        pipeline.load_adapter_weights(path)
+        if strength != 1.0:
+            # set_scale multiplies the delta the merge applies. Measured on peft 0.19.1: a
+            # scale of 0.5 halves the merged delta for LoRA and for LoKr alike, so one code
+            # path covers both instead of reaching into the factors by name.
+            for module in pipeline.transformer.modules():
+                if isinstance(module, (LoraLayer, LycorisLayer)):
+                    module.set_scale('default', strength)
+        peft_model.merge_and_unload()
+        # .value, because PeftType is an enum and str() on it prints 'PeftType.LOKR'.
+        print(f'Merged {peft_config.peft_type.value} adapter {path} at strength {strength}')
+
+
+def build_pipeline(config_path, device, dtype_override, adapters=()):
     """Load through the training pipeline so the loading rules are shared, not duplicated."""
     global cosmos_predict2
     config = toml.load(config_path)
@@ -85,6 +194,24 @@ def build_pipeline(config_path, device, dtype_override):
 
     pipeline = cosmos_predict2.CosmosPredict2Pipeline({'model': model_config})
     pipeline.load_diffusion_model()
+
+    if adapters:
+        if getattr(pipeline, '_refiner_is_fresh', False) and not any(
+                (path / 'context_refiner' / 'context_refiner.safetensors').exists()
+                for path, _ in adapters):
+            # The same combination configure_adapter refuses during training, for the same
+            # reason: the base refiner is random, was never saved, and came from the ambient
+            # RNG stream, so it is not the one the adapter was trained against and cannot be.
+            raise SystemExit(
+                'The refiner in this config is freshly initialised and random, so an adapter '
+                'trained on a real refiner has nothing to attach to and the samples would be '
+                'noise.\n'
+                '  Point transformer_path or context_refiner_path at a trained refiner, or '
+                'pass a --lora from a run that set train_context_refiner, which carries its '
+                'refiner in a context_refiner/ subdirectory.'
+            )
+        apply_adapters(pipeline, adapters)
+
     pipeline.transformer.eval().requires_grad_(False).to(device)
     pipeline.text_encoder.eval().requires_grad_(False).to(device)
     pipeline.vae.model.to(device)
@@ -168,7 +295,8 @@ def decode(pipeline, latents, device):
 def main():
     args = parse_args()
     device = torch.device(args.device)
-    pipeline, model_config = build_pipeline(args.config, device, args.dtype)
+    adapters = resolve_adapters(args.lora, args.lora_strength)
+    pipeline, model_config = build_pipeline(args.config, device, args.dtype, adapters)
     dtype = model_config['dtype']
     if args.shift is None:
         # flux_shift is the other schedule prepare_inputs supports. Reading only `shift` meant a

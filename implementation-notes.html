@@ -33,6 +33,116 @@
 <p class="meta">A running log of decisions taken outside the spec, forced changes, tradeoffs, and
 anything else the maintainer needs to know. Newest entry first.</p>
 
+<h2>2026-09-02 &mdash; Adapters in the sampler, and the LoKr loader that never worked</h2>
+
+<p><strong>Request.</strong> <code>tools/sample_anima_refiner.py</code> loaded no adapter at all,
+while the training side has supported LoRA, LoKr and OPLoRA for some time. Add that, with
+everything adjustable exposed as a command-line argument.</p>
+
+<p><strong>What the request uncovered.</strong> LoKr adapters could never be loaded back, by any
+path, for any model in the repo. <code>load_adapter_weights</code> reconstructed PEFT's adapter-name
+segment with <code>re.sub(r'\.weight$', '.default.weight', k)</code>. Measured against the installed
+peft 0.19.1: a LoRA parameter is
+<code>blocks.0.q_proj.lora_A.default.weight</code> and the rule fits, but a LoKr parameter is
+<code>blocks.0.q_proj.lokr_w1.default</code> &mdash; the factors live in a
+<code>ParameterDict</code>, so there is no <code>.weight</code> for the rule to find. Every LoKr key
+missed and the loader raised
+<code>modified_state_dict key blocks.0.adaln_modulation_cross_attn.1.lokr_w1 is not in the model
+parameters</code>. That is <code>init_from_existing</code> for a LoKr run, not only the new sampler
+path.</p>
+
+<p>The rule appeared twice, once in <code>BasePipeline</code> and once in
+<code>ComfyPipeline</code>, differing only in which attribute holds the model &mdash; one defect
+kept in two places. Both now call a single <code>CommonPipeline.load_adapter_weights_into</code>,
+which inverts what the saver actually wrote rather than guessing where the segment sat:
+<code>utils/saver.py</code> strips <code>.default</code> and <code>.modules_to_save</code> from each
+name, so the way back is a lookup built by applying the same two strips to the model's own
+parameter names. That is the pattern <code>CosmosPredict2Pipeline.load_adapter_weights</code>
+already used for the dense refiner. LoRA behaviour is unchanged: the LoRA half of the round-trip
+test passes both before and after.</p>
+
+<h3>Decisions taken outside the spec</h3>
+
+<ul>
+  <li><strong>Merge rather than keep the adapter live.</strong> Each adapter is injected, loaded,
+    scaled and then <code>merge_and_unload()</code>-ed before <code>to_layers()</code> runs, so what
+    samples is plain <code>nn.Linear</code> throughout &mdash; identical to a full fine tune of the
+    same weights &mdash; and a second adapter can be injected on top of the first. Strength
+    <code>1.0</code> therefore reproduces the training run exactly.</li>
+  <li><strong>Strength goes through <code>set_scale</code>, not through the factors.</strong>
+    Scaling one LoRA factor, or one LoKr Kronecker factor, would scale the delta correctly in
+    principle, but it means naming parameters per adapter type and getting the decomposed LoKr case
+    (<code>lokr_w1_a</code>/<code>lokr_w1_b</code>) right as well. Measured on peft 0.19.1 that
+    <code>LoraLayer.set_scale</code> and <code>LycorisLayer.set_scale</code> both scale the merged
+    delta linearly &mdash; 0.5 gives exactly half for each &mdash; so one code path covers both and
+    peft owns the arithmetic.</li>
+  <li><strong>Positional <code>--lora-strength</code>, refused when the counts disagree.</strong>
+    Recycling one strength across several adapters, or padding a short list with 1.0, applies a
+    weight nobody wrote. Only the two unambiguous spellings are accepted: no strengths at all, or
+    exactly one per <code>--lora</code>.</li>
+  <li><strong>Two adapters carrying a dense <code>context_refiner/</code> is refused.</strong> That
+    file replaces the text frontend outright rather than adding to it, so stacking two means the
+    last silently wins and the earlier adapter is left reading a frontend it never saw. Checked
+    before anything is merged, so the refusal costs no work.</li>
+  <li><strong>A fresh refiner plus an adapter is refused.</strong> The same combination
+    <code>configure_adapter</code> already refuses to <em>train</em>, for the same reason: the random
+    base is never written to any file and came from the ambient RNG stream, so it cannot be the one
+    the adapter was trained against. An adapter from a <code>train_context_refiner</code> run is
+    exempt, because it brings its own refiner.</li>
+  <li><strong>OPLoRA gets no flag.</strong> It constrains a LoRA after each optimizer step and never
+    changes the file format: <code>configure_adapter</code> builds <code>peft.LoraConfig</code> from
+    an explicit key list that no <code>oplora_*</code> key is in, and <code>peft.LoraConfig</code>
+    has no field that could carry one. The artefact is an ordinary LoRA, asserted by three tests so
+    that a future change to either side breaks loudly instead of leaving a phantom flag.</li>
+  <li><strong><code>load_and_fuse_adapter</code> now reads <code>peft.PeftConfig</code></strong>
+    rather than <code>peft.LoraConfig</code>. Both dispatch on the <code>peft_type</code> in
+    <code>adapter_config.json</code> and return the same class, so this is not a behaviour change;
+    naming LoRA there read as though LoKr were unsupported, which is exactly the belief that let the
+    loader bug survive.</li>
+</ul>
+
+<h3>Tests</h3>
+
+<p><code>test/test_anima_refiner_sampling.py</code> gains 22 cases. The load-bearing one is a real
+round trip, parametrised over <code>lora</code> and <code>lokr</code>: build a small
+<code>MiniTrainDIT</code> with a <code>ContextRefiner</code>, configure the adapter through the real
+<code>configure_adapter</code>, give it non-zero weights, serialise it exactly as
+<code>utils/saver.py</code> does, save through the real <code>save_adapter</code>, merge &mdash;
+then rebuild the same DiT from the same seed, load through <code>apply_adapters</code>, and require
+every parameter to match. A companion test asserts the delta is non-zero, because both adapter types
+initialise one factor to zero and a fixture whose delta is zero would prove nothing either way.</p>
+
+<p>Verified to fail without the fix: reverting <code>load_adapter_weights_into</code> to the old
+regex turns the three LoKr-touching cases red with the exact <code>RuntimeError</code> above, while
+the LoRA cases stay green.</p>
+
+<p>No mock stands in for peft anywhere in this work. The defect lives in how peft names its
+parameters, and a stand-in for peft cannot have that property &mdash; the lesson
+<code>test/test_distill_refiner.py</code>'s <code>FakeEngine</code> already taught this branch.</p>
+
+<h3>Things the maintainer needs to know</h3>
+
+<div class="flag">
+  <p><strong>A third copy of the same defect is still there, deliberately.</strong>
+  <code>models/hunyuan_image.py:140</code> carries its own <code>load_adapter_weights</code> with the
+  same <code>'\.weight$'</code> rule, so LoKr <code>init_from_existing</code> is still broken for
+  <code>hunyuan_image</code>. It is an unrelated model that this change has no way to test, so it was
+  left out rather than fixed blind. The fix is the same one line of delegation if you want it.</p>
+</div>
+
+<ul>
+  <li><strong>Never run on a GPU, and no image produced.</strong> Everything here is CPU, on a small
+    real DiT. What is verified is that the merged weights equal the training run's weights; whether
+    the resulting image looks right is not something this suite can say.</li>
+  <li><strong>Adapters merge on CPU, before the model moves to the device.</strong> That keeps peak
+    VRAM at what the merged model needs rather than model plus adapter, at the cost of a slower
+    merge. Worth revisiting if merging a large stack becomes noticeable.</li>
+  <li><strong><code>--lora-strength</code> is not clamped.</strong> Negative and above-1 values are
+    passed through on purpose, since both are ordinary things to want; neither is validated for
+    producing a sensible image.</li>
+</ul>
+
+
 <h2>2026-09-02 &mdash; Full forensic audit: a crash in eight unrelated models, and a ZeRO scaling hole</h2>
 
 <p><strong>Request.</strong> A one-shot forensic audit of the branch against <code>fd00a5e</code>,
