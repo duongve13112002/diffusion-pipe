@@ -175,11 +175,26 @@ higher, or its grad norm is systematically larger. **Run this before committing 
 `deepspeed --num_gpus=2 tools/test_zero_resume_gpu.py`, then a 200-step run with a mid-run restart.
 *Expect:* loss continues smoothly across the restart.
 
-**P3 — fp16-mixed on real kernels.** 30 steps at `precision = 'fp16-mixed'`.
-*Failure:* loss scale collapsing toward 1, or every step skipped.
+**P3 and P4 — both settled by one script, no checkpoints or dataset needed:**
 
-**P4 — Is `allow_fully_masked_rows` load-bearing?** One CUDA `scaled_dot_product_attention` in
-bf16 with an all-False mask row. Settles the rationale; the guard is correct either way.
+```
+python tools/test_precision_gpu.py
+```
+
+Runs in seconds on any single CUDA device. It answers:
+
+- **P4 — is `allow_fully_masked_rows` load-bearing?** Calls `scaled_dot_product_attention`
+  directly with an all-False query row on each backend CUDA offers (flash, mem-efficient, cudnn,
+  math) in both bf16 and fp16, guarded and unguarded. A backend that returns NaN unguarded proves
+  the guard load-bearing; one that returns finite values proves it merely unnecessary. The guard
+  is correct either way — this settles *which*, which is currently an unconfirmed rationale.
+- **P3 — does fp16-mixed behave on real kernels?** 20 real steps through a small `ContextRefiner`
+  under `autocast('cuda', float16)` with a live `GradScaler`, reporting the loss-scale trajectory
+  and how many steps were skipped. *Failure:* the scale collapsing toward 1, or most steps skipped.
+
+Verified on CPU as far as CPU allows: it imports, exits cleanly with a clear message when there is
+no device, the tensor shapes are right, and the guard is confirmed a no-op for rows that have keys.
+What it cannot do here is exercise a fused CUDA backend — which is the question it exists to ask.
 
 **P5 — Rollout memory at the shipped settings.** `loss_points` 2 then 4 at `batch_size = 48`,
 watching peak VRAM. The doc's figures are derived from the DiT's shape, never measured.
