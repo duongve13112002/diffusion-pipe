@@ -238,6 +238,23 @@ gradient inflated by the loss scale; a non-finite gradient skips the optimizer s
 holds the schedule; a finite one does both. The same shape of lesson as the deepspeed one above:
 the capability was there, and the habit of assuming otherwise is what kept it unused.</p>
 
+<p><strong>fp16 arithmetic turned out to be exercisable too.</strong>
+<code>torch.autocast('cpu', dtype=torch.float16)</code> is real in this torch, even though
+<code>Precision.autocast</code> returns a null context off-CUDA and so never engages it. fp16
+numbers now go through the actual ContextRefiner at ordinary scale, at 50x scale, and on the
+degenerate all-padding row, and all stay finite -- the padded row producing exactly zero rather
+than NaN, which is the fp16 half of the fused-attention question. What a CUDA kernel could still
+differ on is the fused path; the operations themselves do not overflow fp16 at these scales. That
+is the third assumption about this machine's limits to fall in one session, which is itself the
+finding: two of the three were written down as facts in the docs.</p>
+
+<p><strong>Hardware, definitively.</strong> Checked rather than assumed:
+<code>torch.cuda.is_available()</code> is False, <code>device_count()</code> is 0,
+<code>torch.version.cuda</code> is None -- this is a <code>+cpu</code> build, so it could not
+drive a GPU even if one were attached -- and <code>nvidia-smi</code> is absent. Validation on real
+CUDA hardware, and a real training run, cannot be performed in this environment by any means. That
+is a property of the machine rather than work left undone.</p>
+
 <p><strong>Not verified, and worth being exact about what that leaves.</strong> Still no training
 run and no image. Of what remains, none is an unverified branch of this code. The fp16
 <em>kernel numerics</em> are a property of CUDA rather than of this control flow. Whether fused

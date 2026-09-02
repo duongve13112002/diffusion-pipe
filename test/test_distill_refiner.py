@@ -2217,6 +2217,65 @@ class TestCorpusCaptionSettingsWarning:
         assert 'WARNING' not in out
 
 
+class TestFp16NumericsThroughTheRefiner:
+    """Run the refiner's own arithmetic in fp16, which CPU autocast does support.
+
+    Precision.autocast returns a null context off-CUDA, so nothing here has ever pushed fp16
+    numbers through these modules -- the concern with fp16 being that its 65504 ceiling turns an
+    overflow into inf, and inf into NaN through the softmax.
+
+    torch.autocast('cpu', dtype=torch.float16) is real in this torch, so the arithmetic can be
+    exercised even though the kernels differ from CUDA's. This does not prove a fused CUDA
+    attention kernel behaves the same way; it does prove these modules do not overflow fp16 on
+    their own at ordinary input scales, including on the degenerate all-padding row that the
+    unconditional embedding produces.
+    """
+
+    @staticmethod
+    def _refiner():
+        from models.text_refiner import ContextRefiner
+        torch.manual_seed(0)
+        refiner = ContextRefiner(cap_feat_dim=32, model_dim=64, num_layers=2, num_heads=4)
+        refiner.init_weights()
+        return refiner.eval()
+
+    def test_a_normal_row_stays_finite_in_fp16(self):
+        refiner = self._refiner()
+        hidden = torch.randn(2, 8, 32)
+        mask = torch.ones(2, 8, dtype=torch.long)
+        with torch.autocast('cpu', dtype=torch.float16):
+            out = refiner(hidden, mask)
+        assert torch.isfinite(out).all(), 'fp16 overflowed on ordinary inputs'
+
+    def test_a_fully_masked_row_stays_finite_in_fp16(self):
+        """The unconditional embedding's row, in the precision most likely to turn it into NaN.
+
+        An all-padding row makes the attention softmax degenerate, and fp16 is where a masked
+        logit is most likely to saturate. allow_fully_masked_rows lets the row attend instead of
+        masking everything, and the output is zeroed afterwards -- so the result must be exactly
+        zero, not NaN.
+        """
+        refiner = self._refiner()
+        hidden = torch.randn(2, 8, 32)
+        mask = torch.ones(2, 8, dtype=torch.long)
+        mask[1] = 0                       # row 1 is entirely padding
+        with torch.autocast('cpu', dtype=torch.float16):
+            out = refiner(hidden, mask)
+        assert torch.isfinite(out).all(), 'the all-padding row produced inf/NaN in fp16'
+        assert out[1].abs().max() == 0, 'a fully padded row must be zeroed on the way out'
+
+    def test_large_inputs_do_not_silently_overflow_to_inf(self):
+        """fp16 tops out at 65504. Worth knowing these modules do not reach it unaided."""
+        refiner = self._refiner()
+        hidden = torch.randn(1, 8, 32) * 50
+        mask = torch.ones(1, 8, dtype=torch.long)
+        with torch.autocast('cpu', dtype=torch.float16):
+            out = refiner(hidden, mask)
+        assert torch.isfinite(out).all(), (
+            'fp16 overflowed at 50x normal input scale; a loss scaler would be masking this'
+        )
+
+
 class TestGradScalerPathAgainstARealScaler:
     """Drive DDPStrategy.step()'s fp16 branch with a real GradScaler, not a fake one.
 
