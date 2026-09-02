@@ -2217,6 +2217,90 @@ class TestCorpusCaptionSettingsWarning:
         assert 'WARNING' not in out
 
 
+class TestGradScalerPathAgainstARealScaler:
+    """Drive DDPStrategy.step()'s fp16 branch with a real GradScaler, not a fake one.
+
+    Every fp16-mixed case elsewhere in this file runs the fp32 path on a CPU box, because
+    `torch.amp.GradScaler('cuda')` disables itself when CUDA is absent and Precision.autocast
+    returns a null context off-CUDA. The branch that unscales before clipping and gates the
+    scheduler on the scale not dropping was therefore never executed here, and the tests that
+    look like they cover it assert against a hand-written stand-in.
+
+    A CPU GradScaler is fully functional in this torch, so the branch can be exercised for real.
+    What remains CUDA-only is the numerics -- whether fp16 actually overflows on a given kernel --
+    not this control flow.
+    """
+
+    @staticmethod
+    def _strategy(max_grad_norm=1e9):
+        from tools.distill_refiner import DDPStrategy
+        torch.manual_seed(0)
+        model = torch.nn.Linear(4, 4, bias=False)
+        optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+        scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=1, gamma=0.5)
+        strategy = object.__new__(DDPStrategy)
+        strategy.refiner = model
+        strategy.optimizer = optimizer
+        strategy.scheduler = scheduler
+        strategy.max_grad_norm = max_grad_norm
+        strategy.scaler = torch.amp.GradScaler('cpu', enabled=True)
+        assert strategy.scaler.is_enabled(), 'this test is pointless with an inert scaler'
+        return strategy, model, scheduler
+
+    def test_the_reported_norm_is_unscaled(self):
+        """unscale_ must precede clipping, or max_grad_norm is compared against a norm inflated
+        by the loss scale and effectively never fires."""
+        strategy, model, _ = self._strategy()
+        x = torch.randn(2, 4)
+        strategy.scaler.scale(model(x).sum()).backward()
+        scale = strategy.scaler.get_scale()
+        assert scale > 1.0
+
+        # What is sitting in .grad right now is `scale` times the true gradient.
+        scaled_norm = torch.linalg.vector_norm(
+            torch.cat([p.grad.flatten() for p in model.parameters()])).item()
+        reported = strategy.step()
+
+        # step() unscales before clipping, so the norm it reports is the true one. Without the
+        # unscale it would report `scaled_norm`, which is `scale` times larger.
+        assert reported == pytest.approx(scaled_norm / scale, rel=1e-3), (
+            f'reported {reported}, expected the unscaled {scaled_norm / scale} '
+            f'(scaled norm {scaled_norm}, loss scale {scale})'
+        )
+
+    def test_an_overflowing_step_is_skipped_and_the_schedule_holds(self):
+        """The real scaler's own skip behaviour, not a stand-in's."""
+        strategy, model, scheduler = self._strategy()
+        before = [p.detach().clone() for p in model.parameters()]
+        strategy.scaler.scale(model(torch.randn(2, 4)).sum()).backward()
+        # What an fp16 overflow produces.
+        for p in model.parameters():
+            p.grad[0, 0] = float('inf')
+
+        scale_before = strategy.scaler.get_scale()
+        strategy.step()
+
+        assert strategy.scaler.get_scale() < scale_before, (
+            'the real scaler should back the scale off after a non-finite gradient'
+        )
+        assert scheduler.last_epoch == 0, (
+            'the LR schedule advanced past an optimizer step that never happened'
+        )
+        for p, was in zip(model.parameters(), before):
+            assert torch.equal(p.detach(), was), 'weights moved on a skipped step'
+
+    def test_a_finite_step_updates_and_advances(self):
+        strategy, model, scheduler = self._strategy()
+        before = [p.detach().clone() for p in model.parameters()]
+        strategy.scaler.scale(model(torch.randn(2, 4)).sum()).backward()
+
+        strategy.step()
+
+        assert scheduler.last_epoch == 1, 'a real step must advance the schedule'
+        assert any(not torch.equal(p.detach(), was)
+                   for p, was in zip(model.parameters(), before)), 'weights did not move'
+
+
 class TestZeROMasterWeightsSurviveAResume:
     """Under ZeRO the module is bit16 and the only full-precision weights are the optimizer's.
 

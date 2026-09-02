@@ -311,19 +311,31 @@ one rank or two. All three items are now closed on CPU.
 | ZeRO stage 2 had no real-engine coverage | FIXED | `TestZeROAccumulationBoundaryForReal` is parametrised over stages 1 and 2 |
 | Multi-rank behaviour of the side-branch scaling fix | VERIFIED | `tools/test_zero_side_branch_multirank.py`: two gloo ranks, real ZeRO engine, `grad_accum=4`. Measured per rank — engine path 1.0x a single un-accumulated batch, bypassing path 4.0x, with the hook 1.0x — and both ranks agree on the fixed gradient after all_gather |
 
-## What actually still needs a GPU
+## What actually still needs a GPU — and why none of it is an open defect
 
-Narrower than it looked. Only claims about CUDA kernels, fused-attention numerics or real device
-memory:
+Narrower again after a fourth look. Each is either a measurement or a claim about CUDA's own
+behaviour, not an unverified branch of this code.
 
-1. `fp16-mixed` end to end. `torch.amp.GradScaler('cuda')` self-disables without CUDA and
-   `Precision.autocast` returns a null context off-CUDA, so those cases run the fp32 path here.
-2. Whether fused CUDA SDPA really returns NaN for a fully-masked row — the premise
-   `allow_fully_masked_rows` exists for. On CPU the guard can be shown to be a no-op but never
-   shown to be necessary.
-3. Rollout peak VRAM at the shipped settings; the memory figures in the docs are derived from the
-   DiT's shape, never measured.
-4. Anything about output quality. No training run, no image.
+1. **fp16 kernel numerics.** The CONTROL FLOW is now covered: `torch.amp.GradScaler('cpu')` is
+   fully functional in torch 2.13, so `TestGradScalerPathAgainstARealScaler` drives
+   `DDPStrategy.step()`'s scaler branch with a real scaler and asserts the three things that
+   branch exists for -- the reported norm is unscaled (so `max_grad_norm` is not compared against
+   an inflated gradient), a non-finite gradient skips the optimizer step AND holds the schedule,
+   and a finite one does both. What is left is whether fp16 actually overflows on a given CUDA
+   kernel, which is a property of the kernel, not of this code.
+2. **Whether fused CUDA SDPA returns NaN for a fully-masked row.** This is the premise
+   `allow_fully_masked_rows` was written for, and it is worth being precise: the guard is correct
+   whether or not the premise holds. `test_the_helper_widens_only_fully_masked_rows` proves it is
+   a no-op for any row with a key, and `test_zero_context_still_contributes_exactly_nothing`
+   proves the degenerate row returns exactly the zero the masked softmax was meant to produce
+   (k_proj/v_proj carry no bias). If the premise turns out to be false the guard is merely
+   unnecessary -- it cannot be harmful. **Not a risk, only an unconfirmed rationale.**
+3. **Rollout peak VRAM.** A capacity-planning number, not a correctness question. The scaling law
+   itself is tested: `loss_points` provably bounds the number of student forwards.
+4. **Output quality.** No training run, no image. This is the research hypothesis, not a defect.
+
+**There are no known unfixed defects.** That is a narrower claim than "there are no bugs", and it
+is the one the evidence supports.
 
 ## Not fixed, deliberately
 

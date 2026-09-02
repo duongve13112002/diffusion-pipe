@@ -228,11 +228,25 @@ It also fails loudly if a future deepspeed moves the division into <code>backwar
 which point the hook would be double-scaling and must be removed.</li>
 </ul>
 
-<p><strong>Not verified.</strong> Still no training run and no image, and what genuinely needs a
-GPU is narrower than it looked: CUDA kernels, fused-attention numerics, and real device memory.
-Specifically <code>fp16-mixed</code> end to end (<code>GradScaler('cuda')</code> self-disables
-without CUDA), whether fused CUDA SDPA really returns NaN for a fully-masked row -- the premise
-<code>allow_fully_masked_rows</code> exists for -- and rollout peak VRAM.</p>
+<p><strong>The fp16 branch was mock-only too, and no longer is.</strong>
+<code>torch.amp.GradScaler('cpu')</code> is fully functional in this torch, which the fp16 tests
+had not been taking advantage of: they asserted against a hand-written stand-in while the real
+branch went unexecuted, because <code>GradScaler('cuda')</code> disables itself here. It now
+drives <code>DDPStrategy.step()</code> for real and asserts the three things that branch exists
+for -- the reported norm is unscaled, so <code>max_grad_norm</code> is not compared against a
+gradient inflated by the loss scale; a non-finite gradient skips the optimizer step <em>and</em>
+holds the schedule; a finite one does both. The same shape of lesson as the deepspeed one above:
+the capability was there, and the habit of assuming otherwise is what kept it unused.</p>
+
+<p><strong>Not verified, and worth being exact about what that leaves.</strong> Still no training
+run and no image. Of what remains, none is an unverified branch of this code. The fp16
+<em>kernel numerics</em> are a property of CUDA rather than of this control flow. Whether fused
+CUDA SDPA really returns NaN for a fully-masked row is the rationale for
+<code>allow_fully_masked_rows</code>, but the guard is correct either way -- it is provably a
+no-op for any row that has a key, and the degenerate row returns exactly the zero the masked
+softmax was meant to produce, because k_proj and v_proj carry no bias. If the premise is wrong
+the guard is merely unnecessary, never harmful. Rollout peak VRAM is a capacity number, and
+output quality is the research question itself.</p>
 
 <p>Two findings are left unfixed on purpose rather than for want of hardware. The relational
 term's magnitude does scale as <code>(B-1)/B</code>, because the <code>mean</code> reduction spans
