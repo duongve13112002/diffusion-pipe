@@ -34,6 +34,7 @@ build_strategy and docs/anima_refiner/README.md for why DDP is the default here.
 import argparse
 import datetime
 import contextlib
+import math
 import os
 import random
 import shutil
@@ -60,6 +61,11 @@ from models.cosmos_predict2_modeling import MiniTrainDIT
 from models.text_refiner import ContextRefiner, extract_refiner_state_dict
 from utils.common import iterate_safetensors, load_state_dict
 from utils.caption_corpus import read_corpus
+# The batch fill keys mean the same thing here as in a dataset config and are validated by the
+# same function, so the two cannot drift into accepting different spellings. It costs 1.6s of
+# import on a ~20s startup, measured, which is not the 50s case utils/captions.py was split out
+# to avoid.
+from utils.dataset import resolve_batch_fill_config
 from utils.lr_schedule import create_lr_scheduler
 from utils.optimizer_factory import resolve_optimizer_class
 from utils.captions import enumerate_captions, preprocess_caption, tag_markers
@@ -172,20 +178,42 @@ class EpochSampler:
     captions forever. Every caption is seen exactly once per epoch across the job, which is the
     property that makes the word mean anything.
 
-    The tail that does not fill a whole global batch is dropped, the same rounding
-    SizeBucketDataset does, so every rank runs the same number of steps and no collective is
-    left waiting on a rank that finished early.
+    What happens to the tail that does not fill a whole global batch depends on
+    batch_fill_strategy. Under 'drop' it is discarded, the same rounding SizeBucketDataset does.
+    Under 'fill' the batch is completed instead, preferring captions borrowed from the next
+    epoch's permutation and falling back to masked-out repeats. Either way every rank runs the
+    same number of steps, so no collective is left waiting on a rank that finished early.
     """
 
-    def __init__(self, captions, batch_size, grad_accum, rank, world_size, seed):
+    def __init__(self, captions, batch_size, grad_accum, rank, world_size, seed,
+                 fill_strategy='drop', undersized='pad_masked', min_real_fraction=0.25):
         self.captions = captions
         self.batch_size = batch_size
         self.grad_accum = grad_accum
         self.rank = rank
         self.world_size = world_size
         self.seed = seed
+        self.fill_strategy = fill_strategy
+        self.undersized = undersized
+        self.min_real_fraction = min_real_fraction
         self.global_batch = batch_size * grad_accum * world_size
-        self.steps_per_epoch = len(captions) // self.global_batch
+        self.num_masked_per_epoch = 0
+
+        too_small = len(captions) < self.global_batch
+        if fill_strategy == 'fill' and not (too_small and undersized == 'drop'):
+            self.steps_per_epoch = math.ceil(len(captions) / self.global_batch)
+            if too_small:
+                fraction = len(captions) / self.global_batch
+                if fraction < min_real_fraction:
+                    raise RuntimeError(
+                        f'{len(captions)} captions against a global batch of '
+                        f'{self.global_batch} is a real fraction of {fraction:.3f}, below '
+                        f'min_real_fraction {min_real_fraction}: most of every step would be '
+                        'masked-out padding. Lower batch_size or gradient_accumulation_steps, '
+                        'supply more captions, or lower min_real_fraction.'
+                    )
+        else:
+            self.steps_per_epoch = len(captions) // self.global_batch
         if self.steps_per_epoch < 1:
             raise RuntimeError(
                 f'{len(captions)} captions cannot fill one global batch of '
@@ -196,13 +224,88 @@ class EpochSampler:
 
     def epoch_order(self, epoch):
         """This rank's captions for `epoch`, already shuffled and sharded."""
+        return [caption for caption, _ in self.epoch_order_weighted(epoch)]
+
+    def epoch_order_weighted(self, epoch):
+        """This rank's (caption, loss weight) pairs for `epoch`.
+
+        The single source of truth; epoch_order is the caption-only view of it. Two methods
+        computing the order separately would be two things to keep in step, which is the same
+        trap resolve_schedule below exists to avoid.
+
+        The weight is 1.0 for every caption under 'drop', so that path is unchanged. Under
+        'fill' a masked repeat gets 0.0 and the real captions of a batch that contains one get
+        G/G_real, which undoes the dilution `.mean()` introduces by dividing by the padded
+        count. The scale is computed over the WHOLE global batch, never over this rank's shard
+        or one micro batch: the ranks average their gradients and the micro batches average
+        their losses, so one shared constant is what makes the result equal a mean over the
+        real captions no matter how the padding lands.
+        """
         order = list(self.captions)
         random.Random(self.seed + epoch).shuffle(order)
         usable = self.steps_per_epoch * self.global_batch
-        return order[self.rank:usable:self.world_size]
+        weights = [1.0] * len(order)
+
+        if len(order) < usable:
+            order, weights = self._extend(order, weights, usable, epoch)
+        order, weights = order[:usable], weights[:usable]
+
+        for start in range(0, usable, self.global_batch):
+            block = weights[start:start + self.global_batch]
+            num_real = sum(1 for w in block if w > 0)
+            if 0 < num_real < len(block):
+                scale = len(block) / num_real
+                for k in range(start, start + self.global_batch):
+                    if weights[k] > 0:
+                        weights[k] = scale
+
+        pairs = list(zip(order, weights))
+        # Strided sharding, so a contiguous slice of this rank's list corresponds to a
+        # contiguous block of the global order: rank r's local element k is global element
+        # k*world_size + r, and one step's slice across all ranks is exactly the global batch.
+        return pairs[self.rank:usable:self.world_size]
+
+    def _extend(self, order, weights, usable, epoch):
+        """Complete the final global batch of `epoch`.
+
+        Captions come from the NEXT epoch's permutation, which keeps this a pure function of
+        (seed, epoch) -- resume needs the order to be reconstructible from the epoch number and
+        nothing else. Anything already in the part of the final batch that comes from this
+        epoch is skipped, so the batch holds no caption twice.
+
+        Duplicates are detected by caption text, not by index: a corpus that genuinely contains
+        the same string twice would otherwise put two identical captions in one batch, and the
+        relational term reads a pair of identical captions as a distance of zero and pushes the
+        model toward exactly the collapse it exists to prevent.
+        """
+        num_missing = usable - len(order)
+        from_this_epoch = order[len(order) - (self.global_batch - num_missing):] if num_missing < self.global_batch else order
+        taken = set(from_this_epoch)
+
+        borrowed = list(self.captions)
+        random.Random(self.seed + epoch + 1).shuffle(borrowed)
+        added, added_weights = [], []
+        for caption in borrowed:
+            if len(added) == num_missing:
+                break
+            if caption in taken:
+                continue
+            taken.add(caption)
+            added.append(caption)
+            added_weights.append(1.0)
+        # Nothing distinct left. A repeat is the only way to fill the batch, and it is masked
+        # so it teaches nothing -- the constructor already refused the case where that would be
+        # most of the batch.
+        while len(added) < num_missing:
+            added.append(order[len(added) % len(order)])
+            added_weights.append(0.0)
+
+        self.num_masked_per_epoch = added_weights.count(0.0)
+        return order + added, weights + added_weights
 
 
-def resolve_schedule(epochs, steps, captions, batch_size, grad_accum, rank, world_size, seed):
+def resolve_schedule(epochs, steps, captions, batch_size, grad_accum, rank, world_size, seed,
+                     fill_strategy='drop', undersized='pad_masked', min_real_fraction=0.25):
     """Build the sampler and settle the final step count in one place.
 
     They are one decision rather than two: with `epochs` the step count is a property of the
@@ -215,7 +318,9 @@ def resolve_schedule(epochs, steps, captions, batch_size, grad_accum, rank, worl
 
     Returns (sampler, steps, description) -- the description is the line worth printing.
     """
-    sampler = EpochSampler(captions, batch_size, grad_accum, rank, world_size, seed)
+    sampler = EpochSampler(captions, batch_size, grad_accum, rank, world_size, seed,
+                           fill_strategy=fill_strategy, undersized=undersized,
+                           min_real_fraction=min_real_fraction)
     if epochs is not None:
         steps = epochs * sampler.steps_per_epoch
         description = (
@@ -227,6 +332,21 @@ def resolve_schedule(epochs, steps, captions, batch_size, grad_accum, rank, worl
             f'{steps} steps over {len(captions)} captions '
             f'({steps / max(sampler.steps_per_epoch, 1):.2f} epochs at a global batch of '
             f'{sampler.global_batch})'
+        )
+    if fill_strategy == 'fill':
+        # steps_per_epoch rounds up here rather than down, so say why an epoch is one step
+        # longer than the division suggests instead of leaving it to be worked out.
+        #
+        # How many of those slots end up masked is not stated: it depends on how many distinct
+        # captions are left once the batch's own are excluded, which is a property of the
+        # epoch's permutation. Computing it here would mean building an epoch's order before
+        # the run starts, and on a multi-million caption corpus that is a real cost for a log
+        # line.
+        tail = sampler.steps_per_epoch * sampler.global_batch - len(captions)
+        description += (
+            f"\nbatch_fill_strategy = 'fill': the last batch of each epoch is completed with "
+            f"{tail} more caption slot(s), taken from the next epoch's order where distinct "
+            'captions remain and from masked-out repeats otherwise'
         )
     return sampler, steps, description
 
@@ -565,7 +685,7 @@ def teacher_trajectory(dit, teacher_feats, teacher_uncond, shape, steps, guidanc
 
 
 def rollout_loss(dit, visited, teacher_feats, student_feats, teacher_uncond, student_uncond,
-                 guidance_scale, loss_points, rng):
+                 guidance_scale, loss_points, rng, weights=None):
     """Compare what the frozen DiT predicts from the two text frontends, on the trajectory.
 
     This is the objective the probe loss approximates. The probe measures agreement at the
@@ -589,7 +709,7 @@ def rollout_loss(dit, visited, teacher_feats, student_feats, teacher_uncond, stu
     for x, t, target in chosen:
         # target came from teacher_trajectory, which already ran this exact forward.
         prediction = _velocity(dit, x, t, student_feats, student_uncond, guidance_scale)
-        loss = loss + F.mse_loss(prediction.float(), target.float())
+        loss = loss + weighted_mse(prediction.float(), target.float(), weights)
     return loss / len(chosen)
 
 
@@ -639,6 +759,27 @@ def build_unconditional_features(teacher_tok, t5_tokenizer, teacher_llm, llm_ada
     student_ids = s_uncond['input_ids'].to(device)
     student_hidden = encode(student_llm, student_ids, student_mask, llm_hidden_layer)
     return teacher_uncond, student_ids, student_mask, student_hidden
+
+
+def weighted_mse(prediction, target, weights):
+    """Mean squared error that ignores the samples batch fill masked out.
+
+    weights is None whenever the batch holds no padding, and then this is exactly
+    F.mse_loss(prediction, target): every sample carries the same element count, so the mean of
+    the per-sample means equals the mean over all elements. That equality is what keeps the
+    'drop' path unchanged rather than merely close.
+
+    Dividing by the batch size rather than by the weight sum is deliberate. The real samples
+    already carry G/G_real, which EpochSampler computed over the whole global batch, and both
+    gradient accumulation and the data-parallel all-reduce are averages -- so one shared
+    constant lands on the mean over real captions however unevenly the padding is spread, while
+    a per-micro-batch normalisation does not, and would divide by zero on a micro batch that is
+    entirely padding.
+    """
+    if weights is None:
+        return F.mse_loss(prediction, target)
+    per_sample = F.mse_loss(prediction, target, reduction='none').flatten(1).mean(dim=1)
+    return (per_sample * weights).mean()
 
 
 def relational_loss(student_pooled, teacher_pooled):
@@ -1386,8 +1527,20 @@ def main():
     # sampler has worked out how many steps an epoch takes. Deriving it after the scheduler was
     # built left it holding total_steps=None, which survives construction and then raises
     # TypeError the moment warmup ends -- 500 steps into a multi-GPU run.
+    # Same four keys the dataset side reads, with the same names and the same defaults, so a
+    # distillation config and a dataset config say this the same way. fill_rotate_per_epoch is
+    # not among them: this sampler already re-permutes on every epoch, so the tail rotates by
+    # construction and there is nothing to switch on.
+    distill_fill = resolve_batch_fill_config(config['distill'])
+    if 'fill_rotate_per_epoch' in config['distill'] and is_main:
+        print('\nWARNING: fill_rotate_per_epoch has no effect under [distill]. This sampler '
+              're-permutes the whole caption list on every epoch, so which captions complete '
+              'the last batch already changes from epoch to epoch.\n')
     sampler, steps, schedule_description = resolve_schedule(
-        epochs, steps, captions, batch_size, grad_accum, rank, world_size, seed)
+        epochs, steps, captions, batch_size, grad_accum, rank, world_size, seed,
+        fill_strategy=distill_fill['batch_fill_strategy'],
+        undersized=distill_fill['undersized_bucket'],
+        min_real_fraction=distill_fill['min_real_fraction'])
     if is_main:
         print(schedule_description)
 
@@ -1533,6 +1686,7 @@ def main():
             rollout_generator=rollout_generator, rollout_rng=rollout_rng,
             scaler=getattr(strategy, 'scaler', None),
             batch_size=batch_size, grad_accum=grad_accum, precision_name=precision.name,
+            batch_fill=distill_fill,
         )
         if start_step >= steps:
             raise RuntimeError(
@@ -1588,17 +1742,24 @@ def main():
         epoch = step // sampler.steps_per_epoch
         if epoch != current_epoch:
             current_epoch = epoch
-            epoch_captions = sampler.epoch_order(epoch)
+            epoch_captions = sampler.epoch_order_weighted(epoch)
         offset = (step % sampler.steps_per_epoch) * grad_accum * batch_size
 
         accum_loss = 0.0
         strategy.zero_grad()
         for micro in range(grad_accum):
             start = offset + micro * batch_size
-            batch = [
-                preprocess_caption(c, **augment)
-                for c in epoch_captions[start:start + batch_size]
-            ]
+            entries = epoch_captions[start:start + batch_size]
+            batch = [preprocess_caption(c, **augment) for c, _ in entries]
+            # None whenever nothing in this global batch is padding, which is every batch under
+            # 'drop' and every batch but the last under 'fill'. weighted_mse then takes the
+            # plain F.mse_loss path, so the ordinary run is not merely equivalent, it is the
+            # same call.
+            sample_weights = None
+            real_index = None
+            if any(w != 1.0 for _, w in entries):
+                sample_weights = torch.tensor([w for _, w in entries], device=device, dtype=torch.float32)
+                real_index = sample_weights > 0
 
             with torch.no_grad():
                 t_enc = teacher_tok(batch, return_tensors='pt', truncation=True, padding='max_length', max_length=max_text_length)
@@ -1647,7 +1808,7 @@ def main():
                     with torch.no_grad():
                         target = cross_attn(q, context=teacher_feats.to(dtype))
                     pred = cross_attn(q, context=student_feats.to(dtype))
-                    loss = loss + F.mse_loss(pred.float(), target.float())
+                    loss = loss + weighted_mse(pred.float(), target.float(), sample_weights)
                 loss = loss / len(cross_attns)
                 terms['probe'] = float(loss.detach())
 
@@ -1656,12 +1817,27 @@ def main():
                 student_pooled = padded_mean(student_feats.float(), s_mask, max_text_length)
                 teacher_pooled = padded_mean(teacher_feats.float(), t5_mask, max_text_length)
                 if pooled_weight > 0:
-                    pooled_term = pooled_weight * F.mse_loss(student_pooled, teacher_pooled)
+                    pooled_term = pooled_weight * weighted_mse(student_pooled, teacher_pooled, sample_weights)
                     terms['pooled'] = float(pooled_term.detach())
                     loss = loss + pooled_term
                 if relational_weight > 0:
                     # Keeps distinct captions distinct. See relational_loss.
-                    relational_term = relational_weight * relational_loss(student_pooled, teacher_pooled)
+                    #
+                    # Padding is REMOVED here rather than weighted to zero, and the difference
+                    # matters more than anywhere else in this loop. A masked repeat is a copy
+                    # of a caption already in the batch, so it contributes a pairwise distance
+                    # of exactly zero -- and this term's whole job is to punish distances that
+                    # collapse toward zero. Left in at weight zero its own term would vanish
+                    # but the teacher's matching zero distance would still be there to be
+                    # matched, teaching the model that two identical captions belong on top of
+                    # each other, which is true but is also the shape of the collapse this
+                    # exists to prevent. No scale is applied either: this is already a mean
+                    # over real pairs, so it never suffered the dilution G/G_real undoes.
+                    if real_index is not None:
+                        relational_term = relational_weight * relational_loss(
+                            student_pooled[real_index], teacher_pooled[real_index])
+                    else:
+                        relational_term = relational_weight * relational_loss(student_pooled, teacher_pooled)
                     terms['relational'] = float(relational_term.detach())
                     loss = loss + relational_term
                 if rollout_weight > 0:
@@ -1700,6 +1876,7 @@ def main():
                         teacher_dit, visited, teacher_feats.to(dtype), student_feats.to(dtype),
                         teacher_uncond.expand(len(batch), -1, -1).to(dtype) if teacher_uncond is not None else None,
                         student_uncond, rollout_guidance, rollout_points, rollout_rng,
+                        weights=sample_weights,
                     )
                     terms['rollout'] = float(rollout_term.detach())
                     loss = loss + rollout_term
@@ -1713,8 +1890,19 @@ def main():
 
                 if is_main:
                     # Diagnostic only, and free: the pooled features already exist.
-                    last_spread = mean_pairwise_cosine_distance(student_pooled.detach())
-                    last_teacher_spread = mean_pairwise_cosine_distance(teacher_pooled.detach().float())
+                    #
+                    # Real samples only. A masked repeat sits exactly on top of the caption it
+                    # was copied from, so counting it drags the mean pairwise distance down and
+                    # the number reads as collapse starting -- which is the one thing this
+                    # figure exists to warn about, so a false reading of it is worse than no
+                    # figure at all.
+                    spread_student = student_pooled.detach()
+                    spread_teacher = teacher_pooled.detach().float()
+                    if real_index is not None:
+                        spread_student = spread_student[real_index]
+                        spread_teacher = spread_teacher[real_index]
+                    last_spread = mean_pairwise_cosine_distance(spread_student)
+                    last_teacher_spread = mean_pairwise_cosine_distance(spread_teacher)
                     last_terms = terms
 
                 strategy.backward(loss)
@@ -1779,6 +1967,7 @@ def main():
                                     scaler=getattr(strategy, 'scaler', None),
                                     batch_size=batch_size, grad_accum=grad_accum,
                                     precision_name=precision.name,
+                                    batch_fill=distill_fill,
                                     master_weights=sharded_state and bool(precision.deepspeed_section))
                 _copy_atomically(training_state_path(tagged_path, state_rank),
                                  training_state_path(refiner_path, state_rank))
@@ -2000,7 +2189,7 @@ def prune_distill_checkpoints(output_dir, keep, protect_tag=None, protect_tags=(
 def save_training_state(refiner_path, optimizer, scheduler, step, rank=None, world_size=1,
                         rollout_generator=None, rollout_rng=None, scaler=None,
                         batch_size=None, grad_accum=None, precision_name=None,
-                        master_weights=False):
+                        master_weights=False, batch_fill=None):
     """Save what a resume needs beyond the weights.
 
     Without this, resume_from restarted Adam's moments at zero and rebuilt the LR schedule from
@@ -2024,6 +2213,12 @@ def save_training_state(refiner_path, optimizer, scheduler, step, rank=None, wor
         # written before this was recorded; nothing is claimed about those.
         'batch_size': batch_size,
         'grad_accum': grad_accum,
+        # batch_fill_strategy moves the epoch boundary the same way the three above do:
+        # steps_per_epoch rounds down under 'drop' and up under 'fill', so the saved step
+        # counts a different number of captions on each side of a switch. Absent in a
+        # checkpoint written before this existed, which is read as 'drop' -- what it was.
+        'batch_fill_strategy': (batch_fill or {}).get('batch_fill_strategy', None),
+        'undersized_bucket': (batch_fill or {}).get('undersized_bucket', None),
         # AdamW allocates exp_avg/exp_avg_sq to match the parameter dtype at construction, so
         # moments saved under one precision are the wrong dtype for another.
         'precision': precision_name,
@@ -2065,7 +2260,8 @@ def save_training_state(refiner_path, optimizer, scheduler, step, rank=None, wor
 
 def load_training_state(refiner_path, optimizer, scheduler, is_main, rank=None, world_size=1,
                         own_python_rng=True, rollout_generator=None, rollout_rng=None,
-                        scaler=None, batch_size=None, grad_accum=None, precision_name=None):
+                        scaler=None, batch_size=None, grad_accum=None, precision_name=None,
+                        batch_fill=None):
     """Restore optimizer, scheduler and step. Returns the step to resume from.
 
     A missing file is not an error: it is a refiner distilled before this existed, or one
@@ -2119,7 +2315,11 @@ def load_training_state(refiner_path, optimizer, scheduler, is_main, rank=None, 
             (name, state.get(key, None), current)
             for name, key, current in (('world_size', 'world_size', world_size),
                                        ('batch_size', 'batch_size', batch_size),
-                                       ('gradient_accumulation_steps', 'grad_accum', grad_accum))
+                                       ('gradient_accumulation_steps', 'grad_accum', grad_accum),
+                                       ('batch_fill_strategy', 'batch_fill_strategy',
+                                        (batch_fill or {}).get('batch_fill_strategy', None)),
+                                       ('undersized_bucket', 'undersized_bucket',
+                                        (batch_fill or {}).get('undersized_bucket', None)))
             if state.get(key, None) is not None and current is not None and state[key] != current
         ]
         if drifted:

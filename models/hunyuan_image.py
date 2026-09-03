@@ -138,29 +138,15 @@ class HunyuanImagePipeline(BasePipeline):
         safetensors.torch.save_file(state_dict, save_dir / 'model.safetensors', metadata={'format': 'pt'})
 
     def load_adapter_weights(self, adapter_path):
-        if is_main_process():
-            print(f'Loading adapter weights from path {adapter_path}')
-        safetensors_files = list(Path(adapter_path).glob('*.safetensors'))
-        if len(safetensors_files) == 0:
-            raise RuntimeError(f'No safetensors file found in {adapter_path}')
-        if len(safetensors_files) > 1:
-            raise RuntimeError(f'Multiple safetensors files found in {adapter_path}')
-        adapter_state_dict = safetensors.torch.load_file(safetensors_files[0])
-        modified_state_dict = {}
-        model_parameters = set(name for name, p in self.transformer.named_parameters())
-        for k, v in adapter_state_dict.items():
-
+        # This model's ComfyUI names differ beyond the shared prefix, so save_adapter rewrites
+        # module path fragments on the way out and they have to be rewritten back on the way in,
+        # before the generic loader looks the name up.
+        def rename_key(k):
             for target, replace in COMFYUI_TO_ORIGINAL_LORA_MAPPING.items():
                 k = k.replace(target, replace)
+            return k
 
-            # Replace Diffusers or ComfyUI prefix
-            k = re.sub(r'^(transformer|diffusion_model)\.', '', k)
-            # Replace weight at end for LoRA format
-            k = re.sub(r'\.weight$', '.default.weight', k)
-            if k not in model_parameters:
-                raise RuntimeError(f'modified_state_dict key {k} is not in the model parameters')
-            modified_state_dict[k] = v
-        self.transformer.load_state_dict(modified_state_dict, strict=False)
+        self.load_adapter_weights_into(self.transformer, adapter_path, rename_key=rename_key)
 
     def get_call_vae_fn(self, vae):
         def fn(image):

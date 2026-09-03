@@ -840,6 +840,14 @@ is dropped, the same rounding the image datasets do, so every rank runs the same
 | `tag_dropout_rate` | from `dataset.toml` | drop each tag with this probability, per sample |
 | `prefix_tag_caption` | markers found in the `dataset.toml` | string or list of markers for tag captions; matched case-insensitively and stripped before training |
 | `caption_prefix` | from `dataset.toml` | prepended after the marker is stripped |
+| `batch_fill_strategy` | `drop` | `fill` completes the last batch of each epoch instead of discarding the caption tail, so `steps_per_epoch` rounds up rather than down. The shipped configs set it |
+| `undersized_bucket` | `pad_masked` | only when the whole corpus is smaller than one global batch: `pad_masked` fills with masked-out repeats, `drop` keeps the old refusal |
+| `min_real_fraction` | `0.25` | refuse to start when the real captions would be less than this fraction of a global batch |
+
+`fill_rotate_per_epoch` is not read here. This sampler re-permutes the whole caption list every
+epoch already, so which captions complete the last batch changes by construction; setting it
+warns and does nothing. See
+[docs/note/batch-fill-strategies.md](../note/batch-fill-strategies.md).
 
 Exactly one of `dataset`, `caption_corpus` and `captions` may be set; setting more than one is
 an error rather than a silent precedence rule.

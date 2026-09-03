@@ -28,6 +28,11 @@ caching_batch_size = 8
 steps_per_print = 10
 blocks_to_swap = 20  # block swapping requires an [adapter] block, so it works here
 
+# Complete the final batch of each size bucket rather than dropping it. Set here rather than in
+# the dataset TOML because this config shares examples/dataset.toml with the other modes and
+# with every other model's examples; the key is read from either place and this one wins.
+batch_fill_strategy = 'fill'
+
 [model]
 type = 'anima_refiner'
 transformer_path = '/data/output/anima_refiner_refiner_crossattn/<run>/model.safetensors'

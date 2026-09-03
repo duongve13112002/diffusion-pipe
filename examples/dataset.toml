@@ -80,6 +80,36 @@ frame_buckets = [1, 33]
 # produces, so it must be opted into, and needs --regenerate_cache to take effect.
 # multiline_captions = true
 
+# What to do when a size bucket holds a number of samples that is not a multiple of the global batch size
+# (micro_batch_size_per_gpu * gradient_accumulation_steps * num_gpus).
+#   'drop' (the default) is what this repo has always done: the leftover tail is cut. With 1000 samples and a
+#   global batch of 64 that is 40 samples discarded, and because the iteration order is fixed it is the SAME 40
+#   every epoch, forever. A bucket holding fewer samples than one global batch is dropped entirely.
+#   'fill' completes the final batch instead, using other samples from the same bucket. No image appears twice
+#   among the real samples of one batch, across gradient accumulation and across GPUs alike.
+# Leaving this unset changes nothing about an existing run.
+# batch_fill_strategy = 'fill'
+
+# Only read when batch_fill_strategy = 'fill'. Which samples complete the final batch is redrawn each epoch, so
+# the handful that get seen twice are not the same handful every time. On a big bucket that hardly matters; with
+# 100 samples and a global batch of 64 it is 28% of the data being oversampled, which does.
+# Set it false when the set must be identical between epochs. Eval datasets default to false for that reason.
+# fill_rotate_per_epoch = true
+
+# Only read when batch_fill_strategy = 'fill', and only for a bucket that cannot fill even one global batch,
+# where repeating something is the only way to produce a batch at all.
+#   'pad_masked' (the default) completes the batch with repeats whose loss is masked to zero, and scales the real
+#   samples back up so the step behaves like a smaller batch rather than a diluted one. The repeats cost GPU time
+#   and teach nothing; they exist so every rank runs the same number of steps.
+#   'drop' keeps the old behaviour for this case only, discarding the bucket.
+# undersized_bucket = 'pad_masked'
+
+# Only read when batch_fill_strategy = 'fill'. A bucket whose real samples make up less than this fraction of a
+# global batch is dropped with a warning naming the numbers, rather than spending most of every step on padding
+# that is masked out anyway. With a global batch of 64 and a bucket of 5 images the fraction is 0.078, so the
+# default drops it. Lower this to keep such a bucket; raise it to be stricter.
+# min_real_fraction = 0.25
+
 [[directory]]
 # Path to directory of images/videos, and corresponding caption files. The caption files should match the media file name, but with a .txt extension.
 # A missing caption file will log a warning, but then just train using an empty caption.

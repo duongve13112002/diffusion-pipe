@@ -10,6 +10,10 @@
 # and holds one full backward graph per loss point, and batch_size 48 is large for that.
 
 [distill]
+# Complete the final batch of each epoch instead of dropping the caption tail. steps_per_epoch
+# rounds up rather than down, so an epoch gains one step and every caption is seen. No caption
+# appears twice in one global batch, including the batch that straddles the epoch boundary.
+batch_fill_strategy = 'fill'
 # The caption source. A corpus from tools/export_caption_corpus.py, not a dataset.toml: this
 # phase never touches images, so a flat caption file is both the honest input and much faster to
 # resolve than walking the dataset tree. The format is inferred from the .jsonl extension;

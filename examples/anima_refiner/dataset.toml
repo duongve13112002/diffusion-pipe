@@ -63,6 +63,13 @@ skip_empty_caption = true
 #     Special: 1girl, smile, outdoors
 #     A girl smiling outdoors.
 # gives that image two captions, and caption_sampling picks one per epoch.
+# Complete the final batch of each size bucket instead of dropping it. Turned on here because
+# this architecture is usually trained on a fixed anime set with several aspect ratio buckets,
+# where the per-bucket remainders add up: every bucket loses up to one global batch of images
+# under 'drop', and the same images every epoch. No image is repeated among the real samples of
+# a batch. See docs/note/batch-fill-strategies.md.
+batch_fill_strategy = 'fill'
+
 [[directory]]
 path = '/data/anime/booru_tags'
 num_repeats = 1

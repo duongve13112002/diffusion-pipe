@@ -20,6 +20,10 @@
 # it back if you have the memory.
 
 [distill]
+# Complete the final batch of each epoch instead of dropping the caption tail. steps_per_epoch
+# rounds up rather than down, so an epoch gains one step and every caption is seen. No caption
+# appears twice in one global batch, including the batch that straddles the epoch boundary.
+batch_fill_strategy = 'fill'
 dataset = 'examples/dataset.toml'
 output_dir = '/data/output/anima_refiner_distill_rollout'
 

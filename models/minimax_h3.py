@@ -445,8 +445,23 @@ class MinimaxH3Pipeline(ComfyPipeline):
             # length is authoritative since the model derives it from this example's own valid_audio flag.
             audio_target = audio_target[..., :audio_output.shape[-1]]
             audio_loss = single_loss(audio_output, audio_target)
+            # The mask is spatial and the audio branch has no spatial dimension to hang it on,
+            # so the audio takes the per-sample maximum of it. That is exact in the cases that
+            # matter: batch fill marks a padded sample with a mask that is identically zero, so
+            # the sample drops out of the audio term as well, and an unmasked sample carries
+            # the same constant weight everywhere, so the maximum IS that weight. Without this
+            # the audio term trained on padding, which is a copy of another sample in the batch.
+            # An image mask that never reaches 1 also attenuates the audio, which is a change
+            # from before; an image the user masked out entirely now contributes no audio either.
+            if mask is not None and mask.numel() > 0:
+                per_sample = mask.to(audio_loss.device, audio_loss.dtype).flatten(1).amax(dim=1)
+                audio_loss = audio_loss * per_sample.view(-1, *([1] * (audio_loss.ndim - 1)))
             # make each token count the same for loss, regardless of modality
             # TODO: what is the best thing to do here? configurable audio loss scale?
+            #
+            # These stay raw element counts even when some samples are masked out. A padded
+            # sample supplies neither video nor audio, so it inflates both counts by the same
+            # factor and the ratio below -- which is all these feed -- is unchanged.
             video_tokens = video_loss.numel()
             audio_tokens = audio_loss.numel()
             total_tokens = video_tokens + audio_tokens

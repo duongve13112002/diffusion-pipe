@@ -25,6 +25,31 @@ in step 1, not the order of the steps.
 
 Every command below runs from the repo root.
 
+## A note on batch fill, which these configs turn on
+
+Every config under `examples/anima_refiner/` ships with `batch_fill_strategy = 'fill'`. It is the
+one setting here that differs from the repo default, so it is worth knowing before the numbers
+look surprising.
+
+Without it, each size bucket drops however many samples are left over after the last whole global
+batch — and because the iteration order is built once and never reshuffled, it is the same
+samples dropped in every epoch. With several aspect-ratio buckets those remainders add up, and a
+bucket holding fewer images than one global batch disappears entirely.
+
+What changes when it is on:
+
+- **Steps per epoch go up**, by up to one step per size bucket. An epoch is a different length
+  than the same run on the same data would have had before, so a step count copied from an older
+  run no longer means the same thing.
+- A bucket too small to fill one batch is completed with repeats whose loss is masked to zero,
+  and dropped with a warning if it would be more than three quarters padding
+  (`min_real_fraction`).
+- No image appears twice among the real samples of one global batch.
+
+Set `batch_fill_strategy = 'drop'` in the config to get the old behaviour back. Full details in
+[docs/note/batch-fill-strategies.md](../note/batch-fill-strategies.md); the four keys are
+documented in [examples/dataset.toml](../../examples/dataset.toml).
+
 ## Step 0: point the configs at your files
 
 Copy `examples/anima_refiner/` somewhere and edit the paths. Every config needs `vae_path` and

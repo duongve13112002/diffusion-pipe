@@ -1032,9 +1032,13 @@ class CosmosPredict2Pipeline(BasePipeline):
                 else:
                     loss = F.mse_loss(output, target, reduction='none')
                 # empty tensor means no masking
+                multiscale_mask = None
                 if mask.numel() > 0:
                     mask = mask.to(output.device, torch.float32)
                     loss *= mask
+                    # (B, 1, 1, h, w), matching the squeeze(2) the multiscale branch does to
+                    # output and target below.
+                    multiscale_mask = mask.squeeze(2)
                 loss = loss.mean()
 
                 if weight := self.multiscale_loss_weight:
@@ -1049,8 +1053,19 @@ class CosmosPredict2Pipeline(BasePipeline):
                         if side_length >= thresh:
                             output = F.avg_pool2d(output, 2)
                             target = F.avg_pool2d(target, 2)
-                            additional_loss = F.mse_loss(output, target) * weight
-                            terms.append(additional_loss)
+                            additional_loss = F.mse_loss(output, target, reduction='none')
+                            # The downsampled scales have to carry the mask too. Without it a
+                            # sample the mask zeroes still reaches the optimizer through these
+                            # terms: the loss VALUE barely moves, because they are averages
+                            # over the same data, but the gradient does -- a batch that is
+                            # mostly masked-out batch-fill padding put about a fifth of its
+                            # gradient on the padded copies, concentrated on the handful of
+                            # images they were copied from. Pooling the mask alongside the
+                            # tensors is what keeps the two aligned as the resolution drops.
+                            if multiscale_mask is not None:
+                                multiscale_mask = F.avg_pool2d(multiscale_mask, 2)
+                                additional_loss = additional_loss * multiscale_mask
+                            terms.append(additional_loss.mean() * weight)
                             total_weight += weight
                         else:
                             break

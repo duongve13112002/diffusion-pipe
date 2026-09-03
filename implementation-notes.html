@@ -33,6 +33,165 @@
 <p class="meta">A running log of decisions taken outside the spec, forced changes, tradeoffs, and
 anything else the maintainer needs to know. Newest entry first.</p>
 
+<h2>2026-09-03 &mdash; Batch fill: completing a short batch instead of dropping it</h2>
+
+<p><strong>Request.</strong> The pipeline silently discards samples in three places when a size
+bucket's count is not a multiple of the global batch size. Add an opt-in way to complete the batch
+instead, never repeating an image inside one global batch, covering training, eval and
+distillation, with the old behaviour unchanged by default.</p>
+
+<h3>What the spec got wrong about the code, and what was decided</h3>
+
+<ul>
+  <li><strong>&sect;3.3 and &sect;5.2 could not both hold.</strong> The spec asked for "no two
+    samples of the same image in one global batch" while also keeping the first N entries of
+    <code>iteration_order</code> untouched. Those conflict, and not because of
+    <code>num_repeats</code>: with the default <code>caption_sampling = 'all'</code>, an image with
+    three captions is three rows sharing a <code>latents_idx</code>, and the seed-0 shuffle in
+    <code>post_init</code> can already put two of them in one batch. Measured on 10 images
+    &times; 2 captions at a global batch of 16: six such pairs in the first batch, before any fill
+    ran. Decided with the maintainer: constrain the appended tail only, and write the limitation
+    into <code>docs/note/batch-fill-strategies.md</code>.</li>
+  <li><strong>&sect;6.4's proof is missing a step.</strong> It writes <code>b&middot;M = G</code>,
+    which is only true at one rank; the per-rank batch is <code>G/W</code>. The conclusion
+    (<code>s = G/G_real</code>) is right, but it needs the data-parallel average to get there. The
+    corrected derivation is in the note, because the version in the spec looks wrong at multi-GPU
+    and would invite someone to "fix" it.</li>
+  <li><strong>&sect;7.2's <code>.sum() / w.sum()</code> is the per-micro-batch normalisation
+    &sect;6.4 warns against.</strong> Same trap, one section apart. Distillation uses the same
+    global constant, for the same reason, and because a micro batch that is entirely padding would
+    divide by zero.</li>
+  <li><strong>Two loss functions leak padding.</strong> Reported, and the maintainer chose to fix
+    both plus add a test over all eight. Details below.</li>
+  <li><strong>&sect;9's premise was wrong.</strong> Six of the seven <code>anima_refiner</code>
+    training configs point at the shared <code>examples/dataset.toml</code>, not at
+    <code>examples/anima_refiner/dataset.toml</code>. So D6 was unreachable through the dataset
+    file without either editing a file every model's examples share or repointing six configs at an
+    anime-specific dataset. The optional training-config override from &sect;4.2 was implemented
+    instead, which is what makes D6 possible at all.</li>
+</ul>
+
+<h3>Decisions taken outside the spec</h3>
+
+<ul>
+  <li><strong>A parallel weights array, not a weight column.</strong> &sect;5.1 says to read a
+    weight column out of <code>iteration_order</code>, but that is an int <code>np.array</code> of
+    <code>(dataset_idx, j)</code> pairs and a float column would change its dtype, breaking the
+    <code>i.item()</code>/<code>j.item()</code> indexing in <code>__getitem__</code>.
+    <code>sample_weights</code> sits alongside it instead.</li>
+  <li><strong><code>_batch_weight_scale</code> returns <code>None</code> for an all-real
+    batch</strong>, and <code>__getitem__</code> then attaches nothing. That is what keeps
+    <code>_collate</code> on its original branch, <code>mask = None</code> included, rather than on
+    a new branch that is merely equivalent.</li>
+  <li><strong>The synthesised mask's shape.</strong> A real mask in the batch supplies the shape
+    whenever there is one, so a synthesised mask can never disagree with it; the size bucket's
+    <code>(h, w)</code> is only the fallback. Checked that all 23 model files interpolate the mask
+    to the latent size, so the pixel shape does not affect the number.</li>
+  <li><strong>float16 masks, so the weight rounds.</strong> <code>G/G_real</code> keeps about four
+    significant digits there. Below bf16 training noise, and it keeps the mask at its existing
+    size, which matters on the box this was developed on.</li>
+  <li><strong>Eval defaults <code>fill_rotate_per_epoch</code> to false.</strong> A metric that
+    moves between epochs for reasons unrelated to the model is worse than one over a fixed tail.</li>
+  <li><strong>Distillation imports <code>utils.dataset</code> for the config validator.</strong>
+    Measured at 1.6s on a ~20s startup, so the two paths share one validation function rather than
+    accepting subtly different spellings. Not the 50s case <code>utils/captions.py</code> was split
+    out to avoid.</li>
+  <li><strong>Padding is removed from <code>relational_loss</code> and <code>spread</code>, not
+    weighted to zero.</strong> A masked repeat sits at distance zero from the caption it copies,
+    and that term exists to punish distances collapsing toward zero.</li>
+</ul>
+
+<h3>The two loss-function fixes, and why they were invisible</h3>
+
+<p><code>models/cosmos_predict2.py</code> computed its <code>multiscale_loss_weight</code> terms
+with a plain <code>F.mse_loss</code>, after the masked term had already been reduced.
+<code>models/minimax_h3.py</code> called <code>single_loss</code> with no mask for the audio
+branch.</p>
+
+<p>Neither moves the loss. Measured on a 3-real / 13-padded batch at
+<code>multiscale_loss_weight = 0.5</code>: 0.155659 against a reference of 0.155521, 0.1% apart,
+because the padding is a copy of real samples and carries the same error distribution. The
+gradient is where it shows: the 13 padded slots carried &Vert;grad&Vert; 0.0084 against 0.0335 for
+the three real ones. About a fifth of the step was extra weight on the three images the padding
+was copied from &mdash; not a scale error, a per-image weighting error, which no loss curve would
+reveal.</p>
+
+<p>The other six were checked rather than assumed. <code>sdxl</code>'s
+<code>mean([1,2,3])</code> and SNR weighting are linear so the weight passes through;
+<code>cosmos</code> multiplies <code>weights_per_sigma</code> after the mask, also linear; and
+<code>ltx_video</code> already divides by <code>mask.mean()</code>, where the weight cancels
+between numerator and denominator, so it is correct either way.</p>
+
+<h3>Tests</h3>
+
+<p>90 new cases: <code>test/test_batch_fill.py</code> (70 passed, 1 skipped) and three classes
+added to <code>test/test_distill_refiner.py</code> (23).</p>
+
+<p>Two of them are the ones worth having. <code>TestEveryLossFunctionIgnoresPadding</code>
+parametrises over all eight <code>get_loss_fn</code> implementations and asserts a padded sample's
+gradient is exactly zero; reverting the two fixes turns exactly
+<code>CosmosPredict2Pipeline-ms</code> and <code>MinimaxH3Pipeline</code> red and leaves the other
+six green. <code>TestNormalisationSurvivesMicroBatching</code> drives the case a per-micro-batch
+ratio gets wrong: all the padding in one micro batch, and a micro batch that is entirely
+padding.</p>
+
+<p>The multiscale case needed a 128&times;128 latent to reach the branch at all. At the default 8
+the <code>side_length</code> is 64 against a threshold of 921.6, so the first version of that test
+passed while never executing the code it existed to cover &mdash; caught because it returned a
+number identical to the non-multiscale case.</p>
+
+<h3>Things the maintainer needs to know</h3>
+
+<div class="flag">
+  <p><strong>Masked training with <code>minimax_h3</code> changes.</strong> The audio loss now
+  takes the per-sample maximum of the image mask. An image mask that never reaches 1 now
+  attenuates the audio loss, and an image masked out entirely contributes no audio. The video
+  branch is unchanged. Audio has no spatial dimension to multiply a spatial mask against, so some
+  reduction had to be chosen; the maximum is exact for an unmasked sample and for padding.</p>
+</div>
+
+<div class="flag">
+  <p><strong>The multiscale fix also changes ordinary masked training.</strong> Anyone using
+  <code>multiscale_loss_weight</code> together with mask images was previously getting unmasked
+  gradient through the reduced scales. Their loss curve will not move, but the effective weighting
+  between images will.</p>
+</div>
+
+<ul>
+  <li><strong>No GPU run, no multi-rank run, no real training run.</strong> The multi-rank
+    behaviour is covered by constructing one bucket per rank and asserting they compute the same
+    global order and that their slices reassemble into it, which is the property a real run
+    depends on &mdash; but it is not the same as running two processes.</li>
+  <li><strong>Duplicate images inside the static part are untouched</strong>, by decision. Turning
+    fill on does not make the whole epoch duplicate-free; it makes the appended tail
+    duplicate-free. Measured numbers are in the note.</li>
+  <li><strong><code>models/cosmos.py</code> is skipped</strong> in the eight-loss test on this box:
+    it imports <code>pynvml</code>, which is not installed without a GPU. Worth running that one
+    case on the training box.</li>
+  <li><strong>Not fixed, noticed in passing:</strong> <code>models/hunyuan_image.py</code> keeps
+    its own copy of the adapter key-rewriting rule that was consolidated in
+    <code>models/base.py</code> earlier today. It was updated to delegate, so this is closed &mdash;
+    noted only because the two changes landed together.</li>
+  <li><strong>A pre-existing static-analysis guard needed extending, not silencing.</strong>
+    <code>TestEveryShippedDistillKeyIsRead</code> parses <code>tools/distill_refiner.py</code>'s
+    source to check every key the shipped configs set is actually read from the table it sits in
+    -- it caught <code>relational_loss_weight</code> shipped in the wrong table once already. It
+    flagged <code>batch_fill_strategy</code> as unread because the four keys reach the script
+    through <code>resolve_batch_fill_config(config['distill'])</code>, a call the analyzer had no
+    pattern for. Taught it a fifth shape, matching the exact style the existing four already use,
+    and added an assertion for it to <code>test_the_extractor_finds_the_known_reads</code> so a
+    regression there is caught by name rather than by four unrelated configs failing. No key was
+    added to satisfy the checker; the checker was taught what the code already does.</li>
+  <li><strong>A repo-checked-in file was briefly reverted trying to verify that guard by hand.</strong>
+    <code>git checkout -- examples/anima_refiner/distill.toml</code> was run to test the
+    misplaced-key case without checking <code>git status</code> first, which discarded that
+    file's uncommitted <code>batch_fill_strategy</code> addition (nothing else was affected --
+    checked immediately after). Restored from the sibling configs' diff. The verification that
+    mattered was redone safely afterward, against the parser's output directly rather than
+    against a real file.</li>
+</ul>
+
+
 <h2>2026-09-02 &mdash; Adapters in the sampler, and the LoKr loader that never worked</h2>
 
 <p><strong>Request.</strong> <code>tools/sample_anima_refiner.py</code> loaded no adapter at all,

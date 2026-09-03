@@ -364,7 +364,7 @@ class CommonPipeline:
         #     elif 'lokr_w2.' in name:
         #         nn.init.zeros_(p)
 
-    def load_adapter_weights_into(self, target_model, adapter_path):
+    def load_adapter_weights_into(self, target_model, adapter_path, rename_key=None):
         """Load a saved adapter into target_model, inverting exactly what the saver wrote.
 
         utils/saver.py stores each trainable parameter under its own name with PEFT's adapter
@@ -376,6 +376,10 @@ class CommonPipeline:
         '...lokr_w1.default' with no '.weight' anywhere, and every LoKr adapter raised here
         instead of loading. Both subclasses had their own copy of the rule, which is why one
         defect existed twice.
+
+        rename_key runs before the prefix strip, for a model whose ComfyUI names differ beyond
+        the shared prefix. It only ever rewrites module path fragments, never the adapter
+        suffix, so it composes with the lookup rather than competing with it.
         """
         if is_main_process():
             print(f'Loading adapter weights from path {adapter_path}')
@@ -391,6 +395,8 @@ class CommonPipeline:
         }
         modified_state_dict = {}
         for k, v in adapter_state_dict.items():
+            if rename_key is not None:
+                k = rename_key(k)
             # Replace Diffusers or ComfyUI prefix
             k = re.sub(r'^(transformer|diffusion_model)\.', '', k)
             if k not in by_saved_key:

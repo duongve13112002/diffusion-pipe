@@ -450,7 +450,14 @@ if __name__ == '__main__':
     caching_batch_size = config.get('caching_batch_size', 1)
     dataset_manager = dataset_util.DatasetManager(model, regenerate_cache=regenerate_cache, trust_cache=args.trust_cache, caching_batch_size=caching_batch_size, keep_models_loaded=args.test_sample)
 
-    train_data = dataset_util.Dataset(dataset_config, model, skip_dataset_validation=args.i_know_what_i_am_doing)
+    # The batch fill keys belong in the dataset config, but several training configs share one
+    # dataset TOML, so the same keys are accepted here and win. Applied to the eval datasets
+    # too: a run that fills its training batches and drops its eval ones would report a metric
+    # over a different subset than the one it trains on.
+    batch_fill_overrides = {key: config[key] for key in dataset_util.BATCH_FILL_DEFAULTS
+                            if key in config}
+    train_data = dataset_util.Dataset(dataset_config, model, skip_dataset_validation=args.i_know_what_i_am_doing,
+                                      batch_fill_overrides=batch_fill_overrides)
     dataset_manager.register(train_data)
 
     eval_data_map = {}
@@ -463,7 +470,13 @@ if __name__ == '__main__':
             config_path = eval_dataset['config']
         with open(config_path) as f:
             eval_dataset_config = toml.load(f)
-        eval_data_map[name] = dataset_util.Dataset(eval_dataset_config, model, skip_dataset_validation=args.i_know_what_i_am_doing)
+        eval_data_map[name] = dataset_util.Dataset(
+            eval_dataset_config, model, skip_dataset_validation=args.i_know_what_i_am_doing,
+            # Eval should be the same set every time it runs, so a figure from epoch 7 is
+            # comparable with one from epoch 3. Rotating the tail would move part of the eval
+            # set between runs for reasons that have nothing to do with the model.
+            batch_fill_defaults={'fill_rotate_per_epoch': False},
+            batch_fill_overrides=batch_fill_overrides)
         dataset_manager.register(eval_data_map[name])
 
     # For testing

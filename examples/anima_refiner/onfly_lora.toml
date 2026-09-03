@@ -44,6 +44,11 @@ steps_per_print = 10
 # train.py asserts against the combination. If you need block swapping, use the cached-embedding
 # config instead; if you need on-the-fly embeddings, lower micro_batch_size_per_gpu.
 
+# Complete the final batch of each size bucket rather than dropping it. Set here rather than in
+# the dataset TOML because this config shares examples/dataset.toml with the other modes and
+# with every other model's examples; the key is read from either place and this one wins.
+batch_fill_strategy = 'fill'
+
 [model]
 type = 'anima_refiner'
 transformer_path = '/data/output/anima_refiner_refiner_crossattn/<run>/model.safetensors'

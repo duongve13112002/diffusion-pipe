@@ -21,6 +21,10 @@
 # LLMAdapter and a handful of the DiT's cross-attention modules.
 
 [distill]
+# Complete the final batch of each epoch instead of dropping the caption tail. steps_per_epoch
+# rounds up rather than down, so an epoch gains one step and every caption is seen. No caption
+# appears twice in one global batch, including the batch that straddles the epoch boundary.
+batch_fill_strategy = 'fill'
 # The ordinary dataset.toml, the same one every other training mode uses. Captions are read
 # through the same rules training uses -- captions.json or matching .txt, caption_prefix, tag
 # shuffling -- so this stage sees exactly the caption distribution training will see. Images

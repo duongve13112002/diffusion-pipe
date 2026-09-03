@@ -5,6 +5,7 @@ cover the two things that machinery would otherwise have given it for free.
 """
 
 import contextlib
+import math
 import os
 import subprocess
 import sys
@@ -1178,12 +1179,13 @@ class TestEveryShippedDistillKeyIsRead:
     def _reads_by_table():
         """Extract which (table, key) pairs tools/distill_refiner.py actually reads.
 
-        Recognises the four shapes the script uses:
+        Recognises the five shapes the script uses:
             config['distill'].get('steps', ...)
             config['teacher']['llm_path']
             config.get('probe', {}).get('num_queries', ...)
             rollout_config.get('steps', ...)      # via `rollout_config = config.get('rollout', {})`
             setting('shuffle_tags', ...)          # caption_augment_config's [distill]-first helper
+            resolve_batch_fill_config(config['distill'])   # reads BATCH_FILL_DEFAULTS's keys
         """
         import ast as ast_module
         source = (REPO / 'tools/distill_refiner.py').read_text(encoding='utf-8')
@@ -1244,6 +1246,21 @@ class TestEveryShippedDistillKeyIsRead:
                 table, key = 'distill', node.args[0].value
             if table and isinstance(key, str):
                 reads.setdefault(table, set()).add(key)
+
+        # resolve_batch_fill_config(config['distill']) reads every key in BATCH_FILL_DEFAULTS
+        # from whichever table its argument names. One AST-visible call, four keys -- the
+        # shapes above only ever bind one key per call, so this is its own pass rather than a
+        # sixth branch inside the loop above.
+        from utils.dataset import BATCH_FILL_DEFAULTS
+        for node in ast_module.walk(tree):
+            if (isinstance(node, ast_module.Call)
+                    and isinstance(node.func, ast_module.Name)
+                    and node.func.id == 'resolve_batch_fill_config' and node.args):
+                table = table_of(node.args[0])
+                if table is None and isinstance(node.args[0], ast_module.Name):
+                    table = aliases.get(node.args[0].id)
+                if table:
+                    reads.setdefault(table, set()).update(BATCH_FILL_DEFAULTS)
         return reads
 
     def test_the_extractor_finds_the_known_reads(self):
@@ -1260,6 +1277,9 @@ class TestEveryShippedDistillKeyIsRead:
         )
         assert 'dataset' in reads.get('distill', set()), (
             'the alias tracking for distill_config = config["distill"] broke'
+        )
+        assert 'batch_fill_strategy' in reads.get('distill', set()), (
+            'the resolve_batch_fill_config(config["distill"]) tracking broke'
         )
 
     @pytest.mark.parametrize('filename', CONFIGS)
@@ -2611,3 +2631,232 @@ class TestNoSyncBoundaryBehaviour:
             with strategy.micro_batch_context(is_last=is_last) as marker:
                 assert marker is None
         assert strategy.module.no_sync_calls == 0
+
+
+class TestEpochSamplerBatchFill:
+    """batch_fill_strategy = 'fill' for the caption sampler.
+
+    The unit here is the caption string, not the image: two identical strings in one global
+    batch are a distance of zero for the relational term, which is exactly the collapse that
+    term exists to punish. Dedup is therefore by content, not by index.
+    """
+
+    CAPTIONS = [f'caption {i}' for i in range(100)]
+
+    def _samplers(self, captions=None, batch_size=2, grad_accum=2, world_size=4, seed=7, **kw):
+        from tools.distill_refiner import EpochSampler
+        captions = self.CAPTIONS if captions is None else captions
+        return [EpochSampler(captions, batch_size, grad_accum, rank, world_size, seed, **kw)
+                for rank in range(world_size)]
+
+    @staticmethod
+    def _global_order(samplers, epoch):
+        """Interleave the rank shards back into the global order.
+
+        Sharding is strided, so rank r's local element k is global element k*world_size + r.
+        That is what makes a contiguous slice of one rank's list line up with a contiguous
+        global batch, and it is the property the training loop's offset arithmetic relies on.
+        """
+        shards = [s.epoch_order_weighted(epoch) for s in samplers]
+        out = []
+        for k in range(len(shards[0])):
+            for shard in shards:
+                out.append(shard[k])
+        return out
+
+    @staticmethod
+    def _batches(pairs, global_batch):
+        return [pairs[i:i + global_batch] for i in range(0, len(pairs), global_batch)]
+
+    def test_drop_is_unchanged(self):
+        sampler = self._samplers()[0]
+        assert sampler.steps_per_epoch == 100 // sampler.global_batch
+        assert all(weight == 1.0 for _, weight in sampler.epoch_order_weighted(0))
+
+    def test_epoch_order_is_the_caption_view_of_the_weighted_one(self):
+        """One implementation, one derived view. Two would be two things to keep in step."""
+        for strategy in ('drop', 'fill'):
+            sampler = self._samplers(fill_strategy=strategy)[2]
+            assert sampler.epoch_order(1) == [c for c, _ in sampler.epoch_order_weighted(1)]
+
+    def test_steps_per_epoch_rounds_up_under_fill(self):
+        sampler = self._samplers(fill_strategy='fill')[0]
+        assert sampler.steps_per_epoch == math.ceil(100 / sampler.global_batch)
+        assert sampler.steps_per_epoch == self._samplers()[0].steps_per_epoch + 1
+
+    def test_every_caption_is_covered_and_the_epoch_is_a_whole_number_of_batches(self):
+        samplers = self._samplers(fill_strategy='fill')
+        order = self._global_order(samplers, 0)
+        assert len(order) == samplers[0].steps_per_epoch * samplers[0].global_batch
+        assert {c for c, _ in order} >= set(self.CAPTIONS)
+
+    def test_no_caption_appears_twice_in_a_global_batch(self):
+        """Including the boundary batch, which is the one the fill touches."""
+        samplers = self._samplers(fill_strategy='fill')
+        order = self._global_order(samplers, 0)
+        for batch in self._batches(order, samplers[0].global_batch):
+            names = [c for c, weight in batch if weight > 0]
+            assert len(set(names)) == len(names)
+
+    def test_a_corpus_with_room_to_borrow_masks_nothing(self):
+        samplers = self._samplers(fill_strategy='fill')
+        order = self._global_order(samplers, 0)
+        assert all(weight > 0 for _, weight in order)
+
+    def test_the_order_is_a_pure_function_of_seed_and_epoch(self):
+        """Resume depends on this and nothing else: no state, no draw count."""
+        assert (self._samplers(fill_strategy='fill')[1].epoch_order_weighted(3)
+                == self._samplers(fill_strategy='fill')[1].epoch_order_weighted(3))
+        assert (self._samplers(fill_strategy='fill')[1].epoch_order_weighted(3)
+                != self._samplers(fill_strategy='fill')[1].epoch_order_weighted(4))
+
+    def test_the_shards_partition_the_global_order(self):
+        samplers = self._samplers(fill_strategy='fill')
+        shards = [s.epoch_order_weighted(0) for s in samplers]
+        assert len({len(shard) for shard in shards}) == 1
+        assert (sum(len(shard) for shard in shards)
+                == samplers[0].steps_per_epoch * samplers[0].global_batch)
+
+    def test_too_few_captions_still_raises_under_drop(self):
+        from tools.distill_refiner import EpochSampler
+        with pytest.raises(RuntimeError, match='cannot fill one global batch'):
+            EpochSampler(['only', 'three', 'captions'], batch_size=8, grad_accum=4,
+                         rank=0, world_size=1, seed=0)
+
+    def test_too_few_captions_is_padded_under_fill(self):
+        tiny = [f'c{i}' for i in range(10)]
+        samplers = self._samplers(tiny, fill_strategy='fill', min_real_fraction=0.1)
+        assert samplers[0].steps_per_epoch == 1
+        order = self._global_order(samplers, 0)
+        assert len(order) == samplers[0].global_batch
+        assert sum(1 for _, weight in order if weight > 0) == 10
+        assert sum(1 for _, weight in order if weight == 0) == 6
+
+    def test_the_real_captions_carry_the_compensating_scale(self):
+        tiny = [f'c{i}' for i in range(10)]
+        samplers = self._samplers(tiny, fill_strategy='fill', min_real_fraction=0.1)
+        order = self._global_order(samplers, 0)
+        weights = sorted({round(weight, 6) for _, weight in order})
+        assert weights == [0.0, round(samplers[0].global_batch / 10, 6)]
+
+    def test_min_real_fraction_refuses_a_mostly_padded_run(self):
+        from tools.distill_refiner import EpochSampler
+        with pytest.raises(RuntimeError, match='min_real_fraction'):
+            EpochSampler([f'c{i}' for i in range(3)], batch_size=4, grad_accum=2,
+                         rank=0, world_size=2, seed=0, fill_strategy='fill')
+
+    def test_undersized_drop_keeps_the_old_refusal(self):
+        from tools.distill_refiner import EpochSampler
+        with pytest.raises(RuntimeError, match='cannot fill one global batch'):
+            EpochSampler([f'c{i}' for i in range(10)], batch_size=8, grad_accum=4,
+                         rank=0, world_size=1, seed=0, fill_strategy='fill',
+                         undersized='drop')
+
+    def test_the_boundary_batch_never_pairs_two_identical_strings(self):
+        """A corpus that genuinely repeats a caption. Dedup is by content, so this holds."""
+        corpus = ['same'] * 30 + [f'unique {i}' for i in range(70)]
+        samplers = self._samplers(corpus, fill_strategy='fill')
+        order = self._global_order(samplers, 0)
+        last = self._batches(order, samplers[0].global_batch)[-1]
+        names = [c for c, weight in last if weight > 0]
+        assert len(set(names)) == len(names)
+
+
+class TestWeightedMse:
+    def test_no_weights_is_the_plain_call(self):
+        from tools.distill_refiner import weighted_mse
+        prediction = torch.randn(6, 4, 8)
+        target = torch.randn(6, 4, 8)
+        assert weighted_mse(prediction, target, None).item() == pytest.approx(
+            F.mse_loss(prediction, target).item(), rel=1e-6)
+
+    def test_all_ones_matches_the_plain_call(self):
+        """The fill path must be the same number as the drop path when nothing is padded."""
+        from tools.distill_refiner import weighted_mse
+        prediction = torch.randn(6, 4, 8)
+        target = torch.randn(6, 4, 8)
+        weights = torch.ones(6)
+        assert weighted_mse(prediction, target, weights).item() == pytest.approx(
+            F.mse_loss(prediction, target).item(), rel=1e-6)
+
+    def test_padding_is_ignored_and_the_scale_compensates(self):
+        from tools.distill_refiner import weighted_mse
+        prediction = torch.randn(8, 4, 8)
+        target = torch.randn(8, 4, 8)
+        prediction[4:] = prediction[:4]
+        target[4:] = target[:4]
+        weights = torch.tensor([2.0] * 4 + [0.0] * 4)
+        assert weighted_mse(prediction, target, weights).item() == pytest.approx(
+            F.mse_loss(prediction[:4], target[:4]).item(), rel=1e-5)
+
+    def test_a_batch_that_is_entirely_padding_gives_zero(self):
+        """Legal under gradient accumulation, and it must not divide by zero."""
+        from tools.distill_refiner import weighted_mse
+        prediction = torch.randn(4, 4, 8)
+        target = torch.randn(4, 4, 8)
+        result = weighted_mse(prediction, target, torch.zeros(4))
+        assert result.item() == 0.0
+        assert torch.isfinite(result)
+
+    def test_the_scale_is_global_so_uneven_micro_batches_still_average(self):
+        """Two micro batches with all the padding in one. A per-micro-batch ratio fails here."""
+        from tools.distill_refiner import weighted_mse
+        prediction = torch.randn(8, 4, 8)
+        target = torch.randn(8, 4, 8)
+        prediction[6:] = prediction[:2]
+        target[6:] = target[:2]
+        weights = torch.tensor([8 / 6] * 6 + [0.0] * 2)
+        pieces = [weighted_mse(p, t, w) for p, t, w in
+                  zip(prediction.chunk(2), target.chunk(2), weights.chunk(2))]
+        averaged = (pieces[0] + pieces[1]) / 2
+        assert averaged.item() == pytest.approx(
+            F.mse_loss(prediction[:6], target[:6]).item(), rel=1e-5)
+
+
+class TestPaddingIsExcludedFromRelationalAndSpread:
+    """Padding must be REMOVED from these two, not weighted to zero.
+
+    A masked repeat is a copy of a caption already in the batch, so it sits at distance zero
+    from it. relational_loss is built to punish distances collapsing toward zero, and
+    mean_pairwise_cosine_distance is the diagnostic for exactly that -- so leaving the copy in
+    teaches the wrong lesson and reports a collapse that is not happening.
+    """
+
+    def test_the_relational_term_ignores_a_duplicated_row(self):
+        from tools.distill_refiner import relational_loss
+        torch.manual_seed(0)
+        student = torch.randn(4, 16)
+        teacher = torch.randn(4, 16)
+        padded_student = torch.cat([student, student[:2]])
+        padded_teacher = torch.cat([teacher, teacher[:2]])
+        real = torch.tensor([True] * 4 + [False] * 2)
+        assert relational_loss(padded_student[real], padded_teacher[real]).item() == pytest.approx(
+            relational_loss(student, teacher).item(), rel=1e-6)
+
+    def test_keeping_the_duplicate_would_change_the_answer(self):
+        """The guard: if it made no difference, excluding it would prove nothing."""
+        from tools.distill_refiner import relational_loss
+        torch.manual_seed(1)
+        student = torch.randn(4, 16)
+        teacher = torch.randn(4, 16)
+        padded_student = torch.cat([student, student[:2]])
+        padded_teacher = torch.cat([teacher, teacher[:2]])
+        assert relational_loss(padded_student, padded_teacher).item() != pytest.approx(
+            relational_loss(student, teacher).item(), rel=1e-3)
+
+    def test_the_spread_diagnostic_ignores_duplicates(self):
+        from tools.distill_refiner import mean_pairwise_cosine_distance
+        torch.manual_seed(2)
+        features = torch.randn(4, 16)
+        padded = torch.cat([features, features[:2]])
+        real = torch.tensor([True] * 4 + [False] * 2)
+        assert mean_pairwise_cosine_distance(padded[real]) == pytest.approx(
+            mean_pairwise_cosine_distance(features), rel=1e-6)
+
+    def test_duplicates_drag_the_spread_down_if_left_in(self):
+        """Why it matters: the number would read as collapse starting."""
+        from tools.distill_refiner import mean_pairwise_cosine_distance
+        torch.manual_seed(3)
+        features = torch.randn(4, 16)
+        padded = torch.cat([features, features[:2]])
+        assert mean_pairwise_cosine_distance(padded) < mean_pairwise_cosine_distance(features)

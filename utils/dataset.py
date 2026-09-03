@@ -84,6 +84,82 @@ def seed_from_hash(item):
     return int(hashlib.md5(str.encode(str(item))).hexdigest(), 16) % int(1e9)
 
 
+# What to do when a size bucket's sample count is not a multiple of the global batch size.
+# 'drop' predates all of this and stays the default everywhere, so an existing config trains on
+# exactly the samples it trained on before.
+BATCH_FILL_STRATEGIES = ('drop', 'fill')
+# What to do for a bucket that cannot even fill one global batch, where repeating something is
+# the only way to produce a batch at all.
+UNDERSIZED_BUCKET_STRATEGIES = ('drop', 'pad_masked')
+
+# Key ConcatenatedBatchedDataset attaches to an example to carry its loss weight to _collate.
+# Leading underscore because it is internal plumbing between two methods of this file and must
+# never reach prepare_inputs, which would pass it on to the model as if it were a feature.
+SAMPLE_WEIGHT_KEY = '_sample_weight'
+
+BATCH_FILL_DEFAULTS = {
+    'batch_fill_strategy': 'drop',
+    'fill_rotate_per_epoch': True,
+    'undersized_bucket': 'pad_masked',
+    'min_real_fraction': 0.25,
+}
+
+
+def resolve_batch_fill_config(dataset_config, defaults=None, overrides=None):
+    """Read and check the four batch-fill keys, raising on anything unrecognised.
+
+    A typo in a strategy name has to fail here rather than fall back to a default: the two
+    values differ by whether data is silently dropped, and a run that quietly took the other
+    branch is a run whose epoch composition nobody can reconstruct afterwards.
+
+    Three layers, lowest first. `defaults` lets eval change a default without restating the
+    table -- eval wants fill_rotate_per_epoch off, because a metric that moves between epochs
+    for reasons unrelated to the model is worse than one computed on a fixed tail. Then the
+    dataset config, which is where the setting belongs. Then `overrides` from the training
+    config, which wins: several training configs share one dataset TOML, so without a layer
+    above it there is no way to turn this on for one run without turning it on for all of them.
+    """
+    resolved = dict(BATCH_FILL_DEFAULTS)
+    if defaults:
+        resolved.update(defaults)
+    for key in BATCH_FILL_DEFAULTS:
+        if key in dataset_config:
+            resolved[key] = dataset_config[key]
+    if overrides:
+        resolved.update({k: v for k, v in overrides.items() if k in BATCH_FILL_DEFAULTS})
+
+    if resolved['batch_fill_strategy'] not in BATCH_FILL_STRATEGIES:
+        raise ValueError(
+            f"batch_fill_strategy must be one of {list(BATCH_FILL_STRATEGIES)}, got "
+            f"{resolved['batch_fill_strategy']!r}"
+        )
+    if resolved['undersized_bucket'] not in UNDERSIZED_BUCKET_STRATEGIES:
+        raise ValueError(
+            f"undersized_bucket must be one of {list(UNDERSIZED_BUCKET_STRATEGIES)}, got "
+            f"{resolved['undersized_bucket']!r}"
+        )
+    if not isinstance(resolved['fill_rotate_per_epoch'], bool):
+        raise ValueError(
+            f"fill_rotate_per_epoch must be a boolean, got {resolved['fill_rotate_per_epoch']!r}"
+        )
+    fraction = resolved['min_real_fraction']
+    if isinstance(fraction, bool) or not isinstance(fraction, (int, float)):
+        raise ValueError(f'min_real_fraction must be a number, got {fraction!r}')
+    if not 0 <= fraction <= 1:
+        raise ValueError(f'min_real_fraction must be between 0 and 1, got {fraction}')
+
+    rotate_was_set = ('fill_rotate_per_epoch' in dataset_config
+                      or 'fill_rotate_per_epoch' in (overrides or {}))
+    if resolved['batch_fill_strategy'] == 'drop' and rotate_was_set:
+        if is_main_process():
+            logger.warning(
+                'fill_rotate_per_epoch is set but batch_fill_strategy is '
+                f"{resolved['batch_fill_strategy']!r}, so it has no effect. It only rotates the "
+                'samples used to fill a short final batch, and nothing is filled under drop.'
+            )
+    return resolved
+
+
 def _content_digest(dataset, column, upto=None):
     """Hash of the first `upto` values of `column`, or all of them when upto is None.
 
@@ -591,10 +667,14 @@ class ConcatenatedBatchedDataset:
     def __init__(self, datasets):
         self.datasets = datasets
         self.post_init_called = False
+        self.batch_fill = dict(BATCH_FILL_DEFAULTS)
+        self.fill_report = None
 
-    def post_init(self, global_batch_size: dict, global_batch_size_image: dict, data_parallel_rank: int, data_parallel_world_size: int):
+    def post_init(self, global_batch_size: dict, global_batch_size_image: dict, data_parallel_rank: int, data_parallel_world_size: int, batch_fill=None):
         self.data_parallel_rank = data_parallel_rank
         self.data_parallel_world_size = data_parallel_world_size
+        if batch_fill is not None:
+            self.batch_fill = batch_fill
         iteration_order = []
         size_bucket = self.datasets[0].size_bucket
         for i, ds in enumerate(self.datasets):
@@ -623,7 +703,19 @@ class ConcatenatedBatchedDataset:
                     self.global_batch_size = bs
 
         assert self.global_batch_size % self.data_parallel_world_size == 0
-        self._make_divisible_by(self.global_batch_size)
+        # size_bucket is [w, h, frames] or [ar, w, h, frames]. Only used to name the bucket in
+        # log lines and to shape a synthesised mask, never to compute a batch.
+        self.size_bucket = size_bucket
+        # (height, width) in pixels, matching what PreprocessMediaFile returns for a real mask.
+        # Only ever the fallback in _collate -- a real mask in the batch supplies the shape --
+        # and only the value matters downstream, since every model interpolates the mask to the
+        # latent size before using it.
+        self.mask_shape = (int(size_bucket[-2]), int(size_bucket[-3]))
+        if self.batch_fill['batch_fill_strategy'] == 'fill':
+            self._fill_to_multiple_of(self.global_batch_size)
+        else:
+            self._make_divisible_by(self.global_batch_size)
+            self.sample_weights = np.ones(len(self.iteration_order), dtype=np.float32)
         self.batch_size = self.global_batch_size // self.data_parallel_world_size
         self.post_init_called = True
 
@@ -633,15 +725,242 @@ class ConcatenatedBatchedDataset:
 
     def __getitem__(self, idx):
         assert self.post_init_called
-        start_idx = idx * self.global_batch_size + self.data_parallel_rank * self.batch_size
+        block_start = idx * self.global_batch_size
+        start_idx = block_start + self.data_parallel_rank * self.batch_size
         end_idx = start_idx + self.batch_size
-        return [self.datasets[i.item()][j.item()] for i, j in self.iteration_order[start_idx : end_idx]]
+        examples = [self.datasets[i.item()][j.item()] for i, j in self.iteration_order[start_idx : end_idx]]
+        scale = self._batch_weight_scale(block_start)
+        if scale is not None:
+            for k, example in enumerate(examples):
+                example[SAMPLE_WEIGHT_KEY] = scale * float(self.sample_weights[start_idx + k])
+        return examples
+
+    def _batch_weight_scale(self, block_start):
+        """Loss weight for the real samples of the global batch starting at block_start.
+
+        Computed over the WHOLE global batch, never over this rank's slice or one micro batch.
+        loss.mean() divides by the element count including the zeroed padding, so the real
+        samples have to be scaled back up by G/G_real to make the step behave like a smaller
+        batch at the same learning rate. Deepspeed averages the micro batch losses and the data
+        parallel ranks average their gradients, so one constant shared by every micro batch and
+        every rank is what makes the arithmetic come out right no matter how unevenly the
+        padding happens to be distributed. A per-micro-batch ratio would not.
+
+        Returns None when every sample in the batch is real, which is every batch under 'drop'
+        and every batch of a bucket that had enough data. That is deliberate: nothing is
+        attached to the examples, so _collate stays on exactly the path it had before batch
+        fill existed, mask = None included.
+        """
+        block = self.sample_weights[block_start : block_start + self.global_batch_size]
+        num_real = int(np.count_nonzero(block))
+        if num_real == len(block):
+            return None
+        if num_real == 0:
+            # Never reached: a bucket with no real sample in a batch is dropped in
+            # _fill_to_multiple_of. Guarded anyway, because the alternative is a division by
+            # zero that surfaces as a NaN loss thousands of steps later.
+            raise RuntimeError(f'size bucket {self.size_bucket} produced a global batch with no real sample')
+        return len(block) / num_real
 
     def _make_divisible_by(self, n):
         new_length = (len(self.iteration_order) // n) * n
         self.iteration_order = self.iteration_order[:new_length]
         if new_length == 0 and is_main_process():
             logger.warning(f"size bucket {self.datasets[0].size_bucket} is being completely dropped because it doesn't have enough images")
+
+    def _cache_row_identity(self):
+        """Read each sub-dataset's latents_idx column once, for the duplicate check below.
+
+        iteration_order is a datasets.Dataset backed by Arrow, and the fill has to ask "which
+        image is this?" for potentially every entry of the bucket. Reading the column per entry
+        is a million Arrow lookups on a real dataset and turns startup into minutes; reading it
+        once is a list.
+
+        list(), not the Column object, for the reason _content_digest spells out: indexing a
+        datasets.Dataset hands back a lazy view holding a reference to its parent.
+        """
+        self._latents_idx = []
+        self._num_rows = []
+        for ds in self.datasets:
+            self._latents_idx.append(list(ds.iteration_order['latents_idx']))
+            self._num_rows.append(len(ds.iteration_order))
+
+    def _row_id(self, entry):
+        """(sub-dataset, row) -- one row of one SizeBucketDataset, so one (image, caption) pair.
+
+        j indexes SizeBucketDataset, whose __len__ is len(iteration_order) * num_repeats and
+        whose __getitem__ takes idx % len(iteration_order). So the num_repeats copies of a row
+        all collapse to the same row here, which is what makes a copy count as a repeat rather
+        than as a new sample.
+        """
+        dataset_idx = int(entry[0])
+        return (dataset_idx, int(entry[1]) % self._num_rows[dataset_idx])
+
+    def _image_id(self, entry):
+        """(sub-dataset, latents_idx) -- one image.
+
+        The sub-dataset index is not optional: several [[directory]] entries land in the same
+        size bucket and latents_idx is local to each one, so image 0 of two directories would
+        otherwise look like the same image.
+        """
+        dataset_idx, row = self._row_id(entry)
+        return (dataset_idx, self._latents_idx[dataset_idx][row])
+
+    def _fill_to_multiple_of(self, n):
+        """Extend iteration_order so it is a multiple of n, instead of truncating to one.
+
+        Only the tail is touched. The first N entries stay exactly what 'drop' would have
+        produced, which is what keeps the change to the training order bounded and keeps the
+        static part reproducible across epochs; the price is that a duplicate image already
+        present inside the static part is left there, exactly as it is today. See
+        docs/note/batch-fill-strategies.md.
+        """
+        self._static_iteration_order = self.iteration_order
+        self._cache_row_identity()
+        n_static = len(self.iteration_order)
+        remainder = n_static % n
+
+        if n_static == 0 or (n_static < n and self.batch_fill['undersized_bucket'] == 'drop'):
+            self._dropped = True
+            self._make_divisible_by(n)
+            self.sample_weights = np.ones(len(self.iteration_order), dtype=np.float32)
+            return
+
+        self._dropped = False
+        if remainder == 0:
+            # Already a whole number of batches. Filling is a no-op, and saying so keeps the
+            # startup report honest rather than reporting a fill of zero samples.
+            self.sample_weights = np.ones(n_static, dtype=np.float32)
+            self.fill_report = self._make_fill_report(n_static, 0, 0)
+            return
+
+        self._fill_tail(epoch=0)
+
+    def _fill_tail(self, epoch):
+        """Choose the entries that pad the final batch, for this epoch.
+
+        Rebuilt from the static order every time rather than mutated in place, so calling this
+        for epoch k gives the same answer whenever it is called. That is what resume needs:
+        the order has to be a function of (seed, epoch), never of how many times anything has
+        been drawn.
+        """
+        n = self.global_batch_size
+        order = self._static_iteration_order
+        n_static = len(order)
+        remainder = n_static % n
+        num_missing = n - remainder
+        tail_start = n_static - remainder
+
+        forbidden_images = set()
+        used_rows = set()
+        for k in range(tail_start, n_static):
+            forbidden_images.add(self._image_id(order[k]))
+            used_rows.add(self._row_id(order[k]))
+
+        candidates = list(range(n_static))
+        shuffle_with_seed(candidates, seed_from_hash((tuple(self.size_bucket), 'fill', epoch)))
+
+        chosen = []
+        weights = []
+        # Tier 1: an image not already in this batch. A genuinely new sample.
+        for k in candidates:
+            if len(chosen) == num_missing:
+                break
+            image_id = self._image_id(order[k])
+            if image_id in forbidden_images:
+                continue
+            chosen.append(k)
+            weights.append(1.0)
+            forbidden_images.add(image_id)
+            used_rows.add(self._row_id(order[k]))
+        # Tier 2: the same image under a different caption. Still a new (image, caption) pair,
+        # so it is real compute and is not masked. Note this tier is empty by construction when
+        # caption_sampling is 'random_per_epoch', because that collapses every image to one
+        # row: a copy of that row would pick its caption at random at access time and there is
+        # nothing guaranteeing a different one, so it belongs in tier 3, not here.
+        if len(chosen) < num_missing:
+            for k in candidates:
+                if len(chosen) == num_missing:
+                    break
+                row_id = self._row_id(order[k])
+                if row_id in used_rows:
+                    continue
+                chosen.append(k)
+                weights.append(1.0)
+                used_rows.add(row_id)
+
+        num_real = remainder + len(chosen)
+        # Tier 3: nothing left but an exact repeat. Masked to zero, so it costs GPU time and
+        # teaches the model nothing -- which is why min_real_fraction exists to refuse a batch
+        # that is mostly this.
+        if len(chosen) < num_missing:
+            fraction = num_real / n
+            if fraction < self.batch_fill['min_real_fraction']:
+                if is_main_process():
+                    logger.warning(
+                        f'size bucket {self.size_bucket} is being dropped: it can supply only '
+                        f'{num_real} real samples for a global batch of {n} '
+                        f'({fraction:.3f} < min_real_fraction {self.batch_fill["min_real_fraction"]}), '
+                        f'so {n - num_real} of every batch would be masked-out padding.\n'
+                        '  To keep it: lower micro_batch_size_per_gpu or '
+                        'gradient_accumulation_steps, raise num_repeats, lower num_ar_buckets so '
+                        'this bucket merges with a neighbour, or lower min_real_fraction.'
+                    )
+                self._dropped = True
+                self.iteration_order = self._static_iteration_order[:0]
+                self.sample_weights = np.ones(0, dtype=np.float32)
+                return
+            k = 0
+            while len(chosen) < num_missing:
+                chosen.append(candidates[k % n_static])
+                weights.append(0.0)
+                k += 1
+
+        self.iteration_order = np.concatenate([order, order[chosen]])
+        self.sample_weights = np.concatenate(
+            [np.ones(n_static, dtype=np.float32), np.array(weights, dtype=np.float32)]
+        )
+        self.fill_report = self._make_fill_report(n_static, len(chosen), weights.count(0.0))
+
+    def _make_fill_report(self, n_static, num_added, num_masked):
+        n = self.global_batch_size
+        return {
+            'size_bucket': tuple(self.size_bucket),
+            'num_samples': n_static,
+            'global_batch_size': n,
+            'batches_before': n_static // n,
+            'batches_after': (n_static + num_added) // n,
+            'num_added': num_added,
+            'num_masked': num_masked,
+        }
+
+    def set_epoch(self, epoch):
+        """Rotate which samples pad the final batch.
+
+        Without this, the same `num_missing` images are seen twice in every epoch forever. On a
+        large bucket that is a rounding error; on a small one it is not -- 100 samples at a
+        global batch of 64 pads 28 of them, so 28% of the data is systematically oversampled.
+        Only the padding moves: the static part stays put, so the change to the training order
+        stays bounded by the size of the tail.
+        """
+        if not self.post_init_called or self._is_static():
+            return
+        before = len(self.iteration_order)
+        self._fill_tail(epoch)
+        # The count of tier-1 and tier-2 candidates depends on which images and rows exist, not
+        # on the order they are visited in, so the length cannot move between epochs. Asserted
+        # because Dataset.post_init built its own iteration order from this length and would
+        # silently index off the end if it ever did.
+        assert len(self.iteration_order) == before, (len(self.iteration_order), before)
+
+    def _is_static(self):
+        return (
+            self.batch_fill['batch_fill_strategy'] != 'fill'
+            or not self.batch_fill['fill_rotate_per_epoch']
+            or getattr(self, '_dropped', False)
+            or self.fill_report is None
+            or self.fill_report['num_added'] == 0
+        )
 
 
 class ARBucketDataset:
@@ -1328,7 +1647,8 @@ class DirectoryDataset:
 # for returning the correct batch for the process's data parallel rank. Calls model.prepare_inputs so the
 # returned tuple of tensors is whatever the model needs.
 class Dataset:
-    def __init__(self, dataset_config, model, skip_dataset_validation=False):
+    def __init__(self, dataset_config, model, skip_dataset_validation=False,
+                 batch_fill_defaults=None, batch_fill_overrides=None):
         super().__init__()
         self.dataset_config = dataset_config
         self.model = model
@@ -1338,6 +1658,11 @@ class Dataset:
         #     self.model_name = 'cosmos_predict2'
         self.post_init_called = False
         self.eval_quantile = None
+        # Checked here rather than at post_init so a typo fails before the caching run, not
+        # after it. batch_fill_defaults lets the eval datasets change a default without
+        # restating the table; train passes nothing and gets the shipped defaults.
+        self.batch_fill = resolve_batch_fill_config(
+            dataset_config, batch_fill_defaults, batch_fill_overrides)
         if not skip_dataset_validation:
             self.model.model_specific_dataset_config_validation(self.dataset_config)
 
@@ -1376,7 +1701,9 @@ class Dataset:
             self.buckets.append(ConcatenatedBatchedDataset(datasets))
 
         for bucket in self.buckets:
-            bucket.post_init(global_batch_size, global_batch_size_image, data_parallel_rank, data_parallel_world_size)
+            bucket.post_init(global_batch_size, global_batch_size_image, data_parallel_rank,
+                             data_parallel_world_size, batch_fill=self.batch_fill)
+        self._report_batch_fill()
 
         iteration_order = []
         for i, bucket in enumerate(self.buckets):
@@ -1396,6 +1723,42 @@ class Dataset:
             new_len = int(len(self) * subsample_ratio)
             self.iteration_order = self.iteration_order[:new_len]
 
+    def _report_batch_fill(self):
+        """Say what the fill did, per bucket, at startup.
+
+        Batch fill changes how many steps an epoch has and can quietly turn a quarter of a
+        batch into masked padding. Both are things someone reading a loss curve needs to know
+        about beforehand, not deduce from it.
+        """
+        if self.batch_fill['batch_fill_strategy'] != 'fill' or not is_main_process():
+            return
+        reports = [b.fill_report for b in self.buckets if b.fill_report is not None]
+        if not reports:
+            return
+        print(f"batch_fill_strategy = 'fill' (undersized_bucket = "
+              f"{self.batch_fill['undersized_bucket']!r}, min_real_fraction = "
+              f"{self.batch_fill['min_real_fraction']}):")
+        for r in reports:
+            line = (f"  bucket {r['size_bucket']}: {r['num_samples']} samples, global batch "
+                    f"{r['global_batch_size']}, {r['batches_before']} -> {r['batches_after']} batches, "
+                    f"+{r['num_added']} filled")
+            if r['num_masked']:
+                line += f", {r['num_masked']} of them masked out"
+            print(line)
+
+    def set_epoch(self, epoch):
+        """Tell every bucket which epoch is starting, so the fill can rotate.
+
+        A no-op unless batch_fill_strategy is 'fill' and fill_rotate_per_epoch is on, so the
+        default path does no work and changes nothing.
+        """
+        for bucket in self.buckets:
+            bucket.set_epoch(epoch)
+
+    def is_batch_fill_static(self):
+        """True when set_epoch can never change anything, so nothing has to be rebuilt for it."""
+        return all(bucket._is_static() for bucket in self.buckets)
+
     def set_eval_quantile(self, quantile):
         self.eval_quantile = quantile
 
@@ -1406,13 +1769,17 @@ class Dataset:
     def __getitem__(self, idx):
         assert self.post_init_called
         i, j = self.iteration_order[idx]
-        examples_for_this_dp_rank = self.buckets[i][j]
-        batch = self._collate(examples_for_this_dp_rank)
+        bucket = self.buckets[i]
+        examples_for_this_dp_rank = bucket[j]
+        batch = self._collate(examples_for_this_dp_rank, mask_shape=bucket.mask_shape)
         return batch
 
     # Collates a list of feature dictionaries into a single dictionary of batched features.
     # Each feature can be a tensor, list, or single item.
-    def _collate(self, examples):
+    def _collate(self, examples, mask_shape=None):
+        # Popped before the loop below, which would otherwise collate it into the batch and
+        # hand it to prepare_inputs as though the model had asked for it.
+        weights = [example.pop(SAMPLE_WEIGHT_KEY, 1.0) for example in examples]
         ret = {}
         for key in examples[0]:
             if key == 'mask':
@@ -1432,15 +1799,44 @@ class Dataset:
             if mask is not None:
                 assert shape is None or mask.shape == shape
                 shape = mask.shape
-        if shape is not None:
-            # At least one item has a mask. Need to make the None masks all 1s.
-            for i, mask in enumerate(masks):
-                if mask is None:
-                    masks[i] = torch.ones(shape, dtype=torch.float16)
-            ret['mask'] = torch.stack(masks)
-        else:
-            # We can leave the batch mask as None and the loss_fn will skip masking entirely.
-            ret['mask'] = None
+        if all(w == 1.0 for w in weights):
+            # No batch fill, or a batch that is entirely real samples. Byte for byte the path
+            # this had before batch fill existed, mask = None included, so nothing about an
+            # ordinary run changes.
+            if shape is not None:
+                # At least one item has a mask. Need to make the None masks all 1s.
+                for i, mask in enumerate(masks):
+                    if mask is None:
+                        masks[i] = torch.ones(shape, dtype=torch.float16)
+                ret['mask'] = torch.stack(masks)
+            else:
+                # We can leave the batch mask as None and the loss_fn will skip masking entirely.
+                ret['mask'] = None
+            return ret
+
+        # This batch holds padding, so every sample needs a mask carrying its weight -- the
+        # padding's zero, and the compensating G/G_real on the rest. Reusing the existing mask
+        # channel is what keeps all of this out of the eight get_loss_fn implementations: they
+        # already multiply by the mask elementwise before averaging.
+        #
+        # A real mask's shape wins when there is one, so a synthesised mask can never disagree
+        # with it. mask_shape is only the fallback for a batch where nobody supplied one, and
+        # it only has to be a plausible spatial shape: every model interpolates the mask to the
+        # latent size, and a constant survives that unchanged.
+        if shape is None:
+            shape = mask_shape
+        if shape is None:
+            raise RuntimeError(
+                'A padded batch needs a mask shape and none could be determined. This means the '
+                'size bucket had no spatial dimensions to fall back on.'
+            )
+        for i, (mask, weight) in enumerate(zip(masks, weights)):
+            base = torch.ones(shape, dtype=torch.float16) if mask is None else mask
+            # float16 to match what PreprocessMediaFile produces, so a synthesised mask and a
+            # real one stack. The weight rounds to about four significant digits here, which is
+            # far below the noise of bf16 training and keeps the mask at its existing size.
+            masks[i] = base * weight
+        ret['mask'] = torch.stack(masks)
         return ret
 
     def cache_metadata(self, regenerate_cache=False, trust_cache=False):
@@ -1739,14 +2135,35 @@ class PipelineDataLoader:
         self.num_batches_pulled = 0
         self.next_micro_batch = None
         self.recreate_dataloader = False
+        self._set_dataset_epoch()
         # Be careful to only create the DataLoader some bounded number of times: https://github.com/pytorch/pytorch/issues/91252
         self._create_dataloader()
         self.data = self._pull_batches_from_dataloader()
+
+    def _set_dataset_epoch(self):
+        """Hand the epoch to the dataset, for batch fill's per-epoch rotation.
+
+        A no-op for every configuration except batch_fill_strategy = 'fill' with
+        fill_rotate_per_epoch on, and the dataset decides that for itself.
+
+        With workers, this assignment happens in the parent and does not reach them:
+        persistent_workers keeps a forked/spawned copy of the dataset that was made when the
+        DataLoader was built, so the workers would go on serving the previous epoch's tail.
+        Rebuilding the DataLoader is what carries the new order across. Once per epoch is a
+        bounded number of times, which is what the pytorch issue linked above is about -- the
+        thing to avoid is rebuilding inside the loop.
+        """
+        if not hasattr(self.dataset, 'set_epoch'):
+            return
+        self.dataset.set_epoch(self.epoch)
+        if self.num_dataloader_workers > 0 and not self.dataset.is_batch_fill_static():
+            self.recreate_dataloader = True
 
     def reset(self):
         self.epoch = 1
         self.num_batches_pulled = 0
         self.next_micro_batch = None
+        self._set_dataset_epoch()
         self.data = self._pull_batches_from_dataloader()
 
     def set_eval_quantile(self, quantile):
@@ -1766,13 +2183,16 @@ class PipelineDataLoader:
         try:
             self.next_micro_batch = next(self.data)
         except StopIteration:
+            self.epoch += 1
+            # Before the DataLoader is rebuilt, so a rebuild triggered here picks up the new
+            # epoch's tail rather than the previous one's.
+            self._set_dataset_epoch()
             if self.recreate_dataloader:
                 self._create_dataloader()
                 self.recreate_dataloader = False
             self.data = self._pull_batches_from_dataloader()
             self.num_batches_pulled = 0
             self.next_micro_batch = None
-            self.epoch += 1
         return ret
 
     def _create_dataloader(self, skip_first_n_batches=None):
@@ -1849,6 +2269,10 @@ class PipelineDataLoader:
         # -1 because by preloading the next micro_batch, it's always going to have one more batch
         # pulled than the actual number of batches iterated by the caller.
         self.num_batches_pulled = state_dict['num_batches_pulled'] - 1
+        # The resumed epoch decides which samples pad the final batch, so this has to happen
+        # before the DataLoader is built or the first epoch after a resume walks a different
+        # tail than the run that was interrupted.
+        self._set_dataset_epoch()
         self._create_dataloader(skip_first_n_batches=self.num_batches_pulled)
         self.data = self._pull_batches_from_dataloader()
         # Recreate the dataloader after the first pass so that it won't skip

@@ -35,6 +35,11 @@ save_dtype = 'bfloat16'
 caching_batch_size = 8
 steps_per_print = 10
 
+# Complete the final batch of each size bucket rather than dropping it. Set here rather than in
+# the dataset TOML because this config shares examples/dataset.toml with the other modes and
+# with every other model's examples; the key is read from either place and this one wins.
+batch_fill_strategy = 'fill'
+
 [model]
 type = 'anima_refiner'
 transformer_path = '/data2/imagegen_models/comfyui-models/anima-preview.safetensors'
