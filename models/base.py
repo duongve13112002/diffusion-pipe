@@ -5,6 +5,17 @@ import os
 import sys
 from collections import defaultdict
 import types
+
+# Import diffusion-pipe's own utils package before ComfyUI joins sys.path below. utils/ has no
+# __init__.py (it's a namespace package), while submodules/ComfyUI/utils/ is a regular package
+# (it has one) -- and a regular package always wins a namespace package for the same top-level
+# name, regardless of which sys.path entry comes first. Importing it now caches 'utils' and
+# 'utils.common' in sys.modules, so the 'from utils.common import ...' below is served from
+# that cache instead of triggering a fresh path search once ComfyUI is on sys.path. Any entry
+# point that imports a model module before importing anything under utils/ itself would
+# otherwise hit 'ModuleNotFoundError: No module named utils.common'.
+from utils.common import is_main_process, VIDEO_EXTENSIONS, round_to_nearest_multiple, round_down_to_multiple, AUTOCAST_DTYPE, empty_cuda_cache
+
 sys.path.insert(0, os.path.join(os.path.abspath(os.path.dirname(__file__)), '../submodules/ComfyUI'))
 
 import peft
@@ -20,7 +31,6 @@ import accelerate
 from diffusers import FlowMatchEulerDiscreteScheduler
 from tqdm import tqdm
 
-from utils.common import is_main_process, VIDEO_EXTENSIONS, round_to_nearest_multiple, round_down_to_multiple, AUTOCAST_DTYPE, empty_cuda_cache
 import comfy.utils
 import comfy.sd
 import comfy.sd1_clip

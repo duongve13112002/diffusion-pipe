@@ -33,6 +33,75 @@
 <p class="meta">A running log of decisions taken outside the spec, forced changes, tradeoffs, and
 anything else the maintainer needs to know. Newest entry first.</p>
 
+<h2>2026-09-05 &mdash; A ComfyUI/utils import shadow, and a deepspeed CLI typo in the distill docs</h2>
+
+<p><strong>Request.</strong> Two real failures were reported from an 8-GPU box while launching
+distillation: <code>deepspeed --num_gpus=8 -m tools.distill_refiner ...</code> failed at argument
+parsing, and once corrected to <code>--module</code>, the process crashed on every rank with
+<code>ModuleNotFoundError: No module named 'utils.common'</code>.</p>
+
+<h3>The CLI typo</h3>
+
+<p><code>deepspeed</code>'s own argument parser has no <code>-m</code> flag; only
+<code>--module</code> is recognised (<code>-m</code> is Python's and <code>torchrun</code>'s flag,
+not deepspeed's). Two example configs had copied the wrong form:
+<code>examples/anima_refiner/distill_4gpu.toml</code> and
+<code>examples/anima_refiner/distill_rollout_4gpu.toml</code>. A repo-wide search found no other
+occurrence; the <code>torchrun ... -m tools.distill_refiner</code> lines elsewhere in the docs are
+correct as written; and the <code>deepspeed ... tools/distill_refiner.py</code> script-path form is a separate
+kind of usage that never took the module flag.</p>
+
+<h3>The import shadow &mdash; the real bug</h3>
+
+<p><code>models/base.py</code> puts <code>submodules/ComfyUI</code> on <code>sys.path</code> so it
+can import <code>comfy.*</code>. ComfyUI ships its own <code>utils/</code> directory, and it has an
+<code>__init__.py</code>, making it a <em>regular</em> package; diffusion-pipe's own
+<code>utils/</code> has none, making it a <em>namespace</em> package. The first instinct &mdash;
+move the ComfyUI insert from <code>sys.path.insert(0, ...)</code> to
+<code>sys.path.append(...)</code>, so the repo's own directory would be searched first &mdash; was
+tried and then reverted after writing a two-directory reproduction and running it both orders: per
+PEP 420, once both a regular and a namespace package exist for the same top-level name anywhere on
+<code>sys.path</code>, the regular package always wins, in either order. Ordering
+<code>sys.path</code> cannot fix this.</p>
+
+<p>What actually works, verified the same way: importing <code>utils.common</code> before ComfyUI
+ever joins <code>sys.path</code>, so it is served from <code>sys.modules</code> afterward instead of
+triggering a fresh search. <code>train.py</code> never hit this bug by accident, because it imports
+<code>utils.dataset</code> before importing any <code>models/*.py</code> module and so claims the
+name first. <code>tools/distill_refiner.py</code> imports <code>models.cosmos_predict2</code>
+first, so it always hit it &mdash; every rank, every launch, on a real box, not a corner case.
+<code>tools/cosmos_vae_test.py</code> has the same import order and would fail the same way if run.
+The fix moves the existing <code>from utils.common import ...</code> line in
+<code>models/base.py</code> to above the <code>sys.path.insert</code> line, with a comment
+explaining why the order matters.</p>
+
+<p>The project had independently diagnosed the identical mechanism once before, but only patched it
+for the test harness: <code>test/conftest.py</code> and <code>test/childenv/sitecustomize.py</code>
+both pre-import a real <code>utils</code> submodule before ComfyUI can be reached, with comments
+describing the exact same regular-vs-namespace collision. Neither one touches
+<code>models/base.py</code> itself, which is why the workaround protected every test process but not
+a real training launch outside pytest.</p>
+
+<h3>Verification</h3>
+
+<ul>
+  <li><strong>The <code>append</code> idea was empirically falsified before being shipped.</strong>
+    A throwaway two-directory reproduction (one namespace package with a real submodule, one regular
+    package without it) was imported fresh in both orderings; both orderings raised the same
+    <code>ModuleNotFoundError</code>, which is what caused the revert.</li>
+  <li><code>test/test_import_order.py</code> (new, 3 cases) reproduces the actual bug against the
+    real repository files &mdash; not toy stand-ins &mdash; because
+    <code>submodules/ComfyUI/utils/__init__.py</code> is empty, so the shadow can be triggered
+    without any GPU or ComfyUI shim. One test statically asserts the import precedes the
+    <code>sys.path.insert</code> in <code>models/base.py</code>; two subprocess tests prove the
+    broken order still breaks and the fixed order still works, with <code>PYTHONPATH</code>
+    stripped of <code>test/childenv</code> so the test-harness workaround cannot mask the result
+    being tested.</li>
+  <li>Targeted suite after the fix: <code>test_anima_refiner*.py</code>, <code>test_batch_fill.py</code>,
+    <code>test_dataset_smoke.py</code>, <code>test_import_order.py</code> &mdash; 287 passed, 1
+    skipped.</li>
+</ul>
+
 <h2>2026-09-03 &mdash; Batch fill: completing a short batch instead of dropping it</h2>
 
 <p><strong>Request.</strong> The pipeline silently discards samples in three places when a size

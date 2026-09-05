@@ -1,6 +1,6 @@
 # Distillation, 4 GPUs, WITH the denoising rollout.
 #
-#   deepspeed --num_gpus=4 -m tools.distill_refiner --config examples/anima_refiner/distill_rollout_4gpu.toml
+#   deepspeed --num_gpus=4 --module tools.distill_refiner --config examples/anima_refiner/distill_rollout_4gpu.toml
 #
 # Identical to distill_4gpu.toml apart from the [rollout] table at the bottom. Every training
 # setting -- epochs, batch size, precision, optimizer, learning rate, checkpointing -- is the

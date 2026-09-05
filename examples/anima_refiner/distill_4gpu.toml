@@ -1,6 +1,6 @@
 # Distillation, 4 GPUs, WITHOUT the denoising rollout.
 #
-#   deepspeed --num_gpus=4 -m tools.distill_refiner --config examples/anima_refiner/distill_4gpu.toml
+#   deepspeed --num_gpus=4 --module tools.distill_refiner --config examples/anima_refiner/distill_4gpu.toml
 #
 # The three cheap objectives only: the cross-attention probe, the pooled mean, and the
 # relational term. This is the configuration to start from; see distill_rollout_4gpu.toml for
