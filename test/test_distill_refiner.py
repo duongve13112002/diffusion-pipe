@@ -138,6 +138,19 @@ class TestScriptStructure:
         for launcher_specific in ('OMPI_COMM_WORLD', 'SLURM_PROCID', 'deepspeed.init_distributed'):
             assert launcher_specific not in src, f'{launcher_specific} ties this to one launcher'
 
+    def test_local_rank_is_accepted_so_deepspeeds_default_launcher_does_not_crash(self):
+        # deepspeed's default launcher appends --local_rank=N to every spawned process's argv
+        # (a legacy PyTorch DDP convention) on top of setting the LOCAL_RANK env var, and
+        # setup_distributed() only reads the env var (see the launcher-agnostic test above), so
+        # without this declared, argparse rejects the launcher's own argv with "unrecognized
+        # arguments: --local_rank=N" before a single line of the script runs. Confirmed against
+        # a real 8-GPU deepspeed launch: `deepspeed --num_gpus=8 --module tools.distill_refiner
+        # --config ...` failed on every rank until this was added.
+        src = self.source()
+        assert "parser.add_argument('--local_rank'" in src, (
+            'deepspeed --module launches will fail argument parsing on every rank without this'
+        )
+
     @pytest.mark.parametrize('env,expected', [
         ({}, (0, 1, 0)),
         ({'RANK': '0', 'WORLD_SIZE': '1', 'LOCAL_RANK': '0'}, (0, 1, 0)),

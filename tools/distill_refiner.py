@@ -1394,6 +1394,12 @@ def build_strategy(config, refiner, world_size, local_rank, device, batch_size, 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('--config', required=True, help='Path to the TOML config.')
+    # Accepted but unused: deepspeed's default launcher appends --local_rank=N to every spawned
+    # process's argv (a legacy PyTorch DDP convention) in addition to setting the LOCAL_RANK
+    # env var, so parsing has to tolerate it. setup_distributed() stays launcher-agnostic and
+    # reads LOCAL_RANK from the environment instead, since torchrun does not inject this flag.
+    parser.add_argument('--local_rank', type=int, default=-1,
+                        help='Unused; accepted so deepspeed\'s default launcher does not fail argument parsing.')
     args = parser.parse_args()
     config = toml.load(args.config)
 

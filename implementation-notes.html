@@ -102,6 +102,33 @@ a real training launch outside pytest.</p>
     skipped.</li>
 </ul>
 
+<h3>A third failure from the same launch: --local_rank</h3>
+
+<p>Fixing the two bugs above got the same 8-GPU launch one step further, straight into a third,
+unrelated one: <code>distill_refiner.py: error: unrecognized arguments: --local_rank=6</code> on
+every rank. deepspeed's default launcher appends <code>--local_rank=N</code> to each spawned
+process's argv &mdash; a legacy PyTorch DDP convention &mdash; on top of setting the
+<code>LOCAL_RANK</code> environment variable. <code>tools/distill_refiner.py</code>'s argparse only
+ever declared <code>--config</code>, so it rejected the launcher's own argument.</p>
+
+<p><code>setup_distributed()</code> is deliberately launcher-agnostic and already reads
+<code>LOCAL_RANK</code> from the environment (both deepspeed and torchrun export it), so the fix is
+to accept and ignore the flag rather than wire it in: <code>train.py</code> already declares the
+identical <code>--local_rank</code> argument for the identical reason, so this brings
+<code>distill_refiner.py</code> in line with the project's own existing convention instead of
+inventing a new one.</p>
+
+<p>Verified against the real file with the same <code>PYTHONPATH=test/childenv</code> technique
+<code>tools/check_comfy_signatures.py</code> already documents for importing the ComfyUI submodule
+on this CPU box: <code>python -m tools.distill_refiner --local_rank=0 --config
+nonexistent_probe.toml</code> now gets past argument parsing and fails on the (expected)
+<code>FileNotFoundError</code> for the missing config, instead of erroring on
+<code>--local_rank</code> before a single line of the script runs. Added
+<code>test_local_rank_is_accepted_so_deepspeeds_default_launcher_does_not_crash</code> to the
+existing <code>TestScriptStructure</code> class in <code>test/test_distill_refiner.py</code>, which
+already documents itself as holding source-level guards for paths that need a real launcher to
+exercise. Full <code>test_distill_refiner.py</code>: 228 passed, 1 skipped.</p>
+
 <h2>2026-09-03 &mdash; Batch fill: completing a short batch instead of dropping it</h2>
 
 <p><strong>Request.</strong> The pipeline silently discards samples in three places when a size
