@@ -1743,7 +1743,7 @@ def main():
     # Resuming mid-epoch resumes at the right point in the right epoch's shuffle, because the
     # order is a pure function of (seed, epoch) rather than of how many draws have happened.
     current_epoch = start_step // sampler.steps_per_epoch
-    epoch_captions = sampler.epoch_order(current_epoch)
+    epoch_captions = sampler.epoch_order_weighted(current_epoch)
     for step in progress_bar:
         epoch = step // sampler.steps_per_epoch
         if epoch != current_epoch:

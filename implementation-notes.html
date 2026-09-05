@@ -129,6 +129,49 @@ existing <code>TestScriptStructure</code> class in <code>test/test_distill_refin
 already documents itself as holding source-level guards for paths that need a real launcher to
 exercise. Full <code>test_distill_refiner.py</code>: 228 passed, 1 skipped.</p>
 
+<h3>A fourth failure: a real regression from the batch-fill commit itself</h3>
+
+<div class="flag">
+  <p><strong>This one is on me.</strong> The first three failures from this launch were pre-existing
+  or environmental. This one is a bug my own <code>496b3f8</code> batch-fill commit introduced, and
+  it broke every distillation run unconditionally &mdash; not only ones with
+  <code>batch_fill_strategy = 'fill'</code> &mdash; on the very first batch of the very first
+  epoch, on every rank.</p>
+</div>
+
+<p>The training loop reads captions as <code>(caption, weight)</code> pairs:
+<code>batch = [preprocess_caption(c, **augment) for c, _ in entries]</code>. Two call sites feed
+<code>epoch_captions</code>: the one-time setup before the loop starts, and the reassignment
+inside the loop whenever the step count crosses into a new epoch.
+<code>git blame</code> shows the loop's own reassignment was correctly changed by
+<code>496b3f8</code> from <code>sampler.epoch_order(epoch)</code> to
+<code>sampler.epoch_order_weighted(epoch)</code> &mdash; the method that actually returns
+weighted pairs. The one-time setup line, three lines earlier, was never touched, and had called
+the plain <code>epoch_order()</code> since before batch fill existed. That method still exists on
+purpose, as the caption-only view other callers use, and correctly strips the weight back off
+&mdash; but here it meant epoch 0 handed the loop a list of bare strings while every later epoch
+handed it a list of tuples. Unpacking a multi-character string into two variables iterates its
+characters, which is exactly the reported
+<code>ValueError: too many values to unpack (expected 2)</code>, immediately, on every rank,
+every time.</p>
+
+<p>Root cause, not just the crash site: searched every call to both methods across
+<code>tools/distill_refiner.py</code> (two call sites total, both now consistent) and confirmed
+the sampler class itself was never wrong &mdash; <code>epoch_order</code> correctly derives from
+<code>epoch_order_weighted</code>, and a pre-existing test already asserted exactly that
+equivalence. The bug was purely in <code>main()</code> calling the two methods inconsistently
+between its two use sites, a class of mistake that per-method unit tests on the sampler cannot
+see, because both call sites individually returned a value in a type the sampler contract
+allows. Fixed by changing the one-time setup line to call
+<code>epoch_order_weighted</code> as well.</p>
+
+<p>Added <code>test_the_pre_loop_epoch_order_call_matches_the_in_loop_one</code> to
+<code>TestScriptStructure</code> (a static guard on both call sites agreeing), and
+<code>test_consuming_epoch_order_the_way_main_used_to_reproduces_the_real_crash</code> to
+<code>TestEpochSamplerBatchFill</code> (a behavioural reproduction: the fixed call unpacks
+cleanly, the old call raises the exact reported <code>ValueError</code>). Full
+<code>test_distill_refiner.py</code>: 230 passed, 1 skipped.</p>
+
 <h2>2026-09-03 &mdash; Batch fill: completing a short batch instead of dropping it</h2>
 
 <p><strong>Request.</strong> The pipeline silently discards samples in three places when a size

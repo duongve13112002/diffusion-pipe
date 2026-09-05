@@ -138,6 +138,24 @@ class TestScriptStructure:
         for launcher_specific in ('OMPI_COMM_WORLD', 'SLURM_PROCID', 'deepspeed.init_distributed'):
             assert launcher_specific not in src, f'{launcher_specific} ties this to one launcher'
 
+    def test_the_pre_loop_epoch_order_call_matches_the_in_loop_one(self):
+        # epoch_order_weighted returns (caption, weight) tuples; the plain epoch_order wrapper
+        # strips the weight back off and returns bare caption strings. The training loop's own
+        # consumer, `batch = [preprocess_caption(c, **augment) for c, _ in entries]`, only
+        # understands the tuple form. The loop reassigns epoch_captions with
+        # sampler.epoch_order_weighted(epoch) every time it crosses an epoch boundary, so the
+        # one-time initial assignment before the loop starts must use the same method -- using
+        # the plain wrapper there gives epoch 0 a list of bare strings, and unpacking each
+        # string's characters into (c, _) fails immediately on the very first batch with
+        # "ValueError: too many values to unpack", on every rank, on every run, confirmed on a
+        # real deepspeed launch.
+        src = self.source()
+        pre_loop = 'epoch_captions = sampler.epoch_order_weighted(current_epoch)'
+        in_loop = 'epoch_captions = sampler.epoch_order_weighted(epoch)'
+        assert pre_loop in src, 'the initial assignment must use the weighted method, not the plain one'
+        assert in_loop in src
+        assert src.index(pre_loop) < src.index(in_loop)
+
     def test_local_rank_is_accepted_so_deepspeeds_default_launcher_does_not_crash(self):
         # deepspeed's default launcher appends --local_rank=N to every spawned process's argv
         # (a legacy PyTorch DDP convention) on top of setting the LOCAL_RANK env var, and
@@ -2691,6 +2709,22 @@ class TestEpochSamplerBatchFill:
         for strategy in ('drop', 'fill'):
             sampler = self._samplers(fill_strategy=strategy)[2]
             assert sampler.epoch_order(1) == [c for c, _ in sampler.epoch_order_weighted(1)]
+
+    def test_consuming_epoch_order_the_way_main_used_to_reproduces_the_real_crash(self):
+        # main()'s loop reads entries as (caption, weight) tuples: `for c, _ in entries`. The
+        # bug this guards was calling the plain epoch_order() for the very first epoch instead
+        # of epoch_order_weighted(), which gave epoch 0 a list of bare caption strings instead
+        # of tuples. Confirmed on a real deepspeed launch: every rank crashed on the first batch
+        # of the first epoch with "ValueError: too many values to unpack (expected 2)", because
+        # unpacking a multi-character string into two variables iterates its characters.
+        sampler = self._samplers()[0]
+        batch = self._batches(sampler.epoch_order_weighted(0), sampler.global_batch)[0]
+        captions = [c for c, _ in batch]  # what the fixed pre-loop call must support
+        assert all(isinstance(c, str) for c in captions)
+
+        bare_batch = self._batches(sampler.epoch_order(0), sampler.global_batch)[0]
+        with pytest.raises(ValueError, match='too many values to unpack'):
+            [c for c, _ in bare_batch]  # what the pre-fix call actually handed the loop
 
     def test_steps_per_epoch_rounds_up_under_fill(self):
         sampler = self._samplers(fill_strategy='fill')[0]
