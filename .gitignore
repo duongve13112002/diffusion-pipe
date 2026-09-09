@@ -43,6 +43,7 @@ htmlcov/
 .coverage
 .coverage.*
 .cache
+.tmp/
 nosetests.xml
 coverage.xml
 *.cover
@@ -163,6 +164,7 @@ cython_debug/
 
 # Local AI agent instructions, kept out of version control on purpose
 CLAUDE.md
+AGENTS.md
 
 # Local research material, kept out of version control on purpose
 anti-forgetting.md

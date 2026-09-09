@@ -33,6 +33,59 @@
 <p class="meta">A running log of decisions taken outside the spec, forced changes, tradeoffs, and
 anything else the maintainer needs to know. Newest entry first.</p>
 
+<h2>2026-09-09 &mdash; Safe cache-count mismatches and two distillation save schedules</h2>
+
+<p><strong>Request.</strong> A latent cache kept across a fingerprint change contained 32,802
+entries while its current size bucket contained fewer rows. <code>_map_and_cache</code> asserted
+that the cache could not be longer than the dataset and killed the caching subprocess. The same
+request asked for distillation's step and epoch checkpoint intervals to work together rather
+than the epoch interval replacing the step interval.</p>
+
+<h3>Cache decision</h3>
+
+<p>A cache from the current fingerprint may be shorter because a previous caching process was
+interrupted, so that case still resumes by appending. A cache explicitly kept after its
+fingerprint changed is different: if its entry count differs in either direction, its index
+alignment with the current dataset cannot be established. <code>Cache</code> now exposes that it
+took this keep path, and <code>_map_and_cache</code> logs both counts, clears the cache, and rebuilds
+it. This deliberately gives up the old append-on-fingerprint-change shortcut; correctness wins
+over avoiding an encode whose prefix cannot be verified.</p>
+
+<h3>Checkpoint decision</h3>
+
+<p><code>save_every</code> and <code>save_every_n_epochs</code> are now independent schedules.
+Only the configured format is written when one is set; neither preserves the historical
+<code>save_every = 2000</code> fallback. When both schedules coincide, both tagged checkpoint
+sets are written, including their matching optimizer state and optional full model. The stable
+untagged names continue to point at the newest weights. Retention already counts epoch and step
+families separately, so it needs no format change.</p>
+
+<h3>Verification</h3>
+
+<p>Regression coverage exercises both old-cache-greater-than-dataset and
+old-cache-less-than-dataset rebuilds, plus step-only, epoch-only, simultaneous, coincident,
+final-step and default checkpoint schedules. The project-local environment uses Python 3.12 and
+the CUDA 13.0 PyTorch build so the local RTX 5070 can also be checked directly. Setup exposed
+that <code>models/base.py</code> imports <code>torchaudio</code> although the installation guide
+previously named only Torch and torchvision; the guide now installs the complete trio.</p>
+
+<p>The full suite's real ZeRO state-machine cases remain CPU/gloo tests. On this GPU machine the
+suite is run with <code>CUDA_VISIBLE_DEVICES=-1</code> so DeepSpeed selects its CPU accelerator;
+attempting to turn that test into a CUDA/gloo test on native Windows reaches an unsupported
+collective path and causes an access violation. CUDA itself is verified separately with a small
+tensor and audio-resampling smoke test.</p>
+
+<ul>
+  <li>New regression cases: 8 passed.</li>
+  <li>Full suite: 654 passed, 2 skipped.</li>
+  <li>Vendored API guard: 60/60 passed against Torch 2.13.0+cu130, bitsandbytes 0.50.2,
+    Transformers 5.16.1 and Accelerate 1.14.0.</li>
+  <li>ComfyUI signature guard: 26/26 passed.</li>
+  <li>GPU: OPLoRA sanity check passed with a maximum residual of 5.412e-07; fp16-mixed
+    precision checks passed with 0/20 skipped steps; CUDA torchaudio resampling produced the
+    expected 800-sample output.</li>
+</ul>
+
 <h2>2026-09-05 &mdash; A ComfyUI/utils import shadow, and a deepspeed CLI typo in the distill docs</h2>
 
 <p><strong>Request.</strong> Two real failures were reported from an 8-GPU box while launching

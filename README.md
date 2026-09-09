@@ -14,6 +14,9 @@ Models supported: SDXL, Flux, LTX-Video, HunyuanVideo (t2v), Cosmos, Lumina Imag
 - Optional OPLoRA (orthogonal projection LoRA) to reduce catastrophic forgetting when training LoRAs
 
 ## Recent changes
+- 2026-09-09
+  - Fix: `keep_latent_cache = true` no longer crashes when an old cache and the current size bucket have different row counts. A fingerprint-changed cache is only reused when its count matches exactly; otherwise the mismatch is logged and the cache is regenerated. Interrupted caching for the current fingerprint still resumes normally.
+  - Distillation can now use `save_every` and `save_every_n_epochs` together. Each schedule writes its own step- or epoch-tagged checkpoint; setting only one keeps the previous single-format behaviour, and setting neither keeps the 2000-step default.
 - 2026-09-03
   - Add `batch_fill_strategy`, an opt-in alternative to dropping the samples that do not fill a whole global batch. **Nothing changes by default**: the shipped default is `'drop'`, which produces the same iteration order it always has. Until now a size bucket whose sample count was not a multiple of `micro_batch_size_per_gpu * gradient_accumulation_steps * num_gpus` had its tail cut, and because the iteration order is built once and never reshuffled, it was the *same* samples discarded in every epoch for the life of the run; a bucket smaller than one global batch was dropped whole. `'fill'` completes the final batch from the same bucket instead, never repeating an image among the real samples of one batch, across gradient accumulation and across GPUs. Four keys, readable from the dataset TOML or from the training config (where they win): `batch_fill_strategy`, `fill_rotate_per_epoch`, `undersized_bucket`, `min_real_fraction`. Applies to training, eval datasets and `tools/distill_refiner.py` alike. See [docs/note/batch-fill-strategies.md](./docs/note/batch-fill-strategies.md) and the comments in [examples/dataset.toml](./examples/dataset.toml).
   - A bucket that cannot fill even one global batch is padded with masked-out repeats (`undersized_bucket = 'pad_masked'`), and the real samples carry a `G/G_real` weight so the step behaves like a smaller batch rather than a diluted one. `min_real_fraction` (default 0.25) drops a bucket that would be mostly padding, naming the numbers.
@@ -97,8 +100,11 @@ conda activate diffusion-pipe
 
 Install PyTorch first. It is not listed in the requirements file, because certain GPUs sometimes need different versions of PyTorch or CUDA, and you might have to find a combination that works for your hardware. As of this writing (October 26, 2025), PyTorch 2.9.0 with CUDA 12.8 works on my 4090, and is compatible with the current latest flash-attn 2.8.3:
 ```
-pip install torch torchvision
+pip install torch torchvision torchaudio
 ```
+
+Install all three from the same official PyTorch CUDA index. `models/base.py` imports
+`torchaudio` for video-audio resampling, so omitting it prevents every model module from loading.
 
 Install nvcc: https://anaconda.org/nvidia/cuda-nvcc. Probably try to make it match the CUDA version of PyTorch.
 

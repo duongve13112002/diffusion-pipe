@@ -26,6 +26,11 @@ class Cache:
         self.fingerprint = fingerprint
         self.metadata_db = self.path / 'metadata.db'
         self.shard_size_gb = shard_size_gb
+        # Set when init() keeps a complete cache even though its fingerprint moved. Callers
+        # use this to distinguish an old cache from a partial cache for the current fingerprint:
+        # the latter can be resumed, while the former is only reusable when its row count still
+        # matches the dataset exactly.
+        self.reused_after_fingerprint_change = False
         os.makedirs(self.path, exist_ok=True)
 
         self.init()
@@ -50,6 +55,7 @@ class Cache:
 
 
     def init(self):
+        self.reused_after_fingerprint_change = False
         print('[CACHE] Initializing')
         # create database
         self.con = sqlite3.connect(self.metadata_db, autocommit=False)
@@ -75,8 +81,10 @@ class Cache:
                     print(
                         f'[CACHE] Fingerprint changed ({existing_fingerprint} -> '
                         f'{self.fingerprint}) but the cache is compatible with this run and '
-                        'keep is set, so the existing files are reused.'
+                        'keep is set, so the existing files are eligible for reuse pending '
+                        'row-count and content checks.'
                     )
+                    self.reused_after_fingerprint_change = True
                 else:
                     print('[CACHE] Fingerprint changed, deleting existing cache files')
                     self.clear()

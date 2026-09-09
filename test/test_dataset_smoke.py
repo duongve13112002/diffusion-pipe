@@ -825,6 +825,42 @@ class TestCacheCompatibilityManifest:
             'later encoder swap could not be detected'
         )
 
+    @pytest.mark.parametrize(('old_size', 'new_size'), ((3, 2), (2, 3)))
+    def test_a_kept_old_cache_with_a_different_row_count_is_regenerated(
+            self, tmp_path, monkeypatch, caplog, old_size, new_size):
+        """A changed fingerprint plus a changed count cannot preserve index alignment."""
+        import datasets as hf_datasets
+        import utils.dataset as dataset_mod
+        from utils.cache import Cache
+        from utils.dataset import _map_and_cache
+
+        monkeypatch.setattr(dataset_mod, 'NUM_PROC', 1)
+        cache_dir = tmp_path / 'cache'
+        old = Cache(str(cache_dir / 'latents'), 'old-fingerprint', identity='vae-A')
+        for value in range(old_size):
+            old.add({'value': value + 100})
+        old.finalize_current_shard()
+        old.write_manifest()
+        old.con.close()
+
+        dataset = hf_datasets.Dataset.from_dict({'value': list(range(new_size))})
+
+        def encode(batch, rank):
+            return {'value': batch['value']}
+
+        with caplog.at_level('WARNING'):
+            rebuilt = _map_and_cache(
+                dataset, encode, cache_dir, cache_file_prefix='latents_',
+                keep_on_fingerprint_change=True, identity='vae-A')
+        try:
+            assert len(rebuilt) == new_size
+            assert [rebuilt[i]['value'] for i in range(new_size)] == list(range(new_size))
+            assert f'{old_size} entries' in caplog.text
+            assert f'{new_size} rows' in caplog.text
+            assert 'regenerating' in caplog.text
+        finally:
+            rebuilt.con.close()
+
     def test_a_different_producer_is_incompatible(self, tmp_path):
         # Checked before construction: Cache.__init__ acts on the answer immediately and clears
         # the cache, manifest included, so asking afterwards finds no evidence either way.
@@ -962,8 +998,8 @@ class TestTextEmbeddingCacheFollowsTheCaptions:
     The flag means "do not recache unnecessarily". For the text embedding cache the caption
     text is essentially the whole fingerprint, so without a content check the flag's only
     reachable effect is to serve embeddings of captions that no longer exist -- correct shapes,
-    correct count, wrong text, no error. Appending rows stays valid, which is the case the flag
-    exists for: the entries already cached still line up index for index.
+    correct count, wrong text, no error. A different row count is also rebuilt: even an apparent
+    append is not trusted after the fingerprint moved, because the old prefix cannot be verified.
     """
 
     @staticmethod
@@ -988,7 +1024,7 @@ class TestTextEmbeddingCacheFollowsTheCaptions:
         # Same count, different text: the stale entries would still be 3.0 and 4.0.
         assert self._run(tmp_path, ['aa', 'bbbb'], keep=True) == [2.0, 4.0]
 
-    def test_appending_reuses_what_is_already_cached(self, tmp_path):
+    def test_appending_regenerates_and_produces_the_complete_new_cache(self, tmp_path):
         assert self._run(tmp_path, ['aaa', 'bbbb'], keep=True) == [3.0, 4.0]
         assert self._run(tmp_path, ['aaa', 'bbbb', 'ccccc'], keep=True) == [3.0, 4.0, 5.0]
 

@@ -79,8 +79,10 @@ seed = 42
 distributed_strategy = 'ddp'
 
 # One checkpoint per epoch, keeping the three most recent. Counted separately per kind, so if a
-# step-tagged save ever runs alongside these it keeps three of those too.
+# step-tagged save runs alongside these it keeps three of those too. Uncomment save_every to
+# enable the independent step schedule as well.
 save_every_n_epochs = 1
+#save_every = 2000
 keep_last_n_checkpoints = 3
 
 # Every 5 optimizer steps. Each update prints the loss, the gradient norm, the learning rate,

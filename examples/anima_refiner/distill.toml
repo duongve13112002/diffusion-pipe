@@ -153,7 +153,8 @@ log_every = 50
 # switch. See examples/anima_refiner/distill_4gpu.toml for an epoch-driven configuration.
 #epochs = 20
 
-# Checkpoint every N epochs instead of every N steps. Overrides save_every when set.
+# Checkpoint every N epochs. This is independent of save_every: set both to write both
+# context_refiner_step<N>.safetensors and context_refiner_epoch<N>.safetensors schedules.
 #save_every_n_epochs = 1
 
 # Keep only this many tagged checkpoints of each kind, deleting older ones as new ones arrive.

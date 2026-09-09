@@ -209,11 +209,26 @@ def _map_and_cache(dataset, map_fn, cache_dir, cache_file_prefix='', new_fingerp
 
     # Skip existing items
     cache_size = len(cache)
+    dataset_size = len(dataset)
+    if cache.reused_after_fingerprint_change and cache_size != dataset_size:
+        # keep_* can only preserve an old cache when every entry still lines up with the
+        # current dataset. A different count proves that is not true. In particular, selecting
+        # fewer rows used to leave a larger cache here and fail at the assertion below; adding
+        # rows was allowed to append, but that still trusted an unverifiable old prefix. Rebuild
+        # both directions and reserve incremental continuation for an interrupted cache whose
+        # fingerprint has not changed.
+        logger.warning(
+            f'Existing cache has {cache_size} entries but the current dataset has '
+            f'{dataset_size} rows after its fingerprint changed. The old cache cannot be '
+            'reused safely; regenerating it.'
+        )
+        cache.clear()
+        cache_size = len(cache)
     if content_column is not None and cache_size:
         # The entries about to be reused were computed from the caller's input as it was when
-        # this cache was last completed. Appending rows is the case keep_* exists for and stays
-        # valid, because the existing entries still line up index for index. Editing a row that
-        # is already cached does not: the entry is kept and silently paired with the new text.
+        # this cache was last completed. The count check above has already ruled out additions
+        # and removals. Editing a row in place is still unsafe: the entry would be kept and
+        # silently paired with the new text.
         recorded = cache.recorded_content_digest()
         if recorded is not None and recorded != _content_digest(dataset, content_column, cache_size):
             print(
@@ -222,7 +237,6 @@ def _map_and_cache(dataset, map_fn, cache_dir, cache_file_prefix='', new_fingerp
             )
             cache.clear()
             cache_size = len(cache)
-    dataset_size = len(dataset)
     assert cache_size <= dataset_size
     if cache_size == dataset_size:
         # Record the identity here too, not only after a map. A cache that is already complete

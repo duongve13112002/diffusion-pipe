@@ -168,7 +168,7 @@ None of these is specific to one objective. Changing them changes all four.
 | `max_grad_norm` | Gradient clipping |
 | `warmup_steps`, `lr_scheduler` | Shares `utils/lr_schedule.py` with `train.py` |
 | `distributed_strategy` | `ddp`, `zero1`, `zero2`. ZeRO needs 2+ ranks |
-| `save_every_n_epochs` / `save_every`, `keep_last_n_checkpoints`, `save_full_model` | Checkpointing |
+| `save_every_n_epochs`, `save_every`, `keep_last_n_checkpoints`, `save_full_model` | Checkpointing. The epoch and step intervals are independent and may both be set |
 | `log_every` | Progress-bar interval |
 | `seed` | Model seed; the caption and rollout streams are rank-offset from it |
 | `[student] resume_from` | Restores weights, optimizer, scheduler, step and the RNG streams. Read from `[student]`, not `[distill]` |

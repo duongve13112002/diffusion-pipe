@@ -774,7 +774,10 @@ and the optimizer says so by name rather than raising `optimizer got an empty pa
 
 ### Checkpoints, and what a run leaves on disk
 
-Each save writes a tagged set and then copies it to the stable, untagged names:
+Each save writes a tagged set and then copies it to the stable, untagged names. `save_every`
+and `save_every_n_epochs` are independent: set both to keep both step and epoch histories. If
+both schedules land on the same update, both tagged sets are written; the stable names still
+point at those same newest weights.
 
 ```
 context_refiner_epoch7.safetensors    the weights at that point
@@ -821,8 +824,8 @@ is dropped, the same rounding the image datasets do, so every rank runs the same
 | `max_grad_norm` | `1.0` | gradient clipping |
 | `warmup_steps` | `500` | LR warmup |
 | `lr_scheduler` | `cosine` | shares `utils/lr_schedule.py` with `train.py` |
-| `save_every` | `2000` | checkpoint interval, in steps. Must be >= 1 |
-| `save_every_n_epochs` | — | checkpoint interval in epochs. Overrides `save_every` when set |
+| `save_every` | `2000` when neither interval is set | checkpoint interval in steps. Independent of `save_every_n_epochs`; must be >= 1 |
+| `save_every_n_epochs` | — | checkpoint interval in epochs. Independent of `save_every`; must be >= 1 |
 | `keep_last_n_checkpoints` | — | keep this many tagged checkpoints of each kind, deleting older ones. Unset keeps everything |
 | `log_every` | `50` | progress-bar update interval. Must be >= 1 |
 | `pooled_loss_weight` | `0.1` | weight of the length-normalised mean term |

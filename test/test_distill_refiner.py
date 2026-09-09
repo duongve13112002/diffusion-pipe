@@ -1768,6 +1768,38 @@ class TestEpochsAndStepsAreAlternatives:
         assert 'steps = 20000' in source
 
 
+class TestCheckpointSchedules:
+    def _tags(self, step, total=20, per_epoch=5, save_every=None,
+              save_every_n_epochs=None):
+        from tools.distill_refiner import checkpoint_tags_for_step
+        return checkpoint_tags_for_step(
+            step, total, per_epoch, save_every, save_every_n_epochs)
+
+    def test_step_only_writes_only_step_tags(self):
+        assert self._tags(6, save_every=3) == ['_step6']
+        assert self._tags(5, save_every=3) == []
+
+    def test_epoch_only_writes_only_epoch_tags(self):
+        assert self._tags(10, save_every_n_epochs=2) == ['_epoch2']
+        assert self._tags(5, save_every_n_epochs=2) == []
+
+    def test_both_schedules_are_independent(self):
+        assert self._tags(6, save_every=3, save_every_n_epochs=2) == ['_step6']
+        assert self._tags(10, save_every=3, save_every_n_epochs=2) == ['_epoch2']
+
+    def test_a_coincident_step_writes_both_formats(self):
+        assert self._tags(10, save_every=5, save_every_n_epochs=2) == [
+            '_step10', '_epoch2']
+
+    def test_final_step_is_written_in_every_configured_format(self):
+        assert self._tags(17, total=17, save_every=10, save_every_n_epochs=2) == [
+            '_step17', '_epoch4']
+
+    def test_neither_schedule_uses_the_historical_step_default(self):
+        assert self._tags(2000, total=3000) == ['_step2000']
+        assert self._tags(3000, total=3000) == ['_step3000']
+
+
 class TestResumeRestoresTheAugmentationStream:
     """The optimizer came back; the RNG did not, so a resumed run saw different augmentations."""
 

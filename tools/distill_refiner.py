@@ -1391,6 +1391,32 @@ def build_strategy(config, refiner, world_size, local_rank, device, batch_size, 
                                  optimizer, scheduler, max_grad_norm, precision)
 
 
+def checkpoint_tags_for_step(step, total_steps, steps_per_epoch, save_every=None,
+                             save_every_n_epochs=None):
+    """Return every checkpoint tag due at this one-based optimizer step.
+
+    Step and epoch schedules are independent. When both land on the same update both names are
+    written, matching train.py's separate step<N> and epoch<N> save families. The final update is
+    always saved in every configured format; with neither interval configured, the historical
+    2000-step default is used.
+    """
+    if save_every is None and save_every_n_epochs is None:
+        save_every = 2000
+
+    tags = []
+    if save_every is not None and (step % save_every == 0 or step == total_steps):
+        tags.append(f'_step{step}')
+
+    epoch = (step - 1) // steps_per_epoch + 1
+    epoch_boundary = step % steps_per_epoch == 0
+    epoch_due = False
+    if save_every_n_epochs is not None:
+        epoch_due = epoch_boundary and epoch % save_every_n_epochs == 0
+    if save_every_n_epochs is not None and (epoch_due or step == total_steps):
+        tags.append(f'_epoch{epoch}')
+    return tags
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('--config', required=True, help='Path to the TOML config.')
@@ -1705,9 +1731,16 @@ def main():
             # augmentation across the job for the rest of the run.
             random.seed(seed + rank + start_step)
 
-    save_every = config['distill'].get('save_every', 2000)
+    save_every = config['distill'].get('save_every', None)
+    save_every_n_epochs = config['distill'].get('save_every_n_epochs', None)
+    if save_every is None and save_every_n_epochs is None:
+        save_every = 2000
     log_every = config['distill'].get('log_every', 50)
-    for key, value in (('save_every', save_every), ('log_every', log_every)):
+    for key, value in (('save_every', save_every),
+                       ('save_every_n_epochs', save_every_n_epochs),
+                       ('log_every', log_every)):
+        if value is None:
+            continue
         if value < 1:
             # Both are used as `(step + 1) % value`. At 0 that is a ZeroDivisionError on rank 0
             # only, so the other ranks sit at the next barrier until the watchdog kills the job
@@ -1724,14 +1757,11 @@ def main():
             'every checkpoint.'
         )
 
-    save_every_n_epochs = config['distill'].get('save_every_n_epochs', None)
     if save_every_n_epochs is not None:
-        if save_every_n_epochs < 1:
-            raise RuntimeError(
-                f'[distill] save_every_n_epochs must be >= 1, got {save_every_n_epochs}')
-        save_every = save_every_n_epochs * sampler.steps_per_epoch
         if is_main:
-            print(f'Saving every {save_every_n_epochs} epoch(s) = every {save_every} steps')
+            print(f'Saving every {save_every_n_epochs} epoch(s)')
+    if save_every is not None and is_main:
+        print(f'Saving every {save_every} step(s)')
 
     running = 0.0
     last_spread = last_teacher_spread = 0.0
@@ -1932,51 +1962,49 @@ def main():
             })
             running = 0.0
 
-        if (step + 1) % save_every == 0 or step + 1 == steps:
-            # Tagged by whichever unit drives the saving, so the two kinds are countable apart
-            # the way train.py's epoch<N>/ and step<N>/ are. Computed outside the rank guards
-            # because under ZeRO every rank writes its own piece of this checkpoint.
-            if save_every_n_epochs is not None:
-                tag = f'_epoch{step // sampler.steps_per_epoch + 1}'
-            else:
-                tag = f'_step{step + 1}'
-            tags_written_here.add(tag)
-            tagged_path = output_dir / f'context_refiner{tag}.safetensors'
+        checkpoint_tags = checkpoint_tags_for_step(
+            step + 1, steps, sampler.steps_per_epoch, save_every, save_every_n_epochs)
+        if checkpoint_tags:
+            # Computed outside the rank guards because under ZeRO every rank writes its own
+            # piece of each checkpoint. Step and epoch schedules can both be due here; keep
+            # their tagged files separate even though they describe the same optimizer update.
+            tags_written_here.update(checkpoint_tags)
             refiner_path = output_dir / 'context_refiner.safetensors'
 
-            # Weights: every rank holds the full, identical set -- DDP all-reduces them, and
-            # ZeRO 1/2 shard optimizer state and gradients but never the parameters. One writer.
-            if is_main:
-                save_refiner(refiner, tagged_path, dtype,
-                             metadata=dict(provenance, step=str(step + 1)))
-                # And the stable name, so every config that points at
-                # context_refiner.safetensors keeps working without knowing about tags.
-                _copy_atomically(tagged_path, refiner_path)
+            for tag in checkpoint_tags:
+                tagged_path = output_dir / f'context_refiner{tag}.safetensors'
 
-                if save_full_model_enabled:
-                    # A complete anima_refiner checkpoint per save, not only at the end: the
-                    # point of keeping N checkpoints is being able to go back to one, and going
-                    # back to a refiner without the model it belongs in is half a checkpoint.
-                    full_path = output_dir / f'model{tag}.safetensors'
-                    save_full_model(config['teacher']['transformer_path'], refiner,
-                                    full_path, dtype)
-                    _copy_atomically(full_path, output_dir / 'model.safetensors')
+                # Weights: every rank holds the full, identical set -- DDP all-reduces them,
+                # and ZeRO 1/2 shard optimizer state and gradients but never the parameters.
+                if is_main:
+                    save_refiner(refiner, tagged_path, dtype,
+                                 metadata=dict(provenance, step=str(step + 1)))
+                    # And the stable name, so every config that points at
+                    # context_refiner.safetensors keeps working without knowing about tags.
+                    _copy_atomically(tagged_path, refiner_path)
 
-            # Optimizer state: whole on rank 0 under DDP, one shard per rank under ZeRO. Writing
-            # only rank 0's shard produced a file that looked valid, cost nothing to write, and
-            # could not be resumed -- the failure landed hours later, on the resume.
-            if is_main or sharded_state:
-                save_training_state(tagged_path, optimizer, scheduler, step + 1,
-                                    rank=state_rank, world_size=world_size,
-                                    rollout_generator=rollout_generator,
-                                    rollout_rng=rollout_rng,
-                                    scaler=getattr(strategy, 'scaler', None),
-                                    batch_size=batch_size, grad_accum=grad_accum,
-                                    precision_name=precision.name,
-                                    batch_fill=distill_fill,
-                                    master_weights=sharded_state and bool(precision.deepspeed_section))
-                _copy_atomically(training_state_path(tagged_path, state_rank),
-                                 training_state_path(refiner_path, state_rank))
+                    if save_full_model_enabled:
+                        # A complete anima_refiner checkpoint per save, not only at the end: the
+                        # point of keeping N checkpoints is being able to go back to one, and
+                        # going back to a refiner without the model it belongs in is half a checkpoint.
+                        full_path = output_dir / f'model{tag}.safetensors'
+                        save_full_model(config['teacher']['transformer_path'], refiner,
+                                        full_path, dtype)
+                        _copy_atomically(full_path, output_dir / 'model.safetensors')
+
+                # Optimizer state: whole on rank 0 under DDP, one shard per rank under ZeRO.
+                if is_main or sharded_state:
+                    save_training_state(tagged_path, optimizer, scheduler, step + 1,
+                                        rank=state_rank, world_size=world_size,
+                                        rollout_generator=rollout_generator,
+                                        rollout_rng=rollout_rng,
+                                        scaler=getattr(strategy, 'scaler', None),
+                                        batch_size=batch_size, grad_accum=grad_accum,
+                                        precision_name=precision.name,
+                                        batch_fill=distill_fill,
+                                        master_weights=sharded_state and bool(precision.deepspeed_section))
+                    _copy_atomically(training_state_path(tagged_path, state_rank),
+                                     training_state_path(refiner_path, state_rank))
 
             if world_size > 1:
                 # Before the prune, so no rank is still writing a shard of an older tag when
@@ -1984,7 +2012,7 @@ def main():
                 dist.barrier()
             if is_main:
                 for gone in prune_distill_checkpoints(output_dir, keep_last_n,
-                                                      protect_tag=tag,
+                                                      protect_tag=checkpoint_tags[-1],
                                                       protect_tags=tags_written_here):
                     print(f'keep_last_n_checkpoints: removed {gone.name}')
 
