@@ -1,0 +1,131 @@
+# teacher_guided: train the refiner with a frozen stock Anima as a second target.
+#
+# Ordinary training regresses onto the ground-truth velocity. This mixes that target toward
+# what a frozen stock Anima predicts for the SAME latent, the SAME timestep and the SAME
+# caption -- differing only in the text frontend, which is what makes the difference
+# attributable to the refiner rather than to anything else.
+#
+#     target = (1 - lam) * v_ground_truth + lam * v_teacher
+#     lam    = loss_weight * shape(t) * decay(step)
+#
+# The teacher wins at high noise, where the caption determines the target and one ground-truth
+# draw is a noisy estimate of it; the ground truth wins at low noise, where the texture being
+# learned should come from your dataset and not from stock Anima. lam then decays to zero, so
+# the run ENDS as ordinary training -- a teacher that never fades pins the student to
+# Qwen3-0.6B, which is the whole thing this architecture exists to escape.
+#
+# Read docs/anima_refiner/teacher-guided-training.md before changing any of it.
+#
+# This file is refiner_only.toml plus the [teacher] table and the two settings it requires.
+# It is not a new stage: teacher guidance is available to any configuration, and which
+# learning rates you set non-zero decides both what the term means and what it costs.
+
+output_dir = '/data/output/anima_refiner_teacher_guided'
+dataset = 'examples/dataset.toml'
+
+epochs = 1
+micro_batch_size_per_gpu = 4
+# REQUIRED by [teacher]: the teacher's forward runs where prepare_inputs runs, so a split
+# student either leaves the whole teacher on one GPU or has no complete DiT to share. Use data
+# parallelism across GPUs (--num_gpus) instead.
+pipeline_stages = 1
+gradient_accumulation_steps = 1
+gradient_clipping = 1
+warmup_steps = 500
+
+eval_every_n_steps = 500
+eval_before_first_step = true
+eval_micro_batch_size_per_gpu = 4
+eval_gradient_accumulation_steps = 1
+
+# Eval always reports the pure ground-truth loss, with lambda = 0, whatever the schedule is
+# doing. Nothing to configure -- but it is why eval numbers stay comparable with a run that has
+# the teacher off, and why they do NOT match the training loss printed alongside them.
+
+save_every_n_steps = 2000
+checkpoint_every_n_minutes = 120
+activation_checkpointing = true
+partition_method = 'parameters'
+save_dtype = 'bfloat16'
+caching_batch_size = 8
+steps_per_print = 10
+
+batch_fill_strategy = 'fill'
+
+[model]
+type = 'anima_refiner'
+transformer_path = '/data2/imagegen_models/comfyui-models/anima-preview.safetensors'
+vae_path = '/data2/imagegen_models/comfyui-models/qwen_image_vae.safetensors'
+dtype = 'bfloat16'
+
+llm_path = '/data2/imagegen_models/Qwen3.5-2B-Base'
+llm_hidden_layer = -1
+n_refiner_layers = 6
+max_text_length = 512
+
+# REQUIRED by [teacher]. The teacher and the student must encode the SAME augmented caption,
+# drawn once and handed to both tokenizers. Cached embeddings freeze that draw, and a mismatch
+# changes no shape and no magnitude -- the loss would compare two captions instead of two text
+# frontends and look completely healthy. VAE latents are still cached; only the text half runs
+# in the loop, at the cost of keeping both text encoders resident (~4 GB for Qwen3.5-2B plus
+# ~1.2 GB for the teacher's Qwen3-0.6B).
+cache_text_embeddings = false
+
+# Warm start from tools/distill_refiner.py. Not required -- teacher guidance works from a fresh
+# refiner too, and is most useful there.
+#context_refiner_path = '/data/output/anima_refiner_distill/context_refiner.safetensors'
+
+# Refiner-only: freeze the DiT. With every DiT rate at 0 and no [adapter], the teacher's DiT IS
+# the student's, so no second copy is loaded and the term is nearly free -- one extra no_grad
+# forward per step. Give any of these a non-zero rate and a separate frozen teacher DiT is
+# loaded instead (~3.5-4 GB in bf16), and the term becomes an anti-forgetting anchor on stock
+# Anima as much as a distillation target.
+base_lr = 0
+self_attn_lr = 0
+cross_attn_lr = 0
+mlp_lr = 0
+mod_lr = 0
+refiner_lr = 1e-4
+
+timestep_sample_method = 'logit_normal'
+
+[teacher]
+# 0 disables the feature completely: nothing is loaded and nothing is allocated.
+loss_weight = 1.0
+
+# The stock Anima checkpoint. It is the only one carrying an llm_adapter, so it is the only
+# possible teacher; a checkpoint already trained through the refiner path has had its adapter
+# dropped and is refused with a message saying so.
+transformer_path = '/data2/imagegen_models/comfyui-models/anima-preview.safetensors'
+
+# The encoder that llm_adapter was trained against -- Qwen3-0.6B-Base, NOT the student's
+# Qwen3.5-2B. This is the easy mistake: get it wrong and the teacher is not the model the DiT
+# knows how to read, so the target the student chases is not one it can reach. A Transformers
+# directory or a single safetensors file both work.
+llm_path = '/data2/imagegen_models/Qwen3-0.6B-Base'
+
+# Shape of lambda across the noise level. 'sigmoid' is a smoothstep centred on t_mid; t is the
+# timestep AFTER shift, so this is the real noise level and needs no shift correction.
+# 'constant' removes the timestep dependence entirely, which is for ablation, not for training.
+shape = 'sigmoid'
+# Where the teacher and the ground truth weigh equally. Raising it (0.6-0.65) hands more of the
+# low-noise band back to your data, which is what you want when the DiT is also training and
+# the texture is the thing you are trying to change. Not swept -- 0.5 is reasoned, not measured.
+t_mid = 0.5
+# How sharp that boundary is. Smaller is more abrupt.
+width = 0.15
+
+# How lambda falls over the run. Set decay_steps to the number of optimizer steps over which
+# the teacher should fade out completely; there is no "whole run" default because prepare_inputs
+# cannot see the run length, and a schedule that silently means something different per config
+# is worse than one you state.
+decay = 'linear'
+decay_steps = 4000
+# decay = 'none' keeps the teacher on forever. It warns at startup, and the warning is real: the
+# student cannot end up better than Qwen3-0.6B that way.
+
+[optimizer]
+type = 'adamw8bitkahan'
+lr = 1e-4
+betas = [0.9, 0.99]
+weight_decay = 0.01

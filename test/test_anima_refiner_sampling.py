@@ -75,10 +75,12 @@ class TestSamplingMath:
                 return velocity
 
         args.cfg = cfg_scale
+        # text is a tuple so one sampler serves both architectures: two entries for
+        # anima_refiner, four for anima, splatted into the layer stack unchanged.
         return sample(
             pipeline=None, layers=[ConstantVelocity()],
-            embeds=torch.zeros(1, 4, 8), mask=torch.ones(1, 4, dtype=torch.long),
-            uncond=torch.zeros(1, 4, 8), uncond_mask=torch.ones(1, 4, dtype=torch.long),
+            text=(torch.zeros(1, 4, 8), torch.ones(1, 4, dtype=torch.long)),
+            uncond_text=(torch.zeros(1, 4, 8), torch.ones(1, 4, dtype=torch.long)),
             args=args, device=torch.device('cpu'), dtype=torch.float32, in_channels=16,
         )
 
@@ -148,9 +150,9 @@ class TestSamplingUsesTheRealLayerStack:
         args = _Args(width=128, height=128, steps=3)
         result = sample(
             pipeline=None, layers=layers,
-            embeds=torch.randn(1, 12, training.CAP_FEAT_DIM),
-            mask=torch.ones(1, 12, dtype=torch.long),
-            uncond=None, uncond_mask=None,
+            text=(torch.randn(1, 12, training.CAP_FEAT_DIM),
+                  torch.ones(1, 12, dtype=torch.long)),
+            uncond_text=None,
             args=args, device=torch.device('cpu'), dtype=torch.float32, in_channels=16,
         )
         assert result.shape == (1, 16, 1, 16, 16)
@@ -589,3 +591,127 @@ class TestOPLoRANeedsNoSamplingFlag:
         written = json.load(open(save_dir / 'adapter_config.json', encoding='utf-8'))
         assert written['peft_type'] == 'LORA'
         assert not any('oplora' in k for k in written)
+
+
+class TestAnimaIsSampledByTheSameScript:
+    """type = 'anima' goes through the same sampler as anima_refiner.
+
+    The point is comparability: the two architectures differ only in the text frontend, so
+    sampling them through one script, one schedule and one seed keeps the comparison about the
+    model rather than about two sampler implementations.
+
+    anima's text tuple is four tensors, two of them integer (T5 token ids and a second attention
+    mask), where anima_refiner's is two floats. The sampler casts float entries to the model
+    dtype and must leave the integer ones alone -- an embedding lookup on a bfloat16 index
+    raises, and a cast mask changes what it selects.
+    """
+
+    @staticmethod
+    def build_anima_layers(crossattn_dim=64, num_blocks=1):
+        """The stack to_layers() builds for anima: LLMAdapterLayer where the refiner would be.
+
+        The adapter is constructed directly rather than through use_llm_adapter=True, which
+        hardcodes 1024 dims and a 32128-entry embedding -- 33M parameters this test does not
+        need to exercise LLMAdapterLayer.
+        """
+        from models.cosmos_predict2 import FinalLayer, InitialLayer, LLMAdapterLayer, TransformerLayer
+        from models.llm_adapter import LLMAdapter
+        from test.test_teacher_guidance import build_dit
+        from test.test_teacher_guidance_training import _NullOffloader
+
+        torch.manual_seed(0)
+        dit = build_dit(crossattn_dim=crossattn_dim, num_blocks=num_blocks)
+        adapter = LLMAdapter(source_dim=32, target_dim=crossattn_dim, model_dim=crossattn_dim,
+                             num_layers=1, num_heads=4, self_attn=True)
+        layers = [InitialLayer(dit, None, False, None), LLMAdapterLayer(adapter)]
+        for i, block in enumerate(dit.blocks):
+            layers.append(TransformerLayer(block, i, _NullOffloader()))
+        layers.append(FinalLayer(dit))
+        for layer in layers:
+            layer.eval()
+        return layers
+
+    def test_the_four_tensor_text_tuple_runs_through_the_real_stack(self):
+        layers = self.build_anima_layers()
+        args = _Args(width=128, height=128, steps=3)
+        result = sample(
+            pipeline=None, layers=layers,
+            text=(
+                torch.randn(1, 6, 32),                      # Qwen3 hidden states
+                torch.ones(1, 6, dtype=torch.long),         # source mask
+                torch.randint(1, 100, (1, 6)),              # T5 token ids
+                torch.ones(1, 6, dtype=torch.long),         # T5 mask
+            ),
+            uncond_text=None,
+            args=args, device=torch.device('cpu'), dtype=torch.float32, in_channels=16,
+        )
+        assert result.shape == (1, 16, 1, 16, 16)
+        assert torch.isfinite(result).all()
+
+    def test_integer_text_tensors_are_not_cast_to_the_model_dtype(self):
+        """The regression this guards: casting the whole tuple breaks the embedding lookup."""
+        seen = {}
+
+        class Capture(nn.Module):
+            def forward(self, inputs):
+                seen['dtypes'] = [item.dtype for item in inputs]
+                return torch.zeros(1, 16, 1, 16, 16)
+
+        args = _Args(width=128, height=128, steps=1)
+        sample(
+            pipeline=None, layers=[Capture()],
+            text=(torch.randn(1, 6, 32), torch.ones(1, 6, dtype=torch.long),
+                  torch.randint(1, 100, (1, 6)), torch.ones(1, 6, dtype=torch.long)),
+            uncond_text=None,
+            args=args, device=torch.device('cpu'), dtype=torch.bfloat16, in_channels=16,
+        )
+        latents, t, embeds, source_mask, t5_ids, t5_mask = seen['dtypes']
+        assert embeds == torch.bfloat16, 'float text features follow the model dtype'
+        assert t5_ids == torch.long, 'T5 token ids must stay integer indices'
+        assert source_mask == torch.long and t5_mask == torch.long
+
+
+class TestEncodePromptPerArchitecture:
+    @staticmethod
+    def make_pipeline(use_context_refiner):
+        import tools.sample_anima_refiner as sampler
+        from models import cosmos_predict2
+        from test.test_teacher_guidance import _FakeLLM, _FakeTokenizer
+
+        sampler.cosmos_predict2 = cosmos_predict2
+
+        class Stub:
+            pass
+
+        pipe = Stub()
+        pipe.use_context_refiner = use_context_refiner
+        pipe.tokenizer = _FakeTokenizer()
+        pipe.t5_tokenizer = _FakeTokenizer()
+        pipe.text_encoder = _FakeLLM(dim=32)
+        pipe.max_text_length = 8
+        pipe.llm_hidden_layer = -1 if use_context_refiner else None
+        return pipe
+
+    def test_the_refiner_gets_two_tensors(self):
+        from tools.sample_anima_refiner import encode_prompt
+        text = encode_prompt(self.make_pipeline(True), ['a cat'], torch.device('cpu'))
+        assert len(text) == 2
+
+    def test_anima_gets_four(self):
+        from tools.sample_anima_refiner import encode_prompt
+        text = encode_prompt(self.make_pipeline(False), ['a cat'], torch.device('cpu'))
+        assert len(text) == 4
+        assert not torch.is_floating_point(text[2]), 'T5 token ids'
+
+    def test_only_the_refiner_forces_a_real_token_for_an_empty_prompt(self):
+        """keep_one_real_token must not change anima, which shares the tokenizer helper.
+
+        Old T5 yields </s> for an empty string, so anima's query sequence already has a real
+        token; forcing one would alter its behaviour rather than repair it. The refiner's Qwen
+        tokenization does not, and an all-padding row hands the frozen DiT an all-zero context.
+        """
+        from tools.sample_anima_refiner import encode_prompt
+        refiner_text = encode_prompt(self.make_pipeline(True), [''], torch.device('cpu'))
+        anima_text = encode_prompt(self.make_pipeline(False), [''], torch.device('cpu'))
+        assert refiner_text[1].sum().item() == 1, 'refiner keeps exactly one real token'
+        assert anima_text[1].sum().item() == 0, 'anima is left exactly as it was'

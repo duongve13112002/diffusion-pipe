@@ -1,12 +1,26 @@
 # Teacher-guided training
 
-**Status: proposal. None of this is implemented.** No config key described here is read by any
-code in the repo today. This document is the design to argue with before it gets built.
-
-Distillation today lives in `tools/distill_refiner.py`: captions only, no images, no VAE, no
-diffusion loss. This proposes the other half — keeping the teacher around during ordinary
+Distillation used to stop at `tools/distill_refiner.py`: captions only, no images, no VAE, no
+diffusion loss. This is the other half — keeping a frozen stock Anima around during ordinary
 diffusion training in `train.py`, and blending its prediction with the ground-truth target by
 timestep.
+
+**Off by default.** `[teacher] loss_weight = 0`, the default, loads nothing and allocates
+nothing, and `cosmos_predict2` and `anima` never read the table at all.
+
+Implementation: `models/teacher_guidance.py` (schedule and teacher forward),
+`models/cosmos_predict2.py` (loading and the blend in `prepare_inputs`). Example config:
+[`examples/anima_refiner/teacher_guided.toml`](../../examples/anima_refiner/teacher_guided.toml).
+Tests: `test/test_teacher_guidance.py` and `test/test_teacher_guidance_training.py`, the second
+of which runs a printed toy simulation:
+
+```
+PYTHONPATH=test/childenv python -m test.test_teacher_guidance_training
+```
+
+**Nothing here has run on a GPU, or produced an image.** The toy teacher in that simulation is a
+differently seeded DiT, so it shows the term is wired up and the schedule behaves; it says
+nothing about image quality.
 
 ## What this is, in one formula
 
@@ -248,39 +262,45 @@ as an ordinary extra text encoder rather than a bespoke cache path.
 
 ## How it fits the pipeline
 
-The plumbing already exists, which is the main reason this is worth building.
-
-- `prepare_inputs` runs in the **main process**, not a dataloader worker
-  (`utils/dataset.py:2229`), so a GPU teacher forward there is possible.
-- The label is already a variable-length list of targets: `*target_list, mask = label`
-  (`utils/dataset.py:2230`), and each element is broadcast from stage 0 to the last stage by
-  `_broadcast_target`. `models/minimax_h3.py:420` already ships `(target, audio_target, mask)`.
-
-So the change is the precedented shape, not a new mechanism:
+The blend happens **in the target, inside `prepare_inputs`** — not in the loss function. That
+follows directly from the identity above: mixing two squared losses is mixing two targets, so
+building the mixed target is the same computation with far less machinery.
 
 ```python
-# prepare_inputs
-return (noisy_latents, t, *conds), (target, teacher_v, t, mask)
-
-# get_loss_fn
-target, teacher_v, t, mask = label
-lam = lambda_schedule(t, step)
-loss = (1 - lam) * D(output, target) + lam * D(output, teacher_v)
+# prepare_inputs, after the ordinary target is built
+if self.teacher is not None and timestep_quantile is None:
+    lam = lambda_at(t, self._current_step(), self.teacher_cfg)
+    if float(lam.max()) > 0:
+        teacher_v = self.teacher.velocity(noisy_latents, t, captions)
+        target = blend_target(target, teacher_v, lam)
 ```
 
-`t` has to travel in the label because `loss_fn` receives only `(output, label)` and needs it to
-evaluate λ. It is `(B, 1)`; the cost is nothing next to the latent-shaped `teacher_v`.
+What that buys, and it is most of the reason the feature is small:
 
-`D` is whatever loss the config already selects — `get_loss_fn` supports `huber_delta` and
-`smooth_l1_beta` as well as MSE. Both terms use the same one; hardcoding MSE for the teacher
-term would silently change what `huber_delta` means for a run.
+- **`get_loss_fn` is untouched.** Masking, `huber_delta`, `smooth_l1_beta`, the multiscale
+  terms and the batch-fill `G/G_real` weighting all apply to the blended target exactly as they
+  applied to the ground-truth one. There is no second term to remember to mask — the bug the
+  2026-09-03 README entry records, where two loss functions computed terms without the mask and
+  a fifth of a padded step's gradient came from padding, is not reachable here.
+- **The label keeps its shape**, `(target, mask)`. Nothing extra is broadcast from stage 0 to
+  the last stage, and no other model's label handling is touched.
+- **`prepare_inputs` runs in the main process**, not a dataloader worker
+  (`utils/dataset.py:2229`), so the teacher forward has somewhere to run. It receives CPU
+  tensors, so the teacher is moved to the training device on first use and the velocity comes
+  back to the target's device before blending.
 
-### The mask applies to both terms
+The one thing this costs: the two terms cannot be logged separately, because only one target
+ever exists. λ is what is worth watching instead, and the toy simulation prints it.
 
-Non-negotiable, and there is history: the 2026-09-03 entry in the README records two loss
-functions that computed terms without the mask, so masked-out samples reached the optimizer and
-a fifth of a padded step's gradient came from padding. The teacher term must take the same mask
-and the same batch-fill `G/G_real` weighting as the ground-truth term.
+### Eval never sees the teacher
+
+`timestep_quantile is not None` means eval, and the teacher is skipped entirely there — no
+forward, no blend. Eval stays on the pure ground-truth loss so the number remains comparable as
+the decay schedule runs, and comparable against a run with the feature off.
+
+This matters more than it sounds. Training loss with the teacher on is **not** comparable to
+training loss without it: a pre-averaged velocity is an easier target, so the number falls for
+that reason alone. The toy simulation shows both columns side by side to make the trap concrete.
 
 ## Configuration
 
@@ -304,7 +324,7 @@ t_mid = 0.5
 width = 0.15
 
 decay = 'linear'    # 'linear' | 'cosine' | 'none'
-decay_steps = 0     # 0 = the whole run
+decay_steps = 4000  # required unless decay = 'none'
 ```
 
 | Key | Default | Meaning |
@@ -314,8 +334,13 @@ decay_steps = 0     # 0 = the whole run
 | `llm_path` | — | Teacher's text encoder. Required when enabled |
 | `shape` | `'sigmoid'` | Timestep shape. `'constant'` removes the timestep dependence, for ablation |
 | `t_mid`, `width` | `0.5`, `0.15` | Midpoint and softness of the smoothstep |
-| `decay` | `'linear'` | How λ falls over the run. `'none'` keeps the teacher on forever — see the ceiling section |
-| `decay_steps` | `0` | Steps to decay over; 0 means the run length |
+| `decay` | `'linear'` | How λ falls over the run. `'none'` keeps the teacher on forever, and warns — see the ceiling section |
+| `decay_steps` | — | Optimizer steps over which λ falls to zero. **Required unless `decay = 'none'`** |
+
+`decay_steps` has no "whole run" default on purpose. `prepare_inputs` cannot see the run length,
+and a schedule that silently means something different in each config is worse than one the user
+states. The step it reads is DeepSpeed's `global_steps`, which is checkpointed, so a resumed run
+picks the decay up where it left off instead of restarting at full teacher weight.
 
 **`teacher.llm_path` is the easy mistake**, and [training.md](./training.md) already flags the
 same trap for distillation: the teacher has to be reproduced exactly as it was trained, or the
@@ -331,29 +356,22 @@ target the student chases is not one the DiT can read.
   imbalance defeats the point of splitting. `pipeline_stages = 1` with data parallelism across
   GPUs is the supported path, which is the same constraint `train.py:809` already imposes on
   refiner-only runs.
-- **`blocks_to_swap` > 0 together with a separate teacher DiT.** Block swapping is moving the
-  student's blocks between CPU and GPU already; a second full forward per step thrashes it.
+- **`blocks_to_swap` > 0.** Block swapping is moving the student's blocks between CPU and GPU
+  already; a second full forward per step thrashes it.
 - **A teacher checkpoint with no `llm_adapter.*` keys.** That is not a teacher, and the failure
-  should name the file rather than surface as a missing-key error later.
-
-## Eval should stay on the ground truth
-
-Eval loss should be reported with **λ = 0**, always.
-
-Otherwise the eval metric moves as `decay` runs, and a number that drifts because the *loss
-definition* changed is indistinguishable from one that drifts because the model changed. Holding
-eval on the pure ground-truth loss keeps it comparable across the decay schedule, across
-`loss_weight` settings, and against runs with the feature off entirely.
-
-Training logs the two terms separately, and λ alongside them — the same reasoning
-[denoising-rollout.md](./denoising-rollout.md) gives for its own terms: there is no reason to
-assume two different MSEs are comparable in magnitude, and a term that dominates should be
-visible rather than buried in a sum.
+  names the file rather than surfacing as a missing-key error later.
+- **A model that is not `anima_refiner`.** The term compares two text frontends through one DiT,
+  and nothing else has a second frontend.
 
 ## Limitations and open questions
 
-- **Nothing here is measured.** No GPU run, no image, no ablation. Consistent with the rest of
-  this branch, and stated rather than implied.
+- **Nothing about the result is measured.** No GPU run, no image, no ablation. The toy
+  simulation shows the term is wired up and the schedule behaves; its teacher is a differently
+  seeded DiT, not a better model, so it ranks nothing.
+- **The two terms cannot be logged separately.** Only one target exists, which is the price of
+  blending in `prepare_inputs` — and the reason that is still the right trade is that it also
+  removes every chance of a second loss term missing the mask. Watch λ instead; the toy
+  simulation prints it per step.
 - **`huber_delta` / `smooth_l1_beta` distort λ; MSE does not.** See the section above. The
   distortion is modest at `delta = 1.0` (0.5 nominal reading as ~0.59 at `t = 0.9`) and it is in
   the teacher's favour, so it is a caveat rather than a blocker — but λ stops being exactly what

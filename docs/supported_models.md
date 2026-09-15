@@ -623,6 +623,16 @@ captions only, no images:
 python -m tools.distill_refiner --config examples/anima_refiner/distill.toml
 ```
 
+An optional `[teacher]` table keeps a frozen stock Anima resident during ordinary training and
+mixes its velocity into the ground-truth target, weighted toward the teacher at high noise and
+decayed to nothing over the run. Off by default; it needs `cache_text_embeddings = false` and
+`pipeline_stages = 1`. See [docs/anima_refiner/teacher-guided-training.md](anima_refiner/teacher-guided-training.md)
+and `examples/anima_refiner/teacher_guided.toml`.
+
+Sample either architecture with the same script — `tools/sample_anima_refiner.py` reads
+`type = 'anima'` as well as `anima_refiner`, so the two can be compared on one schedule and one
+seed.
+
 Anima Refiner LoRAs are saved in ComfyUI format. A densely trained refiner is saved alongside
 them as `context_refiner.safetensors`, ready to load via `context_refiner_path`.
 

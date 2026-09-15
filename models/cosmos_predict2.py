@@ -27,6 +27,13 @@ from accelerate.utils import set_module_tensor_to_device
 from models.base import BasePipeline, PreprocessMediaFile, make_contiguous
 from models.cosmos_predict2_modeling import MiniTrainDIT
 from models.text_refiner import extract_refiner_state_dict
+from models.teacher_guidance import (
+    TeacherGuide,
+    blend_target,
+    lambda_at,
+    teacher_warnings,
+    validate_teacher_config,
+)
 from utils.common import load_state_dict, AUTOCAST_DTYPE, is_main_process, iterate_safetensors
 from utils.offloading import ModelOffloader
 from models.wan.vae2_1 import WanVAE_
@@ -318,6 +325,35 @@ def _load_llm_from_single_file(llm_path, model_config, dtype):
     return tokenizer, text_encoder, text_config.hidden_size
 
 
+def resolve_learning_rates(config, model_config, use_context_refiner):
+    """The learning rate each parameter group ends up with.
+
+    Split out of CosmosPredict2Pipeline.get_param_groups because the teacher needs the same
+    answer, and needs it earlier: whether the DiT is frozen decides whether the teacher can
+    share the student's transformer or needs its own 3.5-4 GB copy. Two copies of this
+    resolution would be two things to keep in step, and the failure if they drifted -- a teacher
+    sharing a DiT that is actually training -- is silent.
+
+    A free function rather than a method because get_param_groups is exercised against a minimal
+    double that carries only these three attributes.
+    """
+    # anima_refiner alone can override base_lr, so that a stage training only the refiner
+    # freezes everything else with base_lr = 0 without zeroing the optimizer's own lr.
+    # cosmos_predict2 and anima keep the original behaviour.
+    base_lr = config['optimizer'].get('lr', None)
+    if use_context_refiner:
+        base_lr = model_config.get('base_lr', base_lr)
+    return {
+        'base': base_lr,
+        'self_attn': model_config.get('self_attn_lr', base_lr),
+        'cross_attn': model_config.get('cross_attn_lr', base_lr),
+        'mlp': model_config.get('mlp_lr', base_lr),
+        'mod': model_config.get('mod_lr', base_lr),
+        'llm_adapter': model_config.get('llm_adapter_lr', base_lr),
+        'refiner': model_config.get('refiner_lr', base_lr),
+    }
+
+
 class CosmosPredict2Pipeline(BasePipeline):
     name = 'cosmos_predict2'
     vae_config_keys = ('vae_path',)
@@ -476,6 +512,16 @@ class CosmosPredict2Pipeline(BasePipeline):
             raise RuntimeError("anima_refiner requires llm_path (a Transformers LLM), not t5_path")
 
         self.text_encoder.requires_grad_(False)
+
+        # Teacher-guided training. Validated here so a bad [teacher] table fails before the
+        # caching run rather than after it; returns a disabled config when the table is absent,
+        # which is what keeps cosmos_predict2 and anima untouched by this feature.
+        self.teacher_cfg = validate_teacher_config(
+            self.config, self.use_context_refiner, self.cache_text_embeddings)
+        self.teacher = None
+        # Set by train.py when the engine exists, so the decay schedule can advance. Left as a
+        # constant 0 otherwise, which is what tools and tests that never train want.
+        self._step_source = None
 
     def text_encoder_cache_key(self, i):
         """Identity of text encoder `i`, mixed into the text embedding cache fingerprint.
@@ -714,6 +760,121 @@ class CosmosPredict2Pipeline(BasePipeline):
         for name, p in self.transformer.named_parameters():
             p.original_name = name
 
+        if self.teacher_cfg.enabled:
+            self.teacher = self._build_teacher(dtype)
+
+    def _load_teacher_llm(self, llm_path, dtype):
+        """Qwen3-0.6B, the encoder Anima's llm_adapter was trained against.
+
+        Accepts the same two shapes anima itself does: a Transformers directory, or a bare
+        safetensors file read against configs/qwen3_06b.
+        """
+        if os.path.isdir(llm_path):
+            tokenizer = AutoTokenizer.from_pretrained(llm_path, local_files_only=True)
+            text_encoder = AutoModelForCausalLM.from_pretrained(
+                llm_path, dtype=dtype, local_files_only=True).model
+        else:
+            tokenizer = AutoTokenizer.from_pretrained('configs/qwen3_06b', local_files_only=True)
+            llm_config = transformers.Qwen3Config.from_pretrained(
+                'configs/qwen3_06b', local_files_only=True)
+            with init_empty_weights():
+                model = transformers.Qwen3ForCausalLM(llm_config)
+            for key, tensor in iterate_safetensors(llm_path):
+                set_module_tensor_to_device(model, key, device='cpu', dtype=dtype, value=tensor)
+            text_encoder = model.model
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+        text_encoder.config.use_cache = False
+        text_encoder.requires_grad_(False)
+        return tokenizer, text_encoder
+
+    def _build_teacher(self, dtype):
+        """Assemble the frozen stock Anima whose velocity the loss mixes toward.
+
+        The DiT is shared with the student only when sharing is provably harmless: the student's
+        DiT cannot move during this run AND both configs name the same checkpoint file. Freezing
+        alone is not enough -- a run whose transformer_path is a previously trained checkpoint
+        has a frozen DiT that is nonetheless not the teacher's, and sharing there would quietly
+        make the model its own teacher, which is a loss of exactly zero teacher signal and no
+        error anywhere.
+        """
+        cfg = self.teacher_cfg
+        teacher_state_dict = {
+            re.sub(r'^model\.diffusion_model\.', '', re.sub(r'^net\.', '', k)): v
+            for k, v in load_state_dict(cfg.transformer_path).items()
+        }
+        if 'llm_adapter.out_proj.weight' not in teacher_state_dict:
+            raise RuntimeError(
+                f'[teacher] transformer_path has no llm_adapter.* weights: {cfg.transformer_path}\n'
+                '  The teacher must be a stock Anima checkpoint. A checkpoint trained through '
+                'the refiner path has had its llm_adapter dropped, so it cannot be a teacher.'
+            )
+
+        same_checkpoint = (
+            os.path.realpath(cfg.transformer_path)
+            == os.path.realpath(self.model_config['transformer_path'])
+        )
+        shares_dit = self._dit_is_frozen() and same_checkpoint
+
+        if shares_dit:
+            teacher_dit = self.transformer
+        else:
+            teacher_dit_config = get_dit_config(teacher_state_dict)
+            teacher_dit_config['use_llm_adapter'] = False  # adapter is held separately
+            with init_empty_weights():
+                teacher_dit = MiniTrainDIT(**teacher_dit_config)
+                for name, p in teacher_dit.named_parameters():
+                    if name not in teacher_state_dict:
+                        continue
+                    set_module_tensor_to_device(
+                        teacher_dit, name, device='cpu', dtype=dtype,
+                        value=teacher_state_dict[name])
+            teacher_dit.requires_grad_(False)
+            teacher_dit.eval()
+
+        # The adapter is always its own module, never the shared DiT's: MiniTrainDIT.forward
+        # takes crossattn_emb already projected, so the text frontend lives outside the DiT in
+        # both the shared and the copied case.
+        adapter_config = get_dit_config(teacher_state_dict)
+        adapter_config['use_llm_adapter'] = True
+        with init_empty_weights():
+            adapter_host = MiniTrainDIT(**adapter_config)
+        llm_adapter = adapter_host.llm_adapter
+        for name, p in llm_adapter.named_parameters():
+            set_module_tensor_to_device(
+                llm_adapter, name, device='cpu', dtype=dtype,
+                value=teacher_state_dict[f'llm_adapter.{name}'])
+        for name, buf in list(llm_adapter.named_buffers()):
+            key = f'llm_adapter.{name}'
+            if key in teacher_state_dict:
+                set_module_tensor_to_device(
+                    llm_adapter, name, device='cpu', dtype=buf.dtype,
+                    value=teacher_state_dict[key])
+
+        tokenizer, text_encoder = self._load_teacher_llm(cfg.llm_path, dtype)
+
+        if is_main_process():
+            for message in teacher_warnings(cfg, self.config):
+                print(message)
+            how = ("sharing the student's frozen DiT" if shares_dit
+                   else 'with its own frozen copy of the DiT')
+            print(
+                f'Teacher guidance on: loss_weight={cfg.loss_weight}, shape={cfg.shape} '
+                f'(t_mid={cfg.t_mid}, width={cfg.width}), decay={cfg.decay}'
+                + (f' over {cfg.decay_steps} steps' if cfg.decay != 'none' else '')
+                + f'. Teacher is {how}.'
+            )
+
+        return TeacherGuide(
+            dit=teacher_dit,
+            llm_adapter=llm_adapter,
+            text_encoder=text_encoder,
+            tokenizer=tokenizer,
+            t5_tokenizer=self.t5_tokenizer,
+            max_text_length=self.max_text_length,
+            shares_dit=shares_dit,
+        )
+
     def get_vae(self):
         return self.vae.model
 
@@ -869,6 +1030,7 @@ class CosmosPredict2Pipeline(BasePipeline):
         latents = inputs['latents'].float()
         mask = inputs['mask']
 
+        captions = None
         if self.cache_text_embeddings:
             prompt_embeds_or_batch_encoding = (inputs['prompt_embeds'], inputs['attn_mask'])
             if not self.use_context_refiner:
@@ -920,7 +1082,40 @@ class CosmosPredict2Pipeline(BasePipeline):
         target = noise - latents
         t = t.view(-1, 1)
 
+        # Teacher guidance mixes the ground-truth target toward what a frozen stock Anima
+        # predicts for the same latent, timestep and caption. For squared error, mixing the two
+        # losses is the same as mixing the two targets, so this happens here: the label keeps its
+        # shape, the loss function is untouched, and nothing extra travels through the pipeline.
+        #
+        # Skipped entirely during eval (timestep_quantile is set). Eval must stay on the pure
+        # ground-truth loss, or the metric moves as the decay schedule runs and a change in the
+        # loss definition is indistinguishable from a change in the model.
+        if self.teacher is not None and timestep_quantile is None:
+            lam = lambda_at(t, self._current_step(), self.teacher_cfg)
+            if float(lam.max()) > 0:
+                self._ensure_teacher_device()
+                device = self.teacher.device
+                teacher_v = self.teacher.velocity(
+                    noisy_latents.to(device), t.to(device), captions)
+                target = blend_target(target, teacher_v.to(target.device), lam)
+
         return (noisy_latents, t, *prompt_embeds_or_batch_encoding), (target, mask)
+
+    def _ensure_teacher_device(self):
+        """Move the teacher to the training device once, on first use.
+
+        prepare_inputs runs in the main process on CPU tensors -- the engine moves them later --
+        so the teacher has to be placed explicitly. Done lazily rather than at load time because
+        load_diffusion_model runs before DeepSpeed has taken the student anywhere, and putting
+        the teacher on the GPU first would count against the memory the student is about to be
+        partitioned into.
+        """
+        if getattr(self.teacher, '_placed', False):
+            return
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        self.teacher.to_device(device, self.model_config['dtype'])
+        self.teacher.device = torch.device(device)
+        self.teacher._placed = True
 
     def to_layers(self):
         transformer = self.transformer
@@ -964,6 +1159,46 @@ class CosmosPredict2Pipeline(BasePipeline):
         self.offloader.set_forward_only(True)
         self.offloader.prepare_block_devices_before_forward()
 
+    def _dit_is_frozen(self):
+        """True when nothing in the DiT can move, so the teacher may share it.
+
+        The refiner is excluded on purpose: it is not part of the DiT the teacher runs. The
+        teacher's own forward uses the llm_adapter as its text frontend and never touches
+        context_refiner, so a training refiner cannot change the teacher's prediction.
+
+        An adapter is disqualifying whatever the learning rates say. A LoRA wraps the DiT's own
+        Linear layers, so the module the teacher would share stops being the stock weights from
+        the first optimizer step.
+        """
+        if self.config.get('adapter', None) is not None:
+            return False
+        lrs = resolve_learning_rates(self.config, self.model_config, self.use_context_refiner)
+        dit_groups = ('base', 'self_attn', 'cross_attn', 'mlp', 'mod', 'llm_adapter')
+        return all((lrs[name] or 0) == 0 for name in dit_groups)
+
+    def set_step_source(self, fn):
+        """Override where the decay schedule reads the current optimizer step.
+
+        Training does not need this: train.py already assigns model.model_engine, and
+        _current_step reads global_steps off it. This exists for tests and for tools that drive
+        prepare_inputs without an engine.
+        """
+        self._step_source = fn
+
+    def _current_step(self):
+        """The optimizer step the decay schedule is at.
+
+        DeepSpeed's global_steps is checkpointed and restored, so a resumed run picks the decay
+        up where it left off rather than restarting at full teacher weight -- which would undo
+        the schedule every time a run is resumed.
+        """
+        if self._step_source is not None:
+            return int(self._step_source())
+        engine = getattr(self, 'model_engine', None)
+        if engine is not None:
+            return int(getattr(engine, 'global_steps', 0))
+        return 0
+
     def get_param_groups(self, parameters):
         base_params, self_attn_params, cross_attn_params, mlp_params, mod_params, llm_adapter_params = [], [], [], [], [], []
         refiner_params = []
@@ -986,18 +1221,14 @@ class CosmosPredict2Pipeline(BasePipeline):
             else:
                 base_params.append(p)
 
-        # anima_refiner alone can override base_lr, so that a stage training only the refiner
-        # freezes everything else with base_lr = 0 without zeroing the optimizer's own lr.
-        # cosmos_predict2 and anima keep the original behaviour.
-        base_lr = self.config['optimizer'].get('lr', None)
-        if self.use_context_refiner:
-            base_lr = self.model_config.get('base_lr', base_lr)
-        self_attn_lr = self.model_config.get('self_attn_lr', base_lr)
-        cross_attn_lr = self.model_config.get('cross_attn_lr', base_lr)
-        mlp_lr = self.model_config.get('mlp_lr', base_lr)
-        mod_lr = self.model_config.get('mod_lr', base_lr)
-        llm_adapter_lr = self.model_config.get('llm_adapter_lr', base_lr)
-        refiner_lr = self.model_config.get('refiner_lr', base_lr)
+        lrs = resolve_learning_rates(self.config, self.model_config, self.use_context_refiner)
+        base_lr = lrs['base']
+        self_attn_lr = lrs['self_attn']
+        cross_attn_lr = lrs['cross_attn']
+        mlp_lr = lrs['mlp']
+        mod_lr = lrs['mod']
+        llm_adapter_lr = lrs['llm_adapter']
+        refiner_lr = lrs['refiner']
 
         if is_main_process():
             print(f'Using base_lr={base_lr}, self_attn_lr={self_attn_lr}, cross_attn_lr={cross_attn_lr}, mlp_lr={mlp_lr}, mod_lr={mod_lr}, llm_adapter_lr={llm_adapter_lr}, refiner_lr={refiner_lr}')

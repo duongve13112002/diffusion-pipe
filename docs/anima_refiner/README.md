@@ -12,9 +12,9 @@ distillation objectives -- what each can and cannot see, and what it costs;
 [denoising-rollout.md](./denoising-rollout.md) documents the
 optional one that compares the frozen DiT's predictions rather than its
 cross-attention outputs; [lessons.md](./lessons.md) is the rules the mistakes on this branch
-turned into. [teacher-guided-training.md](./teacher-guided-training.md) is a **proposal**, not a
-feature — keeping the teacher resident during ordinary diffusion training and mixing its
-prediction with the ground truth by timestep. Nothing in it is implemented.
+turned into. [teacher-guided-training.md](./teacher-guided-training.md) covers the optional
+`[teacher]` term, which keeps a frozen stock Anima resident during ordinary diffusion training
+and mixes its prediction with the ground truth by timestep; it is off by default.
 
 ## Why
 
@@ -702,6 +702,23 @@ there yet. This script fills the gap. It reads the `[model]` table of a training
 loads through `CosmosPredict2Pipeline` — the same class and the same checkpoint-resolution
 rules training uses — then runs the layer stack `to_layers()` builds. There is no second copy
 of the loading logic to drift out of sync.
+
+**It samples `type = 'anima'` too**, from an ordinary anima config:
+
+```
+python -m tools.sample_anima_refiner \
+    --config examples/anima.toml \
+    --prompt '1girl, solo, blue eyes' \
+    --steps 30 --cfg 5 --seed 1234 --output anima.png
+```
+
+That exists for comparison. The two architectures differ only in the text frontend, so running
+both through one sampler, one schedule and one seed keeps the difference about the model instead
+of about two sampling implementations. The only branch inside the script is `encode_prompt`:
+`anima` needs T5 token ids and a second attention mask for its `LLMAdapter`, `anima_refiner`
+needs neither. `keep_one_real_token` is applied for the refiner and deliberately not for anima,
+exactly as `prepare_inputs` does for each — old T5 yields `</s>` for an empty prompt and already
+has the property, so forcing it there would change anima rather than repair it.
 
 Sampling is rectified-flow Euler, inverting what `prepare_inputs()` constructs: training
 builds `noisy = (1-t)*clean + t*noise` with target `noise - clean`, so the model predicts a

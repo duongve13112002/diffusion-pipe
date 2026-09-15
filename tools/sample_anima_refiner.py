@@ -1,8 +1,21 @@
-"""Generate images from an anima_refiner checkpoint.
+"""Generate images from an anima_refiner or anima checkpoint.
 
 diffusion-pipe is a training repo, and ComfyUI's `class Anima(MiniTrainDIT)` has no
-context_refiner, so a model trained with this architecture cannot be sampled anywhere else
-yet. This script fills that gap.
+context_refiner, so a model trained with the refiner architecture cannot be sampled anywhere
+else yet. This script fills that gap.
+
+`type = 'anima'` is supported too, so the two architectures can be sampled side by side with
+the same sampler, the same schedule and the same seed. That comparison is the whole reason
+anima_refiner exists, and running it through a second implementation would put the sampler's
+own differences into the result.
+
+The two differ only in the text frontend, and this file confines that difference to
+`encode_prompt`:
+
+    anima          caption -> Qwen3 hidden states + T5 token ids -> LLMAdapter -> DiT
+    anima_refiner  caption -> LLM hidden states                  -> ContextRefiner -> DiT
+
+Everything else -- the loader, the layer stack, the schedule, CFG, the VAE decode -- is shared.
 
 It deliberately loads the model through CosmosPredict2Pipeline -- the same class, the same
 `[model]` config table and the same checkpoint-resolution rules training uses -- and runs the
@@ -55,6 +68,8 @@ from utils.common import DTYPE_MAP
 # fp16 autocast on CUDA, where the 65504 ceiling makes overflow to inf/NaN a live risk. A
 # CPU test suite cannot catch it, because autocast('cuda') is inert there.
 cosmos_predict2 = None
+
+SUPPORTED_TYPES = ('anima_refiner', 'anima')
 
 
 def parse_args():
@@ -175,8 +190,11 @@ def build_pipeline(config_path, device, dtype_override, adapters=()):
     global cosmos_predict2
     config = toml.load(config_path)
     model_config = dict(config['model'])  # never mutate the caller's parsed config
-    if model_config.get('type') != 'anima_refiner':
-        raise RuntimeError(f"Expected type = 'anima_refiner' in {config_path}, got {model_config.get('type')!r}")
+    if model_config.get('type') not in SUPPORTED_TYPES:
+        raise RuntimeError(
+            f"Expected type = 'anima_refiner' or 'anima' in {config_path}, got "
+            f'{model_config.get("type")!r}'
+        )
     if dtype_override:
         model_config['dtype'] = dtype_override
     if isinstance(model_config['dtype'], str):
@@ -223,17 +241,37 @@ def build_pipeline(config_path, device, dtype_override, adapters=()):
 
 @torch.no_grad()
 def encode_prompt(pipeline, prompts, device):
-    # keep_one_real_token: the negative prompt defaults to '', and an all-padding row would
-    # hand the frozen DiT an all-zero context it was never trained on.
+    """Text tensors for the layer stack, in the order InitialLayer unpacks them.
+
+    The only place the two architectures diverge. Both return a tuple that is splatted straight
+    into the stack, so the sampling loop never branches on the model type:
+
+        anima_refiner  (embeds, attn_mask)
+        anima          (embeds, attn_mask, t5_input_ids, t5_attn_mask)
+
+    keep_one_real_token is set for the refiner and NOT for anima, matching exactly what
+    prepare_inputs does for each. The negative prompt defaults to '', which Qwen tokenizes to an
+    all-padding row; the refiner masks its output to zeros there and hands the DiT an all-zero
+    context it was never trained on. Old T5, which anima's LLMAdapter embeds as its query
+    sequence, yields </s> for an empty string and already has the property, so forcing it there
+    would change anima's behaviour rather than repair it.
+    """
+    use_refiner = pipeline.use_context_refiner
     batch_encoding = cosmos_predict2._tokenize(
-        pipeline.tokenizer, prompts, pipeline.max_text_length, keep_one_real_token=True)
+        pipeline.tokenizer, prompts, pipeline.max_text_length,
+        keep_one_real_token=use_refiner)
     embeds = cosmos_predict2._compute_text_embeddings(
         pipeline.text_encoder,
         batch_encoding.input_ids,
         batch_encoding.attention_mask,
         hidden_layer=pipeline.llm_hidden_layer,
     )
-    return embeds.to(device), batch_encoding.attention_mask.to(device)
+    text = (embeds.to(device), batch_encoding.attention_mask.to(device))
+    if not use_refiner:
+        t5 = cosmos_predict2._tokenize(
+            pipeline.t5_tokenizer, prompts, pipeline.max_text_length)
+        text += (t5.input_ids.to(device), t5.attention_mask.to(device))
+    return text
 
 
 def shifted_timesteps(steps, shift):
@@ -250,8 +288,7 @@ def shifted_timesteps(steps, shift):
 
 
 @torch.no_grad()
-def sample(pipeline, layers, embeds, mask, uncond, uncond_mask, args, device, dtype,
-           in_channels):
+def sample(pipeline, layers, text, uncond_text, args, device, dtype, in_channels):
     latent_h = args.height // 8
     latent_w = args.width // 8
     generator = torch.Generator(device='cpu').manual_seed(args.seed)
@@ -263,20 +300,24 @@ def sample(pipeline, layers, embeds, mask, uncond, uncond_mask, args, device, dt
 
     timesteps = shifted_timesteps(args.steps, args.shift)
 
-    def velocity(latents, t_value, text, text_mask):
+    def velocity(latents, t_value, text):
         # t must share the model dtype. On CUDA the layers' autocast hides a mismatch; on
         # CPU autocast('cuda') is inert and the first matmul raises.
         t = torch.full((latents.shape[0], 1), t_value, device=device, dtype=dtype)
-        inputs = (latents.to(dtype), t, text.to(dtype), text_mask)
+        # Only the float tensors are cast. anima's tuple also carries T5 token ids and two
+        # attention masks, which are integer and must stay that way -- an embedding lookup on a
+        # bfloat16 index tensor raises, and a cast mask silently changes what it selects.
+        inputs = (latents.to(dtype), t) + tuple(
+            item.to(dtype) if torch.is_floating_point(item) else item for item in text)
         for layer in layers:
             inputs = layer(inputs)
         return inputs.float()
 
     for i in range(args.steps):
         t_now, t_next = timesteps[i].item(), timesteps[i + 1].item()
-        v = velocity(x, t_now, embeds, mask)
+        v = velocity(x, t_now, text)
         if args.cfg > 1.0:
-            v_uncond = velocity(x, t_now, uncond, uncond_mask)
+            v_uncond = velocity(x, t_now, uncond_text)
             v = v_uncond + args.cfg * (v - v_uncond)
         # x moves from noise towards clean, so step along -v by the size of the t decrement.
         x = x + (t_next - t_now) * v
@@ -309,20 +350,23 @@ def main():
             )
         args.shift = model_config.get('shift', 1.0)
 
-    print(f'Encoding prompt through {pipeline.cap_feat_dim}-dim text encoder '
-          f'(hidden layer {pipeline.llm_hidden_layer}, {pipeline.max_text_length} tokens)')
+    frontend = 'ContextRefiner' if pipeline.use_context_refiner else 'LLMAdapter'
+    layer_note = (f'hidden layer {pipeline.llm_hidden_layer}, '
+                  if pipeline.llm_hidden_layer is not None else '')
+    print(f'{model_config["type"]}: encoding through a {pipeline.cap_feat_dim}-dim text encoder '
+          f'({layer_note}{pipeline.max_text_length} tokens) into {frontend}')
     prompts = [args.prompt] * args.batch_size
-    embeds, mask = encode_prompt(pipeline, prompts, device)
-    uncond, uncond_mask = (None, None)
+    text = encode_prompt(pipeline, prompts, device)
+    uncond_text = None
     if args.cfg > 1.0:
-        uncond, uncond_mask = encode_prompt(pipeline, [args.negative_prompt] * args.batch_size, device)
+        uncond_text = encode_prompt(pipeline, [args.negative_prompt] * args.batch_size, device)
 
     layers = pipeline.to_layers()
     for layer in layers:
         layer.to(device).eval()
 
     print(f'Sampling {args.steps} steps at {args.width}x{args.height}, cfg={args.cfg}, shift={args.shift}')
-    latents = sample(pipeline, layers, embeds, mask, uncond, uncond_mask, args, device, dtype,
+    latents = sample(pipeline, layers, text, uncond_text, args, device, dtype,
                      in_channels=pipeline.transformer.in_channels)
     images = decode(pipeline, latents, device)
 
