@@ -62,9 +62,16 @@ there.
 
 Decompose the ground-truth target: `v_gt = E[v | x_t, c] + residual`. In expectation, the
 ground-truth loss and a *perfect* teacher's loss have the **same minimiser** — they differ only
-in the variance of the gradient. And `Var[v_gt | x_t]` grows with `t`: at `t → 1` the latent is
-pure noise and `noise − latents` is nearly unpredictable, so most of the gradient is residual;
-at `t → 0` the latent is nearly clean and the target is nearly exact.
+in the variance of the gradient.
+
+That residual grows with `t` **for data on a manifold**, which is the case that matters and not
+a general fact. At `t → 1` the latent is pure noise, `x_0` is unrecoverable, and the caption is
+the only handle on it, so one ground-truth draw is a very noisy estimate of the caption's mean.
+At `t → 0` the latent is nearly a real image: `x_0` is readable off the manifold and the
+off-manifold part divided by a small `t` recovers the noise, so both halves of `noise − latents`
+are nearly determined. Note this does **not** hold for a Gaussian toy model, where the residual
+is symmetric in `t` and peaks at `0.5` — a Gaussian has no manifold to read `x_0` off. It is an
+argument about real latents, and it has not been measured on any.
 
 The teacher is a pre-denoised target: low variance everywhere. It is also not perfect, and what
 it gets wrong is **bias** — Qwen3-0.6B's conditioning, not Qwen3.5-2B's.
@@ -88,6 +95,44 @@ shape(t) = sigmoid((t − t_mid) / width)        t_mid = 0.5, width = 0.15
 then builds `x_t` from the warped value), so it is the true noise level and `shape(t)` needs no
 shift correction. It does interact with `timestep_sample_method = 'logit_normal'`, which already
 concentrates samples near the middle: `shape` reweights that density, it does not replace it.
+
+## What λ means, exactly
+
+Worth stating precisely, because the loss *values* invite a wrong reading. Every number in this
+section comes from `.audit/exp_teacher_lambda.py`, which reproduces them in a few seconds.
+
+For squared error, mixing the two losses is **algebraically identical** to regressing onto a
+mixed target:
+
+```
+(1−λ)‖v_s − v_gt‖² + λ‖v_s − v_T‖²      has the same gradient as
+‖v_s − [(1−λ)·v_gt + λ·v_T]‖²           up to a constant
+```
+
+because the `v_s` terms collect. So λ is exactly the interpolation weight between the two
+targets — nothing rescales it, and nothing needs normalising. Simulated over 800 residual draws,
+the expected gradient of the mixed loss has cosine **0.99999–0.9993** against the mixed-target
+reference, across `t` from 0.1 to 0.9.
+
+This is worth pinning down because the two logged numbers look wildly unbalanced and suggest
+otherwise. With the residual model above, `D(v_s, v_gt)` runs about **5× larger** than
+`D(v_s, v_T)` at `t = 0.9`. That gap is almost entirely the irreducible residual, which is
+**zero-mean**: it inflates the number printed in the log and contributes nothing to the expected
+gradient. Do not normalise the terms to make them look comparable — that would break the
+identity above and make λ mean something else.
+
+What the gap *does* cost is gradient noise. Per-draw gradient deviation relative to the mean
+gradient grows from about **0.1× at `t = 0.1` to 1.1× at `t = 0.9`** — at high noise a single
+sample's gradient is as large as the signal it carries. That is the mechanism this whole feature
+runs on, stated quantitatively: the teacher is a pre-averaged target, so it hands the refiner at
+high `t` the signal that the ground truth only delivers buried in an equal amount of noise.
+
+**The exception is Huber and smooth-L1.** Both clip large residuals, so the ground-truth term
+saturates at high `t` while the teacher term does not, and the identity breaks. Solving for the
+λ whose target-blend gradient best matches the real one: a nominal `0.5` behaves like **0.497 at
+`t = 0.1` and 0.585 at `t = 0.9`** with `huber_delta = 1.0`. The drift favours the teacher —
+clipping suppresses the noisy ground-truth term — so it is mild and in a safe direction, but
+with `huber_delta` or `smooth_l1_beta` set, λ is approximate rather than exact.
 
 ## The teacher is a ceiling, so λ must also decay with training
 
@@ -278,10 +323,10 @@ visible rather than buried in a sum.
 
 - **Nothing here is measured.** No GPU run, no image, no ablation. Consistent with the rest of
   this branch, and stated rather than implied.
-- **The two terms are not on the same scale.** At high `t` the ground-truth residual is large,
-  so `D(v_s, v_gt)` ≫ `D(v_s, v_T)` and the effective mixing weight is well below the nominal λ.
-  Whether λ should be applied to normalised terms instead is the first thing to measure once the
-  two are logged separately.
+- **`huber_delta` / `smooth_l1_beta` distort λ; MSE does not.** See the section above. The
+  distortion is modest at `delta = 1.0` (0.5 nominal reading as ~0.59 at `t = 0.9`) and it is in
+  the teacher's favour, so it is a caveat rather than a blocker — but λ stops being exactly what
+  it says, and a run that changes `huber_delta` also silently changes its mixing schedule.
 - **`t_mid` and `width` are reasoned, not swept.** The arguments above fix the *direction* of
   the schedule confidently and its *shape* only loosely.
 - **No CFG.** The teacher's velocity is the conditional prediction; sampling uses guidance. The
