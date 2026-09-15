@@ -958,13 +958,24 @@ if __name__ == '__main__':
 
         x_axis = examples if config['x_axis_examples'] else step
 
+        # Models may expose extra per-step scalars. Reached through getattr so a model that
+        # defines nothing logs nothing and is untouched by this.
+        extra_scalars = getattr(model, 'get_extra_log_scalars', lambda: {})()
+        # .get, because steps_per_print is read straight into the DeepSpeed config dict and is
+        # never setdefault-ed onto config itself.
+        if is_main_process() and extra_scalars and step % config.get('steps_per_print', 1) == 0:
+            # Echoed to the console as well as Tensorboard. A run on a cluster usually has no
+            # Tensorboard to hand, and a number nobody can see is not much better than no number:
+            # teacher guidance in particular looks identical whether lambda is 0.9 or has decayed
+            # to 0. On the steps_per_print cadence, because logging_steps defaults to every step.
+            summary = '  '.join(f'{name.rsplit("/", 1)[-1]}={value:.4f}'
+                                for name, value in extra_scalars.items())
+            print(f'step {step}: {summary}')
+
         if is_main_process() and step % config['logging_steps'] == 0:
             tb_writer.add_scalar(f'train/loss', loss, x_axis)
             if hasattr(optimizer, '_grad_norm'):
                 tb_writer.add_scalar(f'train/grad_norm', optimizer._grad_norm, x_axis)
-            # Models may expose extra per-step scalars. Reached through getattr so a model that
-            # defines nothing logs nothing and is untouched by this.
-            extra_scalars = getattr(model, 'get_extra_log_scalars', lambda: {})()
             for name, value in extra_scalars.items():
                 tb_writer.add_scalar(name, value, x_axis)
             if wandb_enable:
