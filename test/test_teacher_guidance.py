@@ -611,3 +611,36 @@ class TestBothTypesShareOneCacheName:
         pipe.cap_feat_dim = 2048
         key = pipe.text_encoder_cache_key(0)
         assert key and 'Qwen3.5-2B-Base' in key
+
+
+class TestAMismatchedTeacherShapeIsRefused:
+    """A separately loaded teacher is the only case where the two DiTs can disagree on shape.
+
+    A shared one is the student's module, so it cannot. A copied one comes from whatever file
+    the user named, and the two velocities are mixed elementwise.
+    """
+
+    def test_a_differing_channel_count_raises(self):
+        v_gt = torch.randn(2, 16, 1, 8, 8)
+        with pytest.raises(RuntimeError, match='does not match'):
+            blend_target(v_gt, torch.randn(2, 4, 1, 8, 8), torch.full((2, 1), 0.5))
+
+    def test_a_single_channel_teacher_raises_instead_of_broadcasting(self):
+        """The dangerous one: (B,1,T,H,W) broadcasts cleanly across (B,16,T,H,W).
+
+        Left to torch, that builds a full-sized target out of one channel of prediction, with
+        no error and a loss that looks entirely healthy.
+        """
+        v_gt = torch.randn(2, 16, 1, 8, 8)
+        with pytest.raises(RuntimeError, match='does not match'):
+            blend_target(v_gt, torch.randn(2, 1, 1, 8, 8), torch.full((2, 1), 0.5))
+
+    def test_a_differing_resolution_raises(self):
+        v_gt = torch.randn(2, 16, 1, 8, 8)
+        with pytest.raises(RuntimeError, match='does not match'):
+            blend_target(v_gt, torch.randn(2, 16, 1, 16, 16), torch.full((2, 1), 0.5))
+
+    def test_matching_shapes_still_blend(self):
+        v_gt = torch.randn(2, 16, 1, 8, 8)
+        out = blend_target(v_gt, torch.randn(2, 16, 1, 8, 8), torch.zeros(2, 1))
+        assert torch.allclose(out, v_gt)

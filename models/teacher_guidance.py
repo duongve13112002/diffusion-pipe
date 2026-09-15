@@ -247,7 +247,18 @@ def blend_target(v_gt, v_teacher, lam):
 
     lam arrives as (B, 1) and the targets as (B, C, T, H, W), so it is reshaped to broadcast on
     the batch dimension alone -- every element of one sample shares that sample's timestep.
+
+    The shapes are checked rather than left to broadcasting. Two velocities of different channel
+    counts mostly raise, but a teacher emitting a single channel would broadcast across all of
+    the student's instead, producing a full-sized target built from one channel of prediction
+    and no error anywhere.
     """
+    if v_teacher.shape != v_gt.shape:
+        raise RuntimeError(
+            f'Teacher velocity {tuple(v_teacher.shape)} does not match the ground-truth target '
+            f'{tuple(v_gt.shape)}. The teacher must predict the same latent shape as the '
+            'student, which means the same VAE and the same channel count.'
+        )
     lam = lam.reshape(lam.shape[0], *([1] * (v_gt.ndim - 1))).to(v_gt.device, v_gt.dtype)
     return (1.0 - lam) * v_gt + lam * v_teacher.to(v_gt.device, v_gt.dtype)
 

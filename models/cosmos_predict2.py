@@ -869,6 +869,24 @@ class CosmosPredict2Pipeline(BasePipeline):
                         value=teacher_state_dict[name])
             teacher_dit.requires_grad_(False)
             teacher_dit.eval()
+            # A separately loaded teacher is the only case where the two DiTs can disagree about
+            # latent shape: a shared one is the student's by construction. Both consume the same
+            # x_t and their velocities are mixed elementwise, so a mismatch here is a
+            # configuration error worth naming at startup rather than a broadcast surprise or a
+            # shape error thrown from inside the first forward.
+            for attribute in ('in_channels', 'out_channels'):
+                theirs = getattr(teacher_dit, attribute, None)
+                ours = getattr(self.transformer, attribute, None)
+                if theirs is not None and ours is not None and theirs != ours:
+                    raise RuntimeError(
+                        f'[teacher] transformer_path has {attribute}={theirs}, but the student '
+                        f'has {attribute}={ours}.\n'
+                        '  The teacher predicts a velocity for the same latent the student does, '
+                        'and the two are mixed elementwise, so they must share a VAE and a '
+                        'channel count.\n'
+                        f'  Check that {cfg.transformer_path} is an Anima checkpoint for the '
+                        'same VAE as vae_path.'
+                    )
 
         # The adapter is always its own module, never the shared DiT's: MiniTrainDIT.forward
         # takes crossattn_emb already projected, so the text frontend lives outside the DiT in
