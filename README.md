@@ -103,8 +103,11 @@ Install PyTorch first. It is not listed in the requirements file, because certai
 pip install torch torchvision torchaudio
 ```
 
-Install all three from the same official PyTorch CUDA index. `models/base.py` imports
-`torchaudio` for video-audio resampling, so omitting it prevents every model module from loading.
+Install all three from the same official PyTorch CUDA index, so their versions match. All three
+are required: `models/base.py` uses `torchaudio` for video-audio resampling, and the vendored
+ComfyUI imports it at module scope as well, so omitting it prevents every model module from
+loading. Leaving it out fails with a message naming the fix, rather than a bare import error from
+inside a vendored file.
 
 Install nvcc: https://anaconda.org/nvidia/cuda-nvcc. Probably try to make it match the CUDA version of PyTorch.
 

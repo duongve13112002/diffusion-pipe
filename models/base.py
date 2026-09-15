@@ -20,7 +20,26 @@ sys.path.insert(0, os.path.join(os.path.abspath(os.path.dirname(__file__)), '../
 
 import peft
 import torch
-import torchaudio
+# torchaudio is required, and not only for the one resample call further down. The vendored
+# ComfyUI imports it at module scope in several places -- comfy.sd pulls in
+# comfy.ldm.lightricks.vae.audio_vae, which does -- so the `import comfy.sd` below needs it
+# too, and there is no configuration in which this module loads without it.
+#
+# It is absent from requirements.txt for the same reason torch and torchvision are: all three
+# have to come from the same PyTorch index, chosen for the machine's CUDA version, so the
+# README has the user install them together. Leaving one out is therefore a normal install
+# slip. This import is kept ahead of the comfy imports, and guarded, so that slip produces a
+# message naming the fix instead of a bare ModuleNotFoundError raised from inside a vendored
+# file the user did not know was involved.
+try:
+    import torchaudio
+except ModuleNotFoundError as e:
+    raise ModuleNotFoundError(
+        'torchaudio is required by diffusion-pipe (for video audio) and by the vendored ComfyUI, '
+        'and is not installed. Install it from the same PyTorch index as torch and torchvision -- '
+        "'pip install torch torchvision torchaudio' -- so that all three versions match. "
+        'See the Installing section of README.md.'
+    ) from e
 from torch import nn
 import torch.nn.functional as F
 import safetensors.torch
