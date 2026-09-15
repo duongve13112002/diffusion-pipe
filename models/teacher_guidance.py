@@ -332,22 +332,35 @@ class TeacherGuide(nn.Module):
         That is the whole point: anything else that differed would land in the loss as though it
         were text-frontend error.
         """
+        import utils.common
+
         device = noisy_latents.device
-        feats = self.text_features(captions, device)
         dit = self.dit[0]
+
+        # The padding mask is concatenated onto the latents inside prepare_embedded_sequence,
+        # and torch.cat PROMOTES: a mask in a wider dtype silently drags the latents up with it,
+        # and the result then meets the DiT's own weights and raises at the first Linear. So it
+        # is built from the tensor it will be concatenated with and from nothing else.
         padding_mask = torch.zeros(
             noisy_latents.shape[0], 1, noisy_latents.shape[3], noisy_latents.shape[4],
             dtype=noisy_latents.dtype, device=device,
         )
+
+        # Run under the same autocast every pipeline layer is decorated with, rather than
+        # casting the inputs by hand. Hand-casting has to pick one dtype, and a DiT loaded with
+        # transformer_dtype does not have one -- KEEP_IN_HIGH_PRECISION leaves x_embedder and
+        # final_layer wider than the blocks. Autocast is also what the student's forward does,
+        # so this keeps the two numerically comparable, which is the entire point of the term.
+        autocast_dtype = utils.common.AUTOCAST_DTYPE
         was_training = dit.training
         dit.eval()
         try:
-            out = dit(
-                noisy_latents.to(next(dit.parameters()).dtype),
-                t.reshape(-1),
-                feats,
-                padding_mask=padding_mask,
-            )
+            with torch.autocast('cuda', dtype=autocast_dtype,
+                                enabled=torch.cuda.is_available() and autocast_dtype is not None):
+                # Inside the autocast, because the student computes its text features inside one
+                # too -- InitialLayer and ContextRefinerLayer carry the same decorator.
+                feats = self.text_features(captions, device)
+                out = dit(noisy_latents, t.reshape(-1), feats, padding_mask=padding_mask)
         finally:
             # The student's DiT may be the same module, and train.py put it in train mode.
             if was_training:

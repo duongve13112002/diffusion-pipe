@@ -644,3 +644,62 @@ class TestAMismatchedTeacherShapeIsRefused:
         v_gt = torch.randn(2, 16, 1, 8, 8)
         out = blend_target(v_gt, torch.randn(2, 16, 1, 8, 8), torch.zeros(2, 1))
         assert torch.allclose(out, v_gt)
+
+
+class TestTheTeacherForwardMatchesTheStudentsDtypeHandling:
+    """Regression: a bf16 multi-GPU run died in the teacher's first Linear.
+
+        RuntimeError: expected mat1 and mat2 to have the same dtype, but got:
+        float != c10::BFloat16                     (x_embedder.proj, rank 0/1/5)
+
+    prepare_embedded_sequence concatenates the padding mask onto the latents, and torch.cat
+    PROMOTES. velocity() had cast the latents to the DiT's dtype but built the mask from the
+    original float32 tensor, so the cat dragged the latents back to float32 and the bf16
+    x_embedder rejected them.
+
+    The cast was the mistake, not just the mask. A DiT loaded with transformer_dtype has no
+    single dtype -- KEEP_IN_HIGH_PRECISION leaves x_embedder and final_layer wider than the
+    blocks -- so there is nothing correct to cast to. The student never casts either: every
+    pipeline layer carries @torch.autocast and is handed float32. The teacher now does the same.
+    """
+
+    @staticmethod
+    def capture_dit_inputs():
+        """A stand-in DiT recording the dtypes its forward is handed."""
+        seen = {}
+
+        class RecordingDiT(nn.Module):
+            in_channels = out_channels = 16
+
+            def forward(self, x, t, crossattn_emb, fps=None, padding_mask=None):
+                seen['latents'] = x.dtype
+                seen['padding_mask'] = padding_mask.dtype
+                seen['timesteps'] = t.dtype
+                return torch.zeros(x.shape[0], 16, 1, x.shape[3], x.shape[4], dtype=x.dtype)
+
+        return RecordingDiT(), seen
+
+    def run(self, latents):
+        dit, seen = self.capture_dit_inputs()
+        guide = build_teacher_guide(dit, 64)
+        guide.max_text_length = 8
+        guide.velocity(latents, torch.tensor([[0.5]]), ['a cat'])
+        return seen
+
+    def test_the_padding_mask_shares_the_latents_dtype(self):
+        seen = self.run(torch.randn(1, 16, 1, 8, 8))
+        assert seen['padding_mask'] == seen['latents'], (
+            'the mask is concatenated onto the latents and torch.cat promotes, so a mask in a '
+            'different dtype silently changes what reaches the DiT'
+        )
+
+    def test_the_latents_are_not_cast_before_the_forward(self):
+        """Handed through as they arrive, exactly as the student's layer stack receives them."""
+        latents = torch.randn(1, 16, 1, 8, 8)
+        assert self.run(latents)['latents'] == latents.dtype
+
+    def test_it_holds_for_a_half_precision_latent_too(self):
+        latents = torch.randn(1, 16, 1, 8, 8, dtype=torch.bfloat16)
+        seen = self.run(latents)
+        assert seen['latents'] == torch.bfloat16
+        assert seen['padding_mask'] == torch.bfloat16
