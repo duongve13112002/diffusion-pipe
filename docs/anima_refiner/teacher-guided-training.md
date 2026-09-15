@@ -188,9 +188,34 @@ no second copy to hold — one extra `no_grad` forward through the module alread
 the `llm_adapter` has to come from `teacher.transformer_path`, because a checkpoint that has
 been through the refiner path no longer carries one.
 
-Resolution is automatic, from the learning rates as `get_param_groups` resolves them, and it is
-verified rather than assumed: sharing is taken only when every DiT group is frozen. Anything
-else loads the independent copy.
+Resolution is automatic and verified rather than assumed. Sharing is taken only when **both**
+hold:
+
+1. **The DiT cannot move.** Every DiT learning rate resolves to 0 and there is no `[adapter]`.
+   An adapter disqualifies sharing whatever the rates say, because a LoRA wraps the DiT's own
+   Linear layers and the shared module stops being the stock weights at the first optimizer
+   step. `refiner_lr` is deliberately *not* part of this: the teacher's text frontend is the
+   `llm_adapter` and its forward never touches `context_refiner`, so a training refiner cannot
+   change the teacher's prediction.
+2. **The DiT is the teacher's.** Freezing alone is not enough — a run whose `transformer_path`
+   is a previously trained checkpoint has a frozen DiT that is not stock Anima's, and sharing
+   there would make the model its own teacher: zero teacher signal, and no error anywhere.
+
+The second condition is a fact about **weights**, not paths. Matching `realpath`s are a fast
+path that settles it without reading anything; when the paths differ, the student's in-memory
+DiT is compared against the teacher checkpoint tensor by tensor, and two copies of one file at
+two paths share correctly instead of costing 3.5-4 GB for nothing. `context_refiner` is excluded
+from that comparison, since a stock Anima checkpoint has no such keys and the teacher never runs
+them.
+
+The comparison uses the student's own dtype, so a run with `transformer_dtype` set still
+matches: those parameters came from the same file through the same cast. Sharing is in fact
+*more* faithful there than a separate copy would be, because a bf16 teacher beside a quantised
+student would differ in something other than the text frontend, which is the one thing the loss
+is meant to measure.
+
+The startup line says which case applied — `same checkpoint file` or `different file, identical
+weights` — so a run that is paying for a second DiT says so.
 
 The bottom two rows deserve a warning. Once the student's DiT moves, the teacher's velocity
 stops being an achievable target and becomes a pull back toward where the model started. That is

@@ -12,8 +12,9 @@ The tests that matter most here are the ones covering things that fail *silently
   * eval must not see the teacher, or the eval metric drifts as the decay runs and a change in
     the loss definition looks like a change in the model.
   * the teacher may share the student's DiT only when that DiT provably cannot move AND is
-    provably the same checkpoint. Share it wrongly and the model becomes its own teacher: zero
-    teacher signal, no error anywhere.
+    provably the same weights. Share it wrongly and the model becomes its own teacher: zero
+    teacher signal, no error anywhere. Paths are only a fast path to that answer, never the
+    answer itself.
 """
 
 import pytest
@@ -476,3 +477,62 @@ class TestTheDocConfigSnippetMatchesTheCode:
             resolved = validate_teacher_config(
                 parsed, True, parsed.get('model', {}).get('cache_text_embeddings', True))
             assert resolved.enabled
+
+
+class TestSharingIsDecidedByWeightsNotPaths:
+    """Whether the student's DiT IS the teacher's is a fact about weights.
+
+    Comparing checkpoint paths is only a proxy for it, and one that answers "different" for two
+    copies of a single file -- which would cost 3.5-4 GB to no purpose. These pin the real check.
+    """
+
+    @staticmethod
+    def pipeline_with(dit):
+        pipe = cp2.CosmosPredict2Pipeline.__new__(cp2.CosmosPredict2Pipeline)
+        pipe.transformer = dit
+        return pipe
+
+    def test_identical_weights_match(self):
+        dit = build_dit(crossattn_dim=64, num_blocks=1, seed=0)
+        state_dict = {n: p.detach().clone() for n, p in dit.named_parameters()}
+        assert self.pipeline_with(dit)._dit_weights_match(state_dict)
+
+    def test_a_single_changed_tensor_does_not_match(self):
+        dit = build_dit(crossattn_dim=64, num_blocks=1, seed=0)
+        state_dict = {n: p.detach().clone() for n, p in dit.named_parameters()}
+        key = next(iter(state_dict))
+        state_dict[key] = state_dict[key] + 1e-3
+        assert not self.pipeline_with(dit)._dit_weights_match(state_dict), (
+            'a model that differs anywhere is a different model; the teacher needs its own copy'
+        )
+
+    def test_a_differently_seeded_model_does_not_match(self):
+        dit = build_dit(crossattn_dim=64, num_blocks=1, seed=0)
+        other = build_dit(crossattn_dim=64, num_blocks=1, seed=7)
+        state_dict = {n: p.detach().clone() for n, p in other.named_parameters()}
+        assert not self.pipeline_with(dit)._dit_weights_match(state_dict)
+
+    def test_a_missing_tensor_does_not_match(self):
+        dit = build_dit(crossattn_dim=64, num_blocks=1, seed=0)
+        state_dict = {n: p.detach().clone() for n, p in dit.named_parameters()}
+        del state_dict[next(iter(state_dict))]
+        assert not self.pipeline_with(dit)._dit_weights_match(state_dict)
+
+    def test_the_refiner_is_not_part_of_the_comparison(self):
+        """A stock Anima checkpoint has no context_refiner.* keys, and should not need them.
+
+        The teacher never runs the refiner, so its absence from the teacher's checkpoint says
+        nothing about whether the two DiTs are the same.
+        """
+        dit = build_dit(crossattn_dim=64, num_blocks=1, n_refiner_layers=2, cap_feat_dim=32)
+        state_dict = {n: p.detach().clone() for n, p in dit.named_parameters()
+                      if not n.startswith('context_refiner.')}
+        assert self.pipeline_with(dit)._dit_weights_match(state_dict)
+
+    def test_a_trained_refiner_does_not_stop_the_dit_matching(self):
+        dit = build_dit(crossattn_dim=64, num_blocks=1, n_refiner_layers=2, cap_feat_dim=32)
+        state_dict = {n: p.detach().clone() for n, p in dit.named_parameters()
+                      if not n.startswith('context_refiner.')}
+        with torch.no_grad():
+            dit.context_refiner.cap_embedder[1].weight.add_(0.5)
+        assert self.pipeline_with(dit)._dit_weights_match(state_dict)

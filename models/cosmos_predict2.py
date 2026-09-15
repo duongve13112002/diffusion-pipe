@@ -791,6 +791,31 @@ class CosmosPredict2Pipeline(BasePipeline):
         text_encoder.requires_grad_(False)
         return tokenizer, text_encoder
 
+    def _dit_weights_match(self, state_dict):
+        """Whether the student's in-memory DiT is exactly these weights.
+
+        This is the property sharing actually needs; comparing checkpoint paths is only a proxy
+        for it, and a proxy that says "different" for two copies of one file.
+
+        Compared against the student's own dtype, so a run using transformer_dtype still matches:
+        those parameters came from this same file through this same cast, and what matters is
+        that the teacher and the student would run bit-identical weights -- which under
+        quantisation is truer of a shared module than of a separately loaded bf16 copy.
+
+        context_refiner is skipped: it is not part of the DiT the teacher runs, and the teacher's
+        checkpoint has no such keys. Everything else must be present and equal; a single missing
+        or differing tensor means these are different models and the teacher needs its own copy.
+        """
+        for name, p in self.transformer.named_parameters():
+            if name.startswith('context_refiner.') or name.startswith('llm_adapter.'):
+                continue
+            reference = state_dict.get(name, None)
+            if reference is None or reference.shape != p.shape:
+                return False
+            if not torch.equal(p.detach().cpu(), reference.to(p.dtype).cpu()):
+                return False
+        return True
+
     def _build_teacher(self, dtype):
         """Assemble the frozen stock Anima whose velocity the loss mixes toward.
 
@@ -813,11 +838,21 @@ class CosmosPredict2Pipeline(BasePipeline):
                 'the refiner path has had its llm_adapter dropped, so it cannot be a teacher.'
             )
 
+        # Sharing needs the student's DiT to BE the teacher's, which is a fact about weights,
+        # not about paths. Two copies of one checkpoint at two paths are the same model, and
+        # refusing to share there costs 3.5-4 GB for nothing. So the path check is only a fast
+        # path: when it does not fire, compare the tensors and let the answer decide.
         same_checkpoint = (
             os.path.realpath(cfg.transformer_path)
             == os.path.realpath(self.model_config['transformer_path'])
         )
-        shares_dit = self._dit_is_frozen() and same_checkpoint
+        shares_dit = False
+        share_reason = ''
+        if self._dit_is_frozen():
+            if same_checkpoint:
+                shares_dit, share_reason = True, 'same checkpoint file'
+            elif self._dit_weights_match(teacher_state_dict):
+                shares_dit, share_reason = True, 'different file, identical weights'
 
         if shares_dit:
             teacher_dit = self.transformer
@@ -859,7 +894,7 @@ class CosmosPredict2Pipeline(BasePipeline):
         if is_main_process():
             for message in teacher_warnings(cfg, self.config):
                 print(message)
-            how = ("sharing the student's frozen DiT" if shares_dit
+            how = (f"sharing the student's frozen DiT ({share_reason})" if shares_dit
                    else 'with its own frozen copy of the DiT')
             print(
                 f'Teacher guidance on: loss_weight={cfg.loss_weight}, shape={cfg.shape} '
