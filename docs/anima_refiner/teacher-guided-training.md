@@ -187,39 +187,64 @@ more of the DiT that trains, the more the decay schedule matters.**
 
 ## Where the teacher's text features come from
 
-This follows `cache_text_embeddings`, the setting that already decides the same question for the
-student. There is no separate switch.
+**This feature requires `cache_text_embeddings = false`, and that is the design choice, not a
+limitation to be lifted later.** Caching is discussed below because it is a reasonable thing to
+want and because the reason for refusing it should be on the record.
 
-### `cache_text_embeddings = true`
+### On the fly, which is the only supported mode
 
-Cache the teacher's `LLMAdapter` output the way student embeddings are already cached: a new
-prefix under the same `cache_dir`, with its own fingerprint covering the teacher's identity
-(`teacher.llm_path`, `teacher.transformer_path`, `max_text_length`).
+Both text frontends stay resident and run every step, on **the same caption string**:
 
-Per [lessons.md](./lessons.md), this must invalidate nothing that already exists — it is a new
-cache, so latents and the student's embeddings are untouched, and a fingerprint argument is
-appended only when it is non-empty.
+```
+caption (augmented once)
+   ├─> T5 tokenizer ─────> LLMAdapter ⨯ Qwen3-0.6B  ─> feats_teacher (L, 1024)
+   └─> Qwen3.5 tokenizer ─> Qwen3.5-2B ─> ContextRefiner ─> feats_student (L, 1024)
+```
 
-The teacher's sequence is indexed by **T5** tokens, so the cached tensor is
-`(max_text_length, 1024)` — about 1 MB per caption in bf16, against the 2 MB the student's
-2048-wide embeddings already cost.
+The single-draw requirement is the whole reason this mode is mandatory. On-the-fly exists
+precisely so tag shuffling and `tag_dropout_rate` are re-drawn on every access, so the augmented
+caption must be produced **once** and then handed to both tokenizers. Draw it twice and the
+teacher is answering a different prompt than the student, and the loss compares two captions
+instead of two text frontends. Nothing about the loss value would look wrong. It would quietly
+optimise the wrong thing, and no test that checks shapes or magnitudes would catch it.
 
-Once cached, **Qwen3-0.6B, the `LLMAdapter` and the T5 tokenizer are all droppable.** Only the
-teacher's DiT stays, and only when the table above says a copy is needed.
+With one draw feeding both tokenizers, that failure is not merely avoided, it is unrepresentable.
 
-### `cache_text_embeddings = false`
+Resident cost: Qwen3-0.6B (~1.2 GB bf16) plus the `LLMAdapter`, on top of the student's
+Qwen3.5-2B (~4 GB) and whatever the DiT row of the table above requires.
 
-Both text frontends stay resident and run every step, on **the same caption string**.
+### Why not cached, and what would be involved
 
-This is a correctness requirement, not a convenience. On-the-fly mode exists precisely so that
-tag shuffling and `tag_dropout_rate` are re-drawn on every access — so the augmented caption has
-to be produced **once** and then handed to both tokenizers. Draw it twice and the teacher is
-being asked about a different prompt than the student, and the loss is comparing two captions
-rather than two text frontends. Nothing about the loss would look wrong; it would just quietly
-optimise the wrong thing.
+A reasonable worry about caching goes: the cache holds embeddings, not text — so if the student's
+Qwen3.5-2B embeddings are already cached, how does anything recover the caption to feed the
+teacher's Qwen3-0.6B?
 
-Resident cost in this mode: Qwen3-0.6B (~1.2 GB bf16) plus the `LLMAdapter`, on top of whatever
-the DiT row of the table above requires.
+**Nothing ever has to.** Captions are not lost by caching. `flatten_captions` keeps the caption
+text and its `image_spec` alongside the embeddings (`utils/dataset.py:326`), and the repo already
+caches several text encoders side by side: `cache_text_embeddings(map_fn, i, ...)` runs once per
+text-encoder index, each writing a `text_embeddings_{i}_` prefix with its own fingerprint
+(`utils/dataset.py:1864`, `utils/dataset.py:342-349`). Flux and HiDream already ship two and
+three encoders this way. The teacher would be one more index, written from the same caption rows,
+so row alignment holds by construction rather than by re-deriving anything.
+
+So caching is *mechanically* available, and it would be cheaper at train time: about 1 MB per
+caption for a `(max_text_length, 1024)` tensor, after which Qwen3-0.6B, the `LLMAdapter` and the
+T5 tokenizer are all droppable.
+
+It is still refused, for two reasons.
+
+1. **The augmentation draw.** Caching freezes it. The two caches would agree with each other
+   only if written in the same pass from the same drawn string, and `cache_shuffle_num` then
+   fixes how many draws exist for the entire run — the ceiling
+   [README.md](./README.md#on-the-fly-text-embeddings) already warns about for the student alone.
+   A teacher term multiplies the cost of getting it wrong, because a mismatch is invisible.
+2. **One more fingerprint to get wrong.** [lessons.md](./lessons.md) has a section on exactly
+   this: a fingerprint argument appended unconditionally invalidates the text-embedding cache of
+   *every* model in the repo, and `Hasher.hash([i])` differs from `Hasher.hash([i, ''])`. The
+   feature is not worth that risk before it has been shown to work at all.
+
+If it is ever added, it belongs behind its own key, defaulting off, with the teacher registered
+as an ordinary extra text encoder rather than a bespoke cache path.
 
 ## How it fits the pipeline
 
@@ -263,6 +288,9 @@ A new top-level `[teacher]` table, gated exactly the way `[rollout]` is: **`loss
 disables the feature entirely**, including loading anything.
 
 ```toml
+# Required: the teacher and the student must see one augmentation draw of one caption.
+cache_text_embeddings = false
+
 [teacher]
 loss_weight = 1.0
 
@@ -295,6 +323,9 @@ target the student chases is not one the DiT can read.
 
 ## What has to be refused at startup
 
+- **`cache_text_embeddings = true`.** See the section above: the teacher and the student have to
+  read one augmentation draw of one caption, and caching cannot promise that today. The error
+  should say to set it false rather than name a missing cache.
 - **`pipeline_stages > 1`.** The teacher forward happens where `prepare_inputs` runs, so the
   whole teacher DiT would sit on stage 0 while the student is split across stages — the memory
   imbalance defeats the point of splitting. `pipeline_stages = 1` with data parallelism across
