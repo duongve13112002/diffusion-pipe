@@ -12,7 +12,9 @@ distillation objectives -- what each can and cannot see, and what it costs;
 [denoising-rollout.md](./denoising-rollout.md) documents the
 optional one that compares the frozen DiT's predictions rather than its
 cross-attention outputs; [lessons.md](./lessons.md) is the rules the mistakes on this branch
-turned into.
+turned into. [teacher-guided-training.md](./teacher-guided-training.md) is a **proposal**, not a
+feature — keeping the teacher resident during ordinary diffusion training and mixing its
+prediction with the ground truth by timestep. Nothing in it is implemented.
 
 ## Why
 
