@@ -962,10 +962,17 @@ if __name__ == '__main__':
             tb_writer.add_scalar(f'train/loss', loss, x_axis)
             if hasattr(optimizer, '_grad_norm'):
                 tb_writer.add_scalar(f'train/grad_norm', optimizer._grad_norm, x_axis)
+            # Models may expose extra per-step scalars. Reached through getattr so a model that
+            # defines nothing logs nothing and is untouched by this.
+            extra_scalars = getattr(model, 'get_extra_log_scalars', lambda: {})()
+            for name, value in extra_scalars.items():
+                tb_writer.add_scalar(name, value, x_axis)
             if wandb_enable:
                 wandb.log({'train/loss': loss, 'step': x_axis})
                 if hasattr(optimizer, '_grad_norm'):
                     wandb.log({'train/grad_norm': optimizer._grad_norm, 'step': x_axis})
+                if extra_scalars:
+                    wandb.log({**extra_scalars, 'step': x_axis})
             if optimizer.__class__.__name__ == 'Prodigy':
                 prodigy_d = get_prodigy_d(optimizer)
                 tb_writer.add_scalar(f'train/prodigy_d', prodigy_d, x_axis)

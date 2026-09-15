@@ -31,6 +31,7 @@ from models.teacher_guidance import (
     TeacherGuide,
     blend_target,
     lambda_at,
+    should_announce,
     teacher_warnings,
     validate_teacher_config,
 )
@@ -522,6 +523,8 @@ class CosmosPredict2Pipeline(BasePipeline):
         # Set by train.py when the engine exists, so the decay schedule can advance. Left as a
         # constant 0 otherwise, which is what tools and tests that never train want.
         self._step_source = None
+        self._last_teacher_lambda = None
+        self._teacher_decay_announced = False
 
     def text_encoder_cache_key(self, i):
         """Identity of text encoder `i`, mixed into the text embedding cache fingerprint.
@@ -1091,15 +1094,43 @@ class CosmosPredict2Pipeline(BasePipeline):
         # ground-truth loss, or the metric moves as the decay schedule runs and a change in the
         # loss definition is indistinguishable from a change in the model.
         if self.teacher is not None and timestep_quantile is None:
-            lam = lambda_at(t, self._current_step(), self.teacher_cfg)
+            step = self._current_step()
+            lam = lambda_at(t, step, self.teacher_cfg)
+            # Recorded every training batch so get_extra_log_scalars can report it. Without this
+            # the only evidence the teacher exists is one line at startup, and a run cannot be
+            # told apart from one whose decay reached zero hours ago.
+            self._last_teacher_lambda = float(lam.mean())
             if float(lam.max()) > 0:
                 self._ensure_teacher_device()
                 device = self.teacher.device
                 teacher_v = self.teacher.velocity(
                     noisy_latents.to(device), t.to(device), captions)
                 target = blend_target(target, teacher_v.to(target.device), lam)
+            elif not self._teacher_decay_announced:
+                self._teacher_decay_announced = True
+                if should_announce():
+                    print(
+                        f'Teacher guidance has fully decayed at step {step}: lambda is 0 at '
+                        'every timestep, and the teacher no longer contributes. Training '
+                        'continues on the ground truth alone, which is what the schedule is '
+                        'for. The teacher stays resident; restart to reclaim its memory.'
+                    )
 
         return (noisy_latents, t, *prompt_embeds_or_batch_encoding), (target, mask)
+
+    def get_extra_log_scalars(self):
+        """Per-step scalars for Tensorboard and wandb, on top of the ones train.py always logs.
+
+        Optional: train.py reaches this through getattr, so a model that does not define it logs
+        nothing extra and is unaffected.
+
+        teacher_lambda is the batch mean of lambda. It is the one number that says whether the
+        teacher is still doing anything -- a startup line proves only that it loaded, and says
+        nothing about a decay schedule that zeroed out an hour into the run.
+        """
+        if self._last_teacher_lambda is None:
+            return {}
+        return {'train/teacher_lambda': self._last_teacher_lambda}
 
     def _ensure_teacher_device(self):
         """Move the teacher to the training device once, on first use.

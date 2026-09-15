@@ -160,6 +160,22 @@ def validate_teacher_config(config, use_context_refiner, cache_text_embeddings):
                          shape, t_mid, width, decay, decay_steps)
 
 
+def should_announce():
+    """Whether this process should print an informational message.
+
+    utils.common.is_main_process() asserts a DeepSpeed backend is initialised, which is true
+    during training and not true in a tool, a test, or anything driving prepare_inputs directly.
+    No backend means one process, and one process is the main one -- the same single-process
+    semantics test/conftest.py's stub implements. Printing must never be the reason a code path
+    that would otherwise work raises.
+    """
+    try:
+        from utils.common import is_main_process
+        return is_main_process()
+    except Exception:
+        return True
+
+
 def teacher_warnings(cfg, config):
     """Advisory messages for a valid but risky configuration.
 

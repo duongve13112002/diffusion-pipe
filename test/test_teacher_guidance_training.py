@@ -109,6 +109,11 @@ def build_pipeline(teacher=None, cfg=None, step=0, shift=None):
     pipe.teacher = teacher
     pipe.teacher_cfg = cfg if cfg is not None else teacher_cfg()
     pipe._step_source = lambda: step
+    # Mirrors what __init__ sets. Deliberately not defaulted with getattr in the pipeline: a
+    # missing attribute there would mean __init__ had not run, which is worth an exception
+    # rather than a quietly empty log.
+    pipe._last_teacher_lambda = None
+    pipe._teacher_decay_announced = False
     return pipe
 
 
@@ -369,3 +374,58 @@ def main():
 
 if __name__ == '__main__':
     main()
+
+
+class TestItIsVisibleThatTheTeacherIsOn:
+    """A startup line proves the teacher loaded. It does not prove it is still contributing.
+
+    Without a per-step number, a run whose decay reached zero an hour ago looks exactly like one
+    training at full teacher weight.
+    """
+
+    def test_nothing_is_logged_when_there_is_no_teacher(self):
+        pipe = build_pipeline(teacher=None)
+        pipe.prepare_inputs(toy_batch())
+        assert pipe.get_extra_log_scalars() == {}, (
+            'a model with the feature off must add no scalars at all'
+        )
+
+    def test_lambda_is_reported_after_a_training_batch(self):
+        _, _, guide = build_student_and_teacher()
+        pipe = build_pipeline(teacher=guide)
+        pipe.prepare_inputs(toy_batch())
+        scalars = pipe.get_extra_log_scalars()
+        assert 'train/teacher_lambda' in scalars
+        assert 0 < scalars['train/teacher_lambda'] <= 1
+
+    def test_it_reports_zero_once_the_schedule_has_decayed(self):
+        """The number has to keep being reported after decay, not stop being reported.
+
+        A metric that vanishes is indistinguishable from a logger that broke.
+        """
+        _, _, guide = build_student_and_teacher()
+        cfg = teacher_cfg(decay='linear', decay_steps=10)
+        pipe = build_pipeline(teacher=guide, cfg=cfg, step=10)
+        pipe.prepare_inputs(toy_batch())
+        assert pipe.get_extra_log_scalars()['train/teacher_lambda'] == 0.0
+
+    def test_eval_does_not_overwrite_the_training_number(self):
+        """Eval runs prepare_inputs too, and reports lambda = 0 by construction."""
+        _, _, guide = build_student_and_teacher()
+        pipe = build_pipeline(teacher=guide)
+        pipe.prepare_inputs(toy_batch())
+        during_training = pipe.get_extra_log_scalars()['train/teacher_lambda']
+        pipe.prepare_inputs(toy_batch(), timestep_quantile=0.5)
+        assert pipe.get_extra_log_scalars()['train/teacher_lambda'] == during_training
+
+    def test_full_decay_is_announced_once(self, capsys):
+        # No patching of is_main_process: should_announce() treats "no distributed backend" as
+        # a single process, so prepare_inputs never needs one just to print.
+        _, _, guide = build_student_and_teacher()
+        cfg = teacher_cfg(decay='linear', decay_steps=10)
+        pipe = build_pipeline(teacher=guide, cfg=cfg, step=10)
+        pipe.prepare_inputs(toy_batch())
+        pipe.prepare_inputs(toy_batch())
+        printed = capsys.readouterr().out
+        assert 'fully decayed' in printed
+        assert printed.count('fully decayed') == 1, 'announced once, not on every batch'
