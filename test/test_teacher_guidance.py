@@ -536,3 +536,78 @@ class TestSharingIsDecidedByWeightsNotPaths:
         with torch.no_grad():
             dit.context_refiner.cap_embedder[1].weight.add_(0.5)
         assert self.pipeline_with(dit)._dit_weights_match(state_dict)
+
+
+class TestTheStudentAndTeacherAreDifferentModelTypes:
+    """The normal case: student is anima_refiner, teacher is stock anima, one checkpoint file.
+
+    The two carry different text frontends by definition -- the student a context_refiner and no
+    llm_adapter, the teacher an llm_adapter and no context_refiner -- so a naive comparison would
+    always call them different and always load a redundant DiT. What has to match is the DiT
+    body, which is the same MiniTrainDIT in both and the whole reason one can be swapped for the
+    other.
+    """
+
+    @staticmethod
+    def refiner_student_and_anima_checkpoint(seed=0):
+        student = build_dit(crossattn_dim=64, num_blocks=1, n_refiner_layers=2,
+                            cap_feat_dim=32, seed=seed)
+        # What a stock Anima file holds: the same DiT body, plus an llm_adapter, minus a refiner.
+        state_dict = {n: p.detach().clone() for n, p in student.named_parameters()
+                      if not n.startswith('context_refiner.')}
+        state_dict['llm_adapter.out_proj.weight'] = torch.randn(64, 64)
+        state_dict['llm_adapter.embed.weight'] = torch.randn(32128, 64)
+        pipe = cp2.CosmosPredict2Pipeline.__new__(cp2.CosmosPredict2Pipeline)
+        pipe.transformer = student
+        return pipe, state_dict
+
+    def test_the_two_frontends_do_not_stop_the_dit_matching(self):
+        pipe, state_dict = self.refiner_student_and_anima_checkpoint()
+        assert pipe._dit_weights_match(state_dict), (
+            'an anima_refiner student and an anima teacher from one file share a DiT body; '
+            'their differing text frontends are exactly what the loss measures, not a reason '
+            'to load the body twice'
+        )
+
+    def test_a_difference_in_the_body_still_fails(self):
+        pipe, state_dict = self.refiner_student_and_anima_checkpoint()
+        key = 'blocks.0.self_attn.q_proj.weight'
+        state_dict[key] = state_dict[key] + 1e-3
+        assert not pipe._dit_weights_match(state_dict)
+
+    def test_the_teachers_adapter_is_never_compared(self):
+        """The student has no llm_adapter at all, so it cannot be part of the comparison."""
+        pipe, state_dict = self.refiner_student_and_anima_checkpoint()
+        state_dict['llm_adapter.out_proj.weight'] = torch.randn(64, 64)
+        assert pipe._dit_weights_match(state_dict)
+
+
+class TestBothTypesShareOneCacheName:
+    """anima and anima_refiner deliberately write under the same cache tree name."""
+
+    def test_the_name_is_shared(self):
+        # The name selects the whole cache tree, latents included, and the two use the same VAE.
+        # A separate name would discard latents that are still perfectly valid -- by far the
+        # expensive half. What differs is the text encoder, and that lives in the text-embedding
+        # fingerprint instead, via text_encoder_cache_key.
+        source = (cp2.__file__)
+        with open(source, encoding='utf-8') as f:
+            text = f.read()
+        assert "self.name = 'anima'" in text, (
+            'anima_refiner must keep sharing the cache name with anima, or every switch between '
+            'them re-encodes the entire dataset through an unchanged VAE'
+        )
+
+    def test_only_the_refiner_contributes_a_text_encoder_cache_key(self):
+        """anima returns '' so that adding the key never moved an existing install's cache."""
+        pipe = cp2.CosmosPredict2Pipeline.__new__(cp2.CosmosPredict2Pipeline)
+        pipe.use_context_refiner = False
+        assert pipe.text_encoder_cache_key(0) == ''
+
+        pipe.use_context_refiner = True
+        pipe.model_config = {'llm_path': '/models/Qwen3.5-2B-Base'}
+        pipe.llm_hidden_layer = -1
+        pipe.max_text_length = 512
+        pipe.cap_feat_dim = 2048
+        key = pipe.text_encoder_cache_key(0)
+        assert key and 'Qwen3.5-2B-Base' in key
