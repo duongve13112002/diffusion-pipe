@@ -308,7 +308,13 @@ A new top-level `[teacher]` table, gated exactly the way `[rollout]` is: **`loss
 disables the feature entirely**, including loading anything.
 
 ```toml
-# Required: the teacher and the student must see one augmentation draw of one caption.
+# Top level, not inside a table.
+pipeline_stages = 1
+
+[model]
+type = 'anima_refiner'
+# Required, and it belongs to [model] -- the pipeline reads it from there, so a copy at the top
+# level is silently ignored and the run is refused for having caching on.
 cache_text_embeddings = false
 
 [teacher]

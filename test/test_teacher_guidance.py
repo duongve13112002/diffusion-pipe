@@ -435,3 +435,44 @@ class TestTheShippedExampleConfig:
         config = self.load()
         assert config['teacher']['decay'] != 'none'
         assert config['teacher']['decay_steps'] > 0
+
+
+class TestTheDocConfigSnippetMatchesTheCode:
+    """A config snippet in the docs is something people copy. It has to be loadable.
+
+    The specific trap this guards: cache_text_embeddings is read from [model], so a snippet
+    showing it at the top level parses fine, is silently ignored, and the run is then refused
+    for having caching on -- with an error pointing at a line the user already wrote.
+    """
+
+    @staticmethod
+    def snippets():
+        import re
+        from pathlib import Path
+        repo = Path(__file__).resolve().parent.parent
+        text = (repo / 'docs' / 'anima_refiner' / 'teacher-guided-training.md').read_text('utf-8')
+        return [block for block in re.findall(r'```toml\n(.*?)```', text, re.DOTALL)]
+
+    def test_there_is_a_snippet_to_check(self):
+        assert self.snippets()
+
+    def test_every_snippet_puts_cache_text_embeddings_under_model(self):
+        import toml
+        for snippet in self.snippets():
+            parsed = toml.loads(snippet)
+            assert 'cache_text_embeddings' not in parsed, (
+                'cache_text_embeddings is shown at the top level, where the pipeline never '
+                'looks for it; it belongs under [model]'
+            )
+            if 'model' in parsed:
+                assert parsed['model'].get('cache_text_embeddings') is False
+
+    def test_every_snippet_validates(self):
+        import toml
+        for snippet in self.snippets():
+            parsed = toml.loads(snippet)
+            if 'teacher' not in parsed:
+                continue
+            resolved = validate_teacher_config(
+                parsed, True, parsed.get('model', {}).get('cache_text_embeddings', True))
+            assert resolved.enabled
