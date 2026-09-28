@@ -1,3 +1,4 @@
+import json
 import sqlite3
 from pathlib import Path
 import os
@@ -8,11 +9,28 @@ import torch
 
 
 class Cache:
-    def __init__(self, path: str, fingerprint: str, shard_size_gb=1):
+    def __init__(self, path: str, fingerprint: str, shard_size_gb=1,
+                 keep_on_fingerprint_change=False, identity=None, content_digest=None):
+        self.keep_on_fingerprint_change = keep_on_fingerprint_change
+        # What produced this cache's contents -- the VAE for latents, the text encoder
+        # for embeddings. None means the caller supplies no identity, which is the
+        # behaviour every model had before this existed.
+        self.identity = identity
+        # Digest of the INPUT these contents were computed from, for caches whose input is
+        # cheap to hash. identity answers "who produced this"; this answers "from what".
+        # keep_on_fingerprint_change deliberately tolerates a moved fingerprint, and for the
+        # text embedding cache the caption text is essentially the whole fingerprint -- so
+        # without this, keeping is exactly the same thing as ignoring an edit to the captions.
+        self.content_digest = content_digest
         self.path = Path(path)
         self.fingerprint = fingerprint
         self.metadata_db = self.path / 'metadata.db'
         self.shard_size_gb = shard_size_gb
+        # Set when init() keeps a complete cache even though its fingerprint moved. Callers
+        # use this to distinguish an old cache from a partial cache for the current fingerprint:
+        # the latter can be resumed, while the former is only reusable when its row count still
+        # matches the dataset exactly.
+        self.reused_after_fingerprint_change = False
         os.makedirs(self.path, exist_ok=True)
 
         self.init()
@@ -37,6 +55,7 @@ class Cache:
 
 
     def init(self):
+        self.reused_after_fingerprint_change = False
         print('[CACHE] Initializing')
         # create database
         self.con = sqlite3.connect(self.metadata_db, autocommit=False)
@@ -47,10 +66,29 @@ class Cache:
         if existing_fingerprint is not None:
             existing_fingerprint = existing_fingerprint[0]
             print(f'[CACHE] Existing cache has fingerprint {existing_fingerprint}')
-            if self.fingerprint != existing_fingerprint:
-                print('[CACHE] Fingerprint changed, deleting existing cache files')
+            compatible, reason = self.check_identity()
+            if not compatible:
+                # An incompatible cache is rebuilt no matter what keep_* says. keep_* exists to
+                # avoid recaching UNNECESSARILY, not to reuse contents produced by something
+                # else -- reusing latents from a different VAE trains on silently wrong data.
+                print(f'[CACHE] {reason} Rebuilding.')
                 self.clear()
                 return
+            if self.fingerprint != existing_fingerprint:
+                if self.keep_on_fingerprint_change:
+                    # Compatible, so the contents are still what this model produces; only the
+                    # fingerprint moved, which is what a caption setting change does.
+                    print(
+                        f'[CACHE] Fingerprint changed ({existing_fingerprint} -> '
+                        f'{self.fingerprint}) but the cache is compatible with this run and '
+                        'keep is set, so the existing files are eligible for reuse pending '
+                        'row-count and content checks.'
+                    )
+                    self.reused_after_fingerprint_change = True
+                else:
+                    print('[CACHE] Fingerprint changed, deleting existing cache files')
+                    self.clear()
+                    return
         else:
             print(f'[CACHE] Storing new fingerprint: {self.fingerprint}')
             self.con.execute('INSERT INTO fingerprint VALUES(?)', (self.fingerprint,))
@@ -78,12 +116,73 @@ class Cache:
         self.con.commit()
 
 
+    @property
+    def manifest_file(self):
+        return self.path / 'cache_manifest.json'
+
+    def check_identity(self):
+        """Is this cache's content compatible with what the caller is about to ask for?
+
+        Returns (compatible, reason). Compatible in three cases: the caller supplies no
+        identity, no manifest exists, or the manifest agrees. The middle case is what keeps
+        every cache written before this existed valid -- nothing is known about it, so nothing
+        is claimed, and it gets a manifest the next time it is written in full.
+        """
+        if not self.identity:
+            return True, ''
+        if not self.manifest_file.exists():
+            return True, ''
+        try:
+            with open(self.manifest_file, encoding='utf-8') as f:
+                recorded = json.load(f).get('identity', None)
+        except (OSError, ValueError):
+            # An unreadable manifest says nothing either way; do not destroy a cache over it.
+            return True, ''
+        if recorded is None or recorded == self.identity:
+            return True, ''
+        return False, (
+            f'This cache was built by {recorded!r} but this run is {self.identity!r}, so its '
+            'contents do not belong to this model.'
+        )
+
+    def recorded_content_digest(self):
+        """The content digest this cache was last completed with, or None if unknown.
+
+        None covers a cache written before this existed as well as one with no manifest at
+        all. Both mean nothing is claimed about the input, so the caller must not treat a
+        mismatch it cannot see as proof of anything.
+        """
+        if not self.manifest_file.exists():
+            return None
+        try:
+            with open(self.manifest_file, encoding='utf-8') as f:
+                return json.load(f).get('content_digest', None)
+        except (OSError, ValueError):
+            return None
+
+    def write_manifest(self):
+        """Record what produced this cache, and from what. Called once contents are complete."""
+        if not self.identity and not self.content_digest:
+            return
+        os.makedirs(self.path, exist_ok=True)
+        record = {'schema': 2}
+        if self.identity:
+            record['identity'] = self.identity
+        if self.content_digest:
+            record['content_digest'] = self.content_digest
+        tmp = self.manifest_file.with_name(self.manifest_file.name + '.tmp')
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump(record, f, sort_keys=True)
+        os.replace(tmp, self.manifest_file)
+
     def clear(self):
         '''Deletes all cache files from disk. Calls init() again.'''
         self.con.close()
         os.remove(self.metadata_db)
         for bin_path in self.path.glob('*.bin'):
             os.remove(bin_path)
+        # The manifest describes contents that no longer exist.
+        self.manifest_file.unlink(missing_ok=True)
         self.init()
 
 

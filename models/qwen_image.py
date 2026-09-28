@@ -176,6 +176,7 @@ class QwenDoubleStreamAttnProcessor2_0:
 
 class QwenImagePipeline(BasePipeline):
     name = 'qwen_image'
+    vae_config_keys = ('diffusers_path', 'vae_path',)
     checkpointable_layers = ['TransformerLayer']
     adapter_target_modules = ['QwenImageTransformerBlock']
 

@@ -30,6 +30,9 @@ from utils.isolate_rng import isolate_rng
 from utils.patches import apply_patches
 from utils.unsloth_utils import unsloth_checkpoint
 from utils.pipeline import ManualPipelineModule
+from utils.oplora import OPLoRAProjector, apply_oplora_config_defaults
+from utils.lr_schedule import create_lr_scheduler
+from utils.optimizer_factory import resolve_optimizer_class
 
 # needed for broadcasting Queue in dataset.py
 mp.current_process().authkey = b'afsaskgfdjh4'
@@ -100,6 +103,17 @@ def set_config_defaults(config):
     if config['activation_checkpointing'] == 'unsloth':
         config['reentrant_activation_checkpointing'] = True
     config.setdefault('warmup_steps', 0)
+    if 'keep_last_n_checkpoints' in config:
+        # Validated here for the same reason tools/distill_refiner.py validates it: unset means
+        # keep everything, but 0 or a negative number reads as "keep none" and is silently
+        # treated as unset by prune_all_checkpoint_kinds. The two trainers share the option, so
+        # they should agree on what a typo does.
+        keep = config['keep_last_n_checkpoints']
+        if not isinstance(keep, int) or isinstance(keep, bool) or keep < 1:
+            raise ValueError(
+                f'keep_last_n_checkpoints must be an integer >= 1, got {keep!r}. Remove the key '
+                'to keep every checkpoint.'
+            )
     if 'save_dtype' in config:
         config['save_dtype'] = DTYPE_MAP[config['save_dtype']]
 
@@ -131,6 +145,12 @@ def set_config_defaults(config):
             adapter_config.setdefault('rank_dropout', 0.0)
         else:
             raise NotImplementedError(f'Adapter type {adapter_type} is not implemented')
+
+        # OPLoRA projects each LoRA update onto the orthogonal complement of the base
+        # weight's top-k singular subspace, so the base model's dominant directions are
+        # preserved. Validation and defaults live in utils.oplora so they can be
+        # unit-tested without importing the training stack.
+        apply_oplora_config_defaults(adapter_config)
 
     config.setdefault('logging_steps', 1)
     config.setdefault('eval_datasets', [])
@@ -339,7 +359,7 @@ if __name__ == '__main__':
     elif model_type == 'sd3':
         from models import sd3
         model = sd3.SD3Pipeline(config)
-    elif model_type == 'cosmos_predict2' or model_type == 'anima':
+    elif model_type == 'cosmos_predict2' or model_type == 'anima' or model_type == 'anima_refiner':
         from models import cosmos_predict2
         model = cosmos_predict2.CosmosPredict2Pipeline(config)
     elif model_type == 'omnigen2':
@@ -433,7 +453,14 @@ if __name__ == '__main__':
     caching_batch_size = config.get('caching_batch_size', 1)
     dataset_manager = dataset_util.DatasetManager(model, regenerate_cache=regenerate_cache, trust_cache=args.trust_cache, caching_batch_size=caching_batch_size, keep_models_loaded=args.test_sample)
 
-    train_data = dataset_util.Dataset(dataset_config, model, skip_dataset_validation=args.i_know_what_i_am_doing)
+    # The batch fill keys belong in the dataset config, but several training configs share one
+    # dataset TOML, so the same keys are accepted here and win. Applied to the eval datasets
+    # too: a run that fills its training batches and drops its eval ones would report a metric
+    # over a different subset than the one it trains on.
+    batch_fill_overrides = {key: config[key] for key in dataset_util.BATCH_FILL_DEFAULTS
+                            if key in config}
+    train_data = dataset_util.Dataset(dataset_config, model, skip_dataset_validation=args.i_know_what_i_am_doing,
+                                      batch_fill_overrides=batch_fill_overrides)
     dataset_manager.register(train_data)
 
     eval_data_map = {}
@@ -446,7 +473,13 @@ if __name__ == '__main__':
             config_path = eval_dataset['config']
         with open(config_path) as f:
             eval_dataset_config = toml.load(f)
-        eval_data_map[name] = dataset_util.Dataset(eval_dataset_config, model, skip_dataset_validation=args.i_know_what_i_am_doing)
+        eval_data_map[name] = dataset_util.Dataset(
+            eval_dataset_config, model, skip_dataset_validation=args.i_know_what_i_am_doing,
+            # Eval should be the same set every time it runs, so a figure from epoch 7 is
+            # comparable with one from epoch 3. Rotating the tail would move part of the eval
+            # set between runs for reasons that have nothing to do with the model.
+            batch_fill_defaults={'fill_rotate_per_epoch': False},
+            batch_fill_overrides=batch_fill_overrides)
         dataset_manager.register(eval_data_map[name])
 
     # For testing
@@ -579,6 +612,13 @@ if __name__ == '__main__':
     if blocks_to_swap := config.get('blocks_to_swap', 0):
         assert config['pipeline_stages'] == 1, 'Block swapping only works with pipeline_stages=1'
         assert 'adapter' in config, 'Block swapping only works when training LoRA'
+        assert config['model'].get('cache_text_embeddings', True), (
+            'blocks_to_swap cannot be combined with cache_text_embeddings = false. Block '
+            'swapping replaces PipelineModule.to with a no-op and moves only the transformer to '
+            'CUDA, so a resident text encoder -- which lives on the pipeline layer, not the '
+            'transformer -- silently stays on CPU and returns CPU embeddings into a CUDA batch. '
+            'Use one or the other.'
+        )
         # Don't automatically move to GPU, we'll do that ourselves.
         def to(self, *args, **kwargs):
             pass
@@ -665,42 +705,10 @@ if __name__ == '__main__':
             print(f'Computed beta2 = {betas[1]}')
             optim_config['betas'] = betas
 
-        args = []
-        kwargs = {k: v for k, v in optim_config.items() if k not in ['type', 'gradient_release']}
-
-        if optim_type_lower == 'adamw':
-            # TODO: fix this. I'm getting "fatal error: cuda_runtime.h: No such file or directory"
-            # when Deepspeed tries to build the fused Adam extension.
-            # klass = deepspeed.ops.adam.FusedAdam
-            klass = torch.optim.AdamW
-        elif optim_type_lower == 'adamw8bit':
-            import bitsandbytes
-            klass = bitsandbytes.optim.AdamW8bit
-        elif optim_type_lower == 'adamw_optimi':
-            import optimi
-            klass = optimi.AdamW
-        elif optim_type_lower == 'stableadamw':
-            import optimi
-            klass = optimi.StableAdamW
-        elif optim_type_lower == 'sgd':
-            klass = torch.optim.SGD
-        elif optim_type_lower == 'adamw8bitkahan':
-            from optimizers import adamw_8bit
-            klass = adamw_8bit.AdamW8bitKahan
-        elif optim_type_lower == 'offload':
-            from torchao.prototype.low_bit_optim import CPUOffloadOptimizer
-            klass = CPUOffloadOptimizer
-            args.append(torch.optim.AdamW)
-            kwargs['fused'] = True
-        elif optim_type_lower == 'automagic':
-            from optimizers import automagic
-            klass = automagic.Automagic
-        elif optim_type_lower == 'genericoptim':
-            from optimizers import generic_optim
-            klass = generic_optim.GenericOptim
-        else:
-            import pytorch_optimizer
-            klass = getattr(pytorch_optimizer, optim_type)
+        # The name-to-class mapping lives in utils/optimizer_factory so tools/distill_refiner.py
+        # can accept the same optimizer names. Everything below here is pipeline-specific and
+        # stays put.
+        klass, args, kwargs = resolve_optimizer_class(optim_config)
 
         if optim_config.get('gradient_release', False):
             # Prevent deepspeed from logging every single param group lr
@@ -789,6 +797,22 @@ if __name__ == '__main__':
         else:
             param_groups = model.get_param_groups(model_parameters)
 
+        if not param_groups:
+            # get_param_groups legitimately returns [] when every learning rate that applies to
+            # this rank is 0. The DummyOptimizer escape above cannot catch it, because
+            # parameters_to_train is snapshotted from requires_grad BEFORE get_param_groups
+            # freezes the zero-lr groups. Left alone, the optimizer constructor raises
+            # 'optimizer got an empty parameter list', which names neither the learning rate nor
+            # the pipeline stage.
+            raise RuntimeError(
+                'No trainable parameters on this pipeline stage: every learning rate that '
+                'applies here is 0.\n'
+                '  A refiner-only configuration (base_lr = self_attn_lr = cross_attn_lr = '
+                'mlp_lr = mod_lr = 0) has trainable parameters only on the stage holding the '
+                'refiner, so it needs pipeline_stages = 1. Use data parallelism across GPUs '
+                'instead, or give another parameter group a non-zero learning rate.'
+            )
+
         # split weight decay and no weight decay params
         new_param_groups = []
         for pg in param_groups:
@@ -850,18 +874,13 @@ if __name__ == '__main__':
     steps_per_epoch = len(train_dataloader) // model_engine.gradient_accumulation_steps()
 
     scheduler_type = config.get('lr_scheduler', 'constant')
-    if scheduler_type == 'constant':
-        lr_scheduler = torch.optim.lr_scheduler.ConstantLR(optimizer, factor=1.0)
-    elif scheduler_type == 'linear':
-        lr_scheduler = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=1.0, end_factor=0.0, total_iters=config['epochs'] * steps_per_epoch)
-    elif scheduler_type == 'cosine':
-        lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=config['epochs'] * steps_per_epoch, eta_min=1e-6)
-    else:
-        raise NotImplementedError(f'Unknown lr_scheduler: {scheduler_type}')
-    if config['warmup_steps'] > 0:
-        warmup_steps = config['warmup_steps']
-        warmup_scheduler = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=1/warmup_steps, total_iters=warmup_steps)
-        lr_scheduler = torch.optim.lr_scheduler.SequentialLR(optimizer, schedulers=[warmup_scheduler, lr_scheduler], milestones=[warmup_steps])
+    lr_scheduler = create_lr_scheduler(
+        optimizer,
+        scheduler_type,
+        total_steps=config['epochs'] * steps_per_epoch,
+        warmup_steps=config['warmup_steps'],
+        num_cycles=config.get('lr_scheduler_num_cycles', 1),
+    )
     model_engine.lr_scheduler = lr_scheduler
 
     step = 1
@@ -903,6 +922,18 @@ if __name__ == '__main__':
         for name, eval_data in eval_data_map.items()
     }
 
+    oplora_projector = None
+    if is_adapter and config['adapter']['oplora']:
+        oplora_projector = OPLoRAProjector.build(
+            model_engine.module,
+            rank=config['adapter']['oplora_rank'],
+            full_svd=config['adapter']['oplora_full_svd'],
+            base_seed=config['adapter']['oplora_seed'],
+            exclude_names=model.oplora_exclude_names,
+        )
+        if is_main_process():
+            print(oplora_projector.describe())
+
     epoch = train_dataloader.epoch
     tb_writer = SummaryWriter(log_dir=run_dir) if is_main_process() else None
     saver = utils.saver.Saver(args, config, is_adapter, run_dir, model, train_dataloader, model_engine, pipeline_model)
@@ -919,6 +950,8 @@ if __name__ == '__main__':
         model_engine.reset_activation_shape()
         iterator = get_data_iterator_for_step(train_dataloader, model_engine)
         loss = model_engine.train_batch(iterator).item()
+        if oplora_projector is not None:
+            oplora_projector.project()
         epoch_loss += loss
         num_steps += 1
         train_dataloader.sync_epoch()
@@ -928,14 +961,32 @@ if __name__ == '__main__':
 
         x_axis = examples if config['x_axis_examples'] else step
 
+        # Models may expose extra per-step scalars. Reached through getattr so a model that
+        # defines nothing logs nothing and is untouched by this.
+        extra_scalars = getattr(model, 'get_extra_log_scalars', lambda: {})()
+        # .get, because steps_per_print is read straight into the DeepSpeed config dict and is
+        # never setdefault-ed onto config itself.
+        if is_main_process() and extra_scalars and step % config.get('steps_per_print', 1) == 0:
+            # Echoed to the console as well as Tensorboard. A run on a cluster usually has no
+            # Tensorboard to hand, and a number nobody can see is not much better than no number:
+            # teacher guidance in particular looks identical whether lambda is 0.9 or has decayed
+            # to 0. On the steps_per_print cadence, because logging_steps defaults to every step.
+            summary = '  '.join(f'{name.rsplit("/", 1)[-1]}={value:.4f}'
+                                for name, value in extra_scalars.items())
+            print(f'step {step}: {summary}')
+
         if is_main_process() and step % config['logging_steps'] == 0:
             tb_writer.add_scalar(f'train/loss', loss, x_axis)
             if hasattr(optimizer, '_grad_norm'):
                 tb_writer.add_scalar(f'train/grad_norm', optimizer._grad_norm, x_axis)
+            for name, value in extra_scalars.items():
+                tb_writer.add_scalar(name, value, x_axis)
             if wandb_enable:
                 wandb.log({'train/loss': loss, 'step': x_axis})
                 if hasattr(optimizer, '_grad_norm'):
                     wandb.log({'train/grad_norm': optimizer._grad_norm, 'step': x_axis})
+                if extra_scalars:
+                    wandb.log({**extra_scalars, 'step': x_axis})
             if optimizer.__class__.__name__ == 'Prodigy':
                 prodigy_d = get_prodigy_d(optimizer)
                 tb_writer.add_scalar(f'train/prodigy_d', prodigy_d, x_axis)

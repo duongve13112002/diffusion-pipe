@@ -24,6 +24,7 @@
 |HunyuanVideo-1.5|✅    |✅              |✅                |
 |Flux 2          |✅    |✅              |✅                |
 |Anima           |✅    |✅              |✅                |
+|Anima Refiner   |✅    |✅              |✅                |
 |LTX 2.3         |✅    |❌              |✅                |
 |Ideogram4       |✅    |✅              |✅                |
 |Krea 2          |✅    |✅              |✅                |
@@ -561,6 +562,80 @@ Notes:
   - If you have a larger dataset or a lot of brand-new concepts, you can try training the llm_adapter and see if it helps.
 
 Anima LoRAs are saved in ComfyUI format.
+
+
+## Anima Refiner
+Anima with its text frontend replaced: the `LLMAdapter` (T5 token queries cross-attending into
+the LLM) gives way to a `ContextRefiner`, the `cap_embedder` + bidirectional refiner blocks
+that Lumina 2 and Z-Image use. That drops the T5 tokenizer, its 32128-entry embedding table,
+and the second tokenization pass over every caption, and it lets any Transformers LLM act as
+the text encoder.
+
+```
+[model]
+type = 'anima_refiner'
+transformer_path = '/data2/imagegen_models/comfyui-models/anima-preview.safetensors'
+vae_path = '/data2/imagegen_models/comfyui-models/qwen_image_vae.safetensors'
+# A full Transformers folder, or a single safetensors file (see llm_config_path / llm_repo_id).
+llm_path = '/data2/imagegen_models/Qwen3.5-2B-Base'
+dtype = 'bfloat16'
+
+llm_hidden_layer = -1   # which hidden_states index feeds the refiner
+n_refiner_layers = 6    # only for a FRESH refiner; omit once the checkpoint carries one
+max_text_length = 512
+
+# refiner_only: train just the refiner, freeze the DiT.
+base_lr = 0
+self_attn_lr = 0
+cross_attn_lr = 0
+mlp_lr = 0
+mod_lr = 0
+refiner_lr = 1e-4
+```
+
+Read [docs/anima_refiner/README.md](anima_refiner/README.md) before training this. Example configs for every
+mode live in `examples/`: `anima_refiner_distill`, `_refiner_only`, `_refiner_crossattn`,
+`_lora`, `_lokr`, `_full_finetune`. They are configurations, not a fixed pipeline — each loads
+the model the same way, so they run in any order and any one's output feeds any other. Ordering
+still matters for results: training the refiner against a frozen DiT before opening the
+cross-attention is what avoids forgetting.
+
+**Checkpoint loading.** Whatever weights you point at are the weights used; nothing is
+re-initialised from Anima when real weights exist. When `transformer_path` already contains a
+refiner, its layer count and input dimension are derived from those weights, and a config that
+disagrees raises rather than silently dropping layers. `context_refiner_path` overrides the
+refiner inside the checkpoint, with a warning naming both files.
+
+**Use the Base model, not Instruct** — `Qwen/Qwen3.5-2B-Base`, matching how Anima uses
+Qwen3-0.6B-Base. Their `config.json` is byte-identical so the architecture is the same; the
+tokenizers differ.
+
+`llm_hidden_layer` is easy to get wrong. Lumina 2 uses `hidden_states[-2]`, but Qwen3.5
+interleaves linear and full attention, and for it `-2` lands after a *linear*-attention layer
+while `-1` lands after a full-attention one.
+
+Text embeddings are fingerprinted separately from latents and the fingerprint includes the text
+encoder's identity, so switching text encoders re-caches only the embeddings and leaves latents
+alone. There is nothing to configure for this.
+
+An optional distillation mode warm-starts the refiner from Anima's existing adapter using
+captions only, no images:
+```
+python -m tools.distill_refiner --config examples/anima_refiner/distill.toml
+```
+
+An optional `[teacher]` table keeps a frozen stock Anima resident during ordinary training and
+mixes its velocity into the ground-truth target, weighted toward the teacher at high noise and
+decayed to nothing over the run. Off by default; it needs `cache_text_embeddings = false` and
+`pipeline_stages = 1`. See [docs/anima_refiner/teacher-guided-training.md](anima_refiner/teacher-guided-training.md)
+and `examples/anima_refiner/teacher_guided.toml`.
+
+Sample either architecture with the same script — `tools/sample_anima_refiner.py` reads
+`type = 'anima'` as well as `anima_refiner`, so the two can be compared on one schedule and one
+seed.
+
+Anima Refiner LoRAs are saved in ComfyUI format. A densely trained refiner is saved alongside
+them as `context_refiner.safetensors`, ready to load via `context_refiner_path`.
 
 
 ## Ernie-Image

@@ -13,6 +13,7 @@
 import math
 import os.path
 import re
+from pathlib import Path
 
 import torch
 from torch import nn
@@ -25,12 +26,21 @@ from accelerate.utils import set_module_tensor_to_device
 
 from models.base import BasePipeline, PreprocessMediaFile, make_contiguous
 from models.cosmos_predict2_modeling import MiniTrainDIT
+from models.text_refiner import extract_refiner_state_dict
+from models.teacher_guidance import (
+    TeacherGuide,
+    blend_target,
+    lambda_at,
+    should_announce,
+    teacher_warnings,
+    validate_teacher_config,
+)
 from utils.common import load_state_dict, AUTOCAST_DTYPE, is_main_process, iterate_safetensors
 from utils.offloading import ModelOffloader
 from models.wan.vae2_1 import WanVAE_
 
 
-KEEP_IN_HIGH_PRECISION = ['x_embedder', 't_embedder', 't_embedding_norm', 'final_layer']
+KEEP_IN_HIGH_PRECISION = ['x_embedder', 't_embedder', 't_embedding_norm', 'final_layer', 'context_refiner']
 
 MULTISCALE_LOSS_THRESHOLDS = [size * 0.9 for size in [1024]]
 MULTISCALE_LOSS_THRESHOLDS.sort()
@@ -168,30 +178,188 @@ def get_dit_config(state_dict, key_prefix=''):
     return dit_config
 
 
-def _tokenize(tokenizer, prompts):
-    return tokenizer(
+def _tokenize(tokenizer, prompts, max_length=512, keep_one_real_token=False):
+    """Tokenize to a fixed length.
+
+    padding='max_length' is required, not just convenient: pipeline parallelism needs every
+    micro batch to produce identically shaped tensors. Both lumina_2.py and z_image.py carry
+    the same note where they disable dynamic padding.
+
+    keep_one_real_token exists for the context refiner, and only for it. An empty caption is
+    not a corner case -- it is the unconditional embedding that uncond_fraction and every CFG
+    sample rely on. Qwen pads with its own eos and adds no bos, so an empty string tokenizes to
+    a row whose attention_mask is entirely zero; the refiner then masks its output to zeros,
+    and the DiT cross-attention -- which carries no mask and relies on padded keys being zero
+    -- returns exactly zero for every query. Two consequences: those samples deliver no
+    gradient to the refiner at all, because the output does not depend on any of its
+    parameters, and at sampling time the frozen DiT is handed a context it never saw.
+
+    Old T5, which this DiT was trained against, never produces that row: an empty string still
+    yields </s>, one real token with a real embedding. Marking position 0 real reproduces
+    that. It is applied here rather than at each call site so the caching path, the on-the-fly
+    path and the sampler cannot drift apart -- they all tokenize through this function.
+
+    Off by default because it must not change `anima` or `cosmos_predict2`, which share this
+    helper and whose LLMAdapter consumes a T5 query sequence that already has the property.
+    """
+    batch_encoding = tokenizer(
         prompts,
         return_tensors="pt",
         truncation=True,
         padding="max_length",
-        max_length=512,
+        max_length=max_length,
     )
+    if keep_one_real_token:
+        mask = batch_encoding['attention_mask']
+        empty_rows = mask.sum(dim=-1) == 0
+        if empty_rows.any():
+            mask[empty_rows, 0] = 1
+    return batch_encoding
 
-def _compute_text_embeddings(text_encoder, input_ids, attn_mask, is_generic_llm=False):
+def normalise_hidden_layer(hidden_layer):
+    """-1 means the last hidden state, which is what None already asks for.
+
+    Asking for a specific index takes the output_hidden_states=True branch, which materialises
+    every layer's output -- 25 tensors for a 24-layer model -- and then indexes one. At -1 that
+    tensor IS last_hidden_state, so the whole allocation is wasted: measured at roughly 420 MB
+    per forward for B=8, L=512, d=2048 in bf16, on the caching path and the on-the-fly path
+    alike. Every shipped anima_refiner config uses -1.
+    """
+    return None if hidden_layer == -1 else hidden_layer
+
+
+def _compute_text_embeddings(text_encoder, input_ids, attn_mask, hidden_layer=None):
     input_ids = input_ids.to(text_encoder.device)
     attn_mask = attn_mask.to(text_encoder.device)
 
-    outputs = text_encoder(input_ids=input_ids, attention_mask=attn_mask)
-    encoded_text = outputs.last_hidden_state
+    if hidden_layer is None:
+        outputs = text_encoder(input_ids=input_ids, attention_mask=attn_mask)
+        encoded_text = outputs.last_hidden_state
+    else:
+        # hidden_states[i] is the output of layer i-1 and hidden_states[0] is the embedding
+        # output, so hidden_states[-1] == last_hidden_state. Which index is best is model
+        # specific: for hybrid attention models (Qwen3.5 interleaves linear and full attention)
+        # prefer one that lands right after a full attention layer.
+        outputs = text_encoder(input_ids=input_ids, attention_mask=attn_mask, output_hidden_states=True)
+        encoded_text = outputs.hidden_states[hidden_layer].clone()
+
     encoded_text[~attn_mask.bool()] = 0
 
     return encoded_text
 
 
+# Shipped with the repo so a bare Qwen3.5-2B-Base safetensors file works with no extra downloads.
+DEFAULT_LLM_CONFIG_PATH = 'configs/qwen3_5_2b_base'
+# Tried in order when mapping checkpoint keys onto the bare text model. A file exported from
+# the full VLM keeps the wrapper prefixes; one exported from the text tower alone has none.
+_LLM_KEY_PREFIXES = ('model.language_model.', 'language_model.', 'model.', '')
+
+
+def _load_llm_from_single_file(llm_path, model_config, dtype):
+    """Build a text encoder from a single safetensors file plus a separate config directory.
+
+    Three ways to supply the architecture and tokenizer, in priority order:
+      1. llm_config_path pointing at a local directory,
+      2. llm_repo_id, which Transformers downloads and caches,
+      3. the bundled configs/qwen3_5_2b_base.
+    """
+    config_path = model_config.get('llm_config_path', None)
+    repo_id = model_config.get('llm_repo_id', None)
+    if config_path is None:
+        if repo_id is not None:
+            config_path = repo_id
+        elif os.path.isdir(DEFAULT_LLM_CONFIG_PATH):
+            config_path = DEFAULT_LLM_CONFIG_PATH
+        else:
+            raise RuntimeError(
+                f'llm_path is a single file and {DEFAULT_LLM_CONFIG_PATH} is missing. Set '
+                'llm_config_path to a local Transformers config directory, or llm_repo_id to '
+                'a Hugging Face repo to download it from.'
+            )
+    elif not os.path.isdir(config_path):
+        raise RuntimeError(f'llm_config_path {config_path} is not a directory')
+
+    local_only = os.path.isdir(config_path)
+    tokenizer = AutoTokenizer.from_pretrained(config_path, local_files_only=local_only)
+    llm_config = transformers.AutoConfig.from_pretrained(config_path, local_files_only=local_only)
+    # Vision-language configs nest the language tower's settings under text_config. Building
+    # from that directly means the vision tower is never allocated at all.
+    text_config = getattr(llm_config, 'text_config', llm_config)
+
+    with init_empty_weights():
+        text_encoder = transformers.AutoModel.from_config(text_config)
+
+    # state_dict() is the right expectation set: it holds parameters and persistent buffers,
+    # which is exactly what a checkpoint stores. named_buffers() would additionally demand
+    # non-persistent ones such as rotary_emb.inv_freq, which are computed at init and appear
+    # in no checkpoint.
+    expected = set(text_encoder.state_dict())
+    loaded = set()
+    for key, tensor in iterate_safetensors(llm_path):
+        for prefix in _LLM_KEY_PREFIXES:
+            if key.startswith(prefix) and key[len(prefix):] in expected:
+                target = key[len(prefix):]
+                set_module_tensor_to_device(text_encoder, target, device='cpu', dtype=dtype, value=tensor)
+                loaded.add(target)
+                break
+
+    missing = expected - loaded
+    if missing == {'embed_tokens.weight'} and getattr(text_config, 'tie_word_embeddings', False):
+        # Tied-embedding exports sometimes store the shared matrix only under lm_head.
+        for key, tensor in iterate_safetensors(llm_path):
+            if key.endswith('lm_head.weight'):
+                set_module_tensor_to_device(text_encoder, 'embed_tokens.weight', device='cpu', dtype=dtype, value=tensor)
+                missing = set()
+                break
+
+    if missing:
+        raise RuntimeError(
+            f'{len(missing)} tensors in the text encoder were not found in {llm_path}, for '
+            f'example: {sorted(missing)[:5]}. Check that llm_config_path matches the '
+            'checkpoint, or pass the full Transformers model directory as llm_path instead.'
+        )
+
+    # Non-persistent buffers (rotary_emb.inv_freq and friends) are deliberately left alone:
+    # accelerate's init_empty_weights does not put buffers on the meta device, so the module's
+    # own __init__ has already computed them correctly. Filling them with empty tensors here
+    # would silently corrupt the positional embeddings.
+    return tokenizer, text_encoder, text_config.hidden_size
+
+
+def resolve_learning_rates(config, model_config, use_context_refiner):
+    """The learning rate each parameter group ends up with.
+
+    Split out of CosmosPredict2Pipeline.get_param_groups because the teacher needs the same
+    answer, and needs it earlier: whether the DiT is frozen decides whether the teacher can
+    share the student's transformer or needs its own 3.5-4 GB copy. Two copies of this
+    resolution would be two things to keep in step, and the failure if they drifted -- a teacher
+    sharing a DiT that is actually training -- is silent.
+
+    A free function rather than a method because get_param_groups is exercised against a minimal
+    double that carries only these three attributes.
+    """
+    # anima_refiner alone can override base_lr, so that a stage training only the refiner
+    # freezes everything else with base_lr = 0 without zeroing the optimizer's own lr.
+    # cosmos_predict2 and anima keep the original behaviour.
+    base_lr = config['optimizer'].get('lr', None)
+    if use_context_refiner:
+        base_lr = model_config.get('base_lr', base_lr)
+    return {
+        'base': base_lr,
+        'self_attn': model_config.get('self_attn_lr', base_lr),
+        'cross_attn': model_config.get('cross_attn_lr', base_lr),
+        'mlp': model_config.get('mlp_lr', base_lr),
+        'mod': model_config.get('mod_lr', base_lr),
+        'llm_adapter': model_config.get('llm_adapter_lr', base_lr),
+        'refiner': model_config.get('refiner_lr', base_lr),
+    }
+
+
 class CosmosPredict2Pipeline(BasePipeline):
     name = 'cosmos_predict2'
+    vae_config_keys = ('vae_path',)
     framerate = 16
-    checkpointable_layers = ['TransformerLayer']
+    checkpointable_layers = ['TransformerLayer', 'ContextRefinerLayer']
     adapter_target_modules = [
         'Block',
         'TransformerBlock',  # LLM adapter
@@ -205,15 +373,45 @@ class CosmosPredict2Pipeline(BasePipeline):
         self.cache_text_embeddings = self.model_config.get('cache_text_embeddings', True)
         self.multiscale_loss_weight = self.model_config.get('multiscale_loss_weight', None)
 
+        # The anima_refiner architecture swaps Anima's LLMAdapter (T5 token queries cross
+        # attending into the LLM) for the Lumina 2 / Z-Image text frontend (cap_embedder plus
+        # bidirectional refiner blocks). See docs/anima_refiner/README.md.
+        #
+        # Every option this architecture adds is read only when it is active, so cosmos_predict2
+        # and anima keep exactly the config surface they had before.
+        self.use_context_refiner = self.model_config.get('type', None) == 'anima_refiner'
+        self.max_text_length = 512
+        self.llm_hidden_layer = None
+        self.cap_feat_dim = None
+        if self.use_context_refiner:
+            self.max_text_length = self.model_config.get('max_text_length', 512)
+            self.llm_hidden_layer = normalise_hidden_layer(
+                self.model_config.get('llm_hidden_layer', None))
+            # 'TransformerBlock' would match the LLMAdapter blocks, which this architecture
+            # doesn't build. ContextRefiner takes its place -- and it, not RefinerBlock, because
+            # get_target_modules walks the matched module's own Linears: cap_embedder and
+            # norm_out hang off ContextRefiner, so targeting RefinerBlock would leave
+            # cap_embedder unadapted. That is the single 2048->1024 projection absorbing the
+            # whole LLM-to-DiT distribution gap, and the largest tensor in the refiner.
+            self.adapter_target_modules = ['Block', 'ContextRefiner']
+            # The refiner is new, so it has no pretrained singular directions for OPLoRA to
+            # protect. Two of its six Linear layers per block are zero-initialised as well,
+            # where the "top-k subspace" is an arbitrary basis and projecting against it would
+            # cost the adapter rank directions for nothing.
+            self.oplora_exclude_names = ('context_refiner',)
+
         # This isn't a nn.Module.
         self.vae = WanVAE(
             vae_pth=self.model_config['vae_path'],
             device='cpu',
             dtype=dtype,
         )
-        # These need to be on the device the VAE will be moved to during caching.
-        self.vae.mean = self.vae.mean.to('cuda')
-        self.vae.std = self.vae.std.to('cuda')
+        # These need to be on the device the VAE will be moved to during caching. Guarded so a
+        # CPU-only box can still construct the pipeline (tools/sample_anima_refiner.py offers
+        # --device cpu); on a GPU box this is unchanged.
+        if torch.cuda.is_available():
+            self.vae.mean = self.vae.mean.to('cuda')
+            self.vae.std = self.vae.std.to('cuda')
         self.vae.scale = [self.vae.mean, 1.0 / self.vae.std]
 
         self.is_generic_llm = False
@@ -250,7 +448,31 @@ class CosmosPredict2Pipeline(BasePipeline):
             if os.path.isdir(llm_path):
                 # generic Transformers LLM
                 self.tokenizer = AutoTokenizer.from_pretrained(llm_path, local_files_only=True)
-                text_encoder = AutoModelForCausalLM.from_pretrained(llm_path, dtype=dtype, local_files_only=True)
+                llm_config = transformers.AutoConfig.from_pretrained(llm_path, local_files_only=True)
+                if self.use_context_refiner and hasattr(llm_config, 'text_config'):
+                    # Vision-language model, e.g. Qwen3.5-2B-Base, whose architecture is
+                    # Qwen3_5ForConditionalGeneration with a .model.language_model text tower.
+                    # Only the language tower is used; dropping the vision tower saves its
+                    # weights from ever being held in memory. Gated on the refiner so that
+                    # anima's existing behaviour for this branch is untouched.
+                    full_model = transformers.AutoModelForImageTextToText.from_pretrained(
+                        llm_path, dtype=dtype, local_files_only=True
+                    )
+                    self.text_encoder = full_model.model.language_model
+                    del full_model
+                    self.cap_feat_dim = llm_config.text_config.hidden_size
+                else:
+                    text_encoder = AutoModelForCausalLM.from_pretrained(llm_path, dtype=dtype, local_files_only=True)
+                    self.text_encoder = text_encoder.model
+                    self.cap_feat_dim = getattr(llm_config, 'hidden_size', None)
+            elif self.use_context_refiner:
+                # Single safetensors file. The architecture and tokenizer come from a config
+                # directory instead: configs/qwen3_5_2b_base ships with the repo, and any other
+                # local directory or Hugging Face repo id works via llm_config_path /
+                # llm_repo_id.
+                self.tokenizer, self.text_encoder, self.cap_feat_dim = _load_llm_from_single_file(
+                    llm_path, self.model_config, dtype
+                )
             else:
                 # assume Qwen3-0.6b (Anima)
                 self.tokenizer = AutoTokenizer.from_pretrained('configs/qwen3_06b', local_files_only=True)
@@ -259,17 +481,205 @@ class CosmosPredict2Pipeline(BasePipeline):
                     text_encoder = transformers.Qwen3ForCausalLM(llm_config)
                 for key, tensor in iterate_safetensors(llm_path):
                     set_module_tensor_to_device(text_encoder, key, device='cpu', dtype=dtype, value=tensor)
-            self.text_encoder = text_encoder.model
+                self.text_encoder = text_encoder.model
+                self.cap_feat_dim = llm_config.hidden_size
             if self.tokenizer.pad_token is None:
                 self.tokenizer.pad_token = self.tokenizer.eos_token
             self.text_encoder.config.use_cache = False
             self.is_generic_llm = True
-            # text encoder is different from Cosmos, use a different cache dir
+            # text encoder is different from Cosmos, use a different cache dir.
+            #
+            # anima_refiner deliberately shares this name with anima. The name selects the whole
+            # cache tree, latents included, and the two use the same VAE -- so a separate name
+            # would throw away latents that are still perfectly valid, which is the expensive
+            # half to recompute.
+            #
+            # What differs is the text encoder, and text_encoder_cache_key() puts that in the
+            # text embedding fingerprint. That prevents one model from READING the other's
+            # embeddings -- it does not let both keep a copy: the two write to the same
+            # text_embeddings_N directory, so alternating between an anima run and an
+            # anima_refiner run on one dataset rebuilds that half each time. The latents, which
+            # are the expensive half, survive either way. Give the two runs separate dataset
+            # directories if you need both cached at once.
+            #
+            # The latents themselves are not fingerprinted by VAE, but vae_config_keys records
+            # which VAE produced them, so pointing this at a different VAE is now detected and
+            # rebuilt rather than silently reused.
             self.name = 'anima'
         else:
             raise RuntimeError('Missing text encoder path')
 
+        if self.use_context_refiner and not self.is_generic_llm:
+            raise RuntimeError("anima_refiner requires llm_path (a Transformers LLM), not t5_path")
+
         self.text_encoder.requires_grad_(False)
+
+        # Teacher-guided training. Validated here so a bad [teacher] table fails before the
+        # caching run rather than after it; returns a disabled config when the table is absent,
+        # which is what keeps cosmos_predict2 and anima untouched by this feature.
+        self.teacher_cfg = validate_teacher_config(
+            self.config, self.use_context_refiner, self.cache_text_embeddings)
+        self.teacher = None
+        # Set by train.py when the engine exists, so the decay schedule can advance. Left as a
+        # constant 0 otherwise, which is what tools and tests that never train want.
+        self._step_source = None
+        self._last_teacher_lambda = None
+        self._teacher_decay_announced = False
+
+    def text_encoder_cache_key(self, i):
+        """Identity of text encoder `i`, mixed into the text embedding cache fingerprint.
+
+        Latents and text embeddings share a cache directory but are fingerprinted separately,
+        so swapping the text encoder invalidates only the text embeddings. Latents stay put --
+        they are by far the more expensive half to recompute, and the VAE has not changed.
+
+        Anything that alters what the encoder emits belongs in here.
+        """
+        if not self.use_context_refiner:
+            return ''
+        return '|'.join(str(x) for x in (
+            self.model_config.get('llm_path', ''),
+            self.model_config.get('llm_config_path', ''),
+            self.model_config.get('llm_repo_id', ''),
+            self.llm_hidden_layer,
+            self.max_text_length,
+            self.cap_feat_dim,
+        ))
+
+    def text_encoder_identity(self, i):
+        """Which encoder actually produced these embeddings, for the manifest.
+
+        anima returns '' from text_encoder_cache_key on purpose, so that adding that key never
+        moved an existing install's cache path. The side effect is that nothing distinguishes
+        two anima runs whose llm_path differs, and their embeddings are not interchangeable --
+        the same silent reuse anima_refiner is protected from. Recording it here fixes that for
+        free: the manifest is not part of the fingerprint, so no existing cache moves, and one
+        with no manifest still claims nothing.
+        """
+        return '|'.join(str(x) for x in (
+            self.model_config.get('llm_path', ''),
+            self.model_config.get('llm_config_path', ''),
+            self.model_config.get('llm_repo_id', ''),
+            self.model_config.get('t5_path', ''),
+            getattr(self, 'llm_hidden_layer', ''),
+            getattr(self, 'max_text_length', ''),
+            getattr(self, 'cap_feat_dim', ''),
+        ))
+
+    def _warn_on_refiner_provenance(self, path):
+        """Compare what a refiner file says it was distilled against with what this run provides.
+
+        Shapes already rule out a differently sized refiner, but they cannot tell two 2048-wide
+        LLMs apart and say nothing about which hidden layer was read -- and the last hidden
+        state is post-final-RMSNorm, roughly 50x larger in RMS than a raw residual-stream layer.
+        A mismatch there trains, converges to something plausible-but-bad, and takes days to
+        diagnose.
+
+        Warns rather than raises, and stays silent on a file with no metadata: refiners written
+        before this existed are perfectly usable and must keep loading.
+        """
+        try:
+            with safetensors.safe_open(path, framework='pt') as f:
+                metadata = f.metadata() or {}
+        except Exception:
+            return  # not a safetensors file, or unreadable; the loader below will say so
+
+        expected = {
+            'llm_path': str(self.model_config.get('llm_path', '')),
+            'llm_hidden_layer': str(self.model_config.get('llm_hidden_layer', '')),
+            'max_text_length': str(self.max_text_length),
+        }
+        mismatched = {
+            key: (metadata[key], value)
+            for key, value in expected.items()
+            if metadata.get(key) not in (None, '', value)
+        }
+        if mismatched and is_main_process():
+            lines = '\n'.join(f'    {k}: distilled against {was!r}, this run uses {now!r}'
+                               for k, (was, now) in sorted(mismatched.items()))
+            print(
+                f'\nWARNING: {path} records a different text encoder setup than this run:\n'
+                f'{lines}\n'
+                '  The refiner bridges one specific text encoder to the DiT. Feeding it a\n'
+                '  different one has identical shapes and a different input distribution, so\n'
+                '  this will train and converge to something worse for no visible reason.\n'
+            )
+
+    def _resolve_context_refiner(self, state_dict, dit_config, dtype):
+        """Decide where the refiner's weights and shape come from, and fill in dit_config.
+
+        Three sources, in this order:
+          1. context_refiner_path -- an explicit refiner file, which WINS over the copy inside
+             the checkpoint. Warned about loudly, because silently overriding trained weights
+             is the easiest way to continue training from the wrong starting point.
+          2. context_refiner.* inside transformer_path -- a model saved by a previous run.
+          3. Nothing -- build a fresh refiner (a stock Anima checkpoint).
+
+        In cases 1 and 2 the shape is derived FROM THE WEIGHTS, never from the config. The
+        loading loop skips names absent from the state dict, so a checkpoint holding more
+        refiner layers than the config asks for would quietly lose the surplus; deriving the
+        shape removes that failure mode entirely, and a config that contradicts the weights is
+        an error rather than a silent reshape.
+
+        Returns the refiner state dict to load, None when the main loop already covers it, or
+        the string 'init' meaning build fresh.
+        """
+        from_path = None
+        if path := self.model_config.get('context_refiner_path', None):
+            # Accepts a bare refiner file or a full checkpoint. Pointing this at a
+            # model.safetensors is a reasonable thing to do, and it keys its refiner as
+            # net.context_refiner.*, so the same extraction the distillation tool uses applies
+            # here too.
+            from_path = {k: v.to(dtype) for k, v in extract_refiner_state_dict(load_state_dict(path)).items()}
+        in_checkpoint = {
+            k[len('context_refiner.'):]: v
+            for k, v in state_dict.items() if k.startswith('context_refiner.')
+        }
+
+        if from_path is not None and in_checkpoint and is_main_process():
+            print(
+                '\nWARNING: context_refiner_path overrides the context_refiner already present '
+                'in transformer_path.\n'
+                f"  checkpoint  : {self.model_config['transformer_path']}\n"
+                f"  overridden by: {self.model_config['context_refiner_path']}\n"
+                '  Remove context_refiner_path to train on from the refiner inside the '
+                'checkpoint.\n'
+            )
+
+        if path := self.model_config.get('context_refiner_path', None):
+            self._warn_on_refiner_provenance(path)
+
+        weights = from_path if from_path is not None else (in_checkpoint or None)
+        if weights is None:
+            dit_config['cap_feat_dim'] = self.cap_feat_dim
+            dit_config['n_refiner_layers'] = self.model_config.get('n_refiner_layers', 6)
+            return 'init'
+
+        derived_layers = 1 + max(
+            (int(k.split('.')[1]) for k in weights if k.startswith('blocks.')), default=-1
+        )
+        derived_cap_feat_dim = weights['cap_embedder.1.weight'].shape[1]
+
+        for key, derived in (('n_refiner_layers', derived_layers), ('cap_feat_dim', derived_cap_feat_dim)):
+            configured = self.model_config.get(key, None)
+            if configured is not None and configured != derived:
+                raise RuntimeError(
+                    f'{key}={configured} in the config, but the refiner weights have '
+                    f'{key}={derived}. Remove {key} from the config to use the value the '
+                    'weights carry, or point at weights that match.'
+                )
+        if derived_cap_feat_dim != self.cap_feat_dim:
+            raise RuntimeError(
+                f'The refiner weights expect a text encoder with hidden size '
+                f'{derived_cap_feat_dim}, but llm_path provides {self.cap_feat_dim}. These '
+                'refiner weights were trained against a different text encoder.'
+            )
+        dit_config['cap_feat_dim'] = derived_cap_feat_dim
+        dit_config['n_refiner_layers'] = derived_layers
+
+        # from_path weights are loaded separately; ones already in the checkpoint are picked up
+        # by the main named_parameters loop.
+        return from_path
 
     def load_diffusion_model(self):
         dtype = self.model_config['dtype']
@@ -286,7 +696,12 @@ class CosmosPredict2Pipeline(BasePipeline):
 
         dit_config = get_dit_config(state_dict)
 
-        if 'llm_adapter_path' in self.model_config:
+        context_refiner_state_dict = None
+        if self.use_context_refiner:
+            # The refiner replaces the llm_adapter entirely, so never build both.
+            self.use_llm_adapter = False
+            context_refiner_state_dict = self._resolve_context_refiner(state_dict, dit_config, dtype)
+        elif 'llm_adapter_path' in self.model_config:
             self.use_llm_adapter = True
             dit_config['use_llm_adapter'] = True
             llm_adapter_state_dict = {
@@ -314,10 +729,207 @@ class CosmosPredict2Pipeline(BasePipeline):
                 dtype_to_use = dtype if (any(keyword in name for keyword in KEEP_IN_HIGH_PRECISION) or p.ndim == 1) else transformer_dtype
                 set_module_tensor_to_device(llm_adapter, name, device='cpu', dtype=dtype_to_use, value=llm_adapter_state_dict[name])
 
+        if self.use_context_refiner and context_refiner_state_dict is not None:
+            # init_empty_weights() leaves every parameter on the meta device, and the loop
+            # above only materialises names present in the checkpoint. A stock Anima
+            # checkpoint has no context_refiner.* keys, so without this the refiner would stay
+            # on meta and blow up on the first forward pass.
+            refiner = transformer.context_refiner
+            fresh = context_refiner_state_dict == 'init'
+            # Remembered for configure_adapter: a low-rank update on top of a randomly
+            # initialised base is not a model anyone can reconstruct.
+            self._refiner_is_fresh = fresh
+            for name, p in refiner.named_parameters():
+                # When fresh, this placeholder only gets the parameter off the meta device.
+                # init_weights() below overwrites every one of them -- it is written to be
+                # self-sufficient precisely because __init__'s default init never ran here.
+                # Buffers are deliberately left alone:
+                # init_empty_weights keeps them real, already computed by __init__, and filling
+                # them with empty tensors would corrupt the rotary embeddings.
+                value = torch.empty(p.shape, dtype=dtype) if fresh else context_refiner_state_dict[name]
+                set_module_tensor_to_device(refiner, name, device='cpu', dtype=dtype, value=value)
+            if fresh:
+                refiner.init_weights()
+                if is_main_process():
+                    print(
+                        f'Initialised a fresh ContextRefiner (cap_feat_dim={self.cap_feat_dim}, '
+                        f'{dit_config["n_refiner_layers"]} layers). It has no trained weights yet: run '
+                        'tools/distill_refiner.py, or train it with the DiT frozen, before expecting '
+                        'usable samples.'
+                    )
+
         self.transformer = transformer
         self.transformer.train()
         for name, p in self.transformer.named_parameters():
             p.original_name = name
+
+        if self.teacher_cfg.enabled:
+            self.teacher = self._build_teacher(dtype)
+
+    def _load_teacher_llm(self, llm_path, dtype):
+        """Qwen3-0.6B, the encoder Anima's llm_adapter was trained against.
+
+        Accepts the same two shapes anima itself does: a Transformers directory, or a bare
+        safetensors file read against configs/qwen3_06b.
+        """
+        if os.path.isdir(llm_path):
+            tokenizer = AutoTokenizer.from_pretrained(llm_path, local_files_only=True)
+            text_encoder = AutoModelForCausalLM.from_pretrained(
+                llm_path, dtype=dtype, local_files_only=True).model
+        else:
+            tokenizer = AutoTokenizer.from_pretrained('configs/qwen3_06b', local_files_only=True)
+            llm_config = transformers.Qwen3Config.from_pretrained(
+                'configs/qwen3_06b', local_files_only=True)
+            with init_empty_weights():
+                model = transformers.Qwen3ForCausalLM(llm_config)
+            for key, tensor in iterate_safetensors(llm_path):
+                set_module_tensor_to_device(model, key, device='cpu', dtype=dtype, value=tensor)
+            text_encoder = model.model
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+        text_encoder.config.use_cache = False
+        text_encoder.requires_grad_(False)
+        return tokenizer, text_encoder
+
+    def _dit_weights_match(self, state_dict):
+        """Whether the student's in-memory DiT is exactly these weights.
+
+        This is the property sharing actually needs; comparing checkpoint paths is only a proxy
+        for it, and a proxy that says "different" for two copies of one file.
+
+        Compared against the student's own dtype, so a run using transformer_dtype still matches:
+        those parameters came from this same file through this same cast, and what matters is
+        that the teacher and the student would run bit-identical weights -- which under
+        quantisation is truer of a shared module than of a separately loaded bf16 copy.
+
+        context_refiner is skipped: it is not part of the DiT the teacher runs, and the teacher's
+        checkpoint has no such keys. Everything else must be present and equal; a single missing
+        or differing tensor means these are different models and the teacher needs its own copy.
+        """
+        for name, p in self.transformer.named_parameters():
+            if name.startswith('context_refiner.') or name.startswith('llm_adapter.'):
+                continue
+            reference = state_dict.get(name, None)
+            if reference is None or reference.shape != p.shape:
+                return False
+            if not torch.equal(p.detach().cpu(), reference.to(p.dtype).cpu()):
+                return False
+        return True
+
+    def _build_teacher(self, dtype):
+        """Assemble the frozen stock Anima whose velocity the loss mixes toward.
+
+        The DiT is shared with the student only when sharing is provably harmless: the student's
+        DiT cannot move during this run AND both configs name the same checkpoint file. Freezing
+        alone is not enough -- a run whose transformer_path is a previously trained checkpoint
+        has a frozen DiT that is nonetheless not the teacher's, and sharing there would quietly
+        make the model its own teacher, which is a loss of exactly zero teacher signal and no
+        error anywhere.
+        """
+        cfg = self.teacher_cfg
+        teacher_state_dict = {
+            re.sub(r'^model\.diffusion_model\.', '', re.sub(r'^net\.', '', k)): v
+            for k, v in load_state_dict(cfg.transformer_path).items()
+        }
+        if 'llm_adapter.out_proj.weight' not in teacher_state_dict:
+            raise RuntimeError(
+                f'[teacher] transformer_path has no llm_adapter.* weights: {cfg.transformer_path}\n'
+                '  The teacher must be a stock Anima checkpoint. A checkpoint trained through '
+                'the refiner path has had its llm_adapter dropped, so it cannot be a teacher.'
+            )
+
+        # Sharing needs the student's DiT to BE the teacher's, which is a fact about weights,
+        # not about paths. Two copies of one checkpoint at two paths are the same model, and
+        # refusing to share there costs 3.5-4 GB for nothing. So the path check is only a fast
+        # path: when it does not fire, compare the tensors and let the answer decide.
+        same_checkpoint = (
+            os.path.realpath(cfg.transformer_path)
+            == os.path.realpath(self.model_config['transformer_path'])
+        )
+        shares_dit = False
+        share_reason = ''
+        if self._dit_is_frozen():
+            if same_checkpoint:
+                shares_dit, share_reason = True, 'same checkpoint file'
+            elif self._dit_weights_match(teacher_state_dict):
+                shares_dit, share_reason = True, 'different file, identical weights'
+
+        if shares_dit:
+            teacher_dit = self.transformer
+        else:
+            teacher_dit_config = get_dit_config(teacher_state_dict)
+            teacher_dit_config['use_llm_adapter'] = False  # adapter is held separately
+            with init_empty_weights():
+                teacher_dit = MiniTrainDIT(**teacher_dit_config)
+                for name, p in teacher_dit.named_parameters():
+                    if name not in teacher_state_dict:
+                        continue
+                    set_module_tensor_to_device(
+                        teacher_dit, name, device='cpu', dtype=dtype,
+                        value=teacher_state_dict[name])
+            teacher_dit.requires_grad_(False)
+            teacher_dit.eval()
+            # A separately loaded teacher is the only case where the two DiTs can disagree about
+            # latent shape: a shared one is the student's by construction. Both consume the same
+            # x_t and their velocities are mixed elementwise, so a mismatch here is a
+            # configuration error worth naming at startup rather than a broadcast surprise or a
+            # shape error thrown from inside the first forward.
+            for attribute in ('in_channels', 'out_channels'):
+                theirs = getattr(teacher_dit, attribute, None)
+                ours = getattr(self.transformer, attribute, None)
+                if theirs is not None and ours is not None and theirs != ours:
+                    raise RuntimeError(
+                        f'[teacher] transformer_path has {attribute}={theirs}, but the student '
+                        f'has {attribute}={ours}.\n'
+                        '  The teacher predicts a velocity for the same latent the student does, '
+                        'and the two are mixed elementwise, so they must share a VAE and a '
+                        'channel count.\n'
+                        f'  Check that {cfg.transformer_path} is an Anima checkpoint for the '
+                        'same VAE as vae_path.'
+                    )
+
+        # The adapter is always its own module, never the shared DiT's: MiniTrainDIT.forward
+        # takes crossattn_emb already projected, so the text frontend lives outside the DiT in
+        # both the shared and the copied case.
+        adapter_config = get_dit_config(teacher_state_dict)
+        adapter_config['use_llm_adapter'] = True
+        with init_empty_weights():
+            adapter_host = MiniTrainDIT(**adapter_config)
+        llm_adapter = adapter_host.llm_adapter
+        for name, p in llm_adapter.named_parameters():
+            set_module_tensor_to_device(
+                llm_adapter, name, device='cpu', dtype=dtype,
+                value=teacher_state_dict[f'llm_adapter.{name}'])
+        for name, buf in list(llm_adapter.named_buffers()):
+            key = f'llm_adapter.{name}'
+            if key in teacher_state_dict:
+                set_module_tensor_to_device(
+                    llm_adapter, name, device='cpu', dtype=buf.dtype,
+                    value=teacher_state_dict[key])
+
+        tokenizer, text_encoder = self._load_teacher_llm(cfg.llm_path, dtype)
+
+        if is_main_process():
+            for message in teacher_warnings(cfg, self.config):
+                print(message)
+            how = (f"sharing the student's frozen DiT ({share_reason})" if shares_dit
+                   else 'with its own frozen copy of the DiT')
+            print(
+                f'Teacher guidance on: loss_weight={cfg.loss_weight}, shape={cfg.shape} '
+                f'(t_mid={cfg.t_mid}, width={cfg.width}), decay={cfg.decay}'
+                + (f' over {cfg.decay_steps} steps' if cfg.decay != 'none' else '')
+                + f'. Teacher is {how}.'
+            )
+
+        return TeacherGuide(
+            dit=teacher_dit,
+            llm_adapter=llm_adapter,
+            text_encoder=text_encoder,
+            tokenizer=tokenizer,
+            t5_tokenizer=self.t5_tokenizer,
+            max_text_length=self.max_text_length,
+            shares_dit=shares_dit,
+        )
 
     def get_vae(self):
         return self.vae.model
@@ -328,11 +940,103 @@ class CosmosPredict2Pipeline(BasePipeline):
         else:
             return []
 
+    def configure_adapter(self, adapter_config):
+        # A freshly initialised refiner has nothing for a low-rank update to build on, so when
+        # train_context_refiner is set the refiner is trained densely instead and kept out of
+        # the adapter entirely. That also keeps its parameter names clean (no PEFT base_layer
+        # indirection), so the weights this run saves load straight back via
+        # context_refiner_path.
+        self.train_context_refiner = self.use_context_refiner and adapter_config.get('train_context_refiner', False)
+
+        if self.use_context_refiner and getattr(self, '_refiner_is_fresh', False) and not self.train_context_refiner:
+            # The base refiner is random, frozen, and never written to any file: save_adapter
+            # stores only the adapter tensors, and the dense branch below is gated on
+            # train_context_refiner. init_weights() draws from the ambient RNG stream, so the
+            # base cannot be reconstructed even in principle and the adapter is unusable
+            # without it. A rank-32 update on random weights could not bridge the LLM-to-DiT
+            # gap anyway, so refusing is also the right advice.
+            raise RuntimeError(
+                'This run would train an adapter on top of a freshly initialised, randomly '
+                'weighted ContextRefiner. That base is frozen and is never saved, and it '
+                'cannot be reproduced, so the adapter this run writes would be unusable.\n'
+                '  Do one of:\n'
+                '    - point transformer_path or context_refiner_path at a trained refiner '
+                '(tools/distill_refiner.py produces one), or\n'
+                '    - set train_context_refiner = true under [adapter] to train the refiner '
+                'densely alongside the adapter, which does save it.'
+            )
+
+        if self.train_context_refiner:
+            self.adapter_target_modules = [m for m in self.adapter_target_modules if m != 'ContextRefiner']
+
+        super().configure_adapter(adapter_config)
+
+        if self.train_context_refiner:
+            for name, p in self.transformer.named_parameters():
+                if 'context_refiner' in name:
+                    p.requires_grad_(True)
+                    p.data = p.data.to(self.model_config['dtype'])
+
     def save_adapter(self, save_dir, peft_state_dict):
         self.peft_config.save_pretrained(save_dir)
+        # Densely trained refiner weights are not part of the adapter. Write them to their own
+        # file, in the layout context_refiner_path expects. Only when train_context_refiner is
+        # set: otherwise the refiner is a LoRA/LoKr target, and its adapter tensors also carry
+        # 'context_refiner' in their names and belong in adapter_model.safetensors.
+        refiner_state_dict = {}
+        if getattr(self, 'train_context_refiner', False):
+            for k in [k for k in peft_state_dict if 'context_refiner' in k]:
+                v = peft_state_dict.pop(k)
+                k = k[k.index('context_refiner.') + len('context_refiner.'):].replace('.base_layer', '')
+                refiner_state_dict[k] = v
+        if refiner_state_dict:
+            # A subdirectory, because load_adapter_weights() globs '*.safetensors' in the
+            # save dir and raises on more than one match -- a second file beside the
+            # adapter would break init_from_existing for this run's own output.
+            refiner_dir = save_dir / 'context_refiner'
+            refiner_dir.mkdir(parents=True, exist_ok=True)
+            safetensors.torch.save_file(refiner_state_dict, refiner_dir / 'context_refiner.safetensors', metadata={'format': 'pt'})
         # ComfyUI format.
         peft_state_dict = {'diffusion_model.'+k: v for k, v in peft_state_dict.items()}
         safetensors.torch.save_file(peft_state_dict, save_dir / 'adapter_model.safetensors', metadata={'format': 'pt'})
+
+    def load_adapter_weights(self, adapter_path):
+        """Also restore the densely trained refiner, which is not part of the adapter file.
+
+        save_adapter writes it to a subdirectory precisely so that the base implementation's
+        glob for '*.safetensors' does not trip over a second file. The consequence was that
+        nothing read it back: init_from_existing restored the adapter and silently left the
+        refiner at its fresh random initialisation, throwing away 77.6M trained parameters
+        while the loss curve looked like the adapter simply needed more steps.
+        """
+        super().load_adapter_weights(adapter_path)
+
+        refiner_file = Path(adapter_path) / 'context_refiner' / 'context_refiner.safetensors'
+        if not refiner_file.exists():
+            return
+        if is_main_process():
+            print(f'Loading densely trained context_refiner from {refiner_file}')
+
+        # Invert exactly the transformation save_adapter applied, rather than guessing names:
+        # it stripped everything up to 'context_refiner.' and removed PEFT's '.base_layer'
+        # indirection. configure_adapter has already run by now, so that indirection is back.
+        by_saved_key = {}
+        for name, _ in self.transformer.named_parameters():
+            if 'context_refiner.' not in name:
+                continue
+            key = name[name.index('context_refiner.') + len('context_refiner.'):].replace('.base_layer', '')
+            by_saved_key[key] = name
+
+        state_dict = safetensors.torch.load_file(refiner_file)
+        missing = [k for k in state_dict if k not in by_saved_key]
+        if missing:
+            raise RuntimeError(
+                f'{refiner_file} holds refiner weights this model has no parameter for: '
+                f'{missing[:5]}{"..." if len(missing) > 5 else ""}. It was saved from a '
+                'differently shaped refiner.'
+            )
+        self.transformer.load_state_dict(
+            {by_saved_key[k]: v for k, v in state_dict.items()}, strict=False)
 
     def save_model(self, save_dir, state_dict):
         state_dict = {'net.'+k: v for k, v in state_dict.items()}
@@ -356,9 +1060,18 @@ class CosmosPredict2Pipeline(BasePipeline):
     def get_call_text_encoder_fn(self, text_encoder):
         def fn(captions, is_video):
             # args are lists
-            batch_encoding = _tokenize(self.tokenizer, captions)
-            t5_batch_encoding = _tokenize(self.t5_tokenizer, captions)
-            encoded_text = _compute_text_embeddings(self.text_encoder, batch_encoding.input_ids, batch_encoding.attention_mask)
+            batch_encoding = _tokenize(self.tokenizer, captions, self.max_text_length,
+                                       keep_one_real_token=self.use_context_refiner)
+            encoded_text = _compute_text_embeddings(
+                self.text_encoder,
+                batch_encoding.input_ids,
+                batch_encoding.attention_mask,
+                hidden_layer=self.llm_hidden_layer,
+            )
+            if self.use_context_refiner:
+                # No T5 tokenization: the refiner consumes the LLM's own token sequence.
+                return {'prompt_embeds': encoded_text, 'attn_mask': batch_encoding.attention_mask}
+            t5_batch_encoding = _tokenize(self.t5_tokenizer, captions, self.max_text_length)
             return {'prompt_embeds': encoded_text, 'attn_mask': batch_encoding.attention_mask, 't5_input_ids': t5_batch_encoding.input_ids, 't5_attn_mask': t5_batch_encoding.attention_mask}
         return fn
 
@@ -373,13 +1086,19 @@ class CosmosPredict2Pipeline(BasePipeline):
         latents = inputs['latents'].float()
         mask = inputs['mask']
 
+        captions = None
         if self.cache_text_embeddings:
-            prompt_embeds_or_batch_encoding = (inputs['prompt_embeds'], inputs['attn_mask'], inputs['t5_input_ids'], inputs['t5_attn_mask'])
+            prompt_embeds_or_batch_encoding = (inputs['prompt_embeds'], inputs['attn_mask'])
+            if not self.use_context_refiner:
+                prompt_embeds_or_batch_encoding += (inputs['t5_input_ids'], inputs['t5_attn_mask'])
         else:
             captions = inputs['caption']
-            batch_encoding = _tokenize(self.tokenizer, captions)
-            t5_batch_encoding = _tokenize(self.t5_tokenizer, captions)
-            prompt_embeds_or_batch_encoding = (batch_encoding.input_ids, batch_encoding.attention_mask, t5_batch_encoding.input_ids, t5_batch_encoding.attention_mask)
+            batch_encoding = _tokenize(self.tokenizer, captions, self.max_text_length,
+                                       keep_one_real_token=self.use_context_refiner)
+            prompt_embeds_or_batch_encoding = (batch_encoding.input_ids, batch_encoding.attention_mask)
+            if not self.use_context_refiner:
+                t5_batch_encoding = _tokenize(self.t5_tokenizer, captions, self.max_text_length)
+                prompt_embeds_or_batch_encoding += (t5_batch_encoding.input_ids, t5_batch_encoding.attention_mask)
 
         bs, channels, num_frames, h, w = latents.shape
 
@@ -419,15 +1138,79 @@ class CosmosPredict2Pipeline(BasePipeline):
         target = noise - latents
         t = t.view(-1, 1)
 
+        # Teacher guidance mixes the ground-truth target toward what a frozen stock Anima
+        # predicts for the same latent, timestep and caption. For squared error, mixing the two
+        # losses is the same as mixing the two targets, so this happens here: the label keeps its
+        # shape, the loss function is untouched, and nothing extra travels through the pipeline.
+        #
+        # Skipped entirely during eval (timestep_quantile is set). Eval must stay on the pure
+        # ground-truth loss, or the metric moves as the decay schedule runs and a change in the
+        # loss definition is indistinguishable from a change in the model.
+        if self.teacher is not None and timestep_quantile is None:
+            step = self._current_step()
+            lam = lambda_at(t, step, self.teacher_cfg)
+            # Recorded every training batch so get_extra_log_scalars can report it. Without this
+            # the only evidence the teacher exists is one line at startup, and a run cannot be
+            # told apart from one whose decay reached zero hours ago.
+            self._last_teacher_lambda = float(lam.mean())
+            if float(lam.max()) > 0:
+                self._ensure_teacher_device()
+                device = self.teacher.device
+                teacher_v = self.teacher.velocity(
+                    noisy_latents.to(device), t.to(device), captions)
+                target = blend_target(target, teacher_v.to(target.device), lam)
+            elif not self._teacher_decay_announced:
+                self._teacher_decay_announced = True
+                if should_announce():
+                    print(
+                        f'Teacher guidance has fully decayed at step {step}: lambda is 0 at '
+                        'every timestep, and the teacher no longer contributes. Training '
+                        'continues on the ground truth alone, which is what the schedule is '
+                        'for. The teacher stays resident; restart to reclaim its memory.'
+                    )
+
         return (noisy_latents, t, *prompt_embeds_or_batch_encoding), (target, mask)
+
+    def get_extra_log_scalars(self):
+        """Per-step scalars for Tensorboard and wandb, on top of the ones train.py always logs.
+
+        Optional: train.py reaches this through getattr, so a model that does not define it logs
+        nothing extra and is unaffected.
+
+        teacher_lambda is the batch mean of lambda. It is the one number that says whether the
+        teacher is still doing anything -- a startup line proves only that it loaded, and says
+        nothing about a decay schedule that zeroed out an hour into the run.
+        """
+        if self._last_teacher_lambda is None:
+            return {}
+        return {'train/teacher_lambda': self._last_teacher_lambda}
+
+    def _ensure_teacher_device(self):
+        """Move the teacher to the training device once, on first use.
+
+        prepare_inputs runs in the main process on CPU tensors -- the engine moves them later --
+        so the teacher has to be placed explicitly. Done lazily rather than at load time because
+        load_diffusion_model runs before DeepSpeed has taken the student anywhere, and putting
+        the teacher on the GPU first would count against the memory the student is about to be
+        partitioned into.
+        """
+        if getattr(self.teacher, '_placed', False):
+            return
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        self.teacher.to_device(device, self.model_config['dtype'])
+        self.teacher.device = torch.device(device)
+        self.teacher._placed = True
 
     def to_layers(self):
         transformer = self.transformer
         text_encoder = None if self.cache_text_embeddings else self.text_encoder
         layers = [
-            InitialLayer(transformer, text_encoder, self.is_generic_llm),
-            LLMAdapterLayer(transformer.llm_adapter if self.use_llm_adapter else None),
+            InitialLayer(transformer, text_encoder, self.use_context_refiner, self.llm_hidden_layer),
         ]
+        if self.use_context_refiner:
+            layers.append(ContextRefinerLayer(transformer.context_refiner))
+        else:
+            layers.append(LLMAdapterLayer(transformer.llm_adapter if self.use_llm_adapter else None))
         for i, block in enumerate(transformer.blocks):
             layers.append(TransformerLayer(block, i, self.offloader))
         layers.append(FinalLayer(transformer))
@@ -460,11 +1243,56 @@ class CosmosPredict2Pipeline(BasePipeline):
         self.offloader.set_forward_only(True)
         self.offloader.prepare_block_devices_before_forward()
 
+    def _dit_is_frozen(self):
+        """True when nothing in the DiT can move, so the teacher may share it.
+
+        The refiner is excluded on purpose: it is not part of the DiT the teacher runs. The
+        teacher's own forward uses the llm_adapter as its text frontend and never touches
+        context_refiner, so a training refiner cannot change the teacher's prediction.
+
+        An adapter is disqualifying whatever the learning rates say. A LoRA wraps the DiT's own
+        Linear layers, so the module the teacher would share stops being the stock weights from
+        the first optimizer step.
+        """
+        if self.config.get('adapter', None) is not None:
+            return False
+        lrs = resolve_learning_rates(self.config, self.model_config, self.use_context_refiner)
+        dit_groups = ('base', 'self_attn', 'cross_attn', 'mlp', 'mod', 'llm_adapter')
+        return all((lrs[name] or 0) == 0 for name in dit_groups)
+
+    def set_step_source(self, fn):
+        """Override where the decay schedule reads the current optimizer step.
+
+        Training does not need this: train.py already assigns model.model_engine, and
+        _current_step reads global_steps off it. This exists for tests and for tools that drive
+        prepare_inputs without an engine.
+        """
+        self._step_source = fn
+
+    def _current_step(self):
+        """The optimizer step the decay schedule is at.
+
+        DeepSpeed's global_steps is checkpointed and restored, so a resumed run picks the decay
+        up where it left off rather than restarting at full teacher weight -- which would undo
+        the schedule every time a run is resumed.
+        """
+        if self._step_source is not None:
+            return int(self._step_source())
+        engine = getattr(self, 'model_engine', None)
+        if engine is not None:
+            return int(getattr(engine, 'global_steps', 0))
+        return 0
+
     def get_param_groups(self, parameters):
         base_params, self_attn_params, cross_attn_params, mlp_params, mod_params, llm_adapter_params = [], [], [], [], [], []
+        refiner_params = []
         for p in parameters:
             name = p.original_name
-            if 'llm_adapter' in name:
+            if 'context_refiner' in name:
+                # Must come first: the refiner's own blocks contain .attn and .mlp submodules
+                # that would otherwise be swept into the DiT's parameter groups.
+                refiner_params.append(p)
+            elif 'llm_adapter' in name:
                 llm_adapter_params.append(p)
             elif '.self_attn' in name:
                 self_attn_params.append(p)
@@ -477,24 +1305,27 @@ class CosmosPredict2Pipeline(BasePipeline):
             else:
                 base_params.append(p)
 
-        base_lr = self.config['optimizer'].get('lr', None)
-        self_attn_lr = self.model_config.get('self_attn_lr', base_lr)
-        cross_attn_lr = self.model_config.get('cross_attn_lr', base_lr)
-        mlp_lr = self.model_config.get('mlp_lr', base_lr)
-        mod_lr = self.model_config.get('mod_lr', base_lr)
-        llm_adapter_lr = self.model_config.get('llm_adapter_lr', base_lr)
+        lrs = resolve_learning_rates(self.config, self.model_config, self.use_context_refiner)
+        base_lr = lrs['base']
+        self_attn_lr = lrs['self_attn']
+        cross_attn_lr = lrs['cross_attn']
+        mlp_lr = lrs['mlp']
+        mod_lr = lrs['mod']
+        llm_adapter_lr = lrs['llm_adapter']
+        refiner_lr = lrs['refiner']
 
         if is_main_process():
-            print(f'Using base_lr={base_lr}, self_attn_lr={self_attn_lr}, cross_attn_lr={cross_attn_lr}, mlp_lr={mlp_lr}, mod_lr={mod_lr}, llm_adapter_lr={llm_adapter_lr}')
+            print(f'Using base_lr={base_lr}, self_attn_lr={self_attn_lr}, cross_attn_lr={cross_attn_lr}, mlp_lr={mlp_lr}, mod_lr={mod_lr}, llm_adapter_lr={llm_adapter_lr}, refiner_lr={refiner_lr}')
             print(f'Num base params: {len(base_params)}')
             print(f'Num self_attn params: {len(self_attn_params)}')
             print(f'Num cross_attn params: {len(cross_attn_params)}')
             print(f'Num mlp params: {len(mlp_params)}')
             print(f'Num mod params: {len(mod_params)}')
             print(f'Num llm_adapter params: {len(llm_adapter_params)}')
+            print(f'Num context_refiner params: {len(refiner_params)}')
 
         param_groups = []
-        for lr, params in [(base_lr, base_params), (self_attn_lr, self_attn_params), (cross_attn_lr, cross_attn_params), (mlp_lr, mlp_params), (mod_lr, mod_params), (llm_adapter_lr, llm_adapter_params)]:
+        for lr, params in [(base_lr, base_params), (self_attn_lr, self_attn_params), (cross_attn_lr, cross_attn_params), (mlp_lr, mlp_params), (mod_lr, mod_params), (llm_adapter_lr, llm_adapter_params), (refiner_lr, refiner_params)]:
             if lr == 0:
                 for p in params:
                     p.requires_grad_(False)
@@ -516,9 +1347,13 @@ class CosmosPredict2Pipeline(BasePipeline):
                 else:
                     loss = F.mse_loss(output, target, reduction='none')
                 # empty tensor means no masking
+                multiscale_mask = None
                 if mask.numel() > 0:
                     mask = mask.to(output.device, torch.float32)
                     loss *= mask
+                    # (B, 1, 1, h, w), matching the squeeze(2) the multiscale branch does to
+                    # output and target below.
+                    multiscale_mask = mask.squeeze(2)
                 loss = loss.mean()
 
                 if weight := self.multiscale_loss_weight:
@@ -533,8 +1368,19 @@ class CosmosPredict2Pipeline(BasePipeline):
                         if side_length >= thresh:
                             output = F.avg_pool2d(output, 2)
                             target = F.avg_pool2d(target, 2)
-                            additional_loss = F.mse_loss(output, target) * weight
-                            terms.append(additional_loss)
+                            additional_loss = F.mse_loss(output, target, reduction='none')
+                            # The downsampled scales have to carry the mask too. Without it a
+                            # sample the mask zeroes still reaches the optimizer through these
+                            # terms: the loss VALUE barely moves, because they are averages
+                            # over the same data, but the gradient does -- a batch that is
+                            # mostly masked-out batch-fill padding put about a fifth of its
+                            # gradient on the padded copies, concentrated on the handful of
+                            # images they were copied from. Pooling the mask alongside the
+                            # tensors is what keeps the two aligned as the resolution drops.
+                            if multiscale_mask is not None:
+                                multiscale_mask = F.avg_pool2d(multiscale_mask, 2)
+                                additional_loss = additional_loss * multiscale_mask
+                            terms.append(additional_loss.mean() * weight)
                             total_weight += weight
                         else:
                             break
@@ -545,7 +1391,7 @@ class CosmosPredict2Pipeline(BasePipeline):
 
 
 class InitialLayer(nn.Module):
-    def __init__(self, model, text_encoder, is_generic_llm):
+    def __init__(self, model, text_encoder, use_context_refiner=False, llm_hidden_layer=None):
         super().__init__()
         self.x_embedder = model.x_embedder
         self.pos_embedder = model.pos_embedder
@@ -555,18 +1401,31 @@ class InitialLayer(nn.Module):
         self.t_embedding_norm = model.t_embedding_norm
         self.text_encoder = text_encoder
         self.model = [model]
-        self.is_generic_llm = is_generic_llm
+        self.use_context_refiner = use_context_refiner
+        self.llm_hidden_layer = llm_hidden_layer
 
     @torch.autocast('cuda', dtype=AUTOCAST_DTYPE)
     def forward(self, inputs):
         x_B_C_T_H_W, timesteps_B_T, *prompt_embeds_or_batch_encoding = inputs
 
+        # The refiner architecture has no T5 tokenization, so it carries two text tensors
+        # instead of four.
+        t5_input_ids = t5_attn_mask = None
         if torch.is_floating_point(prompt_embeds_or_batch_encoding[0]):
-            crossattn_emb, attn_mask, t5_input_ids, t5_attn_mask = prompt_embeds_or_batch_encoding
+            if self.use_context_refiner:
+                crossattn_emb, attn_mask = prompt_embeds_or_batch_encoding
+            else:
+                crossattn_emb, attn_mask, t5_input_ids, t5_attn_mask = prompt_embeds_or_batch_encoding
         else:
             with torch.no_grad():
-                input_ids, attn_mask, t5_input_ids, t5_attn_mask = prompt_embeds_or_batch_encoding
-                crossattn_emb = _compute_text_embeddings(self.text_encoder, input_ids, attn_mask, is_generic_llm=self.is_generic_llm)
+                if self.use_context_refiner:
+                    input_ids, attn_mask = prompt_embeds_or_batch_encoding
+                else:
+                    input_ids, attn_mask, t5_input_ids, t5_attn_mask = prompt_embeds_or_batch_encoding
+                crossattn_emb = _compute_text_embeddings(
+                    self.text_encoder, input_ids, attn_mask,
+                    hidden_layer=self.llm_hidden_layer,
+                )
 
         padding_mask = torch.zeros(x_B_C_T_H_W.shape[0], 1, x_B_C_T_H_W.shape[3], x_B_C_T_H_W.shape[4], dtype=x_B_C_T_H_W.dtype, device=x_B_C_T_H_W.device)
         x_B_T_H_W_D, rope_emb_L_1_1_D, extra_pos_emb_B_T_H_W_D_or_T_H_W_B_D = self.model[0].prepare_embedded_sequence(
@@ -582,11 +1441,33 @@ class InitialLayer(nn.Module):
         t_embedding_B_T_D, adaln_lora_B_T_3D = self.t_embedder(timesteps_B_T)
         t_embedding_B_T_D = self.t_embedding_norm(t_embedding_B_T_D)
 
-        outputs =  make_contiguous(x_B_T_H_W_D, t_embedding_B_T_D, crossattn_emb, t5_input_ids, attn_mask, t5_attn_mask, rope_emb_L_1_1_D, adaln_lora_B_T_3D, timesteps_B_T)
+        if self.use_context_refiner:
+            outputs = make_contiguous(x_B_T_H_W_D, t_embedding_B_T_D, crossattn_emb, attn_mask, rope_emb_L_1_1_D, adaln_lora_B_T_3D, timesteps_B_T)
+        else:
+            outputs = make_contiguous(x_B_T_H_W_D, t_embedding_B_T_D, crossattn_emb, t5_input_ids, attn_mask, t5_attn_mask, rope_emb_L_1_1_D, adaln_lora_B_T_3D, timesteps_B_T)
         for tensor in outputs:
             if torch.is_floating_point(tensor):
                 tensor.requires_grad_(True)
         return outputs
+
+
+class ContextRefinerLayer(nn.Module):
+    """Runs the ContextRefiner and drops the attention mask from the pipeline tuple.
+
+    Mirrors LLMAdapterLayer's place in the layer stack: it sits between InitialLayer and the
+    transformer blocks and converts text-encoder output into the crossattn_emb the blocks
+    consume.
+    """
+
+    def __init__(self, context_refiner):
+        super().__init__()
+        self.context_refiner = context_refiner
+
+    @torch.autocast('cuda', dtype=AUTOCAST_DTYPE)
+    def forward(self, inputs):
+        x_B_T_H_W_D, t_embedding_B_T_D, crossattn_emb, attn_mask, rope_emb_L_1_1_D, adaln_lora_B_T_3D, timesteps_B_T = inputs
+        crossattn_emb = self.context_refiner(crossattn_emb, attn_mask)
+        return make_contiguous(x_B_T_H_W_D, t_embedding_B_T_D, crossattn_emb, rope_emb_L_1_1_D, adaln_lora_B_T_3D, timesteps_B_T)
 
 
 class LLMAdapterLayer(nn.Module):

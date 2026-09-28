@@ -206,7 +206,7 @@ class InitialLayer(nn.Module):
             llm = self.llm_cond_proj(llm) * text_mask
             h[:, :L_text] = h[:, :L_text] + llm
 
-        h = h + self.embed_image_indicator((indicator == OUTPUT_IMAGE_INDICATOR).to(torch.long))
+        h = h + self.embed_image_indicator((indicator == OUTPUT_IMAGE_INDICATOR).to(torch.long), out_dtype=h.dtype)
 
         # Qwen3-VL interleaved MRoPE; position_ids (B, L, 3) -> (3, L) (same across batch).
         freqs_cis = precompute_freqs_cis(

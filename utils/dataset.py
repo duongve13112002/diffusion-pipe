@@ -31,8 +31,10 @@ import comfy.model_management as mm
 
 DEBUG = False
 IMAGE_SIZE_ROUND_TO_MULTIPLE = 32
-NUM_PROC = min(8, os.cpu_count())
-CAPTIONS_JSON_FILE = 'captions.json'
+# Worker count for the dataset map pools. A forked worker is nearly free, but on a spawn
+# platform each one re-imports torch, deepspeed and ComfyUI, which costs far more than
+# mapping a small dataset. DIFFUSION_PIPE_NUM_PROC overrides the default; 1 maps in-process.
+NUM_PROC = int(os.environ.get('DIFFUSION_PIPE_NUM_PROC', 0)) or min(8, os.cpu_count())
 ROUND_DECIMAL_DIGITS = 3
 
 UNCOND_FRACTION = 0.0
@@ -45,16 +47,16 @@ def shuffle_with_seed(l, seed=None):
     random.setstate(rng_state)
 
 
-def shuffle_captions(captions: list[str], count: int = 0, delimiter: str = ', ', caption_prefix: str = '') -> list[str]:
-    if count == 0:
-        return [caption_prefix + c for c in captions]
-
-    def shuffle_caption(caption: str, delimiter: str = ", ") -> str:
-        split = caption.split(delimiter)
-        random.shuffle(split)
-        return delimiter.join(split)
-
-    return [caption_prefix + shuffle_caption(caption, delimiter) for caption in captions for _ in range(count)]
+from utils.captions import (
+    CAPTIONS_JSON_FILE,
+    NON_MEDIA_SUFFIXES,
+    drop_tags,
+    enumerate_captions,
+    preprocess_caption,
+    read_caption_file,
+    shuffle_captions,
+    split_tag_prefix,
+)
 
 
 def bucket_suffix(key):
@@ -82,14 +84,118 @@ def seed_from_hash(item):
     return int(hashlib.md5(str.encode(str(item))).hexdigest(), 16) % int(1e9)
 
 
-def _map_and_cache(dataset, map_fn, cache_dir, cache_file_prefix='', new_fingerprint_args=None, regenerate_cache=False, caching_batch_size=1):
-    new_fingerprint_args = [] if new_fingerprint_args is None else new_fingerprint_args
-    new_fingerprint_args.append(dataset._fingerprint)
+# What to do when a size bucket's sample count is not a multiple of the global batch size.
+# 'drop' predates all of this and stays the default everywhere, so an existing config trains on
+# exactly the samples it trained on before.
+BATCH_FILL_STRATEGIES = ('drop', 'fill')
+# What to do for a bucket that cannot even fill one global batch, where repeating something is
+# the only way to produce a batch at all.
+UNDERSIZED_BUCKET_STRATEGIES = ('drop', 'pad_masked')
+
+# Key ConcatenatedBatchedDataset attaches to an example to carry its loss weight to _collate.
+# Leading underscore because it is internal plumbing between two methods of this file and must
+# never reach prepare_inputs, which would pass it on to the model as if it were a feature.
+SAMPLE_WEIGHT_KEY = '_sample_weight'
+
+BATCH_FILL_DEFAULTS = {
+    'batch_fill_strategy': 'drop',
+    'fill_rotate_per_epoch': True,
+    'undersized_bucket': 'pad_masked',
+    'min_real_fraction': 0.25,
+}
+
+
+def resolve_batch_fill_config(dataset_config, defaults=None, overrides=None):
+    """Read and check the four batch-fill keys, raising on anything unrecognised.
+
+    A typo in a strategy name has to fail here rather than fall back to a default: the two
+    values differ by whether data is silently dropped, and a run that quietly took the other
+    branch is a run whose epoch composition nobody can reconstruct afterwards.
+
+    Three layers, lowest first. `defaults` lets eval change a default without restating the
+    table -- eval wants fill_rotate_per_epoch off, because a metric that moves between epochs
+    for reasons unrelated to the model is worse than one computed on a fixed tail. Then the
+    dataset config, which is where the setting belongs. Then `overrides` from the training
+    config, which wins: several training configs share one dataset TOML, so without a layer
+    above it there is no way to turn this on for one run without turning it on for all of them.
+    """
+    resolved = dict(BATCH_FILL_DEFAULTS)
+    if defaults:
+        resolved.update(defaults)
+    for key in BATCH_FILL_DEFAULTS:
+        if key in dataset_config:
+            resolved[key] = dataset_config[key]
+    if overrides:
+        resolved.update({k: v for k, v in overrides.items() if k in BATCH_FILL_DEFAULTS})
+
+    if resolved['batch_fill_strategy'] not in BATCH_FILL_STRATEGIES:
+        raise ValueError(
+            f"batch_fill_strategy must be one of {list(BATCH_FILL_STRATEGIES)}, got "
+            f"{resolved['batch_fill_strategy']!r}"
+        )
+    if resolved['undersized_bucket'] not in UNDERSIZED_BUCKET_STRATEGIES:
+        raise ValueError(
+            f"undersized_bucket must be one of {list(UNDERSIZED_BUCKET_STRATEGIES)}, got "
+            f"{resolved['undersized_bucket']!r}"
+        )
+    if not isinstance(resolved['fill_rotate_per_epoch'], bool):
+        raise ValueError(
+            f"fill_rotate_per_epoch must be a boolean, got {resolved['fill_rotate_per_epoch']!r}"
+        )
+    fraction = resolved['min_real_fraction']
+    if isinstance(fraction, bool) or not isinstance(fraction, (int, float)):
+        raise ValueError(f'min_real_fraction must be a number, got {fraction!r}')
+    if not 0 <= fraction <= 1:
+        raise ValueError(f'min_real_fraction must be between 0 and 1, got {fraction}')
+
+    rotate_was_set = ('fill_rotate_per_epoch' in dataset_config
+                      or 'fill_rotate_per_epoch' in (overrides or {}))
+    if resolved['batch_fill_strategy'] == 'drop' and rotate_was_set:
+        if is_main_process():
+            logger.warning(
+                'fill_rotate_per_epoch is set but batch_fill_strategy is '
+                f"{resolved['batch_fill_strategy']!r}, so it has no effect. It only rotates the "
+                'samples used to fill a short final batch, and nothing is filled under drop.'
+            )
+    return resolved
+
+
+def _content_digest(dataset, column, upto=None):
+    """Hash of the first `upto` values of `column`, or all of them when upto is None.
+
+    list(), not dataset[column], for the same reason the fingerprint code below spells it out:
+    indexing returns a lazy Column holding a reference to its parent dataset.
+    """
+    values = list(dataset[column])
+    return Hasher.hash(values if upto is None else values[:upto])
+
+
+def _map_and_cache(dataset, map_fn, cache_dir, cache_file_prefix='', new_fingerprint_args=None,
+                   regenerate_cache=False, caching_batch_size=1, fingerprint_columns=None,
+                   keep_on_fingerprint_change=False, identity=None, content_column=None):
+    new_fingerprint_args = [] if new_fingerprint_args is None else list(new_fingerprint_args)
+    if fingerprint_columns is None:
+        new_fingerprint_args.append(dataset._fingerprint)
+    else:
+        # Fingerprint only the columns this cache's contents actually depend on. The dataset's
+        # own fingerprint covers every column, captions included, so anything that rewrites the
+        # caption text -- a prefix, tag dropout, a different shuffle count -- moved the latent
+        # fingerprint too and re-encoded the entire dataset through a VAE that had not changed.
+        hasher = Hasher()
+        for column in sorted(fingerprint_columns):
+            hasher.update(column)
+            # list(), not dataset[column]: indexing returns a lazy Column that holds a reference
+            # to its parent dataset, so hashing it drags the whole dataset -- captions included
+            # -- back into the digest and defeats the entire point of selecting columns.
+            hasher.update(list(dataset[column]))
+        new_fingerprint_args.append(hasher.hexdigest())
     new_fingerprint = Hasher.hash(new_fingerprint_args)
     if cache_file_prefix:
         cache_dir = cache_dir / cache_file_prefix.strip('_')
 
-    cache = Cache(cache_dir, new_fingerprint, shard_size_gb=10)
+    cache = Cache(cache_dir, new_fingerprint, shard_size_gb=10,
+                  keep_on_fingerprint_change=keep_on_fingerprint_change, identity=identity,
+                  content_digest=_content_digest(dataset, content_column) if content_column else None)
 
     if map_fn is None:
         # loading directly from cache without mapping
@@ -104,8 +210,43 @@ def _map_and_cache(dataset, map_fn, cache_dir, cache_file_prefix='', new_fingerp
     # Skip existing items
     cache_size = len(cache)
     dataset_size = len(dataset)
+    if cache.reused_after_fingerprint_change and cache_size != dataset_size:
+        # keep_* can only preserve an old cache when every entry still lines up with the
+        # current dataset. A different count proves that is not true. In particular, selecting
+        # fewer rows used to leave a larger cache here and fail at the assertion below; adding
+        # rows was allowed to append, but that still trusted an unverifiable old prefix. Rebuild
+        # both directions and reserve incremental continuation for an interrupted cache whose
+        # fingerprint has not changed.
+        logger.warning(
+            f'Existing cache has {cache_size} entries but the current dataset has '
+            f'{dataset_size} rows after its fingerprint changed. The old cache cannot be '
+            'reused safely; regenerating it.'
+        )
+        cache.clear()
+        cache_size = len(cache)
+    if content_column is not None and cache_size:
+        # The entries about to be reused were computed from the caller's input as it was when
+        # this cache was last completed. The count check above has already ruled out additions
+        # and removals. Editing a row in place is still unsafe: the entry would be kept and
+        # silently paired with the new text.
+        recorded = cache.recorded_content_digest()
+        if recorded is not None and recorded != _content_digest(dataset, content_column, cache_size):
+            print(
+                f'[CACHE] The {content_column} these {cache_size} cached entries were built '
+                'from has changed, so they no longer describe this run. Rebuilding.'
+            )
+            cache.clear()
+            cache_size = len(cache)
     assert cache_size <= dataset_size
     if cache_size == dataset_size:
+        # Record the identity here too, not only after a map. A cache that is already complete
+        # never reaches the write below, so without this it never acquires a manifest at all --
+        # and check_identity treats a cache with no manifest as compatible. The protection
+        # would therefore stay permanently inert on exactly the installs it was written for:
+        # one that already has a warm cache, changes llm_path, and gets the old encoder's
+        # embeddings back with no error. The contents are complete at this point, so claiming
+        # them is true; write_manifest records nothing when there is nothing to record.
+        cache.write_manifest()
         return cache
     dataset = dataset.select(range(cache_size, dataset_size), keep_in_memory=True)
 
@@ -158,6 +299,9 @@ def _map_and_cache(dataset, map_fn, cache_dir, cache_file_prefix='', new_fingerp
 
     pool.close()
     cache.finalize_current_shard()
+    # Written only now: the manifest describes complete contents, so a run interrupted
+    # part-way leaves no claim about what this cache holds.
+    cache.write_manifest()
     return cache
 
 
@@ -175,7 +319,9 @@ class TextEmbeddingDataset:
         return self.te_dataset[self.image_spec_to_te_idx[image_spec][caption_number]]
 
 
-def _cache_text_embeddings(metadata_dataset, map_fn, i, cache_dir, regenerate_cache, caching_batch_size):
+def _cache_text_embeddings(metadata_dataset, map_fn, i, cache_dir, regenerate_cache,
+                           caching_batch_size, text_encoder_key='',
+                           keep_on_fingerprint_change=False, identity=None):
 
     def flatten_captions(example):
         result = {key: [] for key in example}
@@ -194,12 +340,83 @@ def _cache_text_embeddings(metadata_dataset, map_fn, i, cache_dir, regenerate_ca
         map_fn,
         cache_dir,
         cache_file_prefix=f'text_embeddings_{i}_',
-        new_fingerprint_args=[i],
+        keep_on_fingerprint_change=keep_on_fingerprint_change,
+        identity=identity,
+        # text_encoder_key identifies which text encoder produced these embeddings, and is
+        # deliberately only in this fingerprint: latents are cached separately, so swapping
+        # the text encoder must not invalidate them. Models that supply no key keep their
+        # original fingerprint exactly, so existing caches stay valid.
+        new_fingerprint_args=[i, text_encoder_key] if text_encoder_key else [i],
         regenerate_cache=regenerate_cache,
         caching_batch_size=caching_batch_size,
+        # keep_text_embedding_cache tolerates a moved fingerprint, and for this cache the
+        # caption text is what the fingerprint is made of. Without this the flag's only
+        # reachable effect would be to reuse embeddings of captions that no longer exist.
+        content_column='caption',
     )
     assert len(te_dataset) == len(flattened_captions)
     return TextEmbeddingDataset(te_dataset, flattened_captions)
+
+
+CAPTION_SAMPLING_MODES = ('all', 'random_per_epoch')
+
+# Settings that change the caption text stored in the metadata cache, with their defaults. The
+# cache lives at a fixed path and is reused under --trust_cache, so without this a run that
+# flips one of them reads back captions built under the old setting: raw text with its tag
+# marker intact fed straight to the text encoder, or caption_prefix applied a second time.
+#
+# The suffix is empty when every one of them is at its default, so caches written before these
+# settings existed stay valid. That is the same rule text_encoder_cache_key follows.
+CAPTION_CACHE_SETTINGS = {
+    'augment_at_runtime': False,
+    'prefix_tag_caption': '',
+    'tag_dropout_rate': 0.0,
+    'multiline_captions': False,
+}
+
+
+# Caption settings that predate CAPTION_CACHE_SETTINGS. They change the cached caption text
+# exactly as much as the ones above, but they are deliberately NOT part of the suffix: they
+# already existed when the suffix was introduced, so putting them in it would move the cache
+# path of every install that uses them. They are recorded alongside the cache instead, and a
+# mismatch is reported rather than silently served.
+LEGACY_CAPTION_SETTINGS = {
+    'caption_prefix': '',
+    'cache_shuffle_num': 0,
+    'cache_shuffle_delimiter': ', ',
+    'skip_empty_caption': True,
+}
+
+
+def caption_cache_suffix(settings):
+    non_default = {k: v for k, v in settings.items() if v != CAPTION_CACHE_SETTINGS[k]}
+    if not non_default:
+        return ''
+    digest = hashlib.md5(json.dumps(non_default, sort_keys=True, default=str).encode()).hexdigest()
+    return '_' + digest[:12]
+
+
+def collapse_to_one_entry_per_image(iteration_order_list):
+    """Group (image_spec, latents_idx, caption, caption_number) rows by image.
+
+    Used by caption_sampling = 'random_per_epoch'. Instead of one entry per caption, each image
+    gets a single entry carrying all of its captions and their cache indices; __getitem__ draws
+    one per access. An epoch becomes len(images) rather than len(images) * len(captions), and an
+    image gets a different caption on each pass.
+
+    Every caption's embedding is still cached -- selection is an index into that cache -- so
+    this costs nothing extra to cache. Keeping the caption and its index together is what lets
+    __getitem__ pick both with one draw, which models that read the text as well as the cached
+    embedding (HiDream) depend on.
+    """
+    by_image = {}
+    for image_spec, latents_idx, caption, caption_number in iteration_order_list:
+        key = tuple(image_spec)
+        if key not in by_image:
+            by_image[key] = (image_spec, latents_idx, [], [])
+        by_image[key][2].append(caption)
+        by_image[key][3].append(caption_number)
+    return list(by_image.values())
 
 
 # The smallest unit of a dataset. Represents a single size bucket from a single folder of images
@@ -216,6 +433,9 @@ class SizeBucketDataset:
         self.path = Path(self.directory_config['path'])
         self.cache_dir = cache_base / f'cache_{bucket_suffix(size_bucket)}'
         self.captions_dict = directory_dataset.captions_dict  # optional
+        # Kept so the cache identity can be reached without threading it through both
+        # SizeBucketDataset construction sites.
+        self.directory_dataset = directory_dataset
 
         if len(size_bucket) == 4:
             # rename old folder name to the new one for convenience
@@ -228,11 +448,35 @@ class SizeBucketDataset:
         self.uncond_text_embeddings = []
         self.num_repeats = self.directory_config['num_repeats']
         self.shuffle_skip = max(directory_config.get('cache_shuffle_num', 0), 1) # Should be provided in DirectoryDataset
+        # Only used on the online_captions path, where the caption is chosen at __getitem__ time
+        # and so can still be augmented. On the cached path the embedding is already computed,
+        # so shuffling and dropout have to happen at cache time instead (shuffle_captions).
+        self.caption_sampling = directory_config.get('caption_sampling', 'all')
+        self.online_shuffle = directory_config.get('cache_shuffle_num', 0) > 0 or directory_config.get('shuffle_tags', False)
+        self.augment_at_runtime = directory_config.get('augment_at_runtime', False)
+        self.caption_prefix = directory_config.get('caption_prefix', '')
+        self.online_delimiter = directory_config.get('cache_shuffle_delimiter', ', ')
+        self.prefix_tag_caption = directory_config.get('prefix_tag_caption', '')
+        self.tag_dropout_rate = directory_config.get('tag_dropout_rate', 0.0)
         if self.num_repeats <= 0:
             raise ValueError(f'num_repeats must be >0, was {self.num_repeats}')
 
+    @property
+    def vae_identity(self):
+        # Reached through the directory dataset so the two SizeBucketDataset construction sites
+        # do not both have to grow an argument. Absent in tests that build one standalone.
+        return getattr(self.directory_dataset, 'vae_identity', '')
+
+    @property
+    def text_embedding_identity(self):
+        return getattr(self.directory_dataset, 'text_embedding_identity', '')
+
     def cache_latents(self, map_fn, regenerate_cache=False, trust_cache=False, caching_batch_size=1):
         print(f'caching latents: {self.size_bucket}')
+        # Latents depend on the image, its mask, its control image and the size bucket -- never
+        # on the caption, which is only carried alongside them. Fingerprinting the caption
+        # column too meant every caption setting change wiped the whole VAE cache.
+        latent_columns = [c for c in self.metadata_dataset.column_names if c != 'caption']
         self.latent_dataset = _map_and_cache(
             self.metadata_dataset,
             map_fn,
@@ -240,10 +484,18 @@ class SizeBucketDataset:
             cache_file_prefix='latents_',
             regenerate_cache=regenerate_cache,
             caching_batch_size=caching_batch_size,
+            fingerprint_columns=latent_columns,
+            # keep_latent_cache only skips a recache the fingerprint would have forced. It
+            # cannot make an incompatible cache usable -- Cache rebuilds those regardless.
+            keep_on_fingerprint_change=self.directory_config.get('keep_latent_cache', False),
+            identity=self.vae_identity,
         )
         assert len(self.latent_dataset) == len(self.metadata_dataset), (len(self.latent_dataset), len(self.metadata_dataset))
 
-        iteration_order_cache_dir = self.cache_dir / 'iteration_order'
+        suffix = self.directory_config.get('caption_cache_suffix', '')
+        if self.caption_sampling != 'all':
+            suffix += '_' + self.caption_sampling
+        iteration_order_cache_dir = self.cache_dir / f'iteration_order{suffix}'
 
         if regenerate_cache or not iteration_order_cache_dir.exists() or not trust_cache:
             print('Building iteration order')
@@ -267,12 +519,20 @@ class SizeBucketDataset:
                 seed = 0
                 for example in self.metadata_dataset.select_columns(['image_spec', 'caption']):
                     image_spec = example['image_spec']
-                    captions = example['caption']
-                    shuffle_with_seed(captions, seed)
+                    # Shuffle the captions WITH their original positions. The text embedding
+                    # cache is indexed by position in the unshuffled metadata order
+                    # (_cache_text_embeddings flattens metadata_dataset['caption'] as it
+                    # stands), so shuffling the strings alone and then using the post-shuffle
+                    # position as caption_number hands back the embedding of a different
+                    # caption. Harmless for a model that ignores the caption string, wrong for
+                    # one that reads both -- HiDream tokenizes Llama3 from the live caption
+                    # while using cached CLIP and T5 embeddings.
+                    numbered = list(enumerate(example['caption']))
+                    shuffle_with_seed(numbered, seed)
                     seed += 1
                     latents_idx = image_spec_to_latents_idx[tuple(image_spec)]
-                    for i, caption in enumerate(captions):
-                        iteration_order_by_caption_num[i].append((image_spec, latents_idx, caption, i))
+                    for i, (caption_number, caption) in enumerate(numbered):
+                        iteration_order_by_caption_num[i].append((image_spec, latents_idx, caption, caption_number))
                 iteration_order_list = []
                 for l in iteration_order_by_caption_num:
                     iteration_order_list.extend(l)
@@ -286,25 +546,54 @@ class SizeBucketDataset:
                         iteration_order_list.append((image_spec, latents_idx, caption, i))
                 shuffle_with_seed(iteration_order_list, 42)
 
+            if self.caption_sampling == 'random_per_epoch':
+                iteration_order_list = collapse_to_one_entry_per_image(iteration_order_list)
+
             iteration_order_dict = defaultdict(list)
             for image_spec, latents_idx, caption, caption_number in iteration_order_list:
                 iteration_order_dict['image_spec'].append(image_spec)
                 iteration_order_dict['latents_idx'].append(latents_idx)
-                iteration_order_dict['caption'].append(caption)
-                iteration_order_dict['caption_number'].append(caption_number)
+                if self.caption_sampling == 'random_per_epoch':
+                    iteration_order_dict['captions'].append(caption)
+                    iteration_order_dict['caption_numbers'].append(caption_number)
+                else:
+                    iteration_order_dict['caption'].append(caption)
+                    iteration_order_dict['caption_number'].append(caption_number)
             iteration_order = datasets.Dataset.from_dict(iteration_order_dict)
             iteration_order.save_to_disk(str(iteration_order_cache_dir))
             del iteration_order
 
         self.iteration_order = datasets.load_from_disk(str(iteration_order_cache_dir))
 
-    def cache_text_embeddings(self, map_fn, i, regenerate_cache=False, caching_batch_size=1):
+    def cache_text_embeddings(self, map_fn, i, regenerate_cache=False, caching_batch_size=1,
+                              text_encoder_key='', keep_text_embedding_cache=False,
+                              identity=None):
         print(f'caching text embeddings: {self.size_bucket}')
-        te_dataset = _cache_text_embeddings(self.metadata_dataset, map_fn, i, self.cache_dir, regenerate_cache, caching_batch_size)
+        te_dataset = _cache_text_embeddings(
+            self.metadata_dataset, map_fn, i, self.cache_dir, regenerate_cache,
+            caching_batch_size, text_encoder_key,
+            keep_on_fingerprint_change=keep_text_embedding_cache,
+            identity=identity,
+        )
         self.text_embedding_datasets.append(te_dataset)
 
     def add_text_embedding_dataset(self, te_dataset):
         self.text_embedding_datasets.append(te_dataset)
+
+    @property
+    def _augment_at_runtime(self):
+        """Whether __getitem__ should shuffle and drop tags itself.
+
+        Set by DirectoryDataset when the model caches no text embeddings: the caption string is
+        then what gets tokenized every step, so a fresh draw per access costs nothing and beats
+        the fixed variants baked in at cache time. In that case the metadata holds the captions
+        raw -- marker intact -- so tag lists can still be told from prose here.
+
+        A model that caches, or caches only some of its encoders as HiDream does, must never
+        have its text re-augmented behind a frozen embedding, which is exactly what the
+        text_embedding_datasets check below prevents.
+        """
+        return self.augment_at_runtime and not self.text_embedding_datasets
 
     def __getitem__(self, idx):
         idx = idx % len(self.iteration_order)
@@ -312,23 +601,72 @@ class SizeBucketDataset:
 
         ret = self.latent_dataset[entry['latents_idx']]
 
+        if self.caption_sampling == 'random_per_epoch':
+            # Every caption of this image is cached; pick which one this pass uses. The same
+            # index selects both the text and the cached embedding, so the two never disagree
+            # -- which matters for models like HiDream that read both.
+            pick = random.randrange(len(entry['captions']))
+            caption_number = entry['caption_numbers'][pick]
+            entry_caption = entry['captions'][pick]
+        else:
+            caption_number = entry['caption_number']
+            entry_caption = entry['caption']
+
         use_uncond = UNCOND_FRACTION > 0 and random.random() < UNCOND_FRACTION
         if use_uncond:
             caption = ''
         else:
             if self.captions_dict:
-                spec = entry['image_spec']
-                key = spec[-1]
+                tar_file, image_file = entry['image_spec']
+                # Match how DirectoryDataset keys captions.json: a tar member by its full path
+                # inside the archive, a plain file by basename. Using the full on-disk path for
+                # both made every lookup miss on an ordinary image directory, so every caption
+                # became ''.
+                # os.path.basename, not a split on '/': a tar member always uses forward
+                # slashes, but an on-disk path uses the platform separator, and splitting a
+                # Windows path on '/' returns the whole path and misses every lookup.
+                key = image_file if tar_file is not None else os.path.basename(image_file)
                 if key in self.captions_dict:
-                    caption = self.captions_dict[key][entry['caption_number']]
+                    caption = self.captions_dict[key][caption_number]
+                    if self._augment_at_runtime:
+                        caption = preprocess_caption(
+                            caption,
+                            delimiter=self.online_delimiter,
+                            caption_prefix=self.caption_prefix,
+                            prefix_tag_caption=self.prefix_tag_caption,
+                            shuffle=self.online_shuffle,
+                            tag_dropout_rate=self.tag_dropout_rate,
+                        )
+                    else:
+                        # The cached embedding for this caption was built with the marker
+                        # stripped and caption_prefix applied. Re-shuffling here would make the
+                        # text disagree with it, so only the deterministic parts are applied.
+                        caption = preprocess_caption(
+                            caption,
+                            caption_prefix=self.caption_prefix,
+                            prefix_tag_caption=self.prefix_tag_caption,
+                        )
                 else:
                     print(f'WARNING: image {key} did not have entry in captions_dict. Using empty caption.')
                     caption = ''
             else:
-                caption = entry['caption']
+                caption = entry_caption
+                if self._augment_at_runtime:
+                    # Nothing was cached, so this string is what the model tokenizes, every
+                    # step. Augmenting per sample is free here and better than the fixed
+                    # variants baked in at cache time. Models that do cache are excluded:
+                    # re-augmenting text whose embedding is frozen would make the two disagree.
+                    caption = preprocess_caption(
+                        caption,
+                        delimiter=self.online_delimiter,
+                        caption_prefix=self.caption_prefix,
+                        prefix_tag_caption=self.prefix_tag_caption,
+                        shuffle=self.online_shuffle,
+                        tag_dropout_rate=self.tag_dropout_rate,
+                    )
 
         for ds, uncond_ds in zip(self.text_embedding_datasets, self.uncond_text_embeddings):
-            emb_dict = uncond_ds[0] if use_uncond else ds.get_text_embeddings(tuple(entry['image_spec']), entry['caption_number'])
+            emb_dict = uncond_ds[0] if use_uncond else ds.get_text_embeddings(tuple(entry['image_spec']), caption_number)
             ret.update(emb_dict)
         ret['caption'] = caption
         return ret
@@ -343,10 +681,14 @@ class ConcatenatedBatchedDataset:
     def __init__(self, datasets):
         self.datasets = datasets
         self.post_init_called = False
+        self.batch_fill = dict(BATCH_FILL_DEFAULTS)
+        self.fill_report = None
 
-    def post_init(self, global_batch_size: dict, global_batch_size_image: dict, data_parallel_rank: int, data_parallel_world_size: int):
+    def post_init(self, global_batch_size: dict, global_batch_size_image: dict, data_parallel_rank: int, data_parallel_world_size: int, batch_fill=None):
         self.data_parallel_rank = data_parallel_rank
         self.data_parallel_world_size = data_parallel_world_size
+        if batch_fill is not None:
+            self.batch_fill = batch_fill
         iteration_order = []
         size_bucket = self.datasets[0].size_bucket
         for i, ds in enumerate(self.datasets):
@@ -375,7 +717,19 @@ class ConcatenatedBatchedDataset:
                     self.global_batch_size = bs
 
         assert self.global_batch_size % self.data_parallel_world_size == 0
-        self._make_divisible_by(self.global_batch_size)
+        # size_bucket is [w, h, frames] or [ar, w, h, frames]. Only used to name the bucket in
+        # log lines and to shape a synthesised mask, never to compute a batch.
+        self.size_bucket = size_bucket
+        # (height, width) in pixels, matching what PreprocessMediaFile returns for a real mask.
+        # Only ever the fallback in _collate -- a real mask in the batch supplies the shape --
+        # and only the value matters downstream, since every model interpolates the mask to the
+        # latent size before using it.
+        self.mask_shape = (int(size_bucket[-2]), int(size_bucket[-3]))
+        if self.batch_fill['batch_fill_strategy'] == 'fill':
+            self._fill_to_multiple_of(self.global_batch_size)
+        else:
+            self._make_divisible_by(self.global_batch_size)
+            self.sample_weights = np.ones(len(self.iteration_order), dtype=np.float32)
         self.batch_size = self.global_batch_size // self.data_parallel_world_size
         self.post_init_called = True
 
@@ -385,15 +739,242 @@ class ConcatenatedBatchedDataset:
 
     def __getitem__(self, idx):
         assert self.post_init_called
-        start_idx = idx * self.global_batch_size + self.data_parallel_rank * self.batch_size
+        block_start = idx * self.global_batch_size
+        start_idx = block_start + self.data_parallel_rank * self.batch_size
         end_idx = start_idx + self.batch_size
-        return [self.datasets[i.item()][j.item()] for i, j in self.iteration_order[start_idx : end_idx]]
+        examples = [self.datasets[i.item()][j.item()] for i, j in self.iteration_order[start_idx : end_idx]]
+        scale = self._batch_weight_scale(block_start)
+        if scale is not None:
+            for k, example in enumerate(examples):
+                example[SAMPLE_WEIGHT_KEY] = scale * float(self.sample_weights[start_idx + k])
+        return examples
+
+    def _batch_weight_scale(self, block_start):
+        """Loss weight for the real samples of the global batch starting at block_start.
+
+        Computed over the WHOLE global batch, never over this rank's slice or one micro batch.
+        loss.mean() divides by the element count including the zeroed padding, so the real
+        samples have to be scaled back up by G/G_real to make the step behave like a smaller
+        batch at the same learning rate. Deepspeed averages the micro batch losses and the data
+        parallel ranks average their gradients, so one constant shared by every micro batch and
+        every rank is what makes the arithmetic come out right no matter how unevenly the
+        padding happens to be distributed. A per-micro-batch ratio would not.
+
+        Returns None when every sample in the batch is real, which is every batch under 'drop'
+        and every batch of a bucket that had enough data. That is deliberate: nothing is
+        attached to the examples, so _collate stays on exactly the path it had before batch
+        fill existed, mask = None included.
+        """
+        block = self.sample_weights[block_start : block_start + self.global_batch_size]
+        num_real = int(np.count_nonzero(block))
+        if num_real == len(block):
+            return None
+        if num_real == 0:
+            # Never reached: a bucket with no real sample in a batch is dropped in
+            # _fill_to_multiple_of. Guarded anyway, because the alternative is a division by
+            # zero that surfaces as a NaN loss thousands of steps later.
+            raise RuntimeError(f'size bucket {self.size_bucket} produced a global batch with no real sample')
+        return len(block) / num_real
 
     def _make_divisible_by(self, n):
         new_length = (len(self.iteration_order) // n) * n
         self.iteration_order = self.iteration_order[:new_length]
         if new_length == 0 and is_main_process():
             logger.warning(f"size bucket {self.datasets[0].size_bucket} is being completely dropped because it doesn't have enough images")
+
+    def _cache_row_identity(self):
+        """Read each sub-dataset's latents_idx column once, for the duplicate check below.
+
+        iteration_order is a datasets.Dataset backed by Arrow, and the fill has to ask "which
+        image is this?" for potentially every entry of the bucket. Reading the column per entry
+        is a million Arrow lookups on a real dataset and turns startup into minutes; reading it
+        once is a list.
+
+        list(), not the Column object, for the reason _content_digest spells out: indexing a
+        datasets.Dataset hands back a lazy view holding a reference to its parent.
+        """
+        self._latents_idx = []
+        self._num_rows = []
+        for ds in self.datasets:
+            self._latents_idx.append(list(ds.iteration_order['latents_idx']))
+            self._num_rows.append(len(ds.iteration_order))
+
+    def _row_id(self, entry):
+        """(sub-dataset, row) -- one row of one SizeBucketDataset, so one (image, caption) pair.
+
+        j indexes SizeBucketDataset, whose __len__ is len(iteration_order) * num_repeats and
+        whose __getitem__ takes idx % len(iteration_order). So the num_repeats copies of a row
+        all collapse to the same row here, which is what makes a copy count as a repeat rather
+        than as a new sample.
+        """
+        dataset_idx = int(entry[0])
+        return (dataset_idx, int(entry[1]) % self._num_rows[dataset_idx])
+
+    def _image_id(self, entry):
+        """(sub-dataset, latents_idx) -- one image.
+
+        The sub-dataset index is not optional: several [[directory]] entries land in the same
+        size bucket and latents_idx is local to each one, so image 0 of two directories would
+        otherwise look like the same image.
+        """
+        dataset_idx, row = self._row_id(entry)
+        return (dataset_idx, self._latents_idx[dataset_idx][row])
+
+    def _fill_to_multiple_of(self, n):
+        """Extend iteration_order so it is a multiple of n, instead of truncating to one.
+
+        Only the tail is touched. The first N entries stay exactly what 'drop' would have
+        produced, which is what keeps the change to the training order bounded and keeps the
+        static part reproducible across epochs; the price is that a duplicate image already
+        present inside the static part is left there, exactly as it is today. See
+        docs/note/batch-fill-strategies.md.
+        """
+        self._static_iteration_order = self.iteration_order
+        self._cache_row_identity()
+        n_static = len(self.iteration_order)
+        remainder = n_static % n
+
+        if n_static == 0 or (n_static < n and self.batch_fill['undersized_bucket'] == 'drop'):
+            self._dropped = True
+            self._make_divisible_by(n)
+            self.sample_weights = np.ones(len(self.iteration_order), dtype=np.float32)
+            return
+
+        self._dropped = False
+        if remainder == 0:
+            # Already a whole number of batches. Filling is a no-op, and saying so keeps the
+            # startup report honest rather than reporting a fill of zero samples.
+            self.sample_weights = np.ones(n_static, dtype=np.float32)
+            self.fill_report = self._make_fill_report(n_static, 0, 0)
+            return
+
+        self._fill_tail(epoch=0)
+
+    def _fill_tail(self, epoch):
+        """Choose the entries that pad the final batch, for this epoch.
+
+        Rebuilt from the static order every time rather than mutated in place, so calling this
+        for epoch k gives the same answer whenever it is called. That is what resume needs:
+        the order has to be a function of (seed, epoch), never of how many times anything has
+        been drawn.
+        """
+        n = self.global_batch_size
+        order = self._static_iteration_order
+        n_static = len(order)
+        remainder = n_static % n
+        num_missing = n - remainder
+        tail_start = n_static - remainder
+
+        forbidden_images = set()
+        used_rows = set()
+        for k in range(tail_start, n_static):
+            forbidden_images.add(self._image_id(order[k]))
+            used_rows.add(self._row_id(order[k]))
+
+        candidates = list(range(n_static))
+        shuffle_with_seed(candidates, seed_from_hash((tuple(self.size_bucket), 'fill', epoch)))
+
+        chosen = []
+        weights = []
+        # Tier 1: an image not already in this batch. A genuinely new sample.
+        for k in candidates:
+            if len(chosen) == num_missing:
+                break
+            image_id = self._image_id(order[k])
+            if image_id in forbidden_images:
+                continue
+            chosen.append(k)
+            weights.append(1.0)
+            forbidden_images.add(image_id)
+            used_rows.add(self._row_id(order[k]))
+        # Tier 2: the same image under a different caption. Still a new (image, caption) pair,
+        # so it is real compute and is not masked. Note this tier is empty by construction when
+        # caption_sampling is 'random_per_epoch', because that collapses every image to one
+        # row: a copy of that row would pick its caption at random at access time and there is
+        # nothing guaranteeing a different one, so it belongs in tier 3, not here.
+        if len(chosen) < num_missing:
+            for k in candidates:
+                if len(chosen) == num_missing:
+                    break
+                row_id = self._row_id(order[k])
+                if row_id in used_rows:
+                    continue
+                chosen.append(k)
+                weights.append(1.0)
+                used_rows.add(row_id)
+
+        num_real = remainder + len(chosen)
+        # Tier 3: nothing left but an exact repeat. Masked to zero, so it costs GPU time and
+        # teaches the model nothing -- which is why min_real_fraction exists to refuse a batch
+        # that is mostly this.
+        if len(chosen) < num_missing:
+            fraction = num_real / n
+            if fraction < self.batch_fill['min_real_fraction']:
+                if is_main_process():
+                    logger.warning(
+                        f'size bucket {self.size_bucket} is being dropped: it can supply only '
+                        f'{num_real} real samples for a global batch of {n} '
+                        f'({fraction:.3f} < min_real_fraction {self.batch_fill["min_real_fraction"]}), '
+                        f'so {n - num_real} of every batch would be masked-out padding.\n'
+                        '  To keep it: lower micro_batch_size_per_gpu or '
+                        'gradient_accumulation_steps, raise num_repeats, lower num_ar_buckets so '
+                        'this bucket merges with a neighbour, or lower min_real_fraction.'
+                    )
+                self._dropped = True
+                self.iteration_order = self._static_iteration_order[:0]
+                self.sample_weights = np.ones(0, dtype=np.float32)
+                return
+            k = 0
+            while len(chosen) < num_missing:
+                chosen.append(candidates[k % n_static])
+                weights.append(0.0)
+                k += 1
+
+        self.iteration_order = np.concatenate([order, order[chosen]])
+        self.sample_weights = np.concatenate(
+            [np.ones(n_static, dtype=np.float32), np.array(weights, dtype=np.float32)]
+        )
+        self.fill_report = self._make_fill_report(n_static, len(chosen), weights.count(0.0))
+
+    def _make_fill_report(self, n_static, num_added, num_masked):
+        n = self.global_batch_size
+        return {
+            'size_bucket': tuple(self.size_bucket),
+            'num_samples': n_static,
+            'global_batch_size': n,
+            'batches_before': n_static // n,
+            'batches_after': (n_static + num_added) // n,
+            'num_added': num_added,
+            'num_masked': num_masked,
+        }
+
+    def set_epoch(self, epoch):
+        """Rotate which samples pad the final batch.
+
+        Without this, the same `num_missing` images are seen twice in every epoch forever. On a
+        large bucket that is a rounding error; on a small one it is not -- 100 samples at a
+        global batch of 64 pads 28 of them, so 28% of the data is systematically oversampled.
+        Only the padding moves: the static part stays put, so the change to the training order
+        stays bounded by the size of the tail.
+        """
+        if not self.post_init_called or self._is_static():
+            return
+        before = len(self.iteration_order)
+        self._fill_tail(epoch)
+        # The count of tier-1 and tier-2 candidates depends on which images and rows exist, not
+        # on the order they are visited in, so the length cannot move between epochs. Asserted
+        # because Dataset.post_init built its own iteration order from this length and would
+        # silently index off the end if it ever did.
+        assert len(self.iteration_order) == before, (len(self.iteration_order), before)
+
+    def _is_static(self):
+        return (
+            self.batch_fill['batch_fill_strategy'] != 'fill'
+            or not self.batch_fill['fill_rotate_per_epoch']
+            or getattr(self, '_dropped', False)
+            or self.fill_report is None
+            or self.fill_report['num_added'] == 0
+        )
 
 
 class ARBucketDataset:
@@ -438,15 +1019,24 @@ class ARBucketDataset:
         for ds in self.size_buckets:
             ds.cache_latents(map_fn, regenerate_cache=regenerate_cache, trust_cache=trust_cache, caching_batch_size=caching_batch_size)
 
-    def cache_text_embeddings(self, map_fn, i, regenerate_cache=False, caching_batch_size=1):
+    def cache_text_embeddings(self, map_fn, i, regenerate_cache=False, caching_batch_size=1,
+                              text_encoder_key='', keep_text_embedding_cache=False,
+                              identity=None):
         print(f'caching text embeddings: {self.ar_frames}')
-        te_dataset = _cache_text_embeddings(self.metadata_dataset, map_fn, i, self.cache_dir, regenerate_cache, caching_batch_size)
+        te_dataset = _cache_text_embeddings(
+            self.metadata_dataset, map_fn, i, self.cache_dir, regenerate_cache,
+            caching_batch_size, text_encoder_key,
+            keep_on_fingerprint_change=keep_text_embedding_cache,
+            identity=identity,
+        )
         for size_bucket_dataset in self.size_buckets:
             size_bucket_dataset.add_text_embedding_dataset(te_dataset)
 
 
 class DirectoryDataset:
-    def __init__(self, directory_config, dataset_config, model_name, framerate=None, round_to_multiple=32, skip_dataset_validation=False):
+    def __init__(self, directory_config, dataset_config, model_name, framerate=None,
+                 round_to_multiple=32, skip_dataset_validation=False,
+                 caches_text_embeddings=True, vae_identity=''):
         self._set_defaults(directory_config, dataset_config)
         self.directory_config = directory_config
         self.dataset_config = dataset_config
@@ -471,6 +1061,12 @@ class DirectoryDataset:
             self.resolutions = dedup_and_sort(self.resolutions)
             self.ar_bucket_datasets = []
         self.shuffle = directory_config.get('cache_shuffle_num', dataset_config.get('cache_shuffle_num', 0))
+        if self.shuffle == 0 and directory_config.get('shuffle_tags', dataset_config.get('shuffle_tags', False)):
+            # Legacy spelling. This fixup used to live inside _metadata_map_fn's inner function,
+            # which runs later and in a worker process, so every gate computed here missed it --
+            # a config saying shuffle_tags got frozen shuffling while the identical config
+            # saying cache_shuffle_num = 1 got per-access shuffling.
+            self.shuffle = 1
         self.shuffle_metadata = directory_config['shuffle_metadata']
         self.directory_config['cache_shuffle_num'] = self.shuffle # Make accessible if it wasn't yet, for picking one out
         self.shuffle_delimiter = directory_config.get('cache_shuffle_delimiter', dataset_config.get('cache_shuffle_delimiter', ", "))
@@ -480,8 +1076,60 @@ class DirectoryDataset:
         # For testing. Default if a mask is missing.
         self.default_mask_file = Path(self.directory_config['default_mask_file']) if 'default_mask_file' in self.directory_config else None
         self.cache_dir = self.path / 'cache' / self.model_name
-        self.grouping_keys_json_file = self.cache_dir / 'metadata/grouping_keys.json'
+        # Recorded in the cache manifests, not in the fingerprints, so adding them invalidates
+        # nothing. Empty means the model declares no identity and every cache stays valid.
+        self.vae_identity = vae_identity
+        self.text_embedding_identity = ''
+        self.keep_text_embedding_cache = directory_config.get(
+            'keep_text_embedding_cache', dataset_config.get('keep_text_embedding_cache', False))
+        # Every metadata artefact derived from the caption text carries this suffix. It is
+        # empty at the default settings, so caches written before they existed stay valid.
+        self.caption_cache_suffix = caption_cache_suffix({
+            'augment_at_runtime': (
+                not caches_text_embeddings
+                and (directory_config.get('cache_shuffle_num', dataset_config.get('cache_shuffle_num', 0)) > 0
+                     or directory_config.get('shuffle_tags', dataset_config.get('shuffle_tags', False))
+                     or directory_config.get('tag_dropout_rate', dataset_config.get('tag_dropout_rate', 0.0)) > 0)
+            ),
+            'prefix_tag_caption': directory_config.get('prefix_tag_caption', dataset_config.get('prefix_tag_caption', '')),
+            'tag_dropout_rate': directory_config.get('tag_dropout_rate', dataset_config.get('tag_dropout_rate', 0.0)),
+            'multiline_captions': directory_config.get('multiline_captions', dataset_config.get('multiline_captions', False)),
+        })
+        self.grouping_keys_json_file = self.cache_dir / f'metadata/grouping_keys{self.caption_cache_suffix}.json'
         self.skip_empty_caption = directory_config.get('skip_empty_caption', dataset_config.get('skip_empty_caption', True))
+        self.multiline_captions = directory_config.get('multiline_captions', dataset_config.get('multiline_captions', False))
+        self.prefix_tag_caption = directory_config.get('prefix_tag_caption', dataset_config.get('prefix_tag_caption', ''))
+        self.tag_dropout_rate = directory_config.get('tag_dropout_rate', dataset_config.get('tag_dropout_rate', 0.0))
+        self.caption_sampling = directory_config.get('caption_sampling', dataset_config.get('caption_sampling', 'all'))
+        if self.caption_sampling not in CAPTION_SAMPLING_MODES:
+            raise ValueError(
+                f'caption_sampling must be one of {CAPTION_SAMPLING_MODES}, got '
+                f'{self.caption_sampling!r}'
+            )
+        # Not gated on caption_sampling: random_per_epoch draws from the cached variants, so
+        # with cache_shuffle_num = 0 there is still exactly one variant to draw from and the
+        # dropped tags are still gone for good.
+        if self.tag_dropout_rate > 0 and self.shuffle == 0 and caches_text_embeddings:
+            logger.warning(
+                f'{self.path}: tag_dropout_rate={self.tag_dropout_rate} with cache_shuffle_num=0 '
+                f'produces ONE frozen variant per caption, so the dropped tags are gone for good '
+                f'-- that is permanent tag deletion, not augmentation. Set cache_shuffle_num > 1 '
+                f'to cache several draws, or caption_sampling = "random_per_epoch" to pick a '
+                f'different one each epoch.'
+            )
+        self.directory_config['caption_sampling'] = self.caption_sampling
+        # With no cached embeddings the caption string is what gets tokenized every step, so
+        # augmentation moves to __getitem__ and the metadata keeps raw captions -- markers
+        # intact, so tag captions can still be told from prose there.
+        self.augment_at_runtime = (
+            not caches_text_embeddings and (self.shuffle > 0 or self.tag_dropout_rate > 0)
+        )
+        self.directory_config['augment_at_runtime'] = self.augment_at_runtime
+        self.directory_config['caption_cache_suffix'] = self.caption_cache_suffix
+        # SizeBucketDataset needs these at __getitem__ time for the online_captions path.
+        self.directory_config['prefix_tag_caption'] = self.prefix_tag_caption
+        self.directory_config['tag_dropout_rate'] = self.tag_dropout_rate
+        self.directory_config['cache_shuffle_delimiter'] = self.shuffle_delimiter
 
         if not self.path.exists() or not self.path.is_dir():
             raise RuntimeError(f'Invalid path: {self.path}')
@@ -516,7 +1164,10 @@ class DirectoryDataset:
         if online_captions:
             captions_json = self.path / CAPTIONS_JSON_FILE
             assert captions_json.exists()
-            with open(captions_json) as f:
+            # encoding='utf-8' is not optional: open() defaults to the locale encoding, which
+            # on Windows is a codepage that decodes UTF-8 captions into mojibake WITHOUT
+            # raising. The corrupted text then reaches the cache and the text encoder.
+            with open(captions_json, encoding='utf-8-sig') as f:
                 self.captions_dict = json.load(f)
         else:
             self.captions_dict = None
@@ -529,6 +1180,50 @@ class DirectoryDataset:
                       ' and make sure you understand what this setting does. If you still want to proceed with the current configuration,'
                       ' run the script with the --i_know_what_i_am_doing flag.')
             quit()
+
+    def _legacy_caption_settings(self):
+        return {
+            'caption_prefix': self.directory_config.get('caption_prefix', ''),
+            # The resolved count, so the legacy shuffle_tags spelling compares equal to the
+            # cache_shuffle_num it means.
+            'cache_shuffle_num': self.shuffle,
+            'cache_shuffle_delimiter': self.directory_config.get('cache_shuffle_delimiter', ', '),
+            'skip_empty_caption': self.skip_empty_caption,
+        }
+
+    @property
+    def _caption_settings_file(self):
+        return self.cache_dir / f'metadata/caption_settings{self.caption_cache_suffix}.json'
+
+    def _record_caption_settings(self):
+        path = self._caption_settings_file
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump(self._legacy_caption_settings(), f, sort_keys=True)
+
+    def _warn_if_caption_settings_changed(self):
+        """Report a cache built under different caption settings, rather than serving it.
+
+        Absent file means a cache written before this check existed. Nothing is known about it,
+        so nothing is claimed -- staying quiet is what keeps the upgrade seamless.
+        """
+        path = self._caption_settings_file
+        if not path.exists():
+            return
+        with open(path, encoding='utf-8') as f:
+            previous = json.load(f)
+        current = self._legacy_caption_settings()
+        changed = {k: (previous.get(k, LEGACY_CAPTION_SETTINGS[k]), v)
+                   for k, v in current.items() if previous.get(k, LEGACY_CAPTION_SETTINGS[k]) != v}
+        if not changed:
+            return
+        lines = '\n'.join(f'    {k}: {was!r} -> {now!r}' for k, (was, now) in sorted(changed.items()))
+        logger.warning(
+            f'{self.path}: the cached captions were built with different settings, and '
+            f'--trust_cache is reusing them as they are:\n{lines}\n'
+            '  These settings are baked into the cached caption text, so this run will train on '
+            'the OLD captions. Pass --regenerate_cache to rebuild them, or drop --trust_cache.'
+        )
 
     def cache_metadata(self, regenerate_cache=False, trust_cache=False):
         def check_grouped_metadata():
@@ -544,7 +1239,7 @@ class DirectoryDataset:
                     # Using AR buckets but have size bucket keys
                     return False, unique_grouping_keys
                 all_grouped_metadata_exists = all(
-                    (self.cache_dir / f'metadata/grouped_metadata_{bucket_suffix(key)}').exists()
+                    (self.cache_dir / f'metadata/grouped_metadata_{bucket_suffix(key)}{self.caption_cache_suffix}').exists()
                     for key in unique_grouping_keys
                 )
             return all_grouped_metadata_exists, unique_grouping_keys
@@ -555,11 +1250,13 @@ class DirectoryDataset:
             # Otherwise, need to compute the ungrouped metadata and then group.
             print('Grouped metadata is not cached. Computing ungrouped metadata and then grouping.')
             unique_grouping_keys = self._group_metadata_and_save_to_disk(regenerate_cache=regenerate_cache, trust_cache=trust_cache)
+            self._record_caption_settings()
         else:
             print('Found grouped metadata cache. Directly loading it.')
+            self._warn_if_caption_settings_changed()
 
         for grouping_key in unique_grouping_keys:
-            grouped_cache_dir = self.cache_dir / f'metadata/grouped_metadata_{bucket_suffix(grouping_key)}'
+            grouped_cache_dir = self.cache_dir / f'metadata/grouped_metadata_{bucket_suffix(grouping_key)}{self.caption_cache_suffix}'
             print(f'Loading grouped metadata with grouping key {grouping_key}')
             metadata = datasets.load_from_disk(str(grouped_cache_dir))
             if self.use_size_buckets:
@@ -605,12 +1302,12 @@ class DirectoryDataset:
         if self.use_size_buckets:
             for size_bucket, metadata in grouped_metadata.items():
                 metadata = datasets.Dataset.from_dict(metadata)
-                grouped_cache_dir = self.cache_dir / f'metadata/grouped_metadata_{bucket_suffix(size_bucket)}'
+                grouped_cache_dir = self.cache_dir / f'metadata/grouped_metadata_{bucket_suffix(size_bucket)}{self.caption_cache_suffix}'
                 metadata.save_to_disk(str(grouped_cache_dir))
         else:
             for ar_bucket, metadata in grouped_metadata.items():
                 metadata = datasets.Dataset.from_dict(metadata)
-                grouped_cache_dir = self.cache_dir / f'metadata/grouped_metadata_{bucket_suffix(ar_bucket)}'
+                grouped_cache_dir = self.cache_dir / f'metadata/grouped_metadata_{bucket_suffix(ar_bucket)}{self.caption_cache_suffix}'
                 metadata.save_to_disk(str(grouped_cache_dir))
 
         with open(self.grouping_keys_json_file, 'w') as f:
@@ -621,7 +1318,7 @@ class DirectoryDataset:
     def _get_ungrouped_metadata(self, regenerate_cache=False, trust_cache=False):
         # This method caches some intermediate datasets so we don't have to enumerate all the files each time.
         metadata_cache_file_1 = self.cache_dir / 'metadata/metadata_intermediate'
-        metadata_cache_file_2 = self.cache_dir / 'metadata/metadata.arrow'
+        metadata_cache_file_2 = self.cache_dir / f'metadata/metadata{self.caption_cache_suffix}.arrow'
 
         if regenerate_cache or not metadata_cache_file_1.exists() or not trust_cache:
             print('Intermediate metadata is not cached. Enumerating all files.')
@@ -647,7 +1344,7 @@ class DirectoryDataset:
             mask_files = []
             control_files = []
             for file in tqdm(files):
-                if not file.is_file() or file.suffix in ('.txt', '.npz', '.json', '.parquet', '.bak', '.db'):
+                if not file.is_file() or file.suffix in NON_MEDIA_SUFFIXES:
                     continue
                 for image_spec in process_file(file):
                     image_file = Path(image_spec[1])
@@ -679,13 +1376,13 @@ class DirectoryDataset:
 
             if captions_json.exists():
                 print('Loading captions JSON')
-                with open(captions_json) as f:
+                with open(captions_json, encoding='utf-8-sig') as f:
                     caption_data = json.load(f)
 
                 def add_captions(example):
                     tar_file, image_file = example['image_spec']
                     if tar_file is None:
-                        image_file = image_file.split('/')[-1]
+                        image_file = os.path.basename(image_file)
                     captions = caption_data.get(image_file, None)
                     if captions is None:
                         logger.warning(f'Image file {image_file} does not have an entry in captions.json')
@@ -723,7 +1420,8 @@ class DirectoryDataset:
             load_from_cache_file=(not regenerate_cache and trust_cache),
             batched=True,
             batch_size=1,
-            num_proc=NUM_PROC,
+            # None, not 1: datasets still starts a worker process for num_proc=1.
+            num_proc=NUM_PROC if NUM_PROC > 1 else None,
             remove_columns=metadata_dataset.column_names,
         )
         return metadata_dataset
@@ -749,8 +1447,9 @@ class DirectoryDataset:
                 # Already put in dataset from captions.json file.
                 captions = example['caption'][0]
             if captions is None and caption_file:
-                with open(caption_file) as f:
-                    captions = [f.read().strip()]
+                captions = read_caption_file(Path(caption_file), self.multiline_captions)
+            if not captions:
+                captions = None
             if captions is None:
                 if self.skip_empty_caption:
                     logger.warning(f'Cound not find caption for {image_file}. Skipping image.')
@@ -758,9 +1457,26 @@ class DirectoryDataset:
                 else:
                     logger.warning(f'Cound not find caption for {image_file}. Using empty caption.')
                     captions = ['']
-            if self.directory_config['shuffle_tags'] and self.shuffle == 0: # backwards compatibility
-                self.shuffle = 1
-            captions = shuffle_captions(captions, self.shuffle, self.shuffle_delimiter, self.directory_config['caption_prefix'])
+            if self.augment_at_runtime:
+                # Keep the captions exactly as they are on disk, marker included, and expand to
+                # the same number of variants cache_shuffle_num would have produced so the
+                # epoch length is unchanged. __getitem__ augments each access, so the variants
+                # differ every pass instead of being frozen here.
+                captions = [c for c in captions for _ in range(max(self.shuffle, 1))]
+            else:
+                captions = shuffle_captions(
+                    captions,
+                    self.shuffle,
+                    self.shuffle_delimiter,
+                    self.directory_config['caption_prefix'],
+                    self.prefix_tag_caption,
+                    self.tag_dropout_rate,
+                    # Seeded per image so the variants are identical on every launch. These
+                    # captions are a column of the metadata dataset, and the LATENT cache is
+                    # keyed by that dataset's fingerprint -- drawing unseeded meant a full VAE
+                    # re-encode of the whole dataset on every run.
+                    seed=seed_from_hash((self.path, image_spec)),
+                )
             if self.control_path:
                 empty_return['control_file'] = []
 
@@ -772,7 +1488,10 @@ class DirectoryDataset:
                 if tar_filename not in tarfile_map:
                     tarfile_map[tar_filename] = tarfile.TarFile(tar_filename)
                 tar_f = tarfile_map[tar_filename]
-                filepath_or_file = tar_f.extractfile(str(image_file))
+                # as_posix(), not str(): a tar member name always uses forward slashes and
+                # extractfile matches it literally, so str() on a Path looks up a name with
+                # backslashes on Windows and raises KeyError for any member in a subdirectory.
+                filepath_or_file = tar_f.extractfile(image_file.as_posix())
 
             if image_file.suffix == '.webp':
                 # Make sure this this object stays alive so it doesn't close the file on us.
@@ -902,11 +1621,18 @@ class DirectoryDataset:
         for ds in datasets:
             ds.cache_latents(map_fn, regenerate_cache=regenerate_cache, trust_cache=trust_cache, caching_batch_size=caching_batch_size)
 
-    def cache_text_embeddings(self, map_fn, i, regenerate_cache=False, caching_batch_size=1):
+    def cache_text_embeddings(self, map_fn, i, regenerate_cache=False, caching_batch_size=1,
+                              text_encoder_key='', keep_text_embedding_cache=False,
+                              identity=None):
         print(f'caching text embeddings: {self.path}')
         datasets_list = self.size_bucket_datasets if self.use_size_buckets else self.ar_bucket_datasets
         for ds in datasets_list:
-            ds.cache_text_embeddings(map_fn, i, regenerate_cache=regenerate_cache, caching_batch_size=caching_batch_size)
+            ds.cache_text_embeddings(
+                map_fn, i, regenerate_cache=regenerate_cache,
+                caching_batch_size=caching_batch_size, text_encoder_key=text_encoder_key,
+                keep_text_embedding_cache=self.keep_text_embedding_cache,
+                identity=identity,
+            )
         # TODO: do this separately for is_video True and False for models that support it?
         empty_caption_ds = datasets.Dataset.from_dict({'caption': [''], 'is_video': [False], 'image_spec': [(None, None)]})
         uncond_text_embeddings_ds = _map_and_cache(
@@ -914,6 +1640,16 @@ class DirectoryDataset:
             map_fn,
             cache_dir=self.cache_dir,
             cache_file_prefix=f'uncond_text_embeddings_{i}_',
+            # Same reasoning as the conditional embeddings above: this is text encoder
+            # output, so it must follow the text encoder rather than the latents. Left at
+            # None without a key, preserving the original fingerprint.
+            new_fingerprint_args=[text_encoder_key] if text_encoder_key else None,
+            # Same identity as the conditional embeddings: this is the same encoder's output,
+            # and a model whose key is deliberately empty (anima) would otherwise have nothing
+            # distinguishing two runs with different llm_path. Its conditional embeddings would
+            # rebuild while the unconditional one -- the embedding every CFG-dropped sample
+            # trains against -- came back from the old encoder.
+            identity=identity,
             regenerate_cache=regenerate_cache,
         )
         self.uncond_dict = uncond_text_embeddings_ds[0]
@@ -925,7 +1661,8 @@ class DirectoryDataset:
 # for returning the correct batch for the process's data parallel rank. Calls model.prepare_inputs so the
 # returned tuple of tensors is whatever the model needs.
 class Dataset:
-    def __init__(self, dataset_config, model, skip_dataset_validation=False):
+    def __init__(self, dataset_config, model, skip_dataset_validation=False,
+                 batch_fill_defaults=None, batch_fill_overrides=None):
         super().__init__()
         self.dataset_config = dataset_config
         self.model = model
@@ -935,6 +1672,11 @@ class Dataset:
         #     self.model_name = 'cosmos_predict2'
         self.post_init_called = False
         self.eval_quantile = None
+        # Checked here rather than at post_init so a typo fails before the caching run, not
+        # after it. batch_fill_defaults lets the eval datasets change a default without
+        # restating the table; train passes nothing and gets the shipped defaults.
+        self.batch_fill = resolve_batch_fill_config(
+            dataset_config, batch_fill_defaults, batch_fill_overrides)
         if not skip_dataset_validation:
             self.model.model_specific_dataset_config_validation(self.dataset_config)
 
@@ -947,6 +1689,13 @@ class Dataset:
                 framerate=model.framerate,
                 round_to_multiple=model.pixels_round_to_multiple,
                 skip_dataset_validation=skip_dataset_validation,
+                # When the model caches no text embeddings, the caption string itself is what
+                # gets tokenized every step, so augmentation can happen per sample instead of
+                # being frozen into the metadata. The dataset cannot work this out for itself.
+                caches_text_embeddings=len(model.get_text_encoders()) > 0,
+                # What produced the latents. Declared per model via vae_config_keys; empty for
+                # a model that has not declared one, which keeps its caches exactly as before.
+                vae_identity=model.vae_cache_key(),
             )
             self.directory_datasets.append(directory_dataset)
 
@@ -966,7 +1715,9 @@ class Dataset:
             self.buckets.append(ConcatenatedBatchedDataset(datasets))
 
         for bucket in self.buckets:
-            bucket.post_init(global_batch_size, global_batch_size_image, data_parallel_rank, data_parallel_world_size)
+            bucket.post_init(global_batch_size, global_batch_size_image, data_parallel_rank,
+                             data_parallel_world_size, batch_fill=self.batch_fill)
+        self._report_batch_fill()
 
         iteration_order = []
         for i, bucket in enumerate(self.buckets):
@@ -986,6 +1737,42 @@ class Dataset:
             new_len = int(len(self) * subsample_ratio)
             self.iteration_order = self.iteration_order[:new_len]
 
+    def _report_batch_fill(self):
+        """Say what the fill did, per bucket, at startup.
+
+        Batch fill changes how many steps an epoch has and can quietly turn a quarter of a
+        batch into masked padding. Both are things someone reading a loss curve needs to know
+        about beforehand, not deduce from it.
+        """
+        if self.batch_fill['batch_fill_strategy'] != 'fill' or not is_main_process():
+            return
+        reports = [b.fill_report for b in self.buckets if b.fill_report is not None]
+        if not reports:
+            return
+        print(f"batch_fill_strategy = 'fill' (undersized_bucket = "
+              f"{self.batch_fill['undersized_bucket']!r}, min_real_fraction = "
+              f"{self.batch_fill['min_real_fraction']}):")
+        for r in reports:
+            line = (f"  bucket {r['size_bucket']}: {r['num_samples']} samples, global batch "
+                    f"{r['global_batch_size']}, {r['batches_before']} -> {r['batches_after']} batches, "
+                    f"+{r['num_added']} filled")
+            if r['num_masked']:
+                line += f", {r['num_masked']} of them masked out"
+            print(line)
+
+    def set_epoch(self, epoch):
+        """Tell every bucket which epoch is starting, so the fill can rotate.
+
+        A no-op unless batch_fill_strategy is 'fill' and fill_rotate_per_epoch is on, so the
+        default path does no work and changes nothing.
+        """
+        for bucket in self.buckets:
+            bucket.set_epoch(epoch)
+
+    def is_batch_fill_static(self):
+        """True when set_epoch can never change anything, so nothing has to be rebuilt for it."""
+        return all(bucket._is_static() for bucket in self.buckets)
+
     def set_eval_quantile(self, quantile):
         self.eval_quantile = quantile
 
@@ -996,13 +1783,17 @@ class Dataset:
     def __getitem__(self, idx):
         assert self.post_init_called
         i, j = self.iteration_order[idx]
-        examples_for_this_dp_rank = self.buckets[i][j]
-        batch = self._collate(examples_for_this_dp_rank)
+        bucket = self.buckets[i]
+        examples_for_this_dp_rank = bucket[j]
+        batch = self._collate(examples_for_this_dp_rank, mask_shape=bucket.mask_shape)
         return batch
 
     # Collates a list of feature dictionaries into a single dictionary of batched features.
     # Each feature can be a tensor, list, or single item.
-    def _collate(self, examples):
+    def _collate(self, examples, mask_shape=None):
+        # Popped before the loop below, which would otherwise collate it into the batch and
+        # hand it to prepare_inputs as though the model had asked for it.
+        weights = [example.pop(SAMPLE_WEIGHT_KEY, 1.0) for example in examples]
         ret = {}
         for key in examples[0]:
             if key == 'mask':
@@ -1022,15 +1813,44 @@ class Dataset:
             if mask is not None:
                 assert shape is None or mask.shape == shape
                 shape = mask.shape
-        if shape is not None:
-            # At least one item has a mask. Need to make the None masks all 1s.
-            for i, mask in enumerate(masks):
-                if mask is None:
-                    masks[i] = torch.ones(shape, dtype=torch.float16)
-            ret['mask'] = torch.stack(masks)
-        else:
-            # We can leave the batch mask as None and the loss_fn will skip masking entirely.
-            ret['mask'] = None
+        if all(w == 1.0 for w in weights):
+            # No batch fill, or a batch that is entirely real samples. Byte for byte the path
+            # this had before batch fill existed, mask = None included, so nothing about an
+            # ordinary run changes.
+            if shape is not None:
+                # At least one item has a mask. Need to make the None masks all 1s.
+                for i, mask in enumerate(masks):
+                    if mask is None:
+                        masks[i] = torch.ones(shape, dtype=torch.float16)
+                ret['mask'] = torch.stack(masks)
+            else:
+                # We can leave the batch mask as None and the loss_fn will skip masking entirely.
+                ret['mask'] = None
+            return ret
+
+        # This batch holds padding, so every sample needs a mask carrying its weight -- the
+        # padding's zero, and the compensating G/G_real on the rest. Reusing the existing mask
+        # channel is what keeps all of this out of the eight get_loss_fn implementations: they
+        # already multiply by the mask elementwise before averaging.
+        #
+        # A real mask's shape wins when there is one, so a synthesised mask can never disagree
+        # with it. mask_shape is only the fallback for a batch where nobody supplied one, and
+        # it only has to be a plausible spatial shape: every model interpolates the mask to the
+        # latent size, and a constant survives that unchanged.
+        if shape is None:
+            shape = mask_shape
+        if shape is None:
+            raise RuntimeError(
+                'A padded batch needs a mask shape and none could be determined. This means the '
+                'size bucket had no spatial dimensions to fall back on.'
+            )
+        for i, (mask, weight) in enumerate(zip(masks, weights)):
+            base = torch.ones(shape, dtype=torch.float16) if mask is None else mask
+            # float16 to match what PreprocessMediaFile produces, so a synthesised mask and a
+            # real one stack. The weight rounds to about four significant digits here, which is
+            # far below the noise of bf16 training and keeps the mask at its existing size.
+            masks[i] = base * weight
+        ret['mask'] = torch.stack(masks)
         return ret
 
     def cache_metadata(self, regenerate_cache=False, trust_cache=False):
@@ -1042,8 +1862,19 @@ class Dataset:
             ds.cache_latents(map_fn, regenerate_cache=regenerate_cache, trust_cache=trust_cache, caching_batch_size=caching_batch_size)
 
     def cache_text_embeddings(self, map_fn, i, regenerate_cache=False, caching_batch_size=1):
+        text_encoder_key = getattr(self.model, 'text_encoder_cache_key', lambda _i: '')(i)
+        text_encoder_identity = getattr(
+            self.model, 'text_encoder_identity', lambda _i: text_encoder_key)(i)
         for ds in self.directory_datasets:
-            ds.cache_text_embeddings(map_fn, i, regenerate_cache=regenerate_cache, caching_batch_size=caching_batch_size)
+            ds.cache_text_embeddings(
+                map_fn, i, regenerate_cache=regenerate_cache,
+                caching_batch_size=caching_batch_size, text_encoder_key=text_encoder_key,
+                # Two different questions, so two calls. The fingerprint catches a change the
+                # cache must react to by rebuilding; the manifest only says whose contents
+                # these are. A model that keeps something out of its fingerprint, to avoid
+                # moving every existing install's cache path, can still declare it here.
+                identity=text_encoder_identity,
+            )
         # some techniques need access to the uncond
         self.model.uncond_dict = self.directory_datasets[0].uncond_dict
 
@@ -1318,14 +2149,35 @@ class PipelineDataLoader:
         self.num_batches_pulled = 0
         self.next_micro_batch = None
         self.recreate_dataloader = False
+        self._set_dataset_epoch()
         # Be careful to only create the DataLoader some bounded number of times: https://github.com/pytorch/pytorch/issues/91252
         self._create_dataloader()
         self.data = self._pull_batches_from_dataloader()
+
+    def _set_dataset_epoch(self):
+        """Hand the epoch to the dataset, for batch fill's per-epoch rotation.
+
+        A no-op for every configuration except batch_fill_strategy = 'fill' with
+        fill_rotate_per_epoch on, and the dataset decides that for itself.
+
+        With workers, this assignment happens in the parent and does not reach them:
+        persistent_workers keeps a forked/spawned copy of the dataset that was made when the
+        DataLoader was built, so the workers would go on serving the previous epoch's tail.
+        Rebuilding the DataLoader is what carries the new order across. Once per epoch is a
+        bounded number of times, which is what the pytorch issue linked above is about -- the
+        thing to avoid is rebuilding inside the loop.
+        """
+        if not hasattr(self.dataset, 'set_epoch'):
+            return
+        self.dataset.set_epoch(self.epoch)
+        if self.num_dataloader_workers > 0 and not self.dataset.is_batch_fill_static():
+            self.recreate_dataloader = True
 
     def reset(self):
         self.epoch = 1
         self.num_batches_pulled = 0
         self.next_micro_batch = None
+        self._set_dataset_epoch()
         self.data = self._pull_batches_from_dataloader()
 
     def set_eval_quantile(self, quantile):
@@ -1345,13 +2197,16 @@ class PipelineDataLoader:
         try:
             self.next_micro_batch = next(self.data)
         except StopIteration:
+            self.epoch += 1
+            # Before the DataLoader is rebuilt, so a rebuild triggered here picks up the new
+            # epoch's tail rather than the previous one's.
+            self._set_dataset_epoch()
             if self.recreate_dataloader:
                 self._create_dataloader()
                 self.recreate_dataloader = False
             self.data = self._pull_batches_from_dataloader()
             self.num_batches_pulled = 0
             self.next_micro_batch = None
-            self.epoch += 1
         return ret
 
     def _create_dataloader(self, skip_first_n_batches=None):
@@ -1428,6 +2283,10 @@ class PipelineDataLoader:
         # -1 because by preloading the next micro_batch, it's always going to have one more batch
         # pulled than the actual number of batches iterated by the caller.
         self.num_batches_pulled = state_dict['num_batches_pulled'] - 1
+        # The resumed epoch decides which samples pad the final batch, so this has to happen
+        # before the DataLoader is built or the first epoch after a resume walks a different
+        # tail than the run that was interrupted.
+        self._set_dataset_epoch()
         self._create_dataloader(skip_first_n_batches=self.num_batches_pulled)
         self.data = self._pull_batches_from_dataloader()
         # Recreate the dataloader after the first pass so that it won't skip

@@ -5,11 +5,41 @@ import os
 import sys
 from collections import defaultdict
 import types
+
+# Import diffusion-pipe's own utils package before ComfyUI joins sys.path below. utils/ has no
+# __init__.py (it's a namespace package), while submodules/ComfyUI/utils/ is a regular package
+# (it has one) -- and a regular package always wins a namespace package for the same top-level
+# name, regardless of which sys.path entry comes first. Importing it now caches 'utils' and
+# 'utils.common' in sys.modules, so the 'from utils.common import ...' below is served from
+# that cache instead of triggering a fresh path search once ComfyUI is on sys.path. Any entry
+# point that imports a model module before importing anything under utils/ itself would
+# otherwise hit 'ModuleNotFoundError: No module named utils.common'.
+from utils.common import is_main_process, VIDEO_EXTENSIONS, round_to_nearest_multiple, round_down_to_multiple, AUTOCAST_DTYPE, empty_cuda_cache
+
 sys.path.insert(0, os.path.join(os.path.abspath(os.path.dirname(__file__)), '../submodules/ComfyUI'))
 
 import peft
 import torch
-import torchaudio
+# torchaudio is required, and not only for the one resample call further down. The vendored
+# ComfyUI imports it at module scope in several places -- comfy.sd pulls in
+# comfy.ldm.lightricks.vae.audio_vae, which does -- so the `import comfy.sd` below needs it
+# too, and there is no configuration in which this module loads without it.
+#
+# It is absent from requirements.txt for the same reason torch and torchvision are: all three
+# have to come from the same PyTorch index, chosen for the machine's CUDA version, so the
+# README has the user install them together. Leaving one out is therefore a normal install
+# slip. This import is kept ahead of the comfy imports, and guarded, so that slip produces a
+# message naming the fix instead of a bare ModuleNotFoundError raised from inside a vendored
+# file the user did not know was involved.
+try:
+    import torchaudio
+except ModuleNotFoundError as e:
+    raise ModuleNotFoundError(
+        'torchaudio is required by diffusion-pipe (for video audio) and by the vendored ComfyUI, '
+        'and is not installed. Install it from the same PyTorch index as torch and torchvision -- '
+        "'pip install torch torchvision torchaudio' -- so that all three versions match. "
+        'See the Installing section of README.md.'
+    ) from e
 from torch import nn
 import torch.nn.functional as F
 import safetensors.torch
@@ -20,7 +50,6 @@ import accelerate
 from diffusers import FlowMatchEulerDiscreteScheduler
 from tqdm import tqdm
 
-from utils.common import is_main_process, VIDEO_EXTENSIONS, round_to_nearest_multiple, round_down_to_multiple, AUTOCAST_DTYPE, empty_cuda_cache
 import comfy.utils
 import comfy.sd
 import comfy.sd1_clip
@@ -220,6 +249,51 @@ class CommonPipeline:
     spatial_compression = 8
     channels = 16
     is_video_vae = False
+    # Substrings of module names OPLoRA must leave alone. OPLoRA protects a pretrained
+    # weight's dominant singular directions, which is meaningless for a module that has no
+    # pretrained weights to protect. Empty for every model that trains adapters purely on
+    # pretrained layers.
+    oplora_exclude_names = ()
+
+    # Config keys naming the checkpoint this model's VAE is loaded from. They differ per model
+    # -- vae_path, diffusers_path, ckpt_path, checkpoint_path -- and there is no rule that
+    # derives them, because plenty of other keys also name a file without affecting what the
+    # cache holds (transformer_path is the clear case: swapping the DiT changes nothing about
+    # the latents). So each model declares its own, and an empty tuple means no identity is
+    # recorded and every existing cache stays valid.
+    vae_config_keys = ()
+
+    def vae_cache_key(self):
+        """Identity of the VAE, recorded in the latent cache's manifest.
+
+        Latents are fingerprinted over the images and the bucketing, never over the VAE, so
+        without this a run pointed at a different VAE silently reuses latents that belong to
+        the old one. Recorded rather than fingerprinted, so adding it invalidates nothing.
+        """
+        if not self.vae_config_keys:
+            return ''
+        parts = [str(self.model_config.get(key, '')) for key in self.vae_config_keys]
+        parts.append(str(self.model_config.get('dtype', '')))
+        return '|'.join(parts)
+
+    def text_encoder_cache_key(self, i):
+        """Identity of text encoder `i`, recorded in that encoder's cache manifest.
+
+        Default is empty, which records nothing: a model that has not declared what identifies
+        its text encoder keeps exactly the behaviour it had. cosmos_predict2 overrides this.
+        """
+        return ''
+
+    def text_encoder_identity(self, i):
+        """Identity of text encoder `i` for the manifest, when it differs from the fingerprint.
+
+        The two answer different questions. The fingerprint decides whether to rebuild, so
+        adding to it moves the cache path of every existing install. The manifest only records
+        whose contents these are, and a cache with no manifest is treated as compatible -- so a
+        model can declare an identity here that it deliberately keeps out of its fingerprint.
+        Defaults to the fingerprint key, which is the right answer whenever they agree.
+        """
+        return self.text_encoder_cache_key(i)
 
     def __init__(self, *args, **kwargs):
         # sampling only
@@ -247,6 +321,15 @@ class CommonPipeline:
                 te = te.to('cpu')
             else:
                 model_management.unload_all_models()
+        if not hasattr(self, 'get_conds'):
+            # Only a couple of models implement it, and without it this line raises a bare
+            # AttributeError partway through setup -- after the text encoders have already been
+            # loaded and run. Say which flag is unsupported instead.
+            raise RuntimeError(
+                f'--test_sample is not supported for {type(self).__name__}: it needs a '
+                'get_conds() implementation, which this model does not provide. Sample with '
+                'the model in ComfyUI or another inference tool instead.'
+            )
         self.conds = tuple(tensor.cuda() for tensor in self.get_conds(inputs))
         if cfg > 1:
             self.unconds = tuple(tensor.cuda() for tensor in self.get_conds(inputs_uncond))
@@ -310,6 +393,46 @@ class CommonPipeline:
         #     elif 'lokr_w2.' in name:
         #         nn.init.zeros_(p)
 
+    def load_adapter_weights_into(self, target_model, adapter_path, rename_key=None):
+        """Load a saved adapter into target_model, inverting exactly what the saver wrote.
+
+        utils/saver.py stores each trainable parameter under its own name with PEFT's adapter
+        segment ('.default') and '.modules_to_save' removed, so the way back is to build the
+        same mapping from the model's parameters rather than to guess where the segment sat.
+
+        The rule this replaces -- insert '.default' before a trailing '.weight' -- only ever
+        described LoRA. LoKr keeps its factors in ParameterDicts, so its parameters are named
+        '...lokr_w1.default' with no '.weight' anywhere, and every LoKr adapter raised here
+        instead of loading. Both subclasses had their own copy of the rule, which is why one
+        defect existed twice.
+
+        rename_key runs before the prefix strip, for a model whose ComfyUI names differ beyond
+        the shared prefix. It only ever rewrites module path fragments, never the adapter
+        suffix, so it composes with the lookup rather than competing with it.
+        """
+        if is_main_process():
+            print(f'Loading adapter weights from path {adapter_path}')
+        safetensors_files = list(Path(adapter_path).glob('*.safetensors'))
+        if len(safetensors_files) == 0:
+            raise RuntimeError(f'No safetensors file found in {adapter_path}')
+        if len(safetensors_files) > 1:
+            raise RuntimeError(f'Multiple safetensors files found in {adapter_path}')
+        adapter_state_dict = safetensors.torch.load_file(safetensors_files[0])
+        by_saved_key = {
+            name.replace('.default', '').replace('.modules_to_save', ''): name
+            for name, _ in target_model.named_parameters()
+        }
+        modified_state_dict = {}
+        for k, v in adapter_state_dict.items():
+            if rename_key is not None:
+                k = rename_key(k)
+            # Replace Diffusers or ComfyUI prefix
+            k = re.sub(r'^(transformer|diffusion_model)\.', '', k)
+            if k not in by_saved_key:
+                raise RuntimeError(f'modified_state_dict key {k} is not in the model parameters')
+            modified_state_dict[by_saved_key[k]] = v
+        target_model.load_state_dict(modified_state_dict, strict=False)
+
     @torch.no_grad()
     def sample(self, w=512, h=512):
         x = torch.randn((1, self.channels, h//self.spatial_compression, w//self.spatial_compression), device='cuda')
@@ -365,28 +488,13 @@ class BasePipeline(CommonPipeline):
         raise NotImplementedError()
 
     def load_adapter_weights(self, adapter_path):
-        if is_main_process():
-            print(f'Loading adapter weights from path {adapter_path}')
-        safetensors_files = list(Path(adapter_path).glob('*.safetensors'))
-        if len(safetensors_files) == 0:
-            raise RuntimeError(f'No safetensors file found in {adapter_path}')
-        if len(safetensors_files) > 1:
-            raise RuntimeError(f'Multiple safetensors files found in {adapter_path}')
-        adapter_state_dict = safetensors.torch.load_file(safetensors_files[0])
-        modified_state_dict = {}
-        model_parameters = set(name for name, p in self.transformer.named_parameters())
-        for k, v in adapter_state_dict.items():
-            # Replace Diffusers or ComfyUI prefix
-            k = re.sub(r'^(transformer|diffusion_model)\.', '', k)
-            # Replace weight at end for LoRA format
-            k = re.sub(r'\.weight$', '.default.weight', k)
-            if k not in model_parameters:
-                raise RuntimeError(f'modified_state_dict key {k} is not in the model parameters')
-            modified_state_dict[k] = v
-        self.transformer.load_state_dict(modified_state_dict, strict=False)
+        self.load_adapter_weights_into(self.transformer, adapter_path)
 
     def load_and_fuse_adapter(self, path):
-        peft_config = peft.LoraConfig.from_pretrained(path)
+        # PeftConfig dispatches on the peft_type recorded in adapter_config.json, so this reads
+        # a LoKr run as well as a LoRA one. LoraConfig.from_pretrained happens to dispatch the
+        # same way, but naming LoRA here read as though LoKr were unsupported.
+        peft_config = peft.PeftConfig.from_pretrained(path)
         lora_model = peft.get_peft_model(self.transformer, peft_config)
         self.load_adapter_weights(path)
         lora_model.merge_and_unload()
@@ -718,25 +826,7 @@ class ComfyPipeline(CommonPipeline):
         safetensors.torch.save_file(sd, save_dir / 'adapter_model.safetensors', metadata={'format': 'pt'})
 
     def load_adapter_weights(self, adapter_path):
-        if is_main_process():
-            print(f'Loading adapter weights from path {adapter_path}')
-        safetensors_files = list(Path(adapter_path).glob('*.safetensors'))
-        if len(safetensors_files) == 0:
-            raise RuntimeError(f'No safetensors file found in {adapter_path}')
-        if len(safetensors_files) > 1:
-            raise RuntimeError(f'Multiple safetensors files found in {adapter_path}')
-        adapter_state_dict = safetensors.torch.load_file(safetensors_files[0])
-        modified_state_dict = {}
-        model_parameters = set(name for name, p in self.diffusion_model.named_parameters())
-        for k, v in adapter_state_dict.items():
-            # Replace Diffusers or ComfyUI prefix
-            k = re.sub(r'^(transformer|diffusion_model)\.', '', k)
-            # Replace weight at end for LoRA format
-            k = re.sub(r'\.weight$', '.default.weight', k)
-            if k not in model_parameters:
-                raise RuntimeError(f'modified_state_dict key {k} is not in the model parameters')
-            modified_state_dict[k] = v
-        self.diffusion_model.load_state_dict(modified_state_dict, strict=False)
+        self.load_adapter_weights_into(self.diffusion_model, adapter_path)
 
     def load_and_fuse_adapter(self, path):
         raise NotImplementedError()

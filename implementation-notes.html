@@ -1,0 +1,2354 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>diffusion-pipe implementation notes</title>
+<style>
+  body { font-family: system-ui, -apple-system, "Segoe UI", sans-serif; line-height: 1.6;
+         max-width: 60rem; margin: 0 auto; padding: 2rem 1.25rem; color: #1c1c1e; }
+  h1 { font-size: 1.6rem; }
+  h2 { font-size: 1.25rem; margin-top: 2.5rem; border-bottom: 1px solid #d8d8dc; padding-bottom: .3rem; }
+  h3 { font-size: 1.05rem; margin-top: 1.75rem; }
+  code { background: #f2f2f4; padding: .1rem .3rem; border-radius: 3px; font-size: .9em; }
+  table { border-collapse: collapse; width: 100%; margin: 1rem 0; }
+  th, td { border: 1px solid #d8d8dc; padding: .5rem .6rem; text-align: left; vertical-align: top; }
+  th { background: #f2f2f4; }
+  .meta { color: #5a5a60; font-size: .9rem; }
+  .flag { background: #fff6e5; border-left: 4px solid #e8a33d; padding: .75rem 1rem; margin: 1rem 0; }
+  @media (prefers-color-scheme: dark) {
+    body { background: #16161a; color: #e8e8ea; }
+    h2 { border-bottom-color: #34343a; }
+    code { background: #26262c; }
+    th, td { border-color: #34343a; }
+    th { background: #26262c; }
+    .meta { color: #a0a0a8; }
+    .flag { background: #2e2618; border-left-color: #e8a33d; }
+  }
+</style>
+</head>
+<body>
+
+<h1>Implementation notes</h1>
+<p class="meta">A running log of decisions taken outside the spec, forced changes, tradeoffs, and
+anything else the maintainer needs to know. Newest entry first.</p>
+
+<h2>2026-09-09 &mdash; Safe cache-count mismatches and two distillation save schedules</h2>
+
+<p><strong>Request.</strong> A latent cache kept across a fingerprint change contained 32,802
+entries while its current size bucket contained fewer rows. <code>_map_and_cache</code> asserted
+that the cache could not be longer than the dataset and killed the caching subprocess. The same
+request asked for distillation's step and epoch checkpoint intervals to work together rather
+than the epoch interval replacing the step interval.</p>
+
+<h3>Cache decision</h3>
+
+<p>A cache from the current fingerprint may be shorter because a previous caching process was
+interrupted, so that case still resumes by appending. A cache explicitly kept after its
+fingerprint changed is different: if its entry count differs in either direction, its index
+alignment with the current dataset cannot be established. <code>Cache</code> now exposes that it
+took this keep path, and <code>_map_and_cache</code> logs both counts, clears the cache, and rebuilds
+it. This deliberately gives up the old append-on-fingerprint-change shortcut; correctness wins
+over avoiding an encode whose prefix cannot be verified.</p>
+
+<h3>Checkpoint decision</h3>
+
+<p><code>save_every</code> and <code>save_every_n_epochs</code> are now independent schedules.
+Only the configured format is written when one is set; neither preserves the historical
+<code>save_every = 2000</code> fallback. When both schedules coincide, both tagged checkpoint
+sets are written, including their matching optimizer state and optional full model. The stable
+untagged names continue to point at the newest weights. Retention already counts epoch and step
+families separately, so it needs no format change.</p>
+
+<h3>Verification</h3>
+
+<p>Regression coverage exercises both old-cache-greater-than-dataset and
+old-cache-less-than-dataset rebuilds, plus step-only, epoch-only, simultaneous, coincident,
+final-step and default checkpoint schedules. The project-local environment uses Python 3.12 and
+the CUDA 13.0 PyTorch build so the local RTX 5070 can also be checked directly. Setup exposed
+that <code>models/base.py</code> imports <code>torchaudio</code> although the installation guide
+previously named only Torch and torchvision; the guide now installs the complete trio.</p>
+
+<p>The full suite's real ZeRO state-machine cases remain CPU/gloo tests. On this GPU machine the
+suite is run with <code>CUDA_VISIBLE_DEVICES=-1</code> so DeepSpeed selects its CPU accelerator;
+attempting to turn that test into a CUDA/gloo test on native Windows reaches an unsupported
+collective path and causes an access violation. CUDA itself is verified separately with a small
+tensor and audio-resampling smoke test.</p>
+
+<ul>
+  <li>New regression cases: 8 passed.</li>
+  <li>Full suite: 654 passed, 2 skipped.</li>
+  <li>Vendored API guard: 60/60 passed against Torch 2.13.0+cu130, bitsandbytes 0.50.2,
+    Transformers 5.16.1 and Accelerate 1.14.0.</li>
+  <li>ComfyUI signature guard: 26/26 passed.</li>
+  <li>GPU: OPLoRA sanity check passed with a maximum residual of 5.412e-07; fp16-mixed
+    precision checks passed with 0/20 skipped steps; CUDA torchaudio resampling produced the
+    expected 800-sample output.</li>
+</ul>
+
+<h2>2026-09-05 &mdash; A ComfyUI/utils import shadow, and a deepspeed CLI typo in the distill docs</h2>
+
+<p><strong>Request.</strong> Two real failures were reported from an 8-GPU box while launching
+distillation: <code>deepspeed --num_gpus=8 -m tools.distill_refiner ...</code> failed at argument
+parsing, and once corrected to <code>--module</code>, the process crashed on every rank with
+<code>ModuleNotFoundError: No module named 'utils.common'</code>.</p>
+
+<h3>The CLI typo</h3>
+
+<p><code>deepspeed</code>'s own argument parser has no <code>-m</code> flag; only
+<code>--module</code> is recognised (<code>-m</code> is Python's and <code>torchrun</code>'s flag,
+not deepspeed's). Two example configs had copied the wrong form:
+<code>examples/anima_refiner/distill_4gpu.toml</code> and
+<code>examples/anima_refiner/distill_rollout_4gpu.toml</code>. A repo-wide search found no other
+occurrence; the <code>torchrun ... -m tools.distill_refiner</code> lines elsewhere in the docs are
+correct as written; and the <code>deepspeed ... tools/distill_refiner.py</code> script-path form is a separate
+kind of usage that never took the module flag.</p>
+
+<h3>The import shadow &mdash; the real bug</h3>
+
+<p><code>models/base.py</code> puts <code>submodules/ComfyUI</code> on <code>sys.path</code> so it
+can import <code>comfy.*</code>. ComfyUI ships its own <code>utils/</code> directory, and it has an
+<code>__init__.py</code>, making it a <em>regular</em> package; diffusion-pipe's own
+<code>utils/</code> has none, making it a <em>namespace</em> package. The first instinct &mdash;
+move the ComfyUI insert from <code>sys.path.insert(0, ...)</code> to
+<code>sys.path.append(...)</code>, so the repo's own directory would be searched first &mdash; was
+tried and then reverted after writing a two-directory reproduction and running it both orders: per
+PEP 420, once both a regular and a namespace package exist for the same top-level name anywhere on
+<code>sys.path</code>, the regular package always wins, in either order. Ordering
+<code>sys.path</code> cannot fix this.</p>
+
+<p>What actually works, verified the same way: importing <code>utils.common</code> before ComfyUI
+ever joins <code>sys.path</code>, so it is served from <code>sys.modules</code> afterward instead of
+triggering a fresh search. <code>train.py</code> never hit this bug by accident, because it imports
+<code>utils.dataset</code> before importing any <code>models/*.py</code> module and so claims the
+name first. <code>tools/distill_refiner.py</code> imports <code>models.cosmos_predict2</code>
+first, so it always hit it &mdash; every rank, every launch, on a real box, not a corner case.
+<code>tools/cosmos_vae_test.py</code> has the same import order and would fail the same way if run.
+The fix moves the existing <code>from utils.common import ...</code> line in
+<code>models/base.py</code> to above the <code>sys.path.insert</code> line, with a comment
+explaining why the order matters.</p>
+
+<p>The project had independently diagnosed the identical mechanism once before, but only patched it
+for the test harness: <code>test/conftest.py</code> and <code>test/childenv/sitecustomize.py</code>
+both pre-import a real <code>utils</code> submodule before ComfyUI can be reached, with comments
+describing the exact same regular-vs-namespace collision. Neither one touches
+<code>models/base.py</code> itself, which is why the workaround protected every test process but not
+a real training launch outside pytest.</p>
+
+<h3>Verification</h3>
+
+<ul>
+  <li><strong>The <code>append</code> idea was empirically falsified before being shipped.</strong>
+    A throwaway two-directory reproduction (one namespace package with a real submodule, one regular
+    package without it) was imported fresh in both orderings; both orderings raised the same
+    <code>ModuleNotFoundError</code>, which is what caused the revert.</li>
+  <li><code>test/test_import_order.py</code> (new, 3 cases) reproduces the actual bug against the
+    real repository files &mdash; not toy stand-ins &mdash; because
+    <code>submodules/ComfyUI/utils/__init__.py</code> is empty, so the shadow can be triggered
+    without any GPU or ComfyUI shim. One test statically asserts the import precedes the
+    <code>sys.path.insert</code> in <code>models/base.py</code>; two subprocess tests prove the
+    broken order still breaks and the fixed order still works, with <code>PYTHONPATH</code>
+    stripped of <code>test/childenv</code> so the test-harness workaround cannot mask the result
+    being tested.</li>
+  <li>Targeted suite after the fix: <code>test_anima_refiner*.py</code>, <code>test_batch_fill.py</code>,
+    <code>test_dataset_smoke.py</code>, <code>test_import_order.py</code> &mdash; 287 passed, 1
+    skipped.</li>
+</ul>
+
+<h3>A third failure from the same launch: --local_rank</h3>
+
+<p>Fixing the two bugs above got the same 8-GPU launch one step further, straight into a third,
+unrelated one: <code>distill_refiner.py: error: unrecognized arguments: --local_rank=6</code> on
+every rank. deepspeed's default launcher appends <code>--local_rank=N</code> to each spawned
+process's argv &mdash; a legacy PyTorch DDP convention &mdash; on top of setting the
+<code>LOCAL_RANK</code> environment variable. <code>tools/distill_refiner.py</code>'s argparse only
+ever declared <code>--config</code>, so it rejected the launcher's own argument.</p>
+
+<p><code>setup_distributed()</code> is deliberately launcher-agnostic and already reads
+<code>LOCAL_RANK</code> from the environment (both deepspeed and torchrun export it), so the fix is
+to accept and ignore the flag rather than wire it in: <code>train.py</code> already declares the
+identical <code>--local_rank</code> argument for the identical reason, so this brings
+<code>distill_refiner.py</code> in line with the project's own existing convention instead of
+inventing a new one.</p>
+
+<p>Verified against the real file with the same <code>PYTHONPATH=test/childenv</code> technique
+<code>tools/check_comfy_signatures.py</code> already documents for importing the ComfyUI submodule
+on this CPU box: <code>python -m tools.distill_refiner --local_rank=0 --config
+nonexistent_probe.toml</code> now gets past argument parsing and fails on the (expected)
+<code>FileNotFoundError</code> for the missing config, instead of erroring on
+<code>--local_rank</code> before a single line of the script runs. Added
+<code>test_local_rank_is_accepted_so_deepspeeds_default_launcher_does_not_crash</code> to the
+existing <code>TestScriptStructure</code> class in <code>test/test_distill_refiner.py</code>, which
+already documents itself as holding source-level guards for paths that need a real launcher to
+exercise. Full <code>test_distill_refiner.py</code>: 228 passed, 1 skipped.</p>
+
+<h3>A fourth failure: a real regression from the batch-fill commit itself</h3>
+
+<div class="flag">
+  <p><strong>This one is on me.</strong> The first three failures from this launch were pre-existing
+  or environmental. This one is a bug my own <code>496b3f8</code> batch-fill commit introduced, and
+  it broke every distillation run unconditionally &mdash; not only ones with
+  <code>batch_fill_strategy = 'fill'</code> &mdash; on the very first batch of the very first
+  epoch, on every rank.</p>
+</div>
+
+<p>The training loop reads captions as <code>(caption, weight)</code> pairs:
+<code>batch = [preprocess_caption(c, **augment) for c, _ in entries]</code>. Two call sites feed
+<code>epoch_captions</code>: the one-time setup before the loop starts, and the reassignment
+inside the loop whenever the step count crosses into a new epoch.
+<code>git blame</code> shows the loop's own reassignment was correctly changed by
+<code>496b3f8</code> from <code>sampler.epoch_order(epoch)</code> to
+<code>sampler.epoch_order_weighted(epoch)</code> &mdash; the method that actually returns
+weighted pairs. The one-time setup line, three lines earlier, was never touched, and had called
+the plain <code>epoch_order()</code> since before batch fill existed. That method still exists on
+purpose, as the caption-only view other callers use, and correctly strips the weight back off
+&mdash; but here it meant epoch 0 handed the loop a list of bare strings while every later epoch
+handed it a list of tuples. Unpacking a multi-character string into two variables iterates its
+characters, which is exactly the reported
+<code>ValueError: too many values to unpack (expected 2)</code>, immediately, on every rank,
+every time.</p>
+
+<p>Root cause, not just the crash site: searched every call to both methods across
+<code>tools/distill_refiner.py</code> (two call sites total, both now consistent) and confirmed
+the sampler class itself was never wrong &mdash; <code>epoch_order</code> correctly derives from
+<code>epoch_order_weighted</code>, and a pre-existing test already asserted exactly that
+equivalence. The bug was purely in <code>main()</code> calling the two methods inconsistently
+between its two use sites, a class of mistake that per-method unit tests on the sampler cannot
+see, because both call sites individually returned a value in a type the sampler contract
+allows. Fixed by changing the one-time setup line to call
+<code>epoch_order_weighted</code> as well.</p>
+
+<p>Added <code>test_the_pre_loop_epoch_order_call_matches_the_in_loop_one</code> to
+<code>TestScriptStructure</code> (a static guard on both call sites agreeing), and
+<code>test_consuming_epoch_order_the_way_main_used_to_reproduces_the_real_crash</code> to
+<code>TestEpochSamplerBatchFill</code> (a behavioural reproduction: the fixed call unpacks
+cleanly, the old call raises the exact reported <code>ValueError</code>). Full
+<code>test_distill_refiner.py</code>: 230 passed, 1 skipped.</p>
+
+<h2>2026-09-03 &mdash; Batch fill: completing a short batch instead of dropping it</h2>
+
+<p><strong>Request.</strong> The pipeline silently discards samples in three places when a size
+bucket's count is not a multiple of the global batch size. Add an opt-in way to complete the batch
+instead, never repeating an image inside one global batch, covering training, eval and
+distillation, with the old behaviour unchanged by default.</p>
+
+<h3>What the spec got wrong about the code, and what was decided</h3>
+
+<ul>
+  <li><strong>&sect;3.3 and &sect;5.2 could not both hold.</strong> The spec asked for "no two
+    samples of the same image in one global batch" while also keeping the first N entries of
+    <code>iteration_order</code> untouched. Those conflict, and not because of
+    <code>num_repeats</code>: with the default <code>caption_sampling = 'all'</code>, an image with
+    three captions is three rows sharing a <code>latents_idx</code>, and the seed-0 shuffle in
+    <code>post_init</code> can already put two of them in one batch. Measured on 10 images
+    &times; 2 captions at a global batch of 16: six such pairs in the first batch, before any fill
+    ran. Decided with the maintainer: constrain the appended tail only, and write the limitation
+    into <code>docs/note/batch-fill-strategies.md</code>.</li>
+  <li><strong>&sect;6.4's proof is missing a step.</strong> It writes <code>b&middot;M = G</code>,
+    which is only true at one rank; the per-rank batch is <code>G/W</code>. The conclusion
+    (<code>s = G/G_real</code>) is right, but it needs the data-parallel average to get there. The
+    corrected derivation is in the note, because the version in the spec looks wrong at multi-GPU
+    and would invite someone to "fix" it.</li>
+  <li><strong>&sect;7.2's <code>.sum() / w.sum()</code> is the per-micro-batch normalisation
+    &sect;6.4 warns against.</strong> Same trap, one section apart. Distillation uses the same
+    global constant, for the same reason, and because a micro batch that is entirely padding would
+    divide by zero.</li>
+  <li><strong>Two loss functions leak padding.</strong> Reported, and the maintainer chose to fix
+    both plus add a test over all eight. Details below.</li>
+  <li><strong>&sect;9's premise was wrong.</strong> Six of the seven <code>anima_refiner</code>
+    training configs point at the shared <code>examples/dataset.toml</code>, not at
+    <code>examples/anima_refiner/dataset.toml</code>. So D6 was unreachable through the dataset
+    file without either editing a file every model's examples share or repointing six configs at an
+    anime-specific dataset. The optional training-config override from &sect;4.2 was implemented
+    instead, which is what makes D6 possible at all.</li>
+</ul>
+
+<h3>Decisions taken outside the spec</h3>
+
+<ul>
+  <li><strong>A parallel weights array, not a weight column.</strong> &sect;5.1 says to read a
+    weight column out of <code>iteration_order</code>, but that is an int <code>np.array</code> of
+    <code>(dataset_idx, j)</code> pairs and a float column would change its dtype, breaking the
+    <code>i.item()</code>/<code>j.item()</code> indexing in <code>__getitem__</code>.
+    <code>sample_weights</code> sits alongside it instead.</li>
+  <li><strong><code>_batch_weight_scale</code> returns <code>None</code> for an all-real
+    batch</strong>, and <code>__getitem__</code> then attaches nothing. That is what keeps
+    <code>_collate</code> on its original branch, <code>mask = None</code> included, rather than on
+    a new branch that is merely equivalent.</li>
+  <li><strong>The synthesised mask's shape.</strong> A real mask in the batch supplies the shape
+    whenever there is one, so a synthesised mask can never disagree with it; the size bucket's
+    <code>(h, w)</code> is only the fallback. Checked that all 23 model files interpolate the mask
+    to the latent size, so the pixel shape does not affect the number.</li>
+  <li><strong>float16 masks, so the weight rounds.</strong> <code>G/G_real</code> keeps about four
+    significant digits there. Below bf16 training noise, and it keeps the mask at its existing
+    size, which matters on the box this was developed on.</li>
+  <li><strong>Eval defaults <code>fill_rotate_per_epoch</code> to false.</strong> A metric that
+    moves between epochs for reasons unrelated to the model is worse than one over a fixed tail.</li>
+  <li><strong>Distillation imports <code>utils.dataset</code> for the config validator.</strong>
+    Measured at 1.6s on a ~20s startup, so the two paths share one validation function rather than
+    accepting subtly different spellings. Not the 50s case <code>utils/captions.py</code> was split
+    out to avoid.</li>
+  <li><strong>Padding is removed from <code>relational_loss</code> and <code>spread</code>, not
+    weighted to zero.</strong> A masked repeat sits at distance zero from the caption it copies,
+    and that term exists to punish distances collapsing toward zero.</li>
+</ul>
+
+<h3>The two loss-function fixes, and why they were invisible</h3>
+
+<p><code>models/cosmos_predict2.py</code> computed its <code>multiscale_loss_weight</code> terms
+with a plain <code>F.mse_loss</code>, after the masked term had already been reduced.
+<code>models/minimax_h3.py</code> called <code>single_loss</code> with no mask for the audio
+branch.</p>
+
+<p>Neither moves the loss. Measured on a 3-real / 13-padded batch at
+<code>multiscale_loss_weight = 0.5</code>: 0.155659 against a reference of 0.155521, 0.1% apart,
+because the padding is a copy of real samples and carries the same error distribution. The
+gradient is where it shows: the 13 padded slots carried &Vert;grad&Vert; 0.0084 against 0.0335 for
+the three real ones. About a fifth of the step was extra weight on the three images the padding
+was copied from &mdash; not a scale error, a per-image weighting error, which no loss curve would
+reveal.</p>
+
+<p>The other six were checked rather than assumed. <code>sdxl</code>'s
+<code>mean([1,2,3])</code> and SNR weighting are linear so the weight passes through;
+<code>cosmos</code> multiplies <code>weights_per_sigma</code> after the mask, also linear; and
+<code>ltx_video</code> already divides by <code>mask.mean()</code>, where the weight cancels
+between numerator and denominator, so it is correct either way.</p>
+
+<h3>Tests</h3>
+
+<p>90 new cases: <code>test/test_batch_fill.py</code> (70 passed, 1 skipped) and three classes
+added to <code>test/test_distill_refiner.py</code> (23).</p>
+
+<p>Two of them are the ones worth having. <code>TestEveryLossFunctionIgnoresPadding</code>
+parametrises over all eight <code>get_loss_fn</code> implementations and asserts a padded sample's
+gradient is exactly zero; reverting the two fixes turns exactly
+<code>CosmosPredict2Pipeline-ms</code> and <code>MinimaxH3Pipeline</code> red and leaves the other
+six green. <code>TestNormalisationSurvivesMicroBatching</code> drives the case a per-micro-batch
+ratio gets wrong: all the padding in one micro batch, and a micro batch that is entirely
+padding.</p>
+
+<p>The multiscale case needed a 128&times;128 latent to reach the branch at all. At the default 8
+the <code>side_length</code> is 64 against a threshold of 921.6, so the first version of that test
+passed while never executing the code it existed to cover &mdash; caught because it returned a
+number identical to the non-multiscale case.</p>
+
+<h3>Things the maintainer needs to know</h3>
+
+<div class="flag">
+  <p><strong>Masked training with <code>minimax_h3</code> changes.</strong> The audio loss now
+  takes the per-sample maximum of the image mask. An image mask that never reaches 1 now
+  attenuates the audio loss, and an image masked out entirely contributes no audio. The video
+  branch is unchanged. Audio has no spatial dimension to multiply a spatial mask against, so some
+  reduction had to be chosen; the maximum is exact for an unmasked sample and for padding.</p>
+</div>
+
+<div class="flag">
+  <p><strong>The multiscale fix also changes ordinary masked training.</strong> Anyone using
+  <code>multiscale_loss_weight</code> together with mask images was previously getting unmasked
+  gradient through the reduced scales. Their loss curve will not move, but the effective weighting
+  between images will.</p>
+</div>
+
+<ul>
+  <li><strong>No GPU run, no multi-rank run, no real training run.</strong> The multi-rank
+    behaviour is covered by constructing one bucket per rank and asserting they compute the same
+    global order and that their slices reassemble into it, which is the property a real run
+    depends on &mdash; but it is not the same as running two processes.</li>
+  <li><strong>Duplicate images inside the static part are untouched</strong>, by decision. Turning
+    fill on does not make the whole epoch duplicate-free; it makes the appended tail
+    duplicate-free. Measured numbers are in the note.</li>
+  <li><strong><code>models/cosmos.py</code> is skipped</strong> in the eight-loss test on this box:
+    it imports <code>pynvml</code>, which is not installed without a GPU. Worth running that one
+    case on the training box.</li>
+  <li><strong>Not fixed, noticed in passing:</strong> <code>models/hunyuan_image.py</code> keeps
+    its own copy of the adapter key-rewriting rule that was consolidated in
+    <code>models/base.py</code> earlier today. It was updated to delegate, so this is closed &mdash;
+    noted only because the two changes landed together.</li>
+  <li><strong>A pre-existing static-analysis guard needed extending, not silencing.</strong>
+    <code>TestEveryShippedDistillKeyIsRead</code> parses <code>tools/distill_refiner.py</code>'s
+    source to check every key the shipped configs set is actually read from the table it sits in
+    -- it caught <code>relational_loss_weight</code> shipped in the wrong table once already. It
+    flagged <code>batch_fill_strategy</code> as unread because the four keys reach the script
+    through <code>resolve_batch_fill_config(config['distill'])</code>, a call the analyzer had no
+    pattern for. Taught it a fifth shape, matching the exact style the existing four already use,
+    and added an assertion for it to <code>test_the_extractor_finds_the_known_reads</code> so a
+    regression there is caught by name rather than by four unrelated configs failing. No key was
+    added to satisfy the checker; the checker was taught what the code already does.</li>
+  <li><strong>A repo-checked-in file was briefly reverted trying to verify that guard by hand.</strong>
+    <code>git checkout -- examples/anima_refiner/distill.toml</code> was run to test the
+    misplaced-key case without checking <code>git status</code> first, which discarded that
+    file's uncommitted <code>batch_fill_strategy</code> addition (nothing else was affected --
+    checked immediately after). Restored from the sibling configs' diff. The verification that
+    mattered was redone safely afterward, against the parser's output directly rather than
+    against a real file.</li>
+</ul>
+
+
+<h2>2026-09-02 &mdash; Adapters in the sampler, and the LoKr loader that never worked</h2>
+
+<p><strong>Request.</strong> <code>tools/sample_anima_refiner.py</code> loaded no adapter at all,
+while the training side has supported LoRA, LoKr and OPLoRA for some time. Add that, with
+everything adjustable exposed as a command-line argument.</p>
+
+<p><strong>What the request uncovered.</strong> LoKr adapters could never be loaded back, by any
+path, for any model in the repo. <code>load_adapter_weights</code> reconstructed PEFT's adapter-name
+segment with <code>re.sub(r'\.weight$', '.default.weight', k)</code>. Measured against the installed
+peft 0.19.1: a LoRA parameter is
+<code>blocks.0.q_proj.lora_A.default.weight</code> and the rule fits, but a LoKr parameter is
+<code>blocks.0.q_proj.lokr_w1.default</code> &mdash; the factors live in a
+<code>ParameterDict</code>, so there is no <code>.weight</code> for the rule to find. Every LoKr key
+missed and the loader raised
+<code>modified_state_dict key blocks.0.adaln_modulation_cross_attn.1.lokr_w1 is not in the model
+parameters</code>. That is <code>init_from_existing</code> for a LoKr run, not only the new sampler
+path.</p>
+
+<p>The rule appeared twice, once in <code>BasePipeline</code> and once in
+<code>ComfyPipeline</code>, differing only in which attribute holds the model &mdash; one defect
+kept in two places. Both now call a single <code>CommonPipeline.load_adapter_weights_into</code>,
+which inverts what the saver actually wrote rather than guessing where the segment sat:
+<code>utils/saver.py</code> strips <code>.default</code> and <code>.modules_to_save</code> from each
+name, so the way back is a lookup built by applying the same two strips to the model's own
+parameter names. That is the pattern <code>CosmosPredict2Pipeline.load_adapter_weights</code>
+already used for the dense refiner. LoRA behaviour is unchanged: the LoRA half of the round-trip
+test passes both before and after.</p>
+
+<h3>Decisions taken outside the spec</h3>
+
+<ul>
+  <li><strong>Merge rather than keep the adapter live.</strong> Each adapter is injected, loaded,
+    scaled and then <code>merge_and_unload()</code>-ed before <code>to_layers()</code> runs, so what
+    samples is plain <code>nn.Linear</code> throughout &mdash; identical to a full fine tune of the
+    same weights &mdash; and a second adapter can be injected on top of the first. Strength
+    <code>1.0</code> therefore reproduces the training run exactly.</li>
+  <li><strong>Strength goes through <code>set_scale</code>, not through the factors.</strong>
+    Scaling one LoRA factor, or one LoKr Kronecker factor, would scale the delta correctly in
+    principle, but it means naming parameters per adapter type and getting the decomposed LoKr case
+    (<code>lokr_w1_a</code>/<code>lokr_w1_b</code>) right as well. Measured on peft 0.19.1 that
+    <code>LoraLayer.set_scale</code> and <code>LycorisLayer.set_scale</code> both scale the merged
+    delta linearly &mdash; 0.5 gives exactly half for each &mdash; so one code path covers both and
+    peft owns the arithmetic.</li>
+  <li><strong>Positional <code>--lora-strength</code>, refused when the counts disagree.</strong>
+    Recycling one strength across several adapters, or padding a short list with 1.0, applies a
+    weight nobody wrote. Only the two unambiguous spellings are accepted: no strengths at all, or
+    exactly one per <code>--lora</code>.</li>
+  <li><strong>Two adapters carrying a dense <code>context_refiner/</code> is refused.</strong> That
+    file replaces the text frontend outright rather than adding to it, so stacking two means the
+    last silently wins and the earlier adapter is left reading a frontend it never saw. Checked
+    before anything is merged, so the refusal costs no work.</li>
+  <li><strong>A fresh refiner plus an adapter is refused.</strong> The same combination
+    <code>configure_adapter</code> already refuses to <em>train</em>, for the same reason: the random
+    base is never written to any file and came from the ambient RNG stream, so it cannot be the one
+    the adapter was trained against. An adapter from a <code>train_context_refiner</code> run is
+    exempt, because it brings its own refiner.</li>
+  <li><strong>OPLoRA gets no flag.</strong> It constrains a LoRA after each optimizer step and never
+    changes the file format: <code>configure_adapter</code> builds <code>peft.LoraConfig</code> from
+    an explicit key list that no <code>oplora_*</code> key is in, and <code>peft.LoraConfig</code>
+    has no field that could carry one. The artefact is an ordinary LoRA, asserted by three tests so
+    that a future change to either side breaks loudly instead of leaving a phantom flag.</li>
+  <li><strong><code>load_and_fuse_adapter</code> now reads <code>peft.PeftConfig</code></strong>
+    rather than <code>peft.LoraConfig</code>. Both dispatch on the <code>peft_type</code> in
+    <code>adapter_config.json</code> and return the same class, so this is not a behaviour change;
+    naming LoRA there read as though LoKr were unsupported, which is exactly the belief that let the
+    loader bug survive.</li>
+</ul>
+
+<h3>Tests</h3>
+
+<p><code>test/test_anima_refiner_sampling.py</code> gains 22 cases. The load-bearing one is a real
+round trip, parametrised over <code>lora</code> and <code>lokr</code>: build a small
+<code>MiniTrainDIT</code> with a <code>ContextRefiner</code>, configure the adapter through the real
+<code>configure_adapter</code>, give it non-zero weights, serialise it exactly as
+<code>utils/saver.py</code> does, save through the real <code>save_adapter</code>, merge &mdash;
+then rebuild the same DiT from the same seed, load through <code>apply_adapters</code>, and require
+every parameter to match. A companion test asserts the delta is non-zero, because both adapter types
+initialise one factor to zero and a fixture whose delta is zero would prove nothing either way.</p>
+
+<p>Verified to fail without the fix: reverting <code>load_adapter_weights_into</code> to the old
+regex turns the three LoKr-touching cases red with the exact <code>RuntimeError</code> above, while
+the LoRA cases stay green.</p>
+
+<p>No mock stands in for peft anywhere in this work. The defect lives in how peft names its
+parameters, and a stand-in for peft cannot have that property &mdash; the lesson
+<code>test/test_distill_refiner.py</code>'s <code>FakeEngine</code> already taught this branch.</p>
+
+<h3>Things the maintainer needs to know</h3>
+
+<div class="flag">
+  <p><strong>A third copy of the same defect is still there, deliberately.</strong>
+  <code>models/hunyuan_image.py:140</code> carries its own <code>load_adapter_weights</code> with the
+  same <code>'\.weight$'</code> rule, so LoKr <code>init_from_existing</code> is still broken for
+  <code>hunyuan_image</code>. It is an unrelated model that this change has no way to test, so it was
+  left out rather than fixed blind. The fix is the same one line of delegation if you want it.</p>
+</div>
+
+<ul>
+  <li><strong>Never run on a GPU, and no image produced.</strong> Everything here is CPU, on a small
+    real DiT. What is verified is that the merged weights equal the training run's weights; whether
+    the resulting image looks right is not something this suite can say.</li>
+  <li><strong>Adapters merge on CPU, before the model moves to the device.</strong> That keeps peak
+    VRAM at what the merged model needs rather than model plus adapter, at the cost of a slower
+    merge. Worth revisiting if merging a large stack becomes noticeable.</li>
+  <li><strong><code>--lora-strength</code> is not clamped.</strong> Negative and above-1 values are
+    passed through on purpose, since both are ordinary things to want; neither is validated for
+    producing a sensible image.</li>
+</ul>
+
+
+<h2>2026-09-02 &mdash; Full forensic audit: a crash in eight unrelated models, and a ZeRO scaling hole</h2>
+
+<p><strong>Request.</strong> A one-shot forensic audit of the branch against <code>fd00a5e</code>,
+then fix everything it found. Three specialists covered architecture/regression, objective
+mathematics, and distributed/cache/checkpoint/tests; a fourth adversarial pass was started and cut
+short. Every finding below was re-verified at source level, and the two most serious were proved by
+running them.</p>
+
+<p><strong>The worst finding has nothing to do with the refiner.</strong>
+<code>utils/dataset.py</code> called <code>model.vae_cache_key()</code> unconditionally while the
+method was defined on <code>BasePipeline</code> only. <code>ComfyPipeline</code> inherits from
+<code>CommonPipeline</code>, not from <code>BasePipeline</code>, so every ComfyUI-backed model --
+<code>z_image</code>, <code>flux2</code>, <code>krea2</code>, <code>ltx2</code>,
+<code>ideogram4</code>, <code>ernie_image</code>, <code>hunyuan_video_15</code>,
+<code>minimax_h3</code> -- raised <code>AttributeError</code> at dataset construction, before
+training started. Eight of twenty-three model types, none of them related to this branch.</p>
+
+<p>What makes it an oversight rather than a decision is the sibling call ninety-six lines later,
+which reads the text-encoder key through
+<code>getattr(self.model, 'text_encoder_cache_key', lambda _i: '')</code>. The defensive shape was
+already in the file, from an earlier commit; the later one did not follow it. The four members now
+live on <code>CommonPipeline</code>, which both backends share.</p>
+
+<p>It also went unnoticed because <em>no test constructs the top-level <code>Dataset</code></em>.
+Fourteen tests build <code>DirectoryDataset</code> directly and skip the line entirely, so a green
+490-test suite said nothing about it. That is the "a green suite can be evidence of nothing" lesson
+arriving a second time, and the new tests assert the contract on all three classes and exercise the
+call itself.</p>
+
+<p><strong>DeepSpeed does not scale the loss inside <code>backward()</code>.</strong> The class
+docstring said it did, and so did the audit's first reading. It does not:
+<code>engine.py:2490</code> computes <code>gas_scaled_loss</code> and the line above it is commented
+<code># Used only for return value</code>. The real division is a hook DeepSpeed registers on the
+<em>output tensor of its own forward</em>. So the scaling follows the engine forward, not the
+backward call -- and any gradient path that reaches the parameters without passing through
+<code>engine(...)</code> never gets it.</p>
+
+<p>The rollout's unconditional branch is exactly such a path. It calls the bare
+<code>refiner</code> on purpose, because a second engine forward inside one backward builds a
+second hook manager and leaks <code>_backward_active_depth</code>. The comment explaining that
+says "the parameters are shared either way, so the gradients still reduce correctly", which is true
+of the all-reduce and says nothing about the accumulation scaling. Measured against a real engine
+at <code>gradient_accumulation_steps = 4</code>: the engine path lands at 1.0x a single
+un-accumulated batch, the bypassing path at exactly 4.0x.</p>
+
+<p>Fixed with <code>strategy.scale_side_branch()</code> -- a no-op under DDP, which divides the
+whole loss once, and a <code>/N</code> hook under ZeRO. Stating the invariant on the strategy keeps
+it in one place instead of at each call site. The same measurement with the hook applied returns
+1.0x. Worth stating plainly: <strong>no shipped config reached this</strong>, since all four use
+<code>distributed_strategy = 'ddp'</code> and <code>guidance_scale = 0.0</code>. It was a latent
+bug in a supported combination, not a broken default.</p>
+
+<p><strong>Two holes in the cache-identity fix from the entry below.</strong> The first is that
+<code>_map_and_cache</code> returns early when the cache already holds every row, and the manifest
+was only written after the map. A cache that was already complete therefore never acquired one --
+not on the next run, not ever -- so the protection was permanently inert on exactly the installs it
+was written for: someone with a warm cache who changes <code>llm_path</code>. The docstring claimed
+it "gets a manifest the next time it is written in full", which was the property nobody had
+checked. The second is the unconditional embedding cache, written by its own call a few lines
+later, which was never passed the identity at all. For <code>anima</code>, whose fingerprint key is
+deliberately empty, its fingerprint is that of a constant one-row dataset and is identical for
+every run ever -- so a conditional cache would correctly rebuild while the unconditional embedding,
+the one every CFG-dropped sample trains against, came back from the old encoder.</p>
+
+<p><strong>Checkpointing: three things that only bite on the unhappy path.</strong> The stable
+filenames were written with <code>shutil.copy2</code>, which truncates the destination and streams
+-- the precise hazard <code>_save_file_atomically</code> exists to prevent, applied to the tagged
+file but not to the name every shipped config points at. Nothing recorded which step the weights
+came from, so weights and optimizer moments from different saves paired up silently and resumed an
+already-annealed schedule against weights from further ahead. And <code>save_full_model</code>
+rounded the refiner to <code>dtype</code> while <code>save_refiner</code> deliberately kept fp32,
+with a docstring arguing that rounding "threw away sixteen mantissa bits ... on every resume" --
+both files being valid <code>resume_from</code> sources.</p>
+
+<p><strong>Two more tests that could not fail.</strong> The entry below fixed two; these are the
+next two.
+<code>test_setup_distributed_single_process</code> had a parametrisation sitting behind
+<code>if not env:</code>, so the case with <code>RANK</code> set ran zero assertions and passed
+whatever the function returned. The guard's reason was real -- that path calls
+<code>init_process_group</code> -- so the collective is stubbed rather than the check skipped.
+<code>test_the_probe_seed_is_not_rank_offset</code> asserted <code>'manual_seed(seed)' in src</code>,
+which still matches the global seed on another line, so giving the probe generator a rank offset
+left the test green. That is the one invariant whose violation makes every rank optimise a
+different objective. Both now assert on something an inversion breaks, confirmed by mutating the
+probe seed and watching the test go red.</p>
+
+<p><strong>What the audit did not find, stated because it is evidence too.</strong> Every
+distillation objective held up. The CFG formula is the textbook one and matches the sampler, and
+the dangerous <code>0 &lt; g &lt;= 1</code> band is refused. The rollout is teacher-owned, fully
+inside <code>no_grad</code>, evaluates the student at the same <code>(x, t)</code> against the
+stored teacher velocity, has the right Euler sign, and bottoms out at <code>t = 0.125</code> for
+<code>steps = 8</code> exactly as documented. <code>init_weights</code> covers every parameter, and
+the <code>RotaryEmbedding.inv_freq</code> buffer question -- a non-persistent buffer no checkpoint
+would restore -- is already documented and guarded <em>by construction</em> in
+<code>tools/check_vendored_apis.py</code>, which builds a module and checks the property rather
+than reading a signature default. The ZeRO accumulation boundary from the earlier round is correct
+against DeepSpeed 0.18.4's own source. Caption and embedding indices are paired correctly. No
+config key in any shipped distillation config is unread.</p>
+
+<p><strong>One reported finding was wrong, and the experiment is why.</strong> A specialist
+derived that <code>torch.cdist(x, x)</code> switches to a matmul implementation above
+<code>n = 25</code> and that the exactly-zero diagonal would make <code>sqrt</code>'s backward
+produce <code>inf</code>/<code>NaN</code>, breaking <code>relational_loss</code> at the shipped
+<code>batch_size = 48</code>. The implementation does switch -- the <code>grad_fn</code> changes
+and the diagonal stops being exactly zero -- but the gradients are finite at unit scale, at the
+<code>/512</code> scale <code>padded_mean</code> actually produces, and even with the diagonal
+forced to exactly <code>0.0</code>. Reported as refuted rather than fixed. A derivation that
+predicts a number is worth ten seconds of running it.</p>
+
+<p><strong>A second pass closed the findings that had been reported but not yet verified.</strong>
+Each was re-derived before being touched, because the <code>cdist</code> case had already shown
+what fixing on a report rather than on evidence costs.</p>
+
+<ul>
+<li><strong><code>bf16-full</code> under DDP now warns when the optimizer has no Kahan
+compensation.</strong> The cast to bf16 happens before the optimizer is built, so the Adam moments
+become bf16 too, and bf16's 8 mantissa bits put the rounding floor at about <code>2^-9</code>
+relative to the weight. That is the same underflow <code>fp16-full</code> is refused for, with
+three fewer mantissa bits. Not refused, because the shipped 4-GPU configs use it deliberately --
+but they pair it with <code>adamw8bitkahan</code>, and that pairing was documented as "the safer
+pick" rather than as the thing that makes the mode work at all. Worth being explicit, because
+<code>adamw8bit</code> and <code>adamw8bitkahan</code> save <em>the same</em> memory (Kahan is a
+subclass of <code>AdamW8bit</code>, so the moments are 8-bit either way) and only one of them
+addresses the parameter rounding. The example configs and
+<code>docs/anima_refiner/README.md</code> now say which problem each solves.</li>
+
+<li><strong>Checkpoint retention pruned the current run's own checkpoints.</strong> Tags are
+ordered by number, and numbers only increase within one run. A second run into a directory holding
+<code>epoch18/19/20</code> with <code>keep = 3</code> writes <code>epoch1</code> (protected, so
+nothing goes), then <code>epoch2</code> -- at which point <code>epoch1</code> is the lowest number
+present and is deleted. The run ends holding the previous run's three checkpoints and one of its
+own. The obvious fix -- refuse to delete any tag this process wrote -- is worse than the bug, and
+it took two tries to see why. In a single uninterrupted run <em>every</em> tag is one this process
+wrote, so that rule prunes nothing at all and the directory grows without bound, which is the exact
+opposite of what <code>keep_last_n_checkpoints</code> is for. The existing tests did not catch it
+because none of them passes the accumulating set the real save loop passes. What was actually
+needed is an ordering, not an exemption: the sort key puts this run's tags after every tag it did
+not write, so the oldest run is pruned first, while this run's own early checkpoints stay ordinary
+candidates. Only the tag being written right now is exempt outright. There is a test for each half
+-- a second run into a populated directory, and one long run that must still drop its own early
+checkpoints.</li>
+
+<li><strong>Two hardcoded shapes.</strong> The probe's <code>num_heads</code> defaulted to a
+literal 16 while <code>get_dit_config</code> derives the real count from the checkpoint (16 at
+2048 channels, 40 at 5120, 20 at 1280), so <code>head_dim</code> -- and with it the default
+<code>num_queries</code> -- was wrong for anything but Anima. And
+<code>tools/sample_anima_refiner.py</code> allocated its initial latent with a literal 16 channels
+while the rollout in the trainer already took <code>in_channels</code> from the config. Both now
+read the model.</li>
+
+<li><strong>Two stale doc claims.</strong> <code>design-notes.md</code> had a section headed
+<code>num_queries = 64</code> arguing for 64 when the code default has been <code>2 * head_dim</code>
+(256 for Anima) for some time, and <code>denoising-rollout.md</code> said only the summed loss is
+logged when each weighted term has its own column.</li>
+</ul>
+
+<p><strong>Left alone deliberately.</strong> <code>models/base.py</code> takes a tar member name
+with <code>str(spec[1])</code>, which is the "<code>as_posix</code> for archive members" lesson
+again -- but it is byte-identical to <code>fd00a5e</code>, so it belongs to a different change than
+this one, and widening the diff to reach it would make this commit harder to review rather than
+safer.</p>
+
+<p><strong>A third pass: the three "needs GPU" items were mostly not GPU-bound.</strong> What made
+them get deferred was a claim in <code>docs/note/upstream-api-drift-audit.md</code> that
+<code>deepspeed.initialize</code> cannot run on a CPU box because it JIT-builds
+<code>deepspeed_shm_comm</code> and needs a compiler. That is only true of the default path.
+Marking the shm op incompatible in <code>deepspeed.ops.__compatible_ops__</code> first -- which
+the suite's own real-engine test has been doing all along -- lets a real engine run on gloo, at
+one rank or two. The note has been corrected, because a wrong "this cannot be checked" is more
+expensive than a missing check: it stops anyone looking again.</p>
+
+<ul>
+<li><strong>ZeRO fp32 master weights and the dynamic loss scale are now checkpointed.</strong>
+Confirmed against a real engine first: <code>initialize</code> casts the module to bf16, so
+<code>save_refiner</code> -- which writes the module -- was writing the bit16 view, while the only
+full-precision copy sat in the flat fp32 partition <code>initialize</code> installs as the client
+optimizer's <code>param_groups</code>. <code>optimizer.state_dict()</code> carries the moments and
+the loss scaler but never the parameter values, so a resumed <code>bf16-full</code> run restarted
+its masters from 8-mantissa-bit values and discarded every sub-bf16 increment since the last save.
+The payload now carries them and the restore copies in place, because the engine holds references
+to those exact tensors. A checkpoint without masters is left alone, and a count or shape mismatch
+warns rather than corrupting.</li>
+
+<li><strong>ZeRO stage 2 now has real-engine coverage.</strong> The boundary test was hardcoded to
+stage 1, and stage 2 takes a different backward path -- it reduces on every micro batch rather
+than only at the boundary. Parametrised over both.</li>
+
+<li><strong>The side-branch scaling fix is verified across two real ranks.</strong>
+<code>tools/test_zero_side_branch_multirank.py</code> spawns two gloo ranks with a real ZeRO engine
+at <code>grad_accum = 4</code> and measures, per rank: engine path 1.0x a single un-accumulated
+batch, bypassing path 4.0x, and 1.0x with the hook -- then all-gathers to confirm the ranks agree.
+It also fails loudly if a future deepspeed moves the division into <code>backward()</code>, at
+which point the hook would be double-scaling and must be removed.</li>
+</ul>
+
+<p><strong>The fp16 branch was mock-only too, and no longer is.</strong>
+<code>torch.amp.GradScaler('cpu')</code> is fully functional in this torch, which the fp16 tests
+had not been taking advantage of: they asserted against a hand-written stand-in while the real
+branch went unexecuted, because <code>GradScaler('cuda')</code> disables itself here. It now
+drives <code>DDPStrategy.step()</code> for real and asserts the three things that branch exists
+for -- the reported norm is unscaled, so <code>max_grad_norm</code> is not compared against a
+gradient inflated by the loss scale; a non-finite gradient skips the optimizer step <em>and</em>
+holds the schedule; a finite one does both. The same shape of lesson as the deepspeed one above:
+the capability was there, and the habit of assuming otherwise is what kept it unused.</p>
+
+<p><strong>fp16 arithmetic turned out to be exercisable too.</strong>
+<code>torch.autocast('cpu', dtype=torch.float16)</code> is real in this torch, even though
+<code>Precision.autocast</code> returns a null context off-CUDA and so never engages it. fp16
+numbers now go through the actual ContextRefiner at ordinary scale, at 50x scale, and on the
+degenerate all-padding row, and all stay finite -- the padded row producing exactly zero rather
+than NaN, which is the fp16 half of the fused-attention question. What a CUDA kernel could still
+differ on is the fused path; the operations themselves do not overflow fp16 at these scales. That
+is the third assumption about this machine's limits to fall in one session, which is itself the
+finding: two of the three were written down as facts in the docs.</p>
+
+<p><strong>Hardware, definitively.</strong> Checked rather than assumed:
+<code>torch.cuda.is_available()</code> is False, <code>device_count()</code> is 0,
+<code>torch.version.cuda</code> is None -- this is a <code>+cpu</code> build, so it could not
+drive a GPU even if one were attached -- and <code>nvidia-smi</code> is absent. Validation on real
+CUDA hardware, and a real training run, cannot be performed in this environment by any means. That
+is a property of the machine rather than work left undone.</p>
+
+<p><strong>Not verified, and worth being exact about what that leaves.</strong> Still no training
+run and no image. Of what remains, none is an unverified branch of this code. The fp16
+<em>kernel numerics</em> are a property of CUDA rather than of this control flow. Whether fused
+CUDA SDPA really returns NaN for a fully-masked row is the rationale for
+<code>allow_fully_masked_rows</code>, but the guard is correct either way -- it is provably a
+no-op for any row that has a key, and the degenerate row returns exactly the zero the masked
+softmax was meant to produce, because k_proj and v_proj carry no bias. If the premise is wrong
+the guard is merely unnecessary, never harmful. Rollout peak VRAM is a capacity number, and
+output quality is the research question itself.</p>
+
+<p>Two findings are left unfixed on purpose rather than for want of hardware. The relational
+term's magnitude does scale as <code>(B-1)/B</code>, because the <code>mean</code> reduction spans
+the whole <code>B x B</code> matrix including the zero diagonal and counts each pair twice -- but
+measured with a constant per-pair disagreement held across batch sizes, the raw loss moves about
+2x between batch 8 and batch 48 while that factor predicts only 1.12x. Most of the spread is
+sampling noise that settles by batch 16, so correcting a 12% term would move the loss balance of
+every existing run for no measured gain. And <code>models/base.py</code> takes a tar member name
+with <code>str()</code>, which is the <code>as_posix</code> rule again, but it is byte-identical
+to <code>fd00a5e</code> and belongs to a different change than this one.</p>
+
+<p>The full evidence, including what each remaining GPU check would settle, is in
+<code>.audit/FINDINGS.md</code>.</p>
+
+<h2>2026-09-02 &mdash; Audit follow-up: anima's own cache identity, and two tests that could not fail</h2>
+
+<p><strong>Request.</strong> Same session as the entry below, second pass: close the findings that
+were classed as pre-existing or as test-quality rather than as defects, so nothing from the audit
+is left open.</p>
+
+<p><strong>anima shared text embeddings between different LLMs.</strong> The audit filed this as
+pre-existing and out of scope, which it is, but it is the same silent-reuse class as the text cache
+fix below and it had a free fix. <code>text_encoder_cache_key</code> returns <code>''</code> for
+<code>anima</code> deliberately &mdash; putting the key in the fingerprint would move the cache path
+of every existing anima install. The side effect was that nothing distinguished two anima runs with
+different <code>llm_path</code>, so one run silently reused the other's embeddings.</p>
+
+<p>The fix separates the two questions the one string was answering. The fingerprint decides
+whether to rebuild, so adding to it is expensive; the manifest only records whose contents these
+are, and a cache with no manifest is already treated as compatible. So <code>BasePipeline</code>
+gains <code>text_encoder_identity</code>, defaulting to the fingerprint key so every other model is
+unchanged, and cosmos_predict2 overrides it to name the LLM for <code>anima</code> as well as
+<code>anima_refiner</code>. No existing cache moves and none is invalidated; new ones make a claim
+that a later mismatch can be caught against. This is the same recorded-not-fingerprinted shape
+<code>vae_cache_key</code> already uses for latents.</p>
+
+<p><strong>Two tests asserted text that could not fail.</strong> The audit's most useful test
+finding was not a missing test but a passing one: a test that would still pass if the behaviour it
+covers were inverted.</p>
+
+<ul>
+  <li><code>test_ddp_no_sync_wraps_all_but_the_last_micro_batch</code> asserted that two string
+    literals appear somewhere in <code>distill_refiner.py</code>. Inverting the condition to
+    <code>not is_last</code> leaves both literals intact, so the test could not tell the
+    accumulation boundary from its opposite &mdash; while the equivalent ZeRO logic next to it is
+    exercised against a real engine. Added <code>TestNoSyncBoundaryBehaviour</code>, which runs
+    <code>micro_batch_context</code> and checks which context comes back, including that world
+    size 1 never touches <code>no_sync</code> (it only exists on a DDP-wrapped module).</li>
+  <li><code>test_the_two_prefix_lists_agree</code> checked only that the pipeline's prefixes are a
+    subset of <code>_CHECKPOINT_PREFIXES</code>. The other direction is the mirrored bug: a prefix
+    the extractor knows and the pipeline does not means a file that loads as
+    <code>context_refiner_path</code> fails as <code>transformer_path</code>. Both directions are
+    now asserted, plus that the regex still matches anything at all &mdash; a regex that silently
+    stops matching turns this into a test of nothing.</li>
+</ul>
+
+<p>The prefix check passed in the new direction immediately, so the lists did agree; the point is
+that nothing was checking.</p>
+
+<p><strong>Not changed.</strong> The remaining <code>TestScriptStructure</code> cases still assert
+on source text. That is the right tool for some of them &mdash; "the launcher sets this env var",
+"this import exists" &mdash; and rewriting them wholesale was not worth the churn. The two fixed
+here are the ones where a real behaviour with a real inversion sat behind the string.</p>
+
+<h2>2026-09-02 &mdash; Five-agent adversarial audit: a stale text cache, an unguarded teacher, and a drift-guard hole</h2>
+
+<p><strong>Request.</strong> A full adversarial audit of the branch against baseline
+<code>fd00a5e</code>, then fix everything it found. Four specialists covered architecture,
+objective mathematics, distributed/numerical behaviour, and tests/cache/upstream; the two
+headline findings were re-verified at source level before anything was changed.</p>
+
+<p><strong>What the audit did not find is worth stating first.</strong> Every distillation
+objective held up. The CFG formula is algebraically the textbook one, the rollout timestep
+schedule and Euler sign are identical across the trainer, <code>models/cosmos_predict2.py</code>
+and the sampler, the rollout is teacher-driven and fully inside <code>no_grad</code> with
+gradient reaching only the refiner, <code>ContextRefiner.init_weights</code> covers all 28
+parameters on all four construction paths, and the ZeRO accumulation boundary is correct against
+DeepSpeed 0.18.4's own source. The relational loss's deviation from textbook RKD was re-derived
+and is provably the right call: per-side normalisation cancels a uniform collapse factor exactly,
+so the textbook form cannot see the failure it is meant to price.</p>
+
+<p><strong>The text embedding cache could serve embeddings for captions that no longer exist.</strong>
+<code>keep_text_embedding_cache</code> was new on this branch, undocumented, and mapped straight
+onto <code>keep_on_fingerprint_change</code>. It was added to mirror <code>keep_latent_cache</code>,
+but the two are not symmetric. Captions were deliberately removed from the <em>latent</em>
+fingerprint, so that flag has almost nothing left to suppress. For the <em>text</em> cache the
+caption text is essentially the whole fingerprint &mdash; so the flag's only reachable effect was
+to ignore an edit to the captions and pair old embeddings with new text by index, with correct
+shapes, a correct count, and no error. That contradicts the contract the introducing commit wrote
+down for itself: keep_* means "do not recache unnecessarily", and a caption edit is a necessary
+recache.</p>
+
+<p>Fixed by recording a digest of the input in the cache manifest beside the producer identity
+&mdash; <code>identity</code> answers "who produced this", <code>content_digest</code> answers
+"from what". On reuse, the first <em>N</em> current captions are re-hashed against it. Appending
+rows still reuses what is cached, which is the case the flag exists for and the reason it was kept
+rather than deleted; editing a row that is already cached rebuilds. A cache with no recorded digest
+claims nothing and is still reused, so existing installs are unaffected. The manifest is now
+schema 2, and both fields are optional in it.</p>
+
+<p><strong>The teacher had no guard for the fully-masked row the student got one for.</strong>
+<code>ContextRefiner.forward</code> widens an all-padding attention mask so the row attends freely,
+because the fused CUDA backends can return NaN for a fully-masked softmax and NaN times zero is
+still NaN. <code>LLMAdapter</code> &mdash; the teacher the refiner is distilled against &mdash; had
+no such guard, and <code>build_unconditional_features</code> hands it an all-zero
+<code>source_attention_mask</code> on every guided-rollout micro-batch. The docstring explaining
+why the teacher "needs no help" is about <code>target_attention_mask</code>, the T5 query sequence;
+<code>source_attention_mask</code> is a different mask and is genuinely all zero for an empty
+caption. The root is pre-existing and reaches plain <code>anima</code> too; what is new is that the
+rollout exercises it every step rather than on unlucky caption-dropout draws.</p>
+
+<p>The guard moved into <code>Attention</code> itself as <code>allow_fully_masked_rows</code>, so
+both consumers get it from one place &mdash; the duplication is what let them drift apart. This is
+provably not a behaviour change for <code>anima</code>: <code>_compute_text_embeddings</code> zeroes
+every masked position, and <code>k_proj</code>/<code>v_proj</code> carry no bias, so the values are
+zero and attending freely returns the same exact <code>0.0</code> the masked softmax was meant to
+produce. That is asserted directly in the new tests rather than argued.</p>
+
+<p><strong>The drift guard did not cover the newest dependency surface.</strong>
+<code>tools/check_vendored_apis.py</code> covered torch and bitsandbytes;
+<code>check_comfy_signatures.py</code> covered ComfyUI. Neither covered the
+<code>transformers</code>/<code>accelerate</code> surface this branch added, which walks concrete
+attribute paths (<code>full_model.model.language_model</code>) and indexes the hidden-states tuple
+by position &mdash; and requirements.txt pins neither. Added both, with two behavioural checks an
+import test could not make: that <code>output_hidden_states</code> still yields
+<code>num_hidden_layers + 1</code> tensors ending in <code>last_hidden_state</code>, and that
+<code>init_empty_weights</code> still leaves buffers off the meta device. Checks went from 34 to
+60.</p>
+
+<div class="note">
+<p><strong>The accelerate check found something on its first run.</strong> It was written to assert
+<code>include_buffers</code> defaults to <code>False</code>. It does not: the default is
+<code>None</code>, resolved from the <code>ACCELERATE_INIT_INCLUDE_BUFFERS</code> environment
+variable. The effective default is still False, so nothing is broken, but the property
+<code>ContextRefiner.init_weights</code> relies on &mdash; that <code>inv_freq</code> stays real
+while every parameter goes to meta &mdash; is environment-controlled rather than fixed. The check
+was rewritten to prove it by construction instead of by reading a signature.</p>
+</div>
+
+<p><strong>Smaller fixes.</strong> DDP resume now records <code>batch_size</code>,
+<code>grad_accum</code>, <code>world_size</code> and <code>precision</code> and warns when they
+drift, rather than only refusing under ZeRO &mdash; a deliberate warn rather than a refusal, since
+DDP replicates optimizer state and resizing is legitimate; what does not carry across is the
+alignment of the saved step and the schedule total. The DDP <code>fp16-mixed</code> path no longer
+advances the LR scheduler on a step <code>GradScaler</code> skipped, which DeepSpeed already gated
+on and this did not. Caption files are read as <code>utf-8-sig</code>: a Windows editor's BOM
+survives <code>str.strip()</code>, so it rode into the tokenizer on the first caption of a file and
+nowhere else. Files this repo writes itself keep plain utf-8.</p>
+
+<p><strong>Documentation.</strong> <code>keep_text_embedding_cache</code> is now documented in
+<code>examples/dataset.toml</code>, including what it is not for. The design note claiming the
+denoising rollout was unimplemented was written before the rollout landed and now points at it.
+A comment in <code>utils/saver.py</code> warned of a <code>step</code>/<code>global_step</code>
+prefix collision that <code>startswith</code> cannot produce; a local named <code>missing</code>
+held the keys that were present. Both corrected.</p>
+
+<p><strong>Left deliberately unfixed.</strong> Nothing found requires a redesign, and no defect
+reachable from a shipped example config silently corrupts a default run. What remains is that
+nothing on this branch has ever executed on a GPU. Three experiments should run before serious
+compute: one GPU with <code>rollout.guidance_scale &gt; 0</code> asserting a finite loss (this
+settles the teacher-mask finding, which cannot be reproduced on CPU because the CPU math backend
+returns zeros where the fused kernels return NaN); two GPUs at
+<code>gradient_accumulation_steps=3</code> confirming three real optimizer updates in nine steps;
+and one distil-save-sample round trip, because no image has been produced from this branch.</p>
+
+<h2>2026-09-01 &mdash; The 4-GPU configs move to a caption corpus</h2>
+
+<p><strong>Request.</strong> This phase does not use a dataset.toml. Point the two 4-GPU configs
+at a JSONL corpus and restate the caption settings under <code>[distill]</code>.</p>
+
+<p>The switch itself is two keys. What it changes is where caption augmentation comes from: with a
+dataset.toml, <code>caption_augment_config</code> falls back to the dataset&rsquo;s own settings, so
+distillation augments the way the diffusion stages do without restating anything. A corpus carries
+no dataset config, so every unstated setting silently defaults to off &mdash; and the refiner then
+learns a caption distribution the diffusion stages never see. The script already warns about this;
+the configs now restate <code>prefix_tag_caption</code>, <code>shuffle_tags</code>,
+<code>cache_shuffle_delimiter</code> and <code>tag_dropout_rate</code> so the warning does not
+fire and the behaviour is visible in the file.</p>
+
+<div class=flag>
+  <p><strong>The table guard had a blind spot exactly the size of this change.</strong> Adding
+  those four keys made <code>test_every_key_is_read_from_the_table_it_sits_in</code> fail, claiming
+  the script never reads them &mdash; while a direct call to <code>caption_augment_config</code> on
+  the same file resolved all four correctly. The extractor recognises
+  <code>config[table].get(key)</code> and friends, but <code>caption_augment_config</code> reads
+  through a closure, <code>setting(key, default)</code>, which indexes the table with a variable.
+  So the whole caption-augmentation family was invisible, and the guard&rsquo;s first act on
+  meeting them was a false alarm on the documented way to configure a corpus run. The extractor
+  now understands <code>setting()</code>, and <code>test_the_extractor_finds_the_known_reads</code>
+  pins one of those keys so the extension cannot rot silently.</p>
+</div>
+
+<ul>
+  <li><strong>A warmup that is fine at 20,000 steps is not fine at 1,300.</strong> The global batch
+    here is 48 x 8 x 4 = 1536, so an epoch is <code>len(captions) / 1536</code> steps and the run
+    is twenty of those. At 100,000 captions that is 1,300 optimizer steps, where the default
+    <code>warmup_steps = 500</code> is 38% of the schedule &mdash; nothing errors, the run just
+    spends a third of itself ramping. <code>warmup_advice()</code> now says so at startup and names
+    the number it would use, and both configs carry the arithmetic as a table. Extracted rather
+    than left inline in <code>main()</code>, for the same reason <code>resolve_schedule</code> was:
+    a thing that only runs inside a 500-line function is a thing that only gets tested by running
+    a 500-line function.</li>
+  <li><strong>A documentation ambiguity worth naming.</strong> denoising-rollout.md said adjacent
+    trajectory points give correlated signal, &ldquo;the same argument <code>[probe] num_blocks</code>
+    rests on&rdquo;. That reads as though the probe&rsquo;s block count affects the rollout. It does
+    not: <code>num_blocks</code> selects which frozen cross-attention blocks objective 1 measures
+    through, and the rollout calls the whole DiT because it needs the velocity the model actually
+    predicts. Said explicitly now.</li>
+  <li><strong>Tests.</strong> 469 passed, 1 skipped.</li>
+</ul>
+
+<h2>2026-09-01 &mdash; Six defects in the epochs and checkpoint-retention round</h2>
+
+<p><strong>Context.</strong> The previous entry shipped epochs, retention, tagged checkpoints and
+resume, and recorded that the tests arrived a commit late. An audit of that work found six real
+defects, two of them blockers on the exact configuration a four-GPU box would run. Two were found
+by reading the code here, four by an independent adversarial reviewer given the same brief. All
+six are fixed below.</p>
+
+<div class="flag">
+  <p><strong>The two blockers were both in code written the day before, and both had been
+  reported as verified.</strong> That is the finding worth keeping. &ldquo;Verified&rdquo; had
+  meant a throwaway script exercising the happy path of one function; neither blocker is visible
+  from that vantage point, because both are about the <em>order</em> in which a 500-line
+  <code>main()</code> reads its own variables and about what a library does to an object it is
+  handed. Neither is reachable without either running the real thing or reading the whole
+  function as a sequence.</p>
+</div>
+
+<h3>1. The step count was read before it was known (blocker)</h3>
+
+<p>With <code>[distill] epochs</code> set, <code>steps</code> stays <code>None</code> until it is
+derived from the sampler. The sampler was built below the optimizer, so
+<code>build_lr_scheduler</code> received <code>total_steps=None</code>.
+<code>CosineAnnealingLR(T_max=None)</code> constructs without complaint and
+<code>SequentialLR</code> hands over to it at the warmup milestone, so the failure is a
+<code>TypeError</code> from inside torch at <em>scheduler step 500</em> &mdash; roughly 500
+optimizer steps at a global batch of 1536, with a traceback pointing nowhere near the config.
+Both shipped four-GPU configs use <code>epochs = 20</code> with the default
+<code>warmup_steps = 500</code>, so both died. Setting <code>resume_from</code> on an epochs
+config raised <code>TypeError</code> at startup instead, from the resume guard comparing an int
+against None.</p>
+
+<p><strong>Fixed structurally rather than by moving two lines.</strong> The sampler and the step
+count are one decision, so <code>resolve_schedule()</code> now returns both together and is
+called immediately after the captions load. Reading one without the other is no longer possible
+to express. It also means the &ldquo;too few captions&rdquo; refusal fires before ~7 GB of
+teacher and student weights are resident, which is what <code>validate_config_early</code>
+exists to achieve. A warning was added for <code>warmup_steps &gt;= steps</code>: with
+<code>epochs</code> the step count is derived rather than written down, so a warmup longer than
+the whole run is easy to arrive at without noticing, and it silently disables the decay phase.</p>
+
+<h3>2. ZeRO wrote optimizer state it could not read back (blocker)</h3>
+
+<p><code>deepspeed.initialize</code> mutates the client optimizer in place:
+<code>stage_1_and_2.py:473</code> replaces each param group's parameter list with a single flat
+rank-local fp32 partition. So under <code>zero1</code>/<code>zero2</code>, rank 0's
+<code>state_dict()</code> is a shard, not the state, and the other ranks' shards were never
+written at all. Three failure modes, all reproduced against the installed torch and deepspeed:
+the file is written without error; resuming it raises <em>&ldquo;loaded state dict contains a
+parameter group that does not match the size of optimizer's group&rdquo;</em>; and resuming a
+DDP-written file under ZeRO loads successfully, then has its state orphaned by
+<code>initialize</code> and blows up with a <code>KeyError</code> in
+<code>Optimizer.state_dict</code> at the next save &mdash; hours later.</p>
+
+<p>Every rank now writes <code>distill_state_&lt;tag&gt;_rank&lt;N&gt;.pt</code>, and the load
+moved to <em>after</em> <code>build_strategy</code> so the optimizer has the shape the shard was
+written in. DDP could load on either side of the wrap; it moved too, so there is one order to
+reason about and so the fp16 <code>GradScaler</code> exists to be restored as well. The two
+layouts are named apart on disk, which is what stops a DDP file from being fed to a sharded
+optimizer, and <code>world_size</code> is recorded so a resume into a differently sized job is
+refused rather than loading another rank's partition.</p>
+
+<div class="flag">
+  <p><strong>This fix is unit-tested but not hardware-tested.</strong>
+  <code>deepspeed.initialize</code> does not run on this machine &mdash; it JIT-builds
+  <code>deepspeed_shm_comm</code> and needs MSVC. The file-level behaviour is covered in the
+  suite against a plain torch optimizer; the premise it rests on was confirmed by reading the
+  installed deepspeed source, not by running it. <code>tools/test_zero_resume_gpu.py</code>
+  checks all five claims on a real two-rank GPU box and should be run before anyone trusts ZeRO
+  resume. The default and the shipped configs are <code>ddp</code>, which is fully covered.</p>
+</div>
+
+<h3>3. A commented key in the wrong table (serious)</h3>
+
+<p>Both four-GPU configs put <code>#resume_from</code> under <code>[distill]</code>; the code
+reads it from <code>[student]</code>. Uncommenting it starts from a randomly initialised refiner
+at step 0, silently, and the fresh run's checkpoints then overwrite the interrupted one's. The
+existing guard, <code>test_every_key_is_read_from_the_table_it_sits_in</code>, is exactly the
+right shape for this bug class and cannot see it: <code>toml.load</code> discards comments. A
+companion test now scans commented <code>#key =</code> lines, following commented table headers
+so that the fully commented <code>#[rollout]</code> block in <code>distill.toml</code> does not
+read as a hundred misplacements. It was checked against the buggy version of the config before
+being kept, so it is known not to pass vacuously. This repo has now shipped a key in the wrong
+table three times.</p>
+
+<h3>4. A tagged full model found the wrong state file (serious)</h3>
+
+<p><code>training_state_path</code> matched only the <code>context_refiner</code> stem, so
+<code>model_epoch7.safetensors</code> &mdash; documented as a first-class rollback target &mdash;
+resolved to the untagged <code>distill_state.pt</code>: epoch-7 weights paired with the newest
+moments and the newest step counter. That is precisely the mispairing the function's own
+docstring says it exists to prevent. It now matches both prefixes a save writes.</p>
+
+<h3>5. Retention could delete the checkpoint it had just written (minor)</h3>
+
+<p>Tags are ordered by their number, which only increases within one uninterrupted run. Reusing
+an <code>output_dir</code>, or resuming onto fewer ranks (which raises
+<code>steps_per_epoch</code> and lowers the epoch number), writes a lower tag than what is
+already there &mdash; and the prune then removed the fresh checkpoint, announcing it as a routine
+eviction. The current tag is now protected. Rank shards are pruned with their tag as well, globbed
+on the <code>_rank</code> separator rather than on the number: a bare
+<code>distill_state_epoch1*</code> also matches <code>distill_state_epoch10.pt</code>.</p>
+
+<h3>6. A resume correlated the augmentation noise across ranks (minor)</h3>
+
+<p><code>main()</code> offsets the global random seed by rank so the ranks draw different caption
+augmentations. Only rank 0 writes a DDP state file, and restoring it on every rank collapsed that
+offset for the rest of the run. The captions still differ &mdash; <code>EpochSampler</code>
+shards them &mdash; so this was correlation in the noise, not duplicated training data. The
+stream is now restored only by the rank that owns it; the others re-offset. The torch stream is
+rank-uniform by construction and is still restored everywhere, which is what an uninterrupted run
+would have had.</p>
+
+<ul>
+  <li><strong>Also carried in resume state now:</strong> the rollout's two RNG streams (seeded
+    apart from the global one so that enabling the rollout does not shift the caption
+    augmentation), and the fp16 <code>GradScaler</code>. And the restored learning rate is pushed
+    into the optimizer immediately: <code>load_state_dict</code> restores the schedule's position
+    but leaves the optimizer on its construction-time LR until the next <code>step()</code>,
+    which is one step near zero at the start of a warmup.</li>
+  <li><strong>Verified correct under audit, worth recording because it was doubted:</strong>
+    mid-epoch resume walks the right caption stream. The offset derives from the absolute step
+    and <code>epoch_order</code> is a pure function of <code>(seed, epoch)</code>, so position is
+    reconstructed rather than remembered. Also: 8-bit optimizer state survives the round trip
+    &mdash; bitsandbytes overrides <code>load_state_dict</code> with a <code>uint8</code> guard,
+    so torch's dtype-casting policy does not corrupt the quantisation blocks under
+    <code>bf16-full</code>, which is the pairing the four-GPU config ships.</li>
+  <li><strong>Documentation.</strong> The README claimed &ldquo;checkpointing is unaffected
+    either way&rdquo; under ZeRO. True when checkpointing was weights-only; optimizer state is
+    exactly what ZeRO shards.</li>
+</ul>
+
+<h2>2026-09-01 &mdash; Epochs for distillation, and checkpoint retention for both trainers</h2>
+
+<p><strong>Request.</strong> Describe a distillation run in epochs the way the rest of the repo
+does, keep only the last N checkpoints, and produce ready-to-run 4-GPU configs with and without
+the rollout.</p>
+
+<p><strong>I got the first one wrong before getting it right.</strong> Asked for &ldquo;20
+epochs&rdquo;, I reported that the distillation script has no epoch concept and asked how many
+captions there were so I could convert to steps. That was accurate about the code and useless as
+an answer: the request was to <em>add</em> epochs, not to work around their absence. Worth
+recording, because the failure mode is subtle &mdash; a true statement about the current state
+delivered instead of the work.</p>
+
+<p><strong>What an epoch had to mean.</strong> The loop drew
+<code>random.sample(captions, batch_size)</code> per micro batch, which samples with replacement
+across steps: some captions appear many times before others appear once. <code>EpochSampler</code>
+shuffles the full list with a seed derived from the epoch number &mdash; identical on every rank
+&mdash; and then takes this rank's stride. Shuffling <em>before</em> sharding is the part that
+matters: sharding a fixed order would pin each rank to the same captions for the whole run.
+Verified with four ranks that the shards do not overlap, together cover every usable caption, are
+equal sized, differ between epochs, and are deterministic.</p>
+
+<p>That determinism is why resuming mid-epoch stores nothing about position: the order is a pure
+function of <code>(seed, epoch)</code>, so the resumed run lands on the right captions by
+construction. It is a better property than a saved dataloader cursor, not a missing one.</p>
+
+<div class="flag">
+  <p><strong>keep_last_n_checkpoints is the only feature here that deletes data the user did not
+  ask it to delete</strong>, so its edges are pinned by tests rather than by care. Counted
+  separately per kind &mdash; <code>epoch&lt;N&gt;/</code>, <code>step&lt;N&gt;/</code> and
+  <code>global_step&lt;N&gt;/</code> in train.py &mdash; because the three are produced by
+  different triggers at different rates and pruning them as one pool would let a fast trigger
+  evict a slow one. The newest of each is never removed: DeepSpeed's <code>latest</code> file
+  names the <code>global_step</code> it will resume from, and pruning that one turns a cache into
+  an unrecoverable run. Ordered by the number in the name, not lexicographically
+  (<code>step9</code> must not outlive <code>step100</code>) and not by mtime, because a resumed
+  run rewrites older directories' timestamps.</p>
+</div>
+
+<p><strong>Distillation had nothing to keep N of.</strong> It overwrote a single
+<code>context_refiner.safetensors</code>. It now writes a tagged set per save and copies it to the
+untagged names, so every config pointing at the stable name keeps working and gets the newest.
+<code>training_state_path</code> derives from the weights filename rather than being fixed, so a
+tagged checkpoint carries its own optimizer state &mdash; resuming from an older tag would
+otherwise pair the newest moments with older weights. <code>save_full_model</code> moved from
+once-at-the-end to once-per-checkpoint for the same reason: the point of keeping N checkpoints is
+being able to go back to one, and a refiner without the model it belongs in is half a
+checkpoint.</p>
+
+<p><strong>Resume was missing a piece.</strong> It restored the optimizer, the scheduler and the
+step counter, but not the RNG &mdash; and caption shuffling and <code>tag_dropout_rate</code> pull
+from the global <code>random</code> stream, so a resumed run saw different augmentations than an
+uninterrupted one would have. Both the Python and torch states are saved now, and a checkpoint
+written before this still resumes; it simply cannot reproduce the augmentation.</p>
+
+<div class="flag">
+  <p><strong>The tests came a commit late, which is the thing to avoid next time.</strong> All
+  four features above shipped verified by throwaway scripts and with nothing in the suite, then
+  were covered in the following commit. This branch has already been burned twice by exactly that
+  gap &mdash; 182 tests passing while every training run was broken, and a step-0
+  <code>NameError</code> surviving because the tests matched source text instead of importing the
+  module. Verified is not covered.</p>
+</div>
+
+<ul>
+  <li><strong>Two ready-to-run 4-GPU configs.</strong>
+    <code>examples/anima_refiner/distill_4gpu.toml</code> and
+    <code>distill_rollout_4gpu.toml</code> differ only in the <code>[rollout]</code> table, so the
+    two runs are comparable: 20 epochs, a global batch of 1536 (48 &times; 8 &times; 4),
+    bf16-full with AdamW8bitKahan at 5e-5, <code>save_every_n_epochs = 1</code>,
+    <code>keep_last_n_checkpoints = 3</code>, <code>log_every = 5</code>. The rollout one carries
+    an ordered list of what to reduce first if it runs out of memory.</li>
+  <li><strong>A documentation gap that was purely conversational.</strong> The comparison of the
+    four distillation objectives &mdash; what each can and cannot see, and what each costs
+    &mdash; existed only in chat. <code>docs/anima_refiner/distillation-methods.md</code> records
+    it, including that the pooled term is nearly useless at the shipped settings, with the
+    measurements that say so.</li>
+  <li><strong>Tests.</strong> 441 passed, 1 skipped.</li>
+</ul>
+
+<h2>2026-09-01 &mdash; Closing the audit list, and one finding that was wrong</h2>
+
+<p><strong>Request.</strong> Fix everything the QA reports raised, skipping nothing. That covered
+the two rollout reviews and also the earlier three-agent audit, whose findings had been recorded
+as &ldquo;not fixed, reported&rdquo; and left there.</p>
+
+<p><strong>The expensive one was invisible.</strong> <code>llm_hidden_layer = -1</code> asks for
+the last hidden state, which is what <code>None</code> already means &mdash; but asking by index
+takes the <code>output_hidden_states=True</code> branch, materialises every layer's output (25
+tensors for a 24-layer model) and then indexes the one that IS <code>last_hidden_state</code>.
+Roughly 420 MB per forward at B=8, L=512, d=2048 in bf16, on the caching path and the on-the-fly
+path alike, and every shipped anima_refiner config uses -1.
+<code>normalise_hidden_layer</code> folds it where the config is read, so all three consumers
+benefit. A test asserts the expensive branch is not taken.</p>
+
+<p><strong>Failing fast.</strong> Every refusal in the distillation script fired after
+<code>load_captions</code> had walked the whole dataset and both LLMs plus the teacher DiT were
+resident &mdash; a typo in <code>precision</code> cost minutes and tens of GB of I/O per rank
+before being reported. The checks are pure config, so <code>validate_config_early</code> runs
+them first, and a test asserts the ordering because a refactor could undo it silently.</p>
+
+<p><strong>One walk per job, not per rank.</strong> <code>load_captions</code> opens every
+directory and every tar &mdash; its own docstring quotes three minutes for three million captions
+&mdash; and every rank was doing it against the same tree. Rank 0 resolves and broadcasts; a
+single process takes the old path with no serialisation at all. The process group also gets an
+hour instead of NCCL's ten-minute default, because the final barrier waits on rank 0 writing a
+multi-GB checkpoint when <code>save_full_model</code> is set.</p>
+
+<div class="flag">
+  <p><strong>One reported finding was wrong, and checking mattered.</strong> The audit listed
+  three config keys as declared-but-never-read: <code>pseudo_huber_c</code>,
+  <code>image_eval_micro_batch_size_per_gpu</code> and <code>stabilize</code>. The first two are
+  genuinely stale &mdash; replaced by <code>huber_delta</code> and by
+  <code>eval_micro_batch_size_per_gpu</code>'s table form &mdash; and both now document what the
+  code reads plus what they replaced, so an old config points somewhere. <code>stabilize</code>
+  is a <strong>false positive</strong>: it is a real parameter of
+  <code>optimizers/adamw_8bit.py</code>'s <code>AdamW8bitKahan</code>, and the scan that reported
+  it had not covered <code>optimizers/</code>. Confirmed by constructing the optimizer with it.
+  Removing it would have broken a working setting on the strength of a report.</p>
+</div>
+
+<ul>
+  <li><strong>Also fixed.</strong> <code>--test_sample</code> raised a bare
+    <code>AttributeError</code> on <code>get_conds</code> for most models, and only after the
+    text encoders had been loaded and run; it now names the flag and the model.
+    <code>_compute_text_embeddings</code> accepted an <code>is_generic_llm</code> argument it
+    never referenced, passed down from <code>InitialLayer</code>; removed from both. A no-op line
+    in <code>utils/dataset.py</code> re-read the <code>caption_prefix</code> key it had just
+    written. The README config reference was missing the five per-group learning rates that
+    <code>refiner_only</code> depends on to work at all, and listed 13 of roughly 30
+    <code>[distill]</code> keys.</li>
+  <li><strong>A comment that claimed too much.</strong> <code>models/cosmos_predict2.py</code>
+    said anima and anima_refiner sharing a cache name was safe because
+    <code>text_encoder_cache_key</code> handles the difference. It stops one model READING the
+    other's embeddings; it does not let both keep a copy, because they write to the same
+    directory. The latents, the expensive half, survive either way &mdash; and
+    <code>vae_config_keys</code> now means a different VAE is detected rather than silently
+    reused.</li>
+  <li><strong>Tests.</strong> 403 passed, 1 skipped. The rollout QA round ended at 387.</li>
+</ul>
+
+<h2>2026-09-01 &mdash; Denoising rollout, and cache reuse that depends on compatibility</h2>
+
+<p><strong>Request.</strong> Two things, both settled by design review before any code was
+written: make cache reuse depend on whether the cache is actually compatible rather than on a
+flag, and add the denoising rollout objective from the CVPR 2025 text-encoder distillation paper
+as an optional distillation mode.</p>
+
+<p><strong>The research changed the design.</strong> "Rollout" usually implies a student rolling
+out its own predictions, which brings exposure bias and error accumulation with it. Algorithm 1
+of <em>Scaling Down Text Encoders of Text-to-Image Diffusion Models</em> does not do that. The
+trajectory is advanced by the <strong>teacher</strong>, both models are evaluated at the
+<strong>same</strong> x_t, and the student never sees its own output as input. None of the
+exposure-bias literature applies, and the whole walk can therefore run under
+<code>no_grad</code> &mdash; which is what makes <code>steps</code> an inference cost and
+<code>loss_points</code> a backward cost, independent of each other.</p>
+
+<p><strong>One adaptation was required, and it is the part most likely to be wrong.</strong> The
+paper is written for DDPM; Anima is rectified flow. Its DiT predicts a velocity and its training
+target is <code>noise - x0</code> with <code>x_t = (1-t)*x0 + t*noise</code>, so
+<code>dx/dt = v</code> exactly and the DDPM posterior update does not carry over. Verified
+numerically rather than reasoned about: with an exact velocity the Euler step
+<code>x &larr; x - (t - t')*v</code> lands on the true x_t' to 2.4e-07, a full walk from t=1
+lands on x0 to 4.2e-07, and the opposite sign is off by 1.61.</p>
+
+<p><strong>Why a rollout rather than random noisy latents.</strong> This stage has no images, so
+there is no x0 and no way to build <code>x_t = (1-t)*x0 + t*noise</code> the way training
+normally would. The trajectory is the only source of x_t that lie where the model will actually
+be asked to predict. That, rather than fidelity to the paper, is the justification.</p>
+
+<p><strong>Decision: off by default, and off means off.</strong> Enabling it keeps the DiT
+resident &mdash; roughly 3.5-4 GB in bf16 for Anima, taking this stage from about 6 GB to 10-12
+GB. The ~6 GB figure is what makes distillation runnable on modest hardware, so at
+<code>loss_weight = 0</code> <code>build_teacher</code> still throws the DiT away and nothing is
+allocated. A test asserts that discard path is still there.</p>
+
+<p><strong>Measured before choosing a default.</strong> Forward plus backward on a reduced-scale
+replica at 1 / 2 / 4 / 8 loss points: 26 / 49 / 97 / 197 ms, linear as expected, with the 8-step
+trajectory a fixed 78 ms &mdash; about three loss points' worth. Adjacent trajectory points give
+correlated signal, which is the same argument <code>[probe] num_blocks</code> rests on, so the
+default is 2.</p>
+
+<p><strong>Classifier-free guidance is configurable rather than assumed.</strong> Above 0 it
+evaluates the unconditional branch on both sides, doubling the DiT forwards. It is worth having
+because that branch is fed by an empty caption, which is exactly where the refiner path diverges
+most from the T5-native DiT &mdash; the same divergence an earlier commit fixed in
+<code>_tokenize</code>. The student's unconditional features are recomputed with gradient every
+step, because they depend on the refiner too.</p>
+
+<p><strong>Cache compatibility: recorded, not fingerprinted.</strong>
+<code>keep_latent_cache</code> had shipped as a hard override that reused the cache whenever the
+fingerprint moved, with no idea whether the contents still belonged to this model. It now means
+"do not recache unnecessarily", and an incompatible cache is rebuilt regardless &mdash; reusing
+latents produced by a different VAE is training on silently wrong data, and no flag should ask
+for that.</p>
+
+<p>Compatibility lives in a <code>cache_manifest.json</code> beside each cache rather than in the
+fingerprint. Folding it into the fingerprint would be simpler and would rebuild every existing
+cache once; recording it costs existing installs nothing, because a cache with no manifest
+predates the check and is treated as compatible.</p>
+
+<div class="flag">
+  <p><strong>There is no config key that names the VAE across models.</strong> It is
+  <code>vae_path</code> for seven of them, <code>diffusers_path</code> for seven,
+  <code>ckpt_path</code> for two, <code>checkpoint_path</code> for one, and <code>vae</code> /
+  <code>audio_vae</code> elsewhere. A generic "any key naming a file" rule is wrong in the other
+  direction: <code>transformer_path</code> names a file that affects neither latents nor text
+  embeddings, so including it would rebuild the cache on every DiT change &mdash; exactly what
+  <code>anima</code> and <code>anima_refiner</code> sharing a cache tree exists to avoid. So
+  identity is declared per model through <code>vae_config_keys</code>, empty by default, filled
+  in for 15 models. Empty means no identity is recorded and every existing cache stays valid.</p>
+</div>
+
+<p><strong><code>keep_text_embedding_cache</code> did not exist before this.</strong> An earlier
+commit had grown a <code>keep_on_fingerprint_change</code> parameter on
+<code>_cache_text_embeddings</code> with no config key wired to it &mdash; a dead argument.
+Relatedly, <code>text_encoder_cache_key</code> was implemented by exactly one model out of 23
+and every other model fell through a lambda returning <code>''</code>. It is now a real method
+on <code>BasePipeline</code> with that same empty default, so the behaviour is consistent by
+construction rather than by accident.</p>
+
+<p><strong>Two independent QA passes, and what they found.</strong> An Opus reviewer for deep
+algorithmic and distributed correctness, a Sonnet reviewer for config, docs and edge cases, both
+read-only and independent of the implementation. The headline is what Opus did <em>not</em>
+find: nothing that makes training silently produce a wrong result. The Euler step and its sign,
+the t range, dtype handling, teacher/student symmetry, gradient isolation, the empty-caption
+convention and DDP behaviour all checked out, several verified by execution rather than reading.</p>
+
+<p>What they did find was cost and memory, and all of it is fixed. The teacher's velocity at each
+trajectory point was recomputed in the loss after being discarded by the walk that produced it
+&mdash; two redundant full-DiT forwards per micro-batch at the shipped settings, four with
+guidance. The frozen student LLM was re-run every micro-batch to produce an unconditional hidden
+state that is a constant. <code>del state_dict</code> ran after the device transfer, so the
+checkpoint and the CPU-side DiT were both resident at once, roughly 8 GB of host RAM.
+<code>MiniTrainDIT</code> assigns <code>crossattn_emb</code> onto itself every forward, harmless
+while the DiT was discarded and now pinning the last student feature tensor and its autograd
+graph across step boundaries.</p>
+
+<p><strong>Two API problems worth naming.</strong> <code>guidance_scale</code> was discontinuous
+at the bottom: the formula is <code>(1-g)*v_uncond + g*v_cond</code> guarded by
+<code>if g &gt; 0</code>, so 0 short-circuits to the pure conditional prediction while 0.001 is
+nearly the pure unconditional one &mdash; the opposite &mdash; and 1.0 pays a second forward that
+contributes exactly zero gradient. Values between 0 and 1 are now refused with that explanation.
+And a second call into a DeepSpeed engine within one backward builds a second hook manager and
+fires <code>_backward_prologue</code> twice, leaking <code>_backward_active_depth</code> every
+micro-batch; the unconditional forward now goes through the raw refiner rather than the engine.</p>
+
+<div class="flag">
+  <p><strong>The process finding is the one worth keeping.</strong> Nothing tested whether a key
+  in a shipped config is actually read <em>from the table it sits in</em> &mdash; which is
+  exactly the bug found by hand an hour earlier, where <code>relational_loss_weight</code> sat in
+  <code>[student]</code> while the code read it from <code>config['distill']</code>: ignored, and
+  masked by a matching default. There is now a test that extracts every
+  <code>(table, key)</code> the script reads via AST, including through aliases like
+  <code>rollout_config = config.get('rollout', {})</code>, and compares that against every
+  shipped distill config. Putting the key back in <code>[student]</code> makes it fail with the
+  exact diagnosis, which was checked rather than assumed.</p>
+</div>
+
+<ul>
+  <li><strong>Tests.</strong> 387 passed, 1 skipped. The rollout arrived at 371; the QA round
+    added 16 more.</li>
+  <li><strong>Verified by execution, not assertion.</strong> The DDPM-to-rectified-flow
+    adaptation &mdash; with an exact velocity the Euler step lands on the true x_t' to 2.4e-07
+    and a full walk returns x0 to 4.2e-07, while the opposite sign is off by 1.61; all four
+    precision modes; and a real two-rank gloo run confirming the DiT sits outside the DDP module,
+    holds no gradient, that each rank walks a different trajectory, and that the refiner's
+    gradients all-reduce to identical values. That last one lives in
+    <code>tools/test_rollout_multirank.py</code>.</li>
+  <li><strong>Still not verified.</strong> No GPU run, no full-size run, no image. The
+    ~3.5-4 GB resident-DiT figure is derived from the model's shape, not measured. The rollout
+    term's magnitude relative to the probe term is uncalibrated &mdash; each term is now logged
+    separately so that becomes visible rather than buried in the sum.</li>
+</ul>
+
+<h2>2026-09-01 &mdash; Three-agent audit: a silent ZeRO bug, a fifth path bug, and one fix that was wrong</h2>
+
+<p><strong>Request.</strong> A full architecture / QA / adversarial audit of the branch from
+<code>fd00a5e</code>, run as three parallel reviewers, then fix what is real. Plus a progress bar
+for <code>tools/export_caption_corpus.py</code>.</p>
+
+<p><strong>How it was run.</strong> Three Opus agents: architecture-and-research, systematic QA,
+and adversarial. All read-only on the working tree &mdash; three agents editing one checkout would
+have corrupted each other, and the user's instruction was to verify before fixing anyway. The
+machine has 8 GB of RAM; two agents running the full suite at once crashed the user's
+application, and an architecture probe sized at production dims (8 attention blocks at 2048)
+exhausted the allocator. The resource rule that actually held was giving exactly ONE agent the
+right to run torch, with a 600 MB budget, and putting the other two on static analysis. A stated
+cap of "two full-suite agents" was a number on paper with nothing enforcing it.</p>
+
+<p><strong>The find that justified the exercise.</strong> ZeRO plus
+<code>gradient_accumulation_steps &gt; 1</code> applied a fraction of the configured optimizer
+steps. DeepSpeed advances <code>micro_steps</code> inside <code>step()</code>, never inside
+<code>backward()</code>, and derives the accumulation boundary from it; the distillation loop
+calls <code>backward()</code> N times then <code>step()</code> once, so the boundary landed every
+Nth outer step. Measured on a real engine at <code>gas = 4</code>: <strong>one optimizer update in
+six</strong>, and the cosine LR never left its peak. The run completes, the progress bar fills,
+and the artefact is under-trained &mdash; the shipped <code>distill.toml</code> sets
+<code>gradient_accumulation_steps = 2</code> one uncommented line from
+<code>distributed_strategy</code>. Two agents found it independently and the orchestrator
+reproduced it a third time before any code changed. Fixed with
+<code>set_gradient_accumulation_boundary</code>, which is DeepSpeed's documented remedy for
+exactly this call shape.</p>
+
+<p><strong>Why no test caught it, and what changed.</strong> Every ZeRO test monkeypatched
+<code>deepspeed.initialize</code> away and asserted against a fake engine that the right calls
+were made in the right order. All of those assertions were true and none of them could see this.
+<code>TestZeROAccumulationBoundaryForReal</code> now drives a real ZeRO-1 engine on CPU: one test
+asserts the unfixed pattern skips updates, one asserts the fix restores them, one asserts the
+strategy is what sets the boundary. Running DeepSpeed on Windows CPU needs
+<code>deepspeed.ops.__compatible_ops__['ShareMemCommBuilder'] = False</code> to skip a JIT-built
+op that wants MSVC &mdash; which also corrects this log's previous entry, where that was recorded
+as a hard blocker.</p>
+
+<p><strong>A fifth instance of the path-separator class.</strong> The previous entry claimed four
+was the complete set, on the strength of a repo-wide grep for <code>split('/')</code>.
+<code>tar_f.extractfile(str(image_file))</code> in <code>utils/dataset.py</code> was still there
+wearing a different shape: a tar member name always uses forward slashes, <code>str()</code> on a
+<code>Path</code> emits backslashes on Windows, and <code>extractfile</code> matches literally, so
+every member inside a subdirectory raised <code>KeyError</code> during caching. Flat tars are
+unaffected, which is why it survived. Search for the concept, not the string.</p>
+
+<p><strong>An encoding bug that does not raise.</strong> <code>open(captions_json)</code> uses the
+locale encoding; on Windows that is a codepage, and a codepage does not reject UTF-8, it decodes
+it into something else. Measured: <code>1girl, [CJK], caf&eacute;</code> came back mojibaked with
+no error, and that text is what gets cached, embedded and trained. Three sites; two already
+passed <code>encoding='utf-8'</code>, which is how the third escaped review.</p>
+
+<p><strong>Decision: one recommended fix was wrong, and the test said so.</strong> Two agents
+independently flagged that <code>caption_prefix</code>, <code>cache_shuffle_num</code>,
+<code>cache_shuffle_delimiter</code> and <code>skip_empty_caption</code> change the cached caption
+text but are missing from <code>CAPTION_CACHE_SETTINGS</code>, so <code>--trust_cache</code>
+serves stale captions when one changes. The finding is correct; adding them to the suffix is not
+the fix. <code>719aede</code> excluded them deliberately &mdash; all four predate the suffix
+mechanism, so putting them in it moves the cache path of every install that uses them, discarding
+the metadata and the latents keyed off it. A test guards that by name and went red immediately.
+Reverted, and replaced with a <code>caption_settings.json</code> recorded beside the cache: a
+mismatch is reported, the path never moves, and a cache written before the check existed is left
+alone.</p>
+
+<p><strong>Progress bar.</strong> The cost is in <code>enumerate_captions</code>, not in the
+exporter, so that is where it went, behind an opt-in <code>progress=</code> parameter so
+<code>tools/distill_refiner.py</code> is unaffected. The total is not known up front &mdash; it
+becomes known only as each directory is globbed and each tar opened &mdash; so the bar's total
+grows rather than pretending to a figure it does not have. Failures are counted apart:
+<code>skipped</code> (dropped) and <code>empty</code> (kept with an empty caption, and therefore
+trained on) are very different outcomes, so the summary names them separately. No new dependency:
+tqdm is already required and already used in <code>utils/dataset.py</code>.</p>
+
+<div class="flag">
+  <p><strong>AV is a hard dependency and cannot be removed.</strong> <code>utils/dataset.py</code>
+  imports <code>comfy_api.latest</code>, which imports <code>_input_impl/video_types.py</code>,
+  which imports <code>av</code> at module scope. <code>train.py</code> imports
+  <code>utils/dataset.py</code>, so every training run needs it before a line executes &mdash;
+  image-only datasets included. It arrived with the video frame-count fix
+  (<code>e14f976</code>/<code>a14e524</code>), not with the audio commit that added the
+  requirements line. It could only become optional by moving the <code>comfy_api</code> import
+  inside the video branch of <code>_metadata_map_fn</code>. Separately,
+  <code>requirements.txt</code> declares <code>av</code> twice (line 16 and line 34); pip
+  intersects the constraints so behaviour is correct, but line 16 should go.</p>
+</div>
+
+<ul>
+  <li><strong>Tests.</strong> 329 passed, 1 skipped, 0 failed, about three minutes. Was 320 before
+    this work; the 9 new tests cover the ZeRO boundary (3), Windows tar and UTF-8 captions (2),
+    and the caption-settings record (4).</li>
+  <li><strong>Also fixed.</strong> ZeRO left DeepSpeed's bucket sizes at their 5e8-element
+    default, allocating gigabytes to save the 0.93 GB the docs quote as its whole justification
+    &mdash; now sized to the model. Distillation checkpoints are written to a temp file and
+    <code>os.replace</code>d, so an interruption during a periodic save no longer destroys the
+    only artefact. <code>log_every</code>, <code>save_every</code> and <code>[probe]
+    num_blocks</code> are validated instead of raising <code>ZeroDivisionError</code> on rank 0
+    and hanging the others at a barrier. <code>--format</code> on the corpus exporter no longer
+    crashes on exactly the case its warning exists for. The sampler refuses
+    <code>flux_shift</code> rather than silently sampling an unshifted schedule.
+    <code>enumerate_captions</code> raises on a missing directory instead of contributing zero
+    captions in silence. Dead <code>args</code>/<code>kwargs</code> removed from
+    <code>train.py</code>; the duplicate final checkpoint write removed.</li>
+  <li><strong>Not fixed, reported.</strong> The architecture review's findings on the distillation
+    objective (it constrains permutation-invariant moments, with a measured irreducible floor and
+    a generalization gap that scales with <code>num_queries / head_dim</code>), the
+    empty-caption/CFG divergence, refiner provenance metadata,
+    <code>init_from_existing</code> dropping a densely-trained refiner, and
+    <code>refiner_only</code> with <code>pipeline_stages &gt; 1</code>. Each needs a design
+    decision or GPU verification rather than a mechanical fix.</li>
+</ul>
+
+<h2>2026-08-31 &mdash; Running the test suite on Windows, and the four path bugs it found</h2>
+
+<p><strong>Request.</strong> Unblock the test suite on the Windows dev box, run the drift audit,
+squash two same-titled commits, and convert as much of the &ldquo;unverified&rdquo; list as a
+CPU-only machine allows.</p>
+
+<p><strong>Starting point.</strong> Not one test could be collected: <code>test/conftest.py</code>
+imports <code>utils.common</code>, which imports <code>deepspeed</code> at module scope, and the
+venv had no deepspeed. The venv was also only partly provisioned &mdash; imageio, pillow, toml,
+datasets, einops, torchvision, torchaudio, comfy-kitchen and comfy-aimdo were all missing.</p>
+
+<p><strong>DeepSpeed does install on Windows CPU.</strong> This was assumed impossible and is not.
+Two things stand in the way, both surmountable: pip builds the wheel in an isolated environment
+with no torch, and deepspeed&rsquo;s <code>setup.py</code> asserts torch is importable, so it needs
+<code>--no-build-isolation</code>; and on win32 that setup.py lists <code>bin/deepspeed.bat</code>
+and <code>bin/ds_report.bat</code> as scripts while the sdist ships neither, so
+<code>build_scripts</code> dies on a missing file. Create the two <code>.bat</code> wrappers in the
+unpacked sdist, build with <code>DS_BUILD_OPS=0</code>, and 0.18.4 installs and imports fine on the
+CPU accelerator. The conditional stub described below then disables itself.</p>
+
+<p><strong>Decision: implement the single-process deepspeed calls, raise on the collectives.</strong>
+The conftest stub is still there for a box without deepspeed. <code>get_rank</code>,
+<code>get_world_size</code> and <code>barrier</code> have an unambiguous meaning with one process,
+so they are implemented. <code>send</code>, <code>recv</code>, <code>broadcast</code> and
+<code>all_reduce</code> raise with an explanation instead, because a test that reaches one is
+testing distributed behaviour the shim cannot stand in for, and returning a plausible value would
+let it pass while proving nothing. The stub modules also need a real <code>__spec__</code>:
+<code>types.ModuleType</code> leaves it <code>None</code>, and
+<code>importlib.util.find_spec</code> &mdash; which transformers uses to probe for deepspeed
+&mdash; raises <code>ValueError</code> rather than returning <code>None</code> for such an entry.
+transformers additionally requires the package metadata, so it still concludes deepspeed is
+absent, which is the answer we want.</p>
+
+<p><strong>Forced change: spawned children need their own bootstrap.</strong> Hugging Face datasets
+maps with a process pool, and Windows spawns rather than forks, so a worker is a bare interpreter
+that never sees anything conftest did. It could not import <code>utils.dataset</code> at all.
+<code>test/childenv/sitecustomize.py</code> is new: Python imports it automatically at interpreter
+startup, so putting that directory on <code>PYTHONPATH</code> covers the children. It must claim
+the <code>utils</code> namespace <em>before</em> ComfyUI reaches the path &mdash; ComfyUI ships a
+<code>utils/</code> with an <code>__init__.py</code>, making it a regular package that ends
+namespace resolution outright, so once it wins <code>utils.dataset</code> stops existing. The same
+file is what lets <code>tools/check_comfy_signatures.py</code> run on a CPU box, which the docs
+previously listed as needing special conditions.</p>
+
+<p><strong>Forced change: <code>NUM_PROC</code> was hardcoded.</strong>
+<code>min(8, os.cpu_count())</code> is right on Linux, where a forked worker is nearly free. Each
+spawned worker re-imports torch, deepspeed and ComfyUI instead, which is about 45 seconds to map a
+handful of rows &mdash; one test took 49s and the file timed out past ten minutes. It now reads
+<code>DIFFUSION_PIPE_NUM_PROC</code>, and passes <code>num_proc=None</code> rather than 1, because
+datasets still starts a worker for <code>num_proc=1</code>. conftest sets it to 1 on win32 only, so
+a Linux run still exercises the real multiprocess path. That file dropped from timing out to seven
+seconds.</p>
+
+<p><strong>Four instances of the same bug, none visible on Linux.</strong> Splitting a path on a
+literal forward slash to get its basename. <code>add_captions</code> in
+<code>utils/dataset.py</code> did it to an on-disk path, so every <code>captions.json</code> lookup
+missed and every caption came back empty &mdash; that one is pre-existing upstream, present in
+<code>main</code> and at <code>fd00a5e</code>. The online-caption path added in
+<code>a85c535</code> copied the same expression. <code>enumerate_captions</code> in
+<code>utils/captions.py</code> had the mirror image: <code>str(media_file)</code> for a tar member,
+emitting backslashes where a tar name always uses forward slashes. And
+<code>test/test_anima_refiner.py</code> keyed captured writes the same way. Fixed with
+<code>os.path.basename</code> for disk paths and <code>as_posix()</code> for archive members; both
+are no-ops on Linux, so nothing changes there.</p>
+
+<p><strong>One test-side fix, and why it is not cheating.</strong>
+<code>TestLatentCacheStability</code> builds the same directory twice in one process to stand in
+for two training launches. The first build leaves arrow files memory-mapped, and Windows refuses to
+reopen a mapped file for writing, so the second <code>save_to_disk</code> failed with EINVAL. The
+helper now drops its references and collects before returning. A real second launch is a fresh
+process holding no maps, so releasing them is the faithful thing to do, not a workaround.</p>
+
+<p><strong>Drift audit.</strong> Both guards pass: 34/34 vendored-API checks and 26/26 ComfyUI
+signature checks. Two findings in <code>tools/check_vendored_apis.py</code> itself, which was
+crashing before it finished and therefore guarding nothing. It called
+<code>reduction.check_serializing_named_tensor</code>, which <code>utils/reduction.py</code> has
+never defined; torch dropped that call from <code>reduce_tensor</code> and our copy never had it,
+so the two are in step and the check was replaced with a signature comparison against torch for the
+four names we vendor. It also asserted <code>torch.Tensor.has_names</code> exists; torch 2.13
+removed the named-tensor API entirely and the repo uses none of it, so that check is gone. An
+AST-level diff of <code>utils/reduction.py</code> against torch 2.13 found no drift: nothing we
+copied is missing upstream and every shared signature matches. This closes the request left in the
+2026-07-29 entry below, which asked for exactly this run on a 2.13 box.</p>
+
+<div class="flag">
+  <p><strong>The dev venv changed, including torch.</strong> Installing torchvision pulled torch
+  from 2.12.1+cpu to <strong>2.13.0+cpu</strong>. That is a drift-audit trigger in its own right,
+  which is why the audit above was run against 2.13; it also means this box no longer reproduces
+  anything that depended on 2.12. Also installed: deepspeed 0.18.4 (see above), torchaudio,
+  torchvision, imageio[ffmpeg], pillow, toml, datasets, einops, sentencepiece, av, scipy,
+  torch-optimi, pytorch-optimizer, diffusers, protobuf, loguru, omegaconf, iopath, termcolor,
+  hydra-core, easydict, ftfy, wandb, tensorboard, optimum-quanto, comfy-kitchen, comfy-aimdo.</p>
+</div>
+
+<ul>
+  <li><strong>Tests.</strong> 320 passed, 1 skipped, 0 failed in about three minutes. Before this
+    change the suite could not be collected at all.</li>
+  <li><strong>New coverage.</strong> <code>TestLatentCachingRunsForReal</code> runs
+    <code>cache_latents</code> end to end with a stub for the VAE, covering
+    <code>_map_and_cache</code>, the sqlite cache in <code>utils/cache.py</code> and the
+    iteration-order directory. That path was previously unreachable on the dev box, because the
+    sqlite <code>autocommit=</code> keyword needs Python 3.12; this box is 3.12.10.</li>
+  <li><strong>Still not verified.</strong> <code>deepspeed.initialize</code> has still never run.
+    It no longer hangs &mdash; on Windows CPU it fails in seconds while JIT-building the
+    <code>deepspeed_shm_comm</code> op, for want of MSVC <code>cl.exe</code>. Unblocking it needs
+    Visual Studio Build Tools, or a Linux box. No training run, no multi-GPU run and no image yet.</li>
+  <li><strong>History.</strong> <code>967ec73</code> and <code>755d8a9</code> carried the same
+    subject line; they were not duplicates, the second added 84 lines over the first. Squashed into
+    one commit whose tree is byte-identical to the previous branch tip, and force-pushed with
+    <code>--force-with-lease</code>. <code>backup/pre-squash-20260831</code> holds the old history
+    locally.</li>
+</ul>
+
+<h2>2026-08-31 — Distillation: ZeRO option, refiner precision modes, and a crash-on-step-0 bug</h2>
+
+<p><strong>Request.</strong> Add the real-ZeRO option that was offered at the end of the previous
+round (<code>deepspeed.initialize</code> + ZeRO-1 instead of DDP), then add mixed-precision /
+full-bf16 / fp16 support for the refiner.</p>
+
+<h3>The bug found on the way in</h3>
+
+<div class="flag">
+<p><strong><code>tools/distill_refiner.py</code> could not complete a single training step.</strong>
+It used <code>contextlib.nullcontext()</code> at the <code>no_sync</code> call site and never
+imported <code>contextlib</code>. That expression is evaluated on the last micro batch of every
+step, and unconditionally when <code>world_size == 1</code>, so every run died with a
+<code>NameError</code> at step 0 in every configuration.</p>
+</div>
+
+<p>Why the suite did not catch it: every test in <code>TestScriptStructure</code> reads the file
+as a <em>string</em> and asserts on substrings, so the module was never imported. The distributed
+smoke test does import <code>contextlib</code> — but inside its own re-implementation of the
+accumulation loop, embedded as a string literal in the test file. The test had reimplemented the
+logic it was supposed to be testing, so it stayed green while the real code was broken. A
+<code>255 passed</code> against tests shaped like that says less than it looks like it says.</p>
+
+<p>Fixed, plus a test that imports the module rather than grepping it. The lesson is the
+generalisable part: source-substring assertions are cheap to write and cannot fail for the right
+reason. Several of the existing ones were rewritten to exercise behaviour instead.</p>
+
+<h3>ZeRO: added, but not made the default</h3>
+
+<p>The previous round&rsquo;s arithmetic was correct and is why this is opt-in. ZeRO-1/2 shard
+optimizer state and gradients, so the ceiling on what they can save is the <em>trainable</em>
+share — 77.64M params, 1.24 GB, about 0.93 GB per GPU across four — while the ~5.20 GB of frozen
+bf16 LLM weights that dominate residency is exactly what those stages cannot touch. DDP remains
+the default. <code>distributed_strategy = &#39;zero1&#39;</code> exists for the case where that
+0.93 GB is the difference between starting and OOMing.</p>
+
+<p>Launcher and strategy were separated properly: a <code>DDPStrategy</code> /
+<code>DeepSpeedZeROStrategy</code> pair behind one four-method interface, so the training loop has
+a single shape and <code>deepspeed --num_gpus</code> can drive DDP just as <code>torchrun</code>
+can drive ZeRO.</p>
+
+<h3>Decisions not in the request</h3>
+
+<table>
+<tr><th>Decision</th><th>Why</th></tr>
+<tr><td>ZeRO stage 3 refused, not implemented</td><td>It shards the parameters, so
+<code>refiner.state_dict()</code> would hold shards rather than weights and the save path would
+silently write garbage without a gather. Combined with all-gathering the frozen weights on every
+forward pass to save memory that is not the constraint, there is no configuration where it
+wins here.</td></tr>
+<tr><td>ZeRO on a single rank refused</td><td>Sharding across one rank shards nothing. Left to
+DeepSpeed it does not fail cleanly — it falls into MPI discovery and dies on <code>No module
+named &#39;mpi4py&#39;</code>, which points at nothing relevant. Found by running it.</td></tr>
+<tr><td><code>precision</code> as a separate name from <code>dtype</code></td><td>See below.</td></tr>
+<tr><td><code>fp16-full</code> refused</td><td>Pure fp16 parameters with no fp32 master copy lose
+AdamW updates to underflow. At <code>lr = 1e-4</code> most updates are below the ~6e-8 relative
+resolution of fp16 and round to zero. Offering it would mean offering a mode that trains
+nothing.</td></tr>
+</table>
+
+<h3>The <code>dtype</code> / <code>precision</code> confusion, which is worth stating loudly</h3>
+
+<p><code>[distill] dtype = &#39;bfloat16&#39;</code> has been in the config since this stage was
+written, and it reads like &ldquo;this trains in bf16&rdquo;. It does not, and never did.
+<code>dtype</code> applies only to the <em>frozen</em> modules — both LLMs, the LLMAdapter, the
+cross-attention probes, the probe queries. The trainable refiner is cast to fp32 in
+<code>build_student</code> unconditionally. So the config described the precision of everything
+<em>except</em> the thing being trained.</p>
+
+<p>Rather than overload <code>dtype</code>, the refiner gets its own <code>precision</code>
+setting. Measured on identical data and seeds:</p>
+
+<table>
+<tr><th><code>precision</code></th><th>Refiner params</th><th>Grad dtype</th><th>Autocast</th><th>Scaler</th></tr>
+<tr><td><code>fp32</code> (default)</td><td>float32</td><td>float32</td><td>—</td><td>no</td></tr>
+<tr><td><code>bf16-mixed</code></td><td>float32</td><td>float32</td><td>bfloat16</td><td>no</td></tr>
+<tr><td><code>fp16-mixed</code></td><td>float32</td><td>float32</td><td>float16</td><td>yes (DDP) / engine (ZeRO)</td></tr>
+<tr><td><code>bf16-full</code></td><td>bfloat16</td><td>bfloat16</td><td>—</td><td>no</td></tr>
+</table>
+
+<p>Numbers behind the choice: the gradient reaching the refiner under <code>bf16-full</code> has
+cosine similarity <strong>0.999994</strong> with the fp32 gradient, at half the parameter
+storage. Separately, the bf16 hop through the frozen cross-attention that <em>every</em> mode
+already pays costs about <strong>2.9e-03</strong> relative gradient error — so the existing
+pipeline was already further from pure fp32 than <code>bf16-full</code> moves it.</p>
+
+<h3>Things the maintainer needs to know</h3>
+
+<ul>
+<li><strong>The three precision axes are one object, not three settings.</strong> They are not
+independently valid: fp16 without a scaler underflows, a <code>GradScaler</code> on top of
+DeepSpeed&rsquo;s own loss scaling scales twice, and autocast over bf16 parameters is a no-op
+that reads as if it were doing something. <code>resolve_precision</code> owns the whole
+mapping.</li>
+<li><strong><code>bf16-full</code> means something different under ZeRO than under DDP.</strong>
+DeepSpeed&rsquo;s bf16 mode keeps fp32 master weights in the optimizer, so it saves less than the
+DDP path and is numerically better. The asymmetry is deliberate and documented rather than
+papered over.</li>
+<li><strong>Precision is applied before the optimizer is constructed.</strong> AdamW sizes
+<code>exp_avg</code> and <code>exp_avg_sq</code> to each parameter&rsquo;s dtype at construction,
+so casting afterwards leaves the optimizer holding state of the wrong dtype. There is a test
+asserting <code>exp_avg</code> comes out bf16 under <code>bf16-full</code>.</li>
+<li><strong>Do not add a <code>bf16</code> section to the ZeRO config to &ldquo;match&rdquo;
+<code>dtype</code>.</strong> Under the default <code>fp32</code> precision the DeepSpeed config
+deliberately carries no mixed-precision section; adding one casts the refiner and destroys the
+fp32 master weights the default mode depends on.</li>
+<li><strong>Do not set <code>dtype = &#39;float16&#39;</code>.</strong> Gradients flow back
+through the frozen cross-attention at that dtype, and nothing scales them there.</li>
+</ul>
+
+<h3>Optimizer and LR schedule: reuse instead of reimplementation</h3>
+
+<p>Follow-up question from the maintainer, and a fair one: why does distillation hardcode
+<code>torch.optim.AdamW</code> and hand-roll a cosine schedule when <code>train.py</code> has
+nine optimizers and <code>utils/lr_schedule.py</code> exists? There was no principled reason. It
+was never wired up.</p>
+
+<p><strong>The optimizer turns out to matter more than the parallelism work above.</strong>
+Measured on the actual <code>ContextRefiner</code> (<code>cap_feat_dim=2048</code>,
+<code>model_dim=1024</code>, 6 layers), which is 77.64M parameters — matching the figure already
+in the docs:</p>
+
+<table>
+<tr><th>Optimizer state</th><th>Size</th><th>Needs</th></tr>
+<tr><td>AdamW fp32 <code>exp_avg</code> + <code>exp_avg_sq</code></td><td>592 MB</td><td>—</td></tr>
+<tr><td>8-bit (<code>uint8</code> state + per-block <code>absmax</code>)</td><td><strong>148 MB</strong></td><td>one GPU</td></tr>
+<tr><td>ZeRO-1 saving, for comparison</td><td>0.93 GB/GPU</td><td><strong>four GPUs</strong></td></tr>
+</table>
+
+<p>So a single line of config frees 444 MB per GPU with no second GPU required — more per-GPU
+than the entire ZeRO effort reaches at this stage. Worth recording as a sequencing mistake:
+the ZeRO work was requested and delivered correctly, but if the underlying goal was VRAM, the
+cheaper answer was never surfaced first.</p>
+
+<p><code>utils/optimizer_factory.py</code> extracts only the name-to-class mapping out of
+<code>train.py</code>&rsquo;s <code>get_optimizer</code>. Everything else there — parameter
+groups from the model, the weight-decay split keyed on <code>p.original_name</code>, gradient
+release with its pipeline-engine monkeypatching, the GenericOptim 2-d split — depends on the
+pipeline model and stayed put. <code>train.py</code> now calls the shared function;
+<code>optim_type_lower</code> is still defined for its two later uses.</p>
+
+<div class="flag">
+<p><strong>Behaviour change, stated because it was promised not to happen.</strong> Moving to the
+shared LR scheduler is <em>not</em> bit-identical to the old hand-rolled cosine. Over 20000 steps
+with 500 warmup: 0.8% apart at step 5000, 4.6% at step 10000, and the shared one floors at
+<code>eta_min = 1e-6</code> where the old decayed to ~0. Total area under the LR curve rises
+<strong>3.44%</strong>. The optimizer side <em>does</em> keep exact backward compatibility — with
+no <code>[optimizer]</code> table it rebuilds the same AdamW from the same flat
+<code>[distill]</code> keys — but the scheduler side does not, and calling that "no behaviour
+change" would have been false.</p>
+</div>
+
+<h3>A bug in the shared scheduler, left alone deliberately</h3>
+
+<p><code>create_lr_scheduler</code> passes <code>T_max=total_steps</code> to
+<code>CosineAnnealingLR</code>, but under <code>SequentialLR</code> the warmup has already
+consumed <code>warmup_steps</code> of those. The cosine therefore advances only
+<code>total_steps - warmup_steps</code> of its period and never completes its anneal: with the
+distillation defaults it ends at 1.15e-6 instead of <code>eta_min</code>.</p>
+
+<p>Not fixed. It affects <em>every</em> stage that goes through <code>train.py</code>, not just
+this one, so silently changing the LR schedule of every model in the repo while wiring up a
+distillation feature is the wrong trade. Flagged for a deliberate decision instead.</p>
+
+<h3>Decisions on what not to bring over</h3>
+
+<table>
+<tr><th>Refused</th><th>Why</th></tr>
+<tr><td><code>gradient_release</code></td><td>Steps the optimizer from a post-accumulate-grad
+hook and asserts a data-parallel world size of 1. Directly contradicts both DDP and ZeRO
+here.</td></tr>
+<tr><td><code>genericoptim</code></td><td>Needs a pipeline <code>mpu</code> and the 2-d/other
+parameter split that only <code>train.py</code> constructs.</td></tr>
+<tr><td>No-weight-decay-on-1d defaulted <em>off</em></td><td>Skipping decay on LayerNorm gains and
+biases is correct and is what <code>train.py</code> does, but turning it on by default would move
+the numbers of every existing distillation run. Available as
+<code>no_weight_decay_on_1d = true</code>.</td></tr>
+</table>
+
+<h3>A config flaw the maintainer caught by reading</h3>
+
+<p>First version let <code>lr</code> appear in two places — flat under <code>[distill]</code> and
+inside the new <code>[optimizer]</code> table — and merged them. The merge was silently lossy:
+an <code>[optimizer]</code> table holding only <code>type</code> (exactly what someone switching
+to <code>adamw8bit</code> would write) inherited <code>lr</code> but fell back to torch&rsquo;s
+defaults for <code>betas</code> and <code>weight_decay</code>, discarding the configured values
+with nothing printed. Measured: <code>betas</code> went from the configured
+<code>(0.8, 0.95)</code> to <code>(0.9, 0.999)</code> and <code>weight_decay</code> from
+<code>0.05</code> to <code>0.01</code>.</p>
+
+<p>Now refused rather than merged, following the "set exactly one" rule
+<code>load_captions</code> already applies to its three caption sources in the same file. The
+error names the offending keys. <code>warmup_steps</code>, <code>lr_scheduler</code> and
+<code>max_grad_norm</code> are exempt: they configure the schedule and clipping, not the
+optimizer.</p>
+
+<h3>Not verified</h3>
+
+<p>Stated plainly because the distinction matters more than the pass count.</p>
+
+<p><strong>8-bit optimizer under ZeRO is untested and warns at runtime.</strong> Confirmed by
+running that <code>AdamW8bit</code> state is genuinely quantised (<code>uint8</code>
+<code>state1</code>/<code>state2</code> plus fp32 <code>qmap</code>/<code>absmax</code>) and that
+it steps on CPU. Not confirmed: what happens when <code>deepspeed.initialize</code> replaces the
+optimizer&rsquo;s param groups with its own flat fp32 partitions, leaving the quantisation blocks
+laid over partitions rather than whole parameters. Also worth knowing that the two save memory in
+the same place, so combining them buys well under the sum of their separate figures.</p>
+
+<p><strong>Verified by running:</strong> the DDP path across two real gloo ranks (three optimizer
+steps, grad norm 0.5894 &rarr; 0.5344 &rarr; 0.4902); all four precision modes end-to-end, each
+completing a full accumulate-and-step with finite gradients and weights that actually move; the
+generated DeepSpeed config parsed by DeepSpeed&rsquo;s own <code>DeepSpeedConfig</code>; every
+DeepSpeed API called (<code>get_global_grad_norm</code>, <code>backward</code>,
+<code>step</code>, and all five <code>initialize</code> parameters) confirmed present in 0.19.6.
+229 passed, 18 skipped.</p>
+
+<p><strong>Not verified:</strong> <code>deepspeed.initialize</code> has never actually run. The
+development container has no GPU and DeepSpeed hangs indefinitely on the CPU accelerator, with
+<code>overlap_comm</code> ruled out as the cause. The ZeRO tests use a fake engine, so they prove
+this code calls the right things in the right order — not that the real engine behaves as
+assumed. The load-bearing assumption is that <code>engine.backward()</code> applies the
+<code>1/N</code> accumulation scaling itself; if that is wrong, the effective learning rate is off
+by exactly <code>gradient_accumulation_steps</code> and <em>nothing reports it</em> — the loss
+still falls, just at the wrong rate.</p>
+
+<p>Cheapest check on real hardware: 200 steps at <code>ddp</code> and 200 at <code>zero1</code>,
+same seed, compare the loss curves. Also note that autocast is disabled on CPU by design, so the
+<code>bf16-mixed</code> and <code>fp16-mixed</code> numerics specifically have not been exercised
+either — on CPU they fall through to the fp32 path.</p>
+
+<h2>2026-08-31 — Caption corpus, tag dropout, multiline .txt captions</h2>
+
+<p><strong>Request.</strong> A script that flattens every caption in a <code>dataset.toml</code>
+into one file, so distillation can be pointed at that file instead of the dataset. Plus tag
+dropout, and multi-line <code>.txt</code> sidecars.</p>
+
+<h3>A premise worth correcting first</h3>
+
+<p>The request was framed as recovering captions the pipeline drops: "if an image has multiple
+captions, the current flow only picks one." It does not. <code>SizeBucketDataset.cache_latents</code>
+expands <em>every</em> caption of every image into its own entry in <code>iteration_order</code>
+— an image with three captions is three training samples, and <code>enumerate_captions</code>
+already extended the whole list. With <code>captions.json</code>, nothing was ever being lost.</p>
+
+<p>What <em>is</em> lost is narrower and real: a <code>.txt</code> sidecar is read as
+<code>[f.read().strip()]</code>, so a file with three lines is one caption containing two
+newlines. That is the only place captions actually go missing.</p>
+
+<p>So the corpus tool's value is not "recover dropped captions" — it is that distillation trains
+only the text frontend, and pointing it at a <code>dataset.toml</code> makes it walk every media
+file and open every tar purely to discover which captions exist. At three million images that is
+worth doing once. The corpus is a cache of that walk, not a second source of truth. Worth saying
+plainly, because a tool built on a wrong premise gets used for the wrong thing.</p>
+
+<h3>Decisions</h3>
+
+<ul>
+  <li><strong>The corpus is faithful, not preprocessed.</strong> Captions are written exactly as
+  the dataset holds them, tag marker included, shuffling not baked in. One corpus then serves
+  runs configured differently, and every epoch can draw a fresh variant. <code>caption_prefix</code>
+  is the one exception — a fixed string with no random component, so it is applied at export.</li>
+
+  <li><strong>Marker stripped at train time, not at export.</strong> Stripping it at export would
+  be cleaner-looking and would destroy the only signal saying which captions are tag lists. A
+  plain <code>.txt</code> corpus has nowhere to put a replacement flag, so that choice would have
+  quietly made the tag/prose distinction unrepresentable in one of the three formats.</li>
+
+  <li><strong>Dropout never empties a caption.</strong> An all-dropped caption is the empty
+  string, which is the <em>unconditional</em> embedding — the trainer already mints those
+  deliberately at <code>UNCOND_FRACTION</code>. Silently producing more would shift the
+  conditioning ratio with no config change to explain it. With two tags at rate 0.5 that is a
+  1-in-4 event, not a corner case. At least one tag always survives.</li>
+
+  <li><strong><code>multiline_captions</code> is opt-in.</strong> Turning it on changes how many
+  training samples every existing dataset with wrapped <code>.txt</code> files produces. That is
+  a silent retraining-scope change for models unrelated to this branch, so it defaults off and
+  needs <code>--regenerate_cache</code>, matching how <code>cache_shuffle_num</code> already
+  behaves.</li>
+
+  <li><strong>Distillation augments per sample; the diffusion stages cannot.</strong> The
+  diffusion stages bake <code>cache_shuffle_num</code> variants into the embedding cache, because
+  the embedding is computed once. Distillation re-embeds every step, so freezing a fixed variant
+  set there would be a pure loss. It reads its settings from the <code>dataset.toml</code>'s top
+  level when that is the source, so a run matches the diffusion stages without restating them —
+  top-level keys only, since a flat batch of captions has no directory to attach an override to.</li>
+
+  <li><strong>Case-insensitive marker matching, requested mid-implementation.</strong> A marker is
+  a hand-written annotation spread over millions of files; <code>"Special:"</code>,
+  <code>"special:"</code> and <code>"SPECIAL: "</code> have to mean the same thing. Only the first
+  <code>len(marker)</code> characters are casefolded — this runs per sample and captions are
+  long. The body is stripped afterwards, so <code>"SPECIAL:   a, b"</code> does not train as
+  <code>" a, b"</code> and tokenize differently from its neighbours for no reason.</li>
+</ul>
+
+<h3>A test failure that was worth listening to</h3>
+
+<p>Seven exporter tests failed with <code>ModuleNotFoundError: No module named 'comfy_aimdo'</code>.
+The tests run the script as a subprocess, which does not get <code>conftest.py</code>'s stub. The
+easy fix was to stub it in the subprocess too.</p>
+
+<p>The failure was pointing at something real: a tool that reads text files was importing torch,
+DeepSpeed and ComfyUI, because <code>enumerate_captions</code> happened to live in
+<code>utils/dataset.py</code>. Caption resolution needs nothing but the standard library. It moved
+to <code>utils/captions.py</code>, re-exported from <code>utils/dataset.py</code> so no existing
+caller changed. The tests went from 52s to 0.5s — that number <em>is</em> the import cost, paid on
+every invocation of the exporter, for nothing.</p>
+
+<h3>The QA pass that mattered most</h3>
+
+<p>The reviewer's first finding was mine, it was a blocker, and it had nothing to do with
+captions. Extracting the caption code by <em>text range</em> swallowed
+<code>bucket_suffix</code>, <code>dedup_and_sort</code> and <code>seed_from_hash</code>, which
+happened to sit between <code>shuffle_captions</code> and <code>_map_and_cache</code>.
+<code>utils/dataset.py</code> calls all three at twelve sites. Every training run, for every
+model in the repo, died at dataset construction. The copies that landed in
+<code>utils/captions.py</code> were broken too — that module imports neither numpy, hashlib nor
+<code>ROUND_DECIMAL_DIGITS</code>.</p>
+
+<p>And 182 tests passed. The module still <em>imported</em> cleanly, and not one test in this
+repository had ever constructed a <code>DirectoryDataset</code>, <code>ARBucketDataset</code> or
+<code>SizeBucketDataset</code>. A green suite was not evidence of anything here.
+<code>test/test_dataset_smoke.py</code> now builds those objects against real images, and walks
+<code>utils/dataset.py</code>'s AST asserting every global name it loads actually resolves —
+which catches the class of bug, not just these three names. Reverting the fix makes it fail at
+collection.</p>
+
+<table>
+  <tr><th>Also found</th><th>What it was</th></tr>
+
+  <tr><td><code>caption_prefix</code> was baked into the exported corpus, in front of the tag
+      marker.</td>
+      <td>Training builds a caption as <code>caption_prefix + augment(strip_marker(raw))</code>.
+      Storing <code>"anime, Special: red, blue"</code> means it no longer starts with the
+      marker, so the consumer fails to strip it, silently skips augmentation, and trains
+      <code>Special</code> as a tag. Measured: distillation got
+      <code>anime, Special: red, blue</code> where training got <code>anime, blue, red</code>.
+      The prefix is now applied at training time, after stripping.</td></tr>
+
+  <tr><td>A dataset whose directories use different markers could not be recovered from a flat
+      corpus at all.</td>
+      <td>The docs said "restate the per-directory override under <code>[distill]</code>", but
+      with two markers there is no single value to restate. <code>prefix_tag_caption</code> now
+      accepts a list, <code>enumerate_captions</code> reports the markers it skipped, and the
+      exporter prints the exact config line.</td></tr>
+
+  <tr><td><code>num_repeats</code> stored per caption in the corpus, floored per entry.</td>
+      <td>The dataset's semantics are <code>int(len(directory_captions) * num_repeats)</code>
+      over a whole directory. Per caption, any value below 1 floors to zero and deletes the
+      caption: <code>[a, b, c]</code> at 0.5 came back as <code>['b', 'c', 'c']</code> with
+      <code>a</code> simply gone. The field is removed; <code>--apply-num-repeats</code> expands
+      it at export with the dataset's own arithmetic, and setting it on a corpus source now
+      warns instead of silently doing nothing.</td></tr>
+
+  <tr><td>A <code>count</code> of 0, a negative, or a string.</td>
+      <td>Silently dropped the caption, or threw a bare <code>ValueError</code> three lines below
+      a reader that raises careful <code>path:lineno</code> errors. Now validated with the same
+      message shape.</td></tr>
+</table>
+
+<p>The reviewer also confirmed, by differential test against the pre-branch implementation, that
+<code>shuffle_captions</code> at its defaults is byte-identical including the RNG call sequence;
+that fuzzing 3000 adversarial strings through all three corpus formats round-trips cleanly; and
+that the <code>casefold()</code> slicing concern does not materialise, because the same index
+partitions the caption on both sides.</p>
+
+<h3>What the frozen-dropout question exposed</h3>
+
+<p>Asked whether tag dropout does anything when embeddings are cached, the honest answer turned
+out to be "sometimes not". Augmentation is baked into the embedding cache, so
+<code>tag_dropout_rate</code> with <code>cache_shuffle_num = 0</code> produces exactly one draw,
+frozen forever — permanent tag deletion wearing an augmentation's name. It now warns.</p>
+
+<p>That question also produced the better feature.
+<code>caption_sampling = "random_per_epoch"</code> gives one sample per image with the caption
+drawn on each access, instead of one sample per caption. All the embeddings are already cached
+and already indexable, so the draw is just an index — nothing extra to cache. And because the
+draw ranges over every cached variant, shuffling and dropout become real augmentation again with
+cached embeddings, which is what the frozen-draw problem needed.</p>
+
+<p>One constraint fell out of reading the other models rather than assuming: per-sample
+augmentation is applied only when <em>no</em> text embeddings were cached (SDXL always; Cosmos
+with <code>cache_text_embeddings = false</code>). HiDream caches CLIP and T5 but tokenizes Llama3
+from the live caption — re-augmenting there would make the cached embedding and the live text
+describe different captions. The check is <code>not self.text_embedding_datasets</code>, which
+excludes it correctly without naming any model.</p>
+
+<div class="flag">
+<p><strong>Not verified.</strong> Still no training run, no multi-GPU run, no image. The corpus
+round-trip, the augmentation semantics and the exporter are covered by 56 CPU tests including
+newline/backslash/unicode round-trips through all three formats, but no corpus has been built
+from a real multi-million-image dataset, and the claim that reading a corpus is meaningfully
+faster than walking a dataset is reasoning about I/O, not a measurement.</p>
+</div>
+
+<h3>A third QA pass, and the worst bug on the branch</h3>
+
+<p>The first finding was mine, it was a blocker, and it had nothing to do with the feature being
+reviewed. <code>ContextRefiner.init_weights()</code> was written to run <em>after</em>
+<code>__init__</code>, so it set only the ten values that differ from PyTorch's defaults. But the
+pipeline builds the refiner under <code>init_empty_weights()</code> and materialises every
+parameter with <code>torch.empty</code>. The other eighteen kept whatever the allocator last
+held — measured up to 1e32, sometimes NaN.</p>
+
+<p>The reviewer saw NaN in <code>k_proj</code> and NaN gradients on step 1. The same script here
+produced garbage that stayed finite through four training steps, because the zeroed residual
+branches mask it until training moves them off zero. That difference is the point: the behaviour
+depended on allocator residue, so it differed between machines and between runs. A comment in
+<code>cosmos_predict2.py</code> asserted <code>init_weights()</code> "overwrites it". It did
+not.</p>
+
+<table>
+  <tr><th>Also found</th><th>What it was</th></tr>
+
+  <tr><td>Metadata cache poisoning across a <code>cache_text_embeddings</code> flip.</td>
+      <td>The cache is keyed by directory and model name; <code>anima</code> and
+      <code>anima_refiner</code> deliberately share a tree, and <code>--trust_cache</code> reuses
+      it without looking. Reproduced both directions: raw captions with the tag marker intact fed
+      to the text encoder, and <code>anime, anime, red, green, blue</code> — the prefix applied
+      twice and then shuffled into the middle of the tag list. Every metadata artefact derived
+      from caption text now carries a suffix, empty at the defaults so existing caches stay
+      valid.</td></tr>
+
+  <tr><td>A claim in the docs that the code did not support.</td>
+      <td>"The same draw selects the caption text and its embedding, so the two can never
+      disagree." Measured: 8 of 9 rows disagreed. The iteration-order builder shuffles each
+      image's caption list and then uses the post-shuffle position to index an embedding cache
+      built in the <em>original</em> order. Pre-existing at <code>ca42315</code> — but the claim
+      was new, and HiDream reads both.</td></tr>
+
+  <tr><td>Distillation from a caption corpus trained the tag marker as a tag.</td>
+      <td>Only the <code>dataset</code> source inherited caption settings. The corpus source —
+      the one the docs recommend for large datasets — got none, so the exact failure the corpus
+      commit claimed to have fixed survived in the path it recommends.</td></tr>
+
+  <tr><td><code>blocks_to_swap</code> with <code>cache_text_embeddings = false</code>, shipped in
+      the example config.</td>
+      <td>Block swapping replaces <code>PipelineModule.to</code> with a no-op and moves only the
+      transformer to CUDA. The text encoder lives on the pipeline layer, so it stays on CPU and
+      returns CPU embeddings into a CUDA batch. Unverifiable without a GPU, so it now asserts
+      rather than attempting an untested device move.</td></tr>
+
+  <tr><td>Two spellings of one setting behaving differently.</td>
+      <td>The <code>shuffle_tags</code> back-compat fixup lived inside a function that runs in a
+      worker process, after every gate that reads the value. <code>shuffle_tags = true</code> got
+      frozen shuffling; the identical <code>cache_shuffle_num = 1</code> got per-access.</td></tr>
+
+  <tr><td>A test that failed 12% of runs, with a vacuous assertion attached.</td>
+      <td>It asserted set equality between 500 round-trip draws and 4 cache-time draws over a
+      two-tag caption, which cannot hold when all four land on the same order. The
+      <code>assert random</code> beneath it — a module object, always truthy — claimed the draws
+      were seeded. They were not.</td></tr>
+</table>
+
+<p>What the reviewer confirmed rather than found: epoch length really is unchanged versus
+<code>ca42315</code>, established by extracting the old <code>shuffle_captions</code> and sweeping
+the full setting matrix — the differential test the branch's own version should have been, since
+that one only compared the new code to itself.</p>
+
+<h2>2026-08-30 — Anima Refiner: replacing Anima's LLMAdapter text frontend</h2>
+
+<p><strong>Request.</strong> Add an architecture that swaps Anima's <code>LLMAdapter</code> for the
+<code>cap_embedder</code> + bidirectional refiner blocks that Lumina 2 and Z-Image use, so any
+Transformers LLM (target: Qwen3.5-2B-Base) can drive the DiT. New model type
+<code>anima_refiner</code>; <code>cosmos_predict2</code> and <code>anima</code> must be untouched.</p>
+
+<h3>Why the adapter exists at all</h3>
+
+<p>Worth recording, because it explains the whole design. In ComfyUI Anima is literally
+<code>class Anima(MiniTrainDIT)</code> — a Cosmos-Predict2 DiT whose only addition is the adapter.
+Cosmos-Predict2 feeds old-T5 encoder output straight into cross-attention with no adapter, so the
+adapter is a retrofit letting a Qwen3 LLM drive a T5-native DiT.</p>
+
+<p>The mismatch it papers over is <em>not</em> dimensional: old T5-XXL has
+<code>d_model = 1024</code> and Qwen3-0.6B has <code>hidden_size = 1024</code>. They already agree.
+A six-layer cross-attention module with a 32128-entry embedding table was built anyway, which is
+the evidence that the gap is representational — bidirectional encoder vs causal decoder, span
+corruption vs next-token, sentencepiece vs BPE.</p>
+
+<h3>Findings that changed the design</h3>
+
+<table>
+  <tr><th>Finding</th><th>Consequence</th></tr>
+  <tr><td>Qwen3.5 interleaves linear and full attention (<code>full_attention_interval = 4</code>), full-attention layers at 3/7/11/15/19/23</td>
+      <td><code>hidden_states[-2]</code>, Lumina 2's convention, lands after a <em>linear</em>-attention layer. Default is <code>-1</code> here.</td></tr>
+  <tr><td>Linear-attention layers are recurrences with no attention matrix</td>
+      <td>They cannot be made bidirectional by flipping a mask, so the refiner's bidirectional blocks are load-bearing, not decoration.</td></tr>
+  <tr><td><code>Qwen3.5-2B</code> and <code>Qwen3.5-2B-Base</code> have byte-identical <code>config.json</code></td>
+      <td>No architecture change needed for Base; only the tokenizer differs (<code>eos</code> <code>&lt;|endoftext|&gt;</code> vs <code>&lt;|im_end|&gt;</code>). Verified by fetching both.</td></tr>
+  <tr><td>Teacher and student features are indexed by <em>different</em> tokenizers</td>
+      <td>A position-wise distillation MSE runs without error while comparing unrelated slots. The loss is measured at the cross-attention output instead, which is a weighted sum over text positions and therefore invariant to indexing.</td></tr>
+</table>
+
+<h3>Mistakes made in the first version, and what fixed them</h3>
+
+<p>Recorded honestly, because four of them were regressions in code shared with other models.</p>
+
+<div class="flag">
+<p><strong>Shape derived from config instead of from the weights.</strong>
+<code>load_diffusion_model</code> loads with <code>if name not in state_dict: continue</code>, so a
+checkpoint holding more refiner layers than <code>n_refiner_layers</code> asked for silently lost
+the surplus. Measured: a 4-layer refiner loaded under the default of 6 dropped 24 tensors with no
+warning. Now the layer count and input dimension come from the weights, and a config that
+contradicts them raises.</p>
+</div>
+
+<div class="flag">
+<p><strong><code>cache_name</code> discarded the VAE latents.</strong> A config key was added to
+invalidate stale text embeddings when the text encoder changed. It worked by changing the
+pipeline's <code>name</code>, which is the root of the whole cache tree — so switching text encoder
+also threw away latents, by far the more expensive half, for a component that had not changed.
+Replaced by a text-encoder identity mixed into the <em>text embedding</em> fingerprint only.
+<code>anima_refiner</code> now also shares <code>anima</code>'s cache directory deliberately, so
+latents cached by an anima run are reused as is.</p>
+</div>
+
+<p>Three smaller leaks into shared code, all now gated on the model type: <code>base_lr</code> and
+<code>max_text_length</code> were read unconditionally, giving <code>anima</code> and
+<code>cosmos_predict2</code> config keys nobody asked for; and the vision-language branch of the
+<code>llm_path</code> directory loader changed how <code>anima</code> would load a VLM.</p>
+
+<p>One near-miss caught during implementation rather than after: the text-encoder identity was
+first appended to <code>new_fingerprint_args</code> unconditionally.
+<code>Hasher.hash([i])</code> and <code>Hasher.hash([i, ''])</code> differ, so that would have
+invalidated the text embedding cache of <em>every</em> model in the repo. Extra fingerprint args
+are now only appended when non-empty, and the old fingerprint was verified byte-for-byte.</p>
+
+<h3>Decisions made that were not in the request</h3>
+
+<ul>
+  <li><strong>OPLoRA excludes the refiner.</strong> OPLoRA projects a low-rank update away from the
+  top-k singular subspace of the pretrained base weight. A newly built refiner has no pretrained
+  weights to protect, and two of its six Linear layers per block are zero-initialised — where, as
+  measured, the SVD does not fail or produce NaN but returns an <em>arbitrary</em> orthonormal
+  basis. Projecting against that costs the adapter <code>rank</code> directions for nothing.
+  Implemented as a per-model <code>oplora_exclude_names</code>, empty everywhere else.</li>
+
+  <li><strong>Distillation reads <code>dataset.toml</code>.</strong> It originally took a bespoke
+  caption format while every other mode used the repo's. Now it goes through
+  <code>utils.dataset.enumerate_captions()</code>, which mirrors <code>DirectoryDataset</code>'s
+  resolution rules exactly. Images are enumerated to find their captions but never opened.</li>
+
+  <li><strong><code>context_refiner_path</code> wins over the checkpoint, loudly.</strong> Both
+  orderings are defensible; silence is not, so it warns naming both files every time.</li>
+
+  <li><strong>Stage numbering removed.</strong> <code>stage1</code>/<code>stage2</code> implied a
+  pipeline the code does not enforce — every mode loads identically and can run in any order. The
+  configs are named for what they train instead.</li>
+</ul>
+
+<h3>What an independent QA pass found</h3>
+
+<p>A separate reviewer was pointed at the whole branch after it was written. Three real defects,
+all confirmed by reproduction before being fixed:</p>
+
+<table>
+  <tr><th>Defect</th><th>Why it survived the author's own review</th></tr>
+  <tr><td><code>context_refiner_path</code> stripped <code>context_refiner.</code> but not
+      <code>net.</code>, so pointing it at a full <code>model.safetensors</code> — the format
+      this repo's own <code>save_model</code> writes — raised <code>KeyError</code>.</td>
+      <td>The distillation tool had a correct stripper; the pipeline had its own inline copy
+      that handled one prefix fewer. Two implementations of the same idea, only one of them
+      right.</td></tr>
+  <tr><td><code>extract_refiner_state_dict</code> returned every unrelated DiT tensor as if it
+      were the refiner when the file contained no refiner at all, so its own
+      <code>if not refiner: raise</code> guard never fired.</td>
+      <td>The filter that narrows a full checkpoint only activated when a refiner key was
+      present, which is precisely the case that does not need narrowing.</td></tr>
+  <tr><td>An empty caption tokenizes to an <strong>all-padding</strong> row, and that is the
+      unconditional embedding every CFG run uses. A row with no unmasked key makes the attention
+      softmax degenerate.</td>
+      <td>Measured on CPU it returns zeros, so nothing looked wrong. The fused CUDA backends can
+      return NaN, and <code>NaN * 0</code> is still NaN, so zeroing the padded output would not
+      have contained it — it would have poisoned the gradients. Untestable here; guarded
+      defensively by letting such rows attend freely, since their output is discarded anyway.</td></tr>
+</table>
+
+<p>Two of the branch's own tests were also called out and deserved it: one asserted a literal
+string was present in a source file and returned a constant, testing nothing; another was named
+<code>test_checkpoint_without_a_refiner_raises</code> while asserting that it did <em>not</em>
+raise, effectively documenting the second defect above as intended behaviour. Both are fixed —
+the first renamed to say plainly that it is a source-level guard rather than a behaviour test.</p>
+
+<p>The reviewer found no surviving regression in shared code, having traced every changed line in
+<code>utils/dataset.py</code>, <code>utils/oplora.py</code>, <code>models/base.py</code> and
+<code>train.py</code> to confirm no pre-existing model reaches new behaviour.</p>
+
+<h3>What a second, harder QA pass found</h3>
+
+<p>A stronger reviewer was then pointed at the same range. It found eleven further defects — none
+of them overlapping the first pass — and one false positive. Every one below was reproduced before
+being fixed.</p>
+
+<table>
+  <tr><th>Defect</th><th>Why it survived</th></tr>
+
+  <tr><td><code>tools/sample_anima_refiner.py</code> imported <code>models.cosmos_predict2</code>
+      at module scope, before it set <code>utils.common.AUTOCAST_DTYPE</code>. The model module
+      binds that value at import time, so it was <code>None</code> — and
+      <code>torch.autocast('cuda', dtype=None)</code> does not error, it silently resolves to
+      <code>float16</code>. A bf16 model would have sampled in fp16.</td>
+      <td>The bug is an import-order coupling, invisible in either file read alone. Measured:
+      <code>torch.autocast('cuda', dtype=None).fast_dtype</code> is <code>torch.float16</code>.
+      The import is now deferred until after the dtype is set.</td></tr>
+
+  <tr><td><code>enumerate_captions()</code> fell back to a sidecar <code>.txt</code> for images
+      missing from <code>captions.json</code>. <code>DirectoryDataset</code> disables the
+      <code>.txt</code> path for the entire directory once a <code>captions.json</code> exists.
+      Distillation would train on captions the DiT never sees.</td>
+      <td>"Mirrors the repo's resolution rules" was asserted, not diffed. The two produced
+      <code>['from json', 'from txt fallback']</code> against <code>['from json']</code>.</td></tr>
+
+  <tr><td>For tar datasets, captions were keyed by member <em>basename</em> while the dataset keys
+      by full member path. Every lookup missed: zero captions, silently.</td>
+      <td>Tested only on a flat directory, where basename and path coincide. Reproduced as
+      <code>[]</code>; now keyed by <code>(tar_file, member_path)</code>.</td></tr>
+
+  <tr><td>The distillation auxiliary loss used a mask-normalised mean while the primary term is
+      measured through an attention softmax. Padding changes the softmax denominator but not a
+      masked mean, so the two terms disagreed about what a "position" is.</td>
+      <td>A plausible-looking helper. Replaced with <code>padded_mean(x, mask, length)</code>,
+      which normalises by the same padded length the attention does.</td></tr>
+
+  <tr><td>LoRA targeted <code>RefinerBlock</code>, so <code>cap_embedder</code> — which hangs off
+      <code>ContextRefiner</code>, not off any block — was never adapted. The one projection that
+      has to move for a new text encoder to land was frozen in every adapter run.</td>
+      <td><code>get_target_modules</code> matches a class name and then walks only that module's
+      own <code>nn.Linear</code>s. Target changed to <code>ContextRefiner</code>; a test now
+      asserts a <code>cap_embedder</code> LoRA parameter exists.</td></tr>
+
+  <tr><td><code>train_context_refiner</code> wrote its refiner beside the adapter in the same save
+      directory. Two <code>.safetensors</code> in one directory makes
+      <code>load_adapter_weights</code> raise on resume.</td>
+      <td>Only ever exercised as a fresh run. The refiner now goes to a
+      <code>context_refiner/</code> subdirectory.</td></tr>
+
+  <tr><td>Docs said <code>n_refiner_layers</code> is "ignored" when the checkpoint carries a
+      refiner. The code raises on a conflict — deliberately, after the silent-weight-drop bug
+      earlier on this branch.</td>
+      <td>The doc was written before that fix and never revisited. Docs corrected, and the key
+      removed from the configs that point at refiner-bearing checkpoints.</td></tr>
+
+  <tr><td>A blanket rename of the Unsloth references also rewrote the README line that
+      <em>documents the Unsloth option itself</em>.</td>
+      <td>Self-inflicted, by <code>sed</code> over a whole file instead of a located line.
+      Reverted.</td></tr>
+
+  <tr><td><code>--device cpu</code> in the sampler was broken twice over: an unconditional
+      <code>.to('cuda')</code> on the VAE statistics, and a float32 timestep fed to a bf16
+      model.</td>
+      <td>The CPU path was added for testability and then never run end to end on CPU. Both
+      fixed; it now runs.</td></tr>
+
+  <tr><td>A fractional <code>num_repeats</code> crashed caption enumeration, and a
+      <code>config['probe']</code> subscript assumed an optional key was present.</td>
+      <td>Two ordinary omissions. Repeats now expand as
+      <code>int(len(captions) * num_repeats)</code> with wraparound indexing.</td></tr>
+</table>
+
+<p>The twelfth finding — that <code>implementation-notes.html</code> is a stray artifact this
+branch introduced — is <strong>wrong</strong>. The file predates the branch (commit
+<code>a0efffa</code>) and is the document you are reading. Recorded here rather than quietly
+dropped, because a QA pass being right eleven times out of twelve is exactly the pattern that
+makes the twelfth easy to accept without checking.</p>
+
+<p>What the two passes have in common is worth naming: not one of these fourteen defects was a
+wrong algorithm. They were an import order, a prefix, a mask, a dict key, a class name, a
+directory layout, and a doc that had drifted from its code. All of them sit in the seams between
+two pieces that were each individually correct.</p>
+
+<h3>Not verified</h3>
+
+<div class="flag">
+<p>Development happened on a CPU-only box with no model weights. Everything is covered by CPU
+tests — including a real optimisation loop over the layer stack <code>to_layers()</code> builds,
+and sampling checked against a synthetic velocity field where the exact answer is known — but
+<strong>no training run, no multi-GPU run and no image was ever produced</strong>. Multi-GPU is
+covered indirectly by asserting the invariants pipeline parallelism depends on: constant tensor
+shapes across micro batches, and every layer boundary being a valid split point. Real DeepSpeed
+execution still needs <code>deepspeed --num_gpus=2 --module test.debug_deepspeed_init</code>.</p>
+</div>
+
+<p>Also unproven: sampling quality. <code>tools/sample_anima_refiner.py</code> is verified for
+integration math and shape handling, not for producing good images.</p>
+
+<p>See <a href="docs/anima_refiner/README.md">docs/anima_refiner/README.md</a> for the architecture and
+<a href="docs/anima_refiner/lessons.md">docs/anima_refiner/lessons.md</a> for the rules these
+mistakes turned into.</p>
+
+<h2>2026-07-29 — bitsandbytes 0.50 and torch 2.13 upstream drift</h2>
+
+<p><strong>Reported problem.</strong> Two crashes from the training box:
+<code>KeyError: 'percentile_clipping'</code> at <code>optimizers/adamw_8bit.py:30</code>, and a failed
+import of <code>check_serializing_named_tensor</code> from <code>torch._namedtensor_internals</code>
+on torch 2.13.0.</p>
+
+<h3>What the audit actually found</h3>
+
+<p>The reported <code>KeyError</code> was one of four breakages, not one. Verified by extracting the
+bitsandbytes 0.50.0 wheel and reading the source rather than guessing:</p>
+
+<table>
+  <tr><th>Removed in bitsandbytes 0.50.0</th><th>Where it broke</th></tr>
+  <tr><td><code>get_config()</code> key <code>percentile_clipping</code></td><td><code>adamw_8bit.py:30</code> (the reported crash)</td></tr>
+  <tr><td><code>get_config()</code> key <code>block_wise</code></td><td><code>adamw_8bit.py:72</code> and <code>:99</code> — the next two <code>KeyError</code>s</td></tr>
+  <tr><td><code>functional.percentile_clipping</code></td><td><code>adamw_8bit.py:31</code></td></tr>
+  <tr><td><code>functional.optimizer_update_8bit</code> (non-blockwise)</td><td><code>adamw_8bit.py:73</code></td></tr>
+</table>
+
+<p>The positional order of <code>optimizer_update_32bit</code> and
+<code>optimizer_update_8bit_blockwise</code> did <em>not</em> change, so the Kahan summation logic
+itself needed no edit. That was checked argument by argument against the 0.50.0 source.</p>
+
+<h3>Decisions made that were not in the request</h3>
+
+<ul>
+  <li><strong>Kept the non-blockwise 8-bit branch instead of deleting it.</strong> The chosen approach
+    was "support both 0.49.x and 0.50.x", so the branch stays reachable for users still on 0.49 where
+    <code>F.optimizer_update_8bit</code> exists. On 0.50 the <code>block_wise</code> default of
+    <code>True</code> means it is never entered, so the missing function is never touched.</li>
+  <li><strong>Second <code>elif</code> reduced to a bare dtype check.</strong>
+    <code>elif state["state1"].dtype == torch.uint8 and config["block_wise"]</code> became
+    <code>elif state["state1"].dtype == torch.uint8</code>. It is logically equivalent once the
+    preceding branch handles the non-blockwise case, and it avoids a second defensive
+    <code>config.get()</code> for no benefit.</li>
+  <li><strong>Inlined the torch helper rather than a <code>try</code>/<code>except</code> import.</strong>
+    <code>check_serializing_named_tensor</code> is five lines with stable semantics. Importing it from
+    a private module is what broke; a fallback import would leave the same fragility in place, so
+    <code>utils/reduction.py</code> now defines it locally.</li>
+  <li><strong>No pin added to <code>requirements.txt</code>.</strong> The version-adaptive fix works on
+    both releases, and the project deliberately keeps dependencies unpinned.</li>
+  <li><strong>Renamed the audit note.</strong>
+    <code>docs/note/submodule-signature-audit.md</code> became
+    <code>docs/note/upstream-api-drift-audit.md</code> because the rule now covers pip dependencies as
+    well as submodules, and the old filename would have been misleading. Done with <code>git mv</code>
+    to keep history; all three referring files were updated.</li>
+  <li><strong>Guard script skips bitsandbytes instead of failing it.</strong> In
+    <code>tools/check_vendored_apis.py</code>, a missing bitsandbytes is reported as
+    <code>[SKIP]</code>, so the torch half of the audit still runs (and still exits zero) on the
+    CPU-only dev box where bitsandbytes is not part of the normal setup.</li>
+</ul>
+
+<h3>Tradeoffs weighed</h3>
+
+<ul>
+  <li><strong>Version-adaptive vs. following 0.50 exactly.</strong> Mirroring 0.50 would be cleaner and
+    would delete two dead branches, but it breaks anyone on 0.49.x, and <code>requirements.txt</code>
+    leaves bitsandbytes unpinned so that is a real population. Cost of the chosen path: two branches
+    that are unreachable on modern bitsandbytes, kept alive by <code>config.get()</code> defaults.</li>
+  <li><strong>Inlining vs. re-vendoring <code>utils/reduction.py</code> from torch 2.13.</strong>
+    Re-vendoring would resync the whole file, but it is a large diff that needs real
+    multi-process GPU testing to trust, and only one symbol was reported broken. Inlining is a
+    five-line change; the guard script covers the risk that other symbols went missing too.</li>
+  <li><strong>Test realism.</strong> The tests build <code>AdamW8bitKahan</code> via
+    <code>__new__</code> and stub <code>bitsandbytes.functional</code>, because the real update
+    kernels need CUDA. That means they verify the config handling and the branch routing —
+    the parts that actually broke — but not the numerics of the kernels themselves.</li>
+</ul>
+
+<h3>Things the maintainer needs to know</h3>
+
+<div class="flag">
+  <p><strong>Not verifiable on the dev box.</strong> This machine runs torch 2.12.1+cpu, so the torch
+  2.13 removal could not be reproduced locally. <code>utils/reduction.py</code> depends on 14 other
+  private torch symbols beyond the one that broke; all 14 were confirmed present on 2.12.1 but not on
+  2.13. Please run <code>python tools/check_vendored_apis.py</code> on the 2.13 training box and
+  report any <code>FAIL</code> lines.</p>
+</div>
+
+<ul>
+  <li><strong>The dev venv changed.</strong> <code>multiprocess</code> and
+    <code>bitsandbytes==0.50.0</code> were installed into <code>.venv</code> so the fixes could be
+    verified rather than assumed. bitsandbytes 0.50.0 ships a CPU-capable <code>win_amd64</code> wheel
+    and imports without a GPU, which is what made the audit checkable locally.</li>
+  <li><strong>Tests.</strong> <code>test/test_adamw_8bit.py</code> (5 cases) covers the new and old
+    config shapes, both 8-bit paths, and the Kahan compensation. Confirmed to reproduce the original
+    <code>KeyError: 'percentile_clipping'</code> when the fix is reverted. Full suite: 31 passed.</li>
+  <li><strong>Left out of the commit.</strong> An unrelated in-progress research note,
+    <code>docs/note/lumina2-vs-sd-scripts-training.md</code> and its index line, was already
+    uncommitted in the working tree. It was deliberately not included so this change stays atomic;
+    it is still sitting in the working tree.</li>
+</ul>
+
+</body>
+</html>

@@ -1,0 +1,88 @@
+# refiner_only: train ONLY the ContextRefiner, with the whole DiT frozen.
+#
+# The refiner has to adapt to the DiT, not the other way round. Unfreezing the DiT while the
+# refiner still emits noise is what actually causes forgetting: loss is highest at the start,
+# so the gradients are largest exactly when the signal is least meaningful.
+#
+# Run tools/distill_refiner.py first (examples/anima_refiner/distill.toml) and point
+# context_refiner_path at its output for a much cheaper start. Without it the refiner begins
+# from a zero-init identity, which still trains, just more slowly.
+#
+# transformer_path may be a stock Anima checkpoint (a fresh refiner is built) or any
+# checkpoint that already carries a refiner, from any other mode. Nothing here assumes an
+# order.
+
+output_dir = '/data/output/anima_refiner_refiner_only'
+dataset = 'examples/dataset.toml'
+
+epochs = 1
+micro_batch_size_per_gpu = 4
+pipeline_stages = 1
+gradient_accumulation_steps = 1
+gradient_clipping = 1
+warmup_steps = 500
+
+eval_every_n_steps = 500
+eval_before_first_step = true
+eval_micro_batch_size_per_gpu = 4
+eval_gradient_accumulation_steps = 1
+
+save_every_n_steps = 2000
+checkpoint_every_n_minutes = 120
+activation_checkpointing = true
+partition_method = 'parameters'
+save_dtype = 'bfloat16'
+caching_batch_size = 8
+steps_per_print = 10
+
+# Complete the final batch of each size bucket rather than dropping it. Set here rather than in
+# the dataset TOML because this config shares examples/dataset.toml with the other modes and
+# with every other model's examples; the key is read from either place and this one wins.
+batch_fill_strategy = 'fill'
+
+[model]
+type = 'anima_refiner'
+transformer_path = '/data2/imagegen_models/comfyui-models/anima-preview.safetensors'
+vae_path = '/data2/imagegen_models/comfyui-models/qwen_image_vae.safetensors'
+dtype = 'bfloat16'
+
+# Text encoder. Either a full Transformers folder:
+llm_path = '/data2/imagegen_models/Qwen3.5-2B-Base'
+# ...or a single safetensors file, in which case the architecture and tokenizer come from a
+# config directory. configs/qwen3_5_2b_base ships with the repo and is used by default:
+#llm_path = '/data2/imagegen_models/comfyui-models/qwen3_5_2b.safetensors'
+#llm_config_path = 'configs/qwen3_5_2b_base'      # any local Transformers config directory
+#llm_repo_id = 'Qwen/Qwen3.5-2B-Base'             # or download the config/tokenizer from the Hub
+
+# Which hidden state feeds the refiner. Qwen3.5-2B-Base interleaves linear and full attention, with
+# full-attention layers at 3/7/11/15/19/23. hidden_states[i] is the output of layer i-1, so -1
+# lands right after a full-attention layer. -2 (Lumina 2's convention) would land after a
+# linear-attention one, which is likely worse here. Worth sweeping -1 against 20.
+llm_hidden_layer = -1
+n_refiner_layers = 6
+max_text_length = 512
+
+# Warm start from tools/distill_refiner.py. Omit to build a fresh refiner.
+#context_refiner_path = '/data/output/anima_refiner_distill/context_refiner.safetensors'
+
+
+# Cache text embeddings to disk (default). At 3M images x 512 tokens x 2048 dims in bf16 that
+# is roughly 6TB, so set it false to run the text encoder inside the training loop instead:
+# no disk cost, about 4.5GB more VRAM and a slower step.
+cache_text_embeddings = true
+
+# THE KEY SETTING: freeze everything except the refiner.
+base_lr = 0        # x_embedder, t_embedder, pos_emb, final_layer
+self_attn_lr = 0
+cross_attn_lr = 0
+mlp_lr = 0
+mod_lr = 0
+refiner_lr = 1e-4  # the only thing that trains
+
+timestep_sample_method = 'logit_normal'
+
+[optimizer]
+type = 'adamw8bitkahan'
+lr = 1e-4
+betas = [0.9, 0.99]
+weight_decay = 0.01

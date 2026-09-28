@@ -1,0 +1,71 @@
+# LoKr on top of a TRAINED anima_refiner model. See lora.toml for the shared notes.
+#
+# Important: a LoRA is a low-rank update to existing weights, so it has nothing to build on if
+# the refiner is still freshly initialised. Either point context_refiner_path at a trained
+# refiner (normal case), or set train_context_refiner in [adapter] to train it densely
+# alongside the LoRA.
+
+output_dir = '/data/output/anima_refiner_lokr'
+dataset = 'examples/dataset.toml'
+
+epochs = 100
+micro_batch_size_per_gpu = 4
+pipeline_stages = 1
+gradient_accumulation_steps = 1
+gradient_clipping = 1
+warmup_steps = 100
+
+eval_every_n_epochs = 1
+eval_before_first_step = true
+eval_micro_batch_size_per_gpu = 4
+eval_gradient_accumulation_steps = 1
+
+save_every_n_epochs = 2
+activation_checkpointing = true
+partition_method = 'parameters'
+save_dtype = 'bfloat16'
+caching_batch_size = 8
+steps_per_print = 10
+blocks_to_swap = 20  # block swapping requires an [adapter] block, so it works here
+
+# Complete the final batch of each size bucket rather than dropping it. Set here rather than in
+# the dataset TOML because this config shares examples/dataset.toml with the other modes and
+# with every other model's examples; the key is read from either place and this one wins.
+batch_fill_strategy = 'fill'
+
+[model]
+type = 'anima_refiner'
+transformer_path = '/data/output/anima_refiner_refiner_crossattn/<run>/model.safetensors'
+vae_path = '/data2/imagegen_models/comfyui-models/qwen_image_vae.safetensors'
+llm_path = '/data2/imagegen_models/Qwen3.5-2B-Base'
+dtype = 'bfloat16'
+
+llm_hidden_layer = -1
+# n_refiner_layers is omitted: transformer_path already carries a refiner, and its layer
+# count is read from those weights. Setting it here would raise if the two disagree.
+max_text_length = 512
+# Needed if transformer_path does not already contain trained refiner weights.
+#context_refiner_path = '/data/output/anima_refiner_distill/context_refiner.safetensors'
+
+timestep_sample_method = 'logit_normal'
+
+[adapter]
+type = 'lokr'
+rank = 16
+decompose_factor = -1
+rank_dropout = 0.0
+dtype = 'bfloat16'
+# Targets 'Block' (the DiT) and 'ContextRefiner' (the text refiner) by default.
+# ContextRefiner rather than RefinerBlock, so cap_embedder -- which hangs off the refiner
+# itself, not off any block -- is adapted too. It is the one projection that has to move
+# for a new text encoder to land.
+# Set this to train the refiner densely instead of adapting it. It is then excluded from the
+# LoRA targets and saved separately under context_refiner/, ready for
+# context_refiner_path. Use it when starting from an untrained refiner.
+#train_context_refiner = true
+
+[optimizer]
+type = 'adamw8bitkahan'
+lr = 1e-4
+betas = [0.9, 0.99]
+weight_decay = 0.01

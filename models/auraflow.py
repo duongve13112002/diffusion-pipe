@@ -18,6 +18,7 @@ KEEP_IN_HIGH_PRECISION = ['register_tokens', 'pos_embed', 'context_embedder', 't
 
 class AuraFlowPipeline(BasePipeline):
     name = 'auraflow'
+    vae_config_keys = ('vae_path',)
     checkpointable_layers = ['DoubleTransformerLayer', 'SingleTransformerLayer']
     adapter_target_modules = ['AuraFlowJointTransformerBlock', 'AuraFlowSingleTransformerBlock']
 

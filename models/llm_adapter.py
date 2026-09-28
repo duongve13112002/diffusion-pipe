@@ -69,6 +69,29 @@ class RotaryEmbedding(nn.Module):
         return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
 
 
+def allow_fully_masked_rows(mask):
+    """Let a query row with no unmasked key attend freely, instead of masking everything.
+
+    Such a row makes the attention softmax degenerate. The CPU math backend returns zeros, but
+    the fused CUDA backends can return NaN, and NaN * 0 is still NaN, so zeroing the padded
+    output afterwards would not contain it -- it would poison the gradients instead.
+
+    An empty caption produces exactly this row, and it is not a corner case: it is the
+    unconditional embedding that uncond_fraction and every CFG sample rely on. Qwen pads with
+    its own eos and adds no bos, so '' tokenizes to an all-padding row. Whatever such a row
+    attends to is discarded downstream, so letting it attend is free.
+
+    Lives here, and is applied inside Attention, so every consumer gets it: the context refiner
+    and the LLMAdapter both run this attention, and the guard existing in only one of them is
+    what this function exists to prevent.
+    """
+    if mask is None or mask.dtype != torch.bool:
+        return mask
+    # No .any() short circuit: that would be a host sync on every attention call, and the
+    # or-ing is a no-op for rows that already have a key.
+    return mask | ~mask.any(dim=-1, keepdim=True)
+
+
 class Attention(nn.Module):
     def __init__(self, query_dim, context_dim, n_heads, head_dim):
         super().__init__()
@@ -107,7 +130,8 @@ class Attention(nn.Module):
             cos, sin = position_embeddings_context
             key_states = apply_rotary_pos_emb(key_states, cos, sin)
 
-        attn_output = F.scaled_dot_product_attention(query_states, key_states, value_states, attn_mask=mask)
+        attn_output = F.scaled_dot_product_attention(
+            query_states, key_states, value_states, attn_mask=allow_fully_masked_rows(mask))
 
         attn_output = attn_output.transpose(1, 2).reshape(*input_shape, -1).contiguous()
         attn_output = self.o_proj(attn_output)

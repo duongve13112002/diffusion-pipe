@@ -11,6 +11,7 @@ Models supported: SDXL, Flux, LTX-Video, HunyuanVideo (t2v), Cosmos, Lumina Imag
 - Efficient multi-process, multi-GPU pre-caching of latents and text embeddings
 - Seemlessly supports both image and video models in a unified way
 - Easily add new models by implementing a single subclass
+- Optional OPLoRA (orthogonal projection LoRA) to reduce catastrophic forgetting when training LoRAs
 
 ## Recent changes
 - 2026-09-28
@@ -22,6 +23,9 @@ Models supported: SDXL, Flux, LTX-Video, HunyuanVideo (t2v), Cosmos, Lumina Imag
   - Modify dataset code to support audio from videos.
   - Allow training LoRAs directly on quantized models. This should theoretically work with any ComfyUI-based model (Z-Image and later, excluding Anima).
   - Simplified some latent caching code. If training Z-Image, Flux2, or Ernie-Image, make sure to `--regenerate_cache` because latent scaling is now done in the caching phase and not in the model.
+- 2026-06-27
+  - Add OPLoRA (orthogonal projection LoRA) to reduce catastrophic forgetting during LoRA training. Enable it with `oplora = true` and `oplora_rank` in the `[adapter]` table. See [docs/oplora.md](./docs/oplora.md).
+  - Add the `cosine_with_restarts` LR scheduler (set `lr_scheduler = 'cosine_with_restarts'`, optionally `lr_scheduler_num_cycles`).
 - 2026-06-24
   - Support Krea 2.
 - 2026-06-07
@@ -65,8 +69,14 @@ conda activate diffusion-pipe
 
 Install PyTorch first. It is not listed in the requirements file, because certain GPUs sometimes need different versions of PyTorch or CUDA, and you might have to find a combination that works for your hardware. As of this writing (October 26, 2025), PyTorch 2.9.0 with CUDA 12.8 works on my 4090, and is compatible with the current latest flash-attn 2.8.3:
 ```
-pip install torch torchvision
+pip install torch torchvision torchaudio
 ```
+
+Install all three from the same official PyTorch CUDA index, so their versions match. All three
+are required: `models/base.py` uses `torchaudio` for video-audio resampling, and the vendored
+ComfyUI imports it at module scope as well, so omitting it prevents every model module from
+loading. Leaving it out fails with a message naming the fix, rather than a bare import error from
+inside a vendored file.
 
 Install nvcc: https://anaconda.org/nvidia/cuda-nvcc. Probably try to make it match the CUDA version of PyTorch.
 
@@ -103,6 +113,78 @@ Most dependencies are intentionally left unpinned in the requirements.txt file. 
 A dataset consists of one or more directories containing image or video files, and corresponding captions. You can mix images and videos in the same directory, but it's probably a good idea to separate them in case you need to specify certain settings on a per-directory basis. Caption files should be .txt files with the same base name as the corresponding media file, e.g. image1.png should have caption file image1.txt in the same directory. If a media file doesn't have a matching caption file, a warning is printed, but training will proceed with an empty caption.
 
 For images, any image format that can be loaded by Pillow should work. For videos, any format that can be loaded by ImageIO should work. Note that this means **WebP videos are not supported**, because ImageIO can't load multi-frame WebPs.
+
+### Multi-caption and tag augmentation
+
+An image can have more than one caption. `captions.json` holds a list per image, and every
+caption in that list becomes its own training sample — nothing is picked at random and
+discarded. A `.txt` sidecar is one caption by default, newlines included; set
+`multiline_captions = true` to treat each non-empty line as a separate caption instead. That
+one is opt-in because turning it on changes how many samples an existing dataset produces, and
+like `cache_shuffle_num` it needs `--regenerate_cache` to take effect.
+
+Two caption augmentations, both off by default and both settable per directory or dataset-wide:
+
+| Setting | What it does |
+| --- | --- |
+| `cache_shuffle_num` / `shuffle_tags` | Shuffle the tag order. `cache_shuffle_num` caches that many shuffled variants per caption. |
+| `tag_dropout_rate` | Drop each tag independently with this probability. At least one tag always survives — an all-dropped caption is the *unconditional* embedding, which the trainer already produces deliberately, so minting more of them would quietly change the conditioning ratio. |
+
+`prefix_tag_caption` says which captions those apply to. A dataset that mixes tag lists with
+natural language should not have its prose shuffled on commas; mark the tag captions with a
+prefix and only they are augmented:
+
+```toml
+prefix_tag_caption = "Special: "
+```
+
+The marker is **stripped before training**, so `"Special: a, b, c"` is trained as `"a, b, c"`.
+Matching **ignores case**, and both the marker and what follows it are stripped of surrounding
+whitespace — `"Special:"`, `"special: "` and `"SPECIAL:"` all match, and `"SPECIAL:   a, b"`
+still trains as `"a, b"`. Unset (the default) means the dataset is not annotated and every
+caption is treated as tags, which is how this repo behaved before the setting existed.
+
+Both augmentations are applied when the text embeddings are **cached**, so changing either needs
+`--regenerate_cache`, and each cached variant is a separate training sample. That means
+`tag_dropout_rate` with `cache_shuffle_num = 0` gives exactly **one** frozen draw — permanent tag
+deletion, not augmentation. Raise `cache_shuffle_num` to cache several draws; the code warns if
+you don't.
+
+They are applied fresh per sample in two cases: when the model caches no text embeddings at all
+(so the caption string is what gets tokenized every step — SDXL always, Cosmos with
+`cache_text_embeddings = false`), and on the `online_captions` path below. A model that caches
+*some* encoders and reads the caption for others, like HiDream, is deliberately excluded:
+re-augmenting text whose embedding is already frozen would make the two disagree.
+
+### Choosing which caption an image trains on
+
+By default **every** caption is its own training sample: an image with three captions appears
+three times per epoch, and one epoch is `n_images × n_captions`. Nothing is picked at random and
+discarded.
+
+```toml
+caption_sampling = "random_per_epoch"
+```
+
+switches to one sample per image, with a caption drawn at random on every access — so an epoch is
+`n_images` and an image gets a different caption on each pass. Every caption's embedding is still
+cached; the draw is just an index into that cache, so it costs nothing extra to cache. The same
+draw selects the caption text and its embedding together, so the two can never disagree.
+
+This also restores tag augmentation with cached embeddings: with `cache_shuffle_num = 10` the
+cache holds ten shuffled/dropped variants per caption, and each epoch draws a different one.
+
+### `online_captions`
+
+```toml
+online_captions = true
+```
+
+reads captions from `captions.json` at access time instead of from the cached metadata, so you can
+edit captions without rebuilding the metadata cache. It does **not** change how many samples an
+image produces. And note the caption text only reaches the model when the model does not have a
+cached embedding for it — with text embeddings cached, editing `captions.json` changes nothing
+until you regenerate the cache.
 
 ## Supported models
 See the [supported models doc](./docs/supported_models.md) for more information on how to configure each model, the options it supports, and the format of the saved LoRAs.

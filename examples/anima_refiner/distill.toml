@@ -1,0 +1,310 @@
+# Stage 1 (optional but recommended): distil a ContextRefiner from Anima's LLMAdapter.
+#
+# Run with:
+#   python -m tools.distill_refiner --config examples/anima_refiner/distill.toml
+#
+# Multi-GPU, 4 ranks. Either launcher works -- both export RANK/LOCAL_RANK/WORLD_SIZE, which is
+# all this script reads. Use the deepspeed one to stay consistent with the other stages:
+#   deepspeed --num_gpus=4 tools/distill_refiner.py --config examples/anima_refiner/distill.toml
+#   torchrun --nproc_per_node=4 -m tools.distill_refiner --config examples/anima_refiner/distill.toml
+#
+# Note the launcher is DeepSpeed's but the parallelism is plain DDP, which is deliberate. ZeRO
+# shards optimizer state and gradients; here that is 1.24 GB total for the 77.64M-parameter
+# refiner (0.93 GB saved per GPU across four), while the two frozen LLMs that dominate memory --
+# 5.20 GB in bf16 -- are exactly what ZeRO-1/2 cannot touch. See docs/anima_refiner/README.md.
+#
+# This is not a diffusion training run and does not use train.py. It needs captions only --
+# no images, no VAE, no DiT forward pass -- and gets the refiner into roughly the space the
+# frozen DiT can read. Follow it with refiner_only.toml.
+#
+# Roughly 6GB of VRAM: Qwen3-0.6B (teacher source) + Qwen3.5-2B-Base (student source) + the
+# LLMAdapter and a handful of the DiT's cross-attention modules.
+
+[distill]
+# Complete the final batch of each epoch instead of dropping the caption tail. steps_per_epoch
+# rounds up rather than down, so an epoch gains one step and every caption is seen. No caption
+# appears twice in one global batch, including the batch that straddles the epoch boundary.
+batch_fill_strategy = 'fill'
+# The ordinary dataset.toml, the same one every other training mode uses. Captions are read
+# through the same rules training uses -- captions.json or matching .txt, caption_prefix, tag
+# shuffling -- so this stage sees exactly the caption distribution training will see. Images
+# are never opened: only the text frontend trains here.
+dataset = 'examples/dataset.toml'
+# Set true to honour num_repeats from the dataset config. Off by default: repeats exist to
+# rebalance how often images are sampled, which does not mean much for captions alone.
+#apply_num_repeats = false
+
+# A caption corpus produced by tools/export_caption_corpus.py -- every caption of the dataset
+# flattened into one .jsonl, .csv or .txt file:
+#
+#   python tools/export_caption_corpus.py --dataset examples/dataset.toml --output captions.jsonl
+#
+# Same captions as reading the dataset.toml, but without walking millions of image files (and
+# opening every tar) on each run. Set exactly one of 'dataset', 'caption_corpus' or 'captions'.
+#caption_corpus = '/data/anime_dataset/captions.jsonl'
+# The format is taken from the extension; override it only if the extension does not say.
+#caption_corpus_format = 'jsonl'
+
+# Fallback when there is no dataset.toml to hand: a file with one caption per line, or a
+# directory of .txt files.
+#captions = '/data/anime_dataset/captions.txt'
+
+# Caption augmentation, applied fresh to every sampled batch rather than baked in, so each
+# epoch sees a different tag order and a different dropout draw. When 'dataset' is the source,
+# any of these left unset here is read from the dataset.toml's top level instead, so a
+# distillation run matches the diffusion stages without restating them. (Only top-level keys:
+# a batch here is a flat sample of captions with no directory attached, so per-directory
+# overrides have to be restated here if they matter.)
+#shuffle_tags = true
+#cache_shuffle_delimiter = ', '
+#tag_dropout_rate = 0.1
+# Only captions starting with this marker are treated as tag lists; the marker is stripped
+# before the text encoder sees it, case-insensitively and with surrounding whitespace removed.
+# Unset means every caption is treated as tags. When 'dataset' is the source this defaults to
+# the markers actually in use across its directories, so it rarely needs setting by hand; with
+# 'caption_corpus' you must set it, and the exporter prints the exact line to paste.
+# A list is accepted, for a dataset whose directories use different markers.
+#prefix_tag_caption = 'Special: '
+#prefix_tag_caption = ['Tags: ', 'Special: ']
+# Prepended after the marker is stripped, so "Special: a, b" becomes "anime, a, b".
+#caption_prefix = 'anime, '
+
+output_dir = '/data/output/anima_refiner_distill'
+# Also write a complete anima_refiner checkpoint (the teacher's DiT with the trained
+# refiner attached, llm_adapter dropped) so this mode produces the same kind of artefact
+# the others do: one file that is a whole model, usable directly as transformer_path.
+# Equivalent to pairing the Anima checkpoint with context_refiner_path by hand.
+#save_full_model = true
+
+steps = 20000
+# Captions per micro batch, per rank.
+batch_size = 16
+# Micro batches accumulated before each optimizer step. The effective batch is
+# batch_size * gradient_accumulation_steps * world_size, so the four ranks above with these
+# values give 16 * 2 * 4 = 128 captions per step. Raise this instead of batch_size when the
+# text encoders will not fit a larger micro batch; the loss is scaled by 1/N so the gradient
+# matches one batch of that size rather than growing with the number of micro batches.
+gradient_accumulation_steps = 2
+# lr / betas / weight_decay configure the optimizer, and there are two ways to write them:
+# these flat keys, or the [optimizer] table at the bottom of this file. Set EXACTLY ONE --
+# having both raises an error rather than half-merging them.
+#
+# Keep these flat keys for plain AdamW, which is what this stage has always used. Move to
+# [optimizer] to pick a different optimizer (adamw8bit and friends); when you do, move all
+# three of these down there with it.
+lr = 1e-4
+betas = [0.9, 0.99]
+weight_decay = 0.01
+
+# Stays here either way: it configures gradient clipping, not the optimizer.
+max_grad_norm = 1.0
+
+warmup_steps = 500
+# From utils/lr_schedule.py, the same scheduler train.py uses: 'constant', 'linear', 'cosine'
+# (default) or 'cosine_with_restarts'. Before this was wired up only cosine existed here.
+#lr_scheduler = 'cosine'
+#lr_scheduler_num_cycles = 1
+# Skip weight decay on 1-d parameters (LayerNorm/RMSNorm gains, biases), which is what train.py
+# does. Off by default so existing runs keep their numbers.
+#no_weight_decay_on_1d = true
+max_text_length = 512
+
+# Parallelism strategy, independent of which launcher started the job: 'ddp' (default),
+# 'zero1' or 'zero2'. DDP is the right default here -- see the note at the top of this file for
+# why 0.93 GB per GPU is all ZeRO can reach at this stage. Switch to 'zero1' when that 0.93 GB
+# is the difference between starting and OOMing: a much larger batch_size, a wider student LLM
+# or a deeper refiner all raise the trainable share and shift the balance. Requires more than
+# one rank (sharding across one shards nothing) and, for zero1/zero2, deepspeed installed.
+# Stage 3 is deliberately not offered: it shards the frozen weights but all-gathers them every
+# forward pass, paying bandwidth for memory that is not the constraint.
+#distributed_strategy = 'zero1'
+dtype = 'bfloat16'
+# NOTE: 'dtype' above applies to the FROZEN modules only -- both LLMs, the LLMAdapter and the
+# cross-attention probes. The trainable refiner is controlled by 'precision' below, and has
+# always been fp32 regardless of what dtype said.
+#
+#   'fp32'        (default) fp32 parameters and compute. Most stable, most memory.
+#   'bf16-mixed'  fp32 parameters, bf16 compute via autocast. Saves activation memory. No loss
+#                 scaler needed -- bf16 has fp32's exponent range.
+#   'fp16-mixed'  fp32 parameters, fp16 compute. For pre-Ampere cards with no bf16. Uses a
+#                 GradScaler under DDP, or DeepSpeed's dynamic loss scaling under ZeRO.
+#   'bf16-full'   bf16 parameters. Halves refiner parameter and optimizer-state memory, at the
+#                 cost of the fp32 master weights. Under ZeRO the engine keeps fp32 masters
+#                 anyway, so this saves less there -- and is numerically better there.
+#                 Under DDP it needs type = 'adamw8bitkahan' below; see the note there. The
+#                 script warns if you pair it with an optimizer that has no compensation.
+#
+# 'fp16-full' is deliberately not offered: pure fp16 parameters with no fp32 master copy lose
+# most AdamW updates to underflow at this learning rate.
+#precision = 'bf16-mixed'
+seed = 42
+
+# Overrides where everything runs. Unset it and the script picks cuda:LOCAL_RANK when CUDA is
+# available and cpu otherwise, which is what you want for a real run. It exists so the stage can
+# be smoke-tested on a machine with no GPU.
+#device = 'cpu'
+
+save_every = 2000
+log_every = 50
+
+# How long to train. `epochs` counts passes over the caption set -- one epoch is one pass over
+# EVERY caption, sharded across ranks -- and is an ALTERNATIVE to `steps`, not an addition:
+# setting both is refused at startup. This file uses steps; uncomment epochs and delete steps to
+# switch. See examples/anima_refiner/distill_4gpu.toml for an epoch-driven configuration.
+#epochs = 20
+
+# Checkpoint every N epochs. This is independent of save_every: set both to write both
+# context_refiner_step<N>.safetensors and context_refiner_epoch<N>.safetensors schedules.
+#save_every_n_epochs = 1
+
+# Keep only this many tagged checkpoints of each kind, deleting older ones as new ones arrive.
+# Counted separately per kind, so 3 means three epoch-tagged AND three step-tagged. All of a
+# pruned tag's files go together -- weights, optimizer state, and the full model if
+# save_full_model is on -- and the untagged context_refiner.safetensors is never pruned.
+# Unset keeps everything, which is what this did before the option existed.
+#keep_last_n_checkpoints = 3
+# Weight on the auxiliary masked-mean term. Also permutation invariant, and it gives a useful
+# gradient early on while the probe-attention term is still noisy. Set to 0 to disable.
+pooled_loss_weight = 0.1
+
+# Keeps distinct captions distinct. The probe loss compares one caption at a time, so it
+# constrains where each caption lands but says nothing about how captions sit relative to each
+# other -- and a student that maps every caption to the same feature satisfies it about as well
+# as one that keeps them apart. That is the mode collapse reported for naive text-encoder
+# distillation (Scaling Down Text Encoders of Text-to-Image Diffusion Models, CVPR 2025, where
+# "rat", "cat" and "man" collapse to identical embeddings).
+#
+# This is Relational Knowledge Distillation's distance-wise term: match the teacher's pairwise
+# distance structure within the batch. It costs nothing -- both feature sets are already
+# computed -- and needs no images, so the stage keeps the property that is its whole reason to
+# exist. Set to 0 to disable, and watch 'spread' in the progress bar if you do.
+relational_loss_weight = 1.0
+
+[teacher]
+# Anima's Qwen3-0.6B text encoder (ComfyUI single-file format).
+llm_path = '/data2/imagegen_models/comfyui-models/qwen_3_06b_base.safetensors'
+# Must be a trained Anima checkpoint: it supplies both the LLMAdapter (the teacher) and the
+# frozen cross-attention modules the loss is measured through.
+transformer_path = '/data2/imagegen_models/comfyui-models/anima-preview.safetensors'
+
+[student]
+# Either a full Transformers folder, or a single safetensors file (see llm_config_path in
+# examples/anima_refiner/refiner_only.toml).
+llm_path = '/data2/imagegen_models/Qwen3.5-2B-Base'
+# Which hidden state to take. For Qwen3.5-2B-Base, full-attention layers sit at 3/7/11/15/19/23,
+# and hidden_states[i] is the output of layer i-1, so -1 lands right after a full-attention
+# layer while -2 would land after a linear-attention one.
+llm_hidden_layer = -1
+# Ignored when resume_from is set: the layer count then comes from the weights.
+n_refiner_layers = 6
+# Resume a refiner from anywhere: a bare context_refiner.safetensors, or a full
+# model.safetensors saved by refiner_only / refiner_crossattn / a full fine tune. The
+# teacher stays the stock Anima checkpoint either way, which is what makes distillation
+# reachable again from a model trained by any other mode.
+#resume_from = '/data/output/anima_refiner_refiner_crossattn/<run>/model.safetensors'
+
+# Denoising rollout. OFF by default, and off means off: at loss_weight = 0 the DiT is thrown
+# away exactly as it always was, nothing is allocated, and this stage behaves byte for byte
+# the way it did before this option existed.
+#
+# What it does: run the frozen DiT from pure noise toward clean, driven by the teacher's own
+# prediction, and compare what the DiT predicts from the teacher's text features against what
+# it predicts from the student's, at points along that path.
+#
+# Why it is stronger than [probe]: the probe measures agreement at the cross-attention output
+# for synthetic random queries. This measures agreement at the model's actual prediction, for
+# inputs the model itself produced. It is the remedy the CVPR 2025 text-encoder distillation
+# paper uses for the mode collapse that embedding-space objectives are prone to.
+#
+# Cost: the DiT stays resident, roughly 3.5-4 GB in bf16 for Anima, taking this stage from
+# about 6 GB to 10-12 GB. Turn it on when the `spread` diagnostic in the progress bar shows
+# the student's captions collapsing toward each other despite relational_loss_weight.
+#[rollout]
+# 0 disables the feature entirely. 1.0 is a reasonable starting point when enabling it.
+#loss_weight = 0.0
+# Steps along the trajectory. Cheap: the walk is teacher-driven and runs under no_grad, so it
+# costs inference only. Measured on a reduced-scale replica, 8 steps cost about as much as 3
+# loss points.
+#steps = 8
+# How many of those points the loss is measured at. This is the expensive knob -- cost is
+# linear, measured at 1.0x / 1.9x / 3.7x / 7.6x for 1 / 2 / 4 / 8 points. Adjacent trajectory
+# points give correlated signal, and random sampling covers the whole path across training
+# steps, so 2 is the knee. Same reasoning as [probe] num_blocks.
+#loss_points = 2
+# Pixel resolution the latent is sized from. Must be a multiple of 16: the VAE downsamples by
+# 8 and the DiT patches by 2. 256 gives a 32x32 latent, 256 tokens after patching.
+#resolution = 256
+# Classifier-free guidance during the rollout. Must be 0 (disabled) or above 1: between the two
+# the formula weights the UNconditional branch more heavily. 0 disables it and only the
+# conditional branch
+# is evaluated. Above 0 also evaluates the unconditional branch on both sides, which doubles
+# the DiT forwards but covers the branch every CFG sample actually uses -- and that branch is
+# fed by an empty caption, so it is worth covering. The paper samples 2-5.
+#guidance_scale = 0.0
+# Warps the trajectory's timesteps the way training and sampling warp them
+# (t <- t*shift / (1 + (shift-1)*t)). Should match [model] shift in the config you will train
+# with; 1.0 walks a uniform schedule. flux_shift is not supported here -- it derives its warp
+# from the image resolution, and the rollout's latent size is a config value, not a real image.
+#shift = 1.0
+
+[probe]
+# Fixed random queries pushed through the DiT's frozen cross-attention. The loss is measured
+# on the output, which is a weighted sum over text positions and therefore does not depend on
+# how that text is tokenised -- teacher (T5 indexed) and student (LLM indexed) sequences can
+# be compared even though position i means different things on each side.
+#
+# Defaults to 2 * head_dim, which is 256 for Anima (model_channels 2048 / 16 heads = 128).
+# The number that matters is num_queries / head_dim, not num_queries alone: inside one
+# attention head the probe only ever constrains the span of its own projected queries, so
+# below head_dim there are directions of the key space the student can fill with anything.
+# Measured on a reduced-scale replica -- held-out probe error relative to training-probe
+# error: 0.25 -> 2.8x, 0.5 -> 1.63x, 1.0 -> 1.32x, 2.0 -> 1.16x, 4.0 -> 1.04x.
+#
+# Raising it to 512 or 1024 is safe and helps a little. It buys progressively less -- the
+# curve is already flat past 2x head_dim -- while costing linearly in probe compute and
+# activation memory, since every query is pushed through every probe block. 256 is the knee.
+# There is no correctness risk at any value; it is purely a compute-for-coverage trade.
+#num_queries = 256
+# Adjacent DiT blocks give highly correlated signal, so a spread of them covers the same
+# ground for less compute. Do NOT go below 4. Each block projects the queries differently, so
+# blocks cover directions that more queries within one block cannot: at the default query
+# count, 8 blocks give a 1.14x held-out gap, 4 give 1.28x, 2 give 1.63x and 1 gives 2.27x.
+num_blocks = 8
+
+# Optional, and an ALTERNATIVE to the flat lr / betas / weight_decay under [distill] above --
+# not an addition to them. Uncommenting this table means deleting those three keys up there,
+# or the run stops with an error saying so.
+#
+# Accepts the same names as train.py's [optimizer]: adamw (default), adamw8bit,
+# adamw8bitkahan, adamw_optimi, stableadamw, sgd, automagic, offload, or any pytorch_optimizer
+# class by name. Every key other than 'type' is passed to the optimizer's constructor.
+#
+# Worth a look at this stage specifically. The refiner is 77.64M parameters, so AdamW's two
+# fp32 moments are 592 MB; the 8-bit variants cut that to 148 MB, on a single GPU with no extra
+# ranks. That is more per-GPU saving than ZeRO-1 reaches here, and it does not need a second
+# GPU to reach it.
+#
+# With precision = 'bf16-full' under DDP, use 'adamw8bitkahan' and not 'adamw8bit'. The two save
+# the same memory -- Kahan is a subclass of AdamW8bit, so the moments are 8-bit either way -- but
+# they solve different problems. 8-bit quantisation shrinks the optimizer moments. bf16-full
+# additionally makes the parameters themselves bf16, and bf16 carries 8 mantissa bits, so an
+# update smaller
+# than about 2^-9 relative to the weight rounds to exactly nothing. That is the same underflow
+# 'fp16-full' is refused for, with three fewer mantissa bits. adamw8bitkahan keeps a per-parameter
+# `shift` buffer (optimizers/adamw_8bit.py) carrying the lost remainder into the next step, which
+# is what makes bf16 parameters trainable at this learning rate. Pair bf16-full with plain
+# 'adamw8bit' and you get the memory saving plus silently discarded updates: the run completes and
+# the loss barely moves, with nothing in the output to explain it.
+#
+# Caveat: 8-bit optimizers are mostly validated on fine-tuning, and this refiner trains from a
+# random init -- another reason to prefer the Kahan variant. Combining any 8-bit optimizer with
+# ZeRO is unverified, because ZeRO replaces the param groups with flat fp32 partitions and the
+# quantisation blocks then lie over partitions rather than whole parameters; the script warns.
+#
+# 'genericoptim' and 'gradient_release' are refused here: both need pipeline machinery that
+# only train.py builds.
+#[optimizer]
+#type = 'adamw8bitkahan'
+#lr = 1e-4
+#betas = [0.9, 0.99]
+#weight_decay = 0.01

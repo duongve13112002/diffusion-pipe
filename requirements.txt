@@ -13,7 +13,6 @@ tqdm
 safetensors
 bitsandbytes
 imageio[ffmpeg]
-av
 einops
 accelerate
 loguru

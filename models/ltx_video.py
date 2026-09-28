@@ -23,6 +23,7 @@ KEEP_IN_HIGH_PRECISION = ['norm', 'bias', 'scale_shift_table', 'patchify_proj', 
 
 class LTXVideoPipeline(BasePipeline):
     name = 'ltx-video'
+    vae_config_keys = ('diffusers_path',)
     framerate = 25
     pixels_round_to_multiple = 32
     checkpointable_layers = ['TransformerLayer']

@@ -1,0 +1,66 @@
+# Anima: the stock architecture, with its LLMAdapter text frontend.
+#
+# Kept alongside examples/anima_refiner/ so the two can be trained and sampled side by side.
+# They share a DiT -- in ComfyUI the class is literally `class Anima(MiniTrainDIT)` -- and
+# differ only in how a caption reaches its cross-attention:
+#
+#   anima          caption -> Qwen3-0.6B hidden states + T5 token ids -> LLMAdapter -> DiT
+#   anima_refiner  caption -> any Transformers LLM hidden states       -> ContextRefiner -> DiT
+#
+# tools/sample_anima_refiner.py reads both, so one sampler, one schedule and one seed can
+# compare them:
+#
+#   python -m tools.sample_anima_refiner --config examples/anima.toml \
+#       --prompt '1girl, solo, blue eyes' --steps 30 --cfg 5 --seed 1234 --output anima.png
+#
+# See docs/supported_models.md for the option reference.
+
+output_dir = '/data/output/anima'
+dataset = 'examples/dataset.toml'
+
+epochs = 10
+micro_batch_size_per_gpu = 4
+pipeline_stages = 1
+gradient_accumulation_steps = 1
+gradient_clipping = 1
+warmup_steps = 100
+
+eval_every_n_steps = 500
+eval_before_first_step = true
+eval_micro_batch_size_per_gpu = 4
+eval_gradient_accumulation_steps = 1
+
+save_every_n_epochs = 2
+checkpoint_every_n_minutes = 120
+activation_checkpointing = true
+partition_method = 'parameters'
+save_dtype = 'bfloat16'
+caching_batch_size = 8
+steps_per_print = 10
+
+[model]
+type = 'anima'
+# The official ComfyUI-format files: https://huggingface.co/circlestone-labs/Anima
+transformer_path = '/data2/imagegen_models/comfyui-models/anima-preview.safetensors'
+vae_path = '/data2/imagegen_models/comfyui-models/qwen_image_vae.safetensors'
+llm_path = '/data2/imagegen_models/comfyui-models/qwen_3_06b_base.safetensors'
+dtype = 'bfloat16'
+
+# The llm_adapter processes the Qwen3 embeddings before they reach the DiT, and its learning
+# rate is separate from everything else. 0 freezes it, which is usually steadier on a small
+# dataset; raise it if you have a lot of data or a lot of brand-new concepts.
+llm_adapter_lr = 0
+
+timestep_sample_method = 'logit_normal'
+
+[optimizer]
+type = 'adamw8bitkahan'
+# Anima often wants a lower rate than other models.
+lr = 5e-5
+betas = [0.9, 0.99]
+weight_decay = 0.01
+
+[adapter]
+type = 'lora'
+rank = 32
+dtype = 'bfloat16'

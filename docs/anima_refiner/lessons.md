@@ -1,0 +1,376 @@
+# Lessons from adding Anima Refiner
+
+Mistakes made while building the `anima_refiner` architecture, written down so the next
+change to this codebase does not repeat them. Every item below is something that actually
+shipped or was caught mid-implementation, not a hypothetical.
+
+## Adding a model must not change any existing model
+
+`models/cosmos_predict2.py` serves three model types (`cosmos_predict2`, `anima`,
+`anima_refiner`), and the dataset/caching code is shared by every model in the repo. Any new
+option belongs behind a check on the model type, not in a shared default.
+
+Mistakes actually made while adding `anima_refiner`, all of which shipped before being caught:
+
+- **`base_lr` and `max_text_length` were read unconditionally**, so `anima` and
+  `cosmos_predict2` silently gained config keys nobody asked for. Now gated on
+  `use_context_refiner`.
+- **The VLM detection branch was added to the shared `llm_path` directory path**, changing how
+  `anima` would load a vision-language model. Now gated too.
+- **A new fingerprint argument was nearly added unconditionally** to
+  `_cache_text_embeddings`, which would have invalidated the text embedding cache of *every*
+  model in the repo. `Hasher.hash([i])` and `Hasher.hash([i, ''])` differ. Extra fingerprint
+  args must only be appended when they are actually non-empty.
+
+Before committing a change to a shared file, diff it and check every modified line against the
+other models that use it.
+
+## Caching: latents and text embeddings are separate, keep them that way
+
+`DirectoryDataset.cache_dir` is `<dataset>/cache/<model.name>`, and **both** latents
+(`latents_` prefix) and text embeddings (`text_embeddings_{i}_` prefix) live under it.
+
+A `cache_name` config key was added to invalidate stale text embeddings when the text encoder
+changed. That was wrong: it changed `model.name`, which moves the *whole* tree, so switching
+text encoder also threw away the VAE latents — by far the more expensive half, for a component
+that had not changed.
+
+The right hook is the per-cache fingerprint (`new_fingerprint_args` in `_map_and_cache`), which
+is already separate for latents and text embeddings. Invalidate the narrowest thing that
+actually changed.
+
+## Derive model shape from weights, never from config
+
+`load_diffusion_model` loads with `if name not in state_dict: continue`. That means a config
+declaring *fewer* layers than the checkpoint holds will build the smaller model and **silently
+drop the surplus weights** — no warning, no error, just a quietly wrong model. This was a real
+bug in the first version of `anima_refiner`: a 4-layer refiner checkpoint loaded under the
+default `n_refiner_layers = 6` lost 24 tensors.
+
+When a checkpoint carries a component, derive that component's shape from the weights and treat
+a contradicting config as an error. `get_dit_config()` already does this for the DiT; follow it.
+
+## Checkpoint priority
+
+Whatever weights the user points at are the weights used. Never re-initialise from a base model
+when real weights exist. When two sources overlap (a component file plus a full checkpoint that
+also contains that component), pick one deliberately, document it, and **warn every time it
+happens** — silently choosing is how someone ends up training from the wrong starting point for
+a week.
+
+## Don't invent formats that already exist
+
+`tools/distill_refiner.py` originally took its own caption format (a text file or a folder of
+`.txt`). Every other training mode used `dataset.toml`. A tool that needs captions should read
+`dataset.toml` through `utils.dataset.enumerate_captions()` so it sees the same captions
+training will see — same `captions.json`/`.txt` resolution, same `caption_prefix`, same tag
+shuffling. Skip only the parts that genuinely do not apply (this tool never opens an image).
+
+## Example configs are documentation
+
+All example configs shipped with `activation_checkpointing = 'unsloth'`, copied from another
+model's example, when the user had not asked for it and the repo default is `False`. Two things
+follow:
+
+- Don't copy settings between example configs without checking they are wanted.
+- `activation_checkpointing = true` uses `torch.utils.checkpoint` with `use_reentrant=False`;
+  `'unsloth'` is only ever used when written explicitly. There is no automatic fallback.
+
+Also: a hard-coded path from one example to another (`stage2` pointing at `stage1`'s output)
+implies a one-way dependency the code does not have. Say so explicitly when the order is a
+recommendation rather than a constraint.
+
+## Base vs Instruct models
+
+Use the **Base** model when the encoder is a pretrained LM, not an instruction-tuned one. For
+Qwen3.5-2B the `config.json` of Base and Instruct is byte-identical, so the architecture needs
+no code change and the mistake is invisible in the model code — but the bundled tokenizer
+differs (`eos = <|endoftext|>` vs `<|im_end|>`). Download config/tokenizer from the exact repo
+the weights come from.
+
+## Docs must say when a file exists
+
+`context_refiner.safetensors` is produced by only two of the six modes; the rest embed the
+refiner inside `model.safetensors`. Documenting the option without saying when the file exists
+led to real confusion about whether a step had been missed. For any optional artefact, document
+which runs produce it and which do not.
+
+## Testing on a CPU-only machine
+
+`test/conftest.py` carries three shims, all conditional: it stubs `comfy_aimdo`, forces ComfyUI to
+CPU, and stubs `deepspeed`. Each one disables itself when the real thing is present, so none of
+them changes anything in a training environment. Without them `models/*.py` cannot even be
+imported off-GPU.
+
+The deepspeed stub is deliberately uneven. `get_rank`, `get_world_size` and `barrier` have an
+unambiguous single-process meaning and are implemented; `send`, `recv`, `broadcast` and
+`all_reduce` raise instead. A test that reaches a collective is testing distributed behaviour a
+shim cannot stand in for, and a plausible return value would let it pass while proving nothing.
+
+`pytest test/` runs everything on CPU with no downloads. Multi-GPU behaviour is covered indirectly
+by asserting the invariants pipeline parallelism depends on (constant tensor shapes across micro
+batches; every layer boundary being a valid split point). Real DeepSpeed execution needs
+`deepspeed --num_gpus=2 --module test.debug_deepspeed_init`.
+
+### Windows needs two more things, because it spawns instead of forking
+
+Both come from the same root: a spawned worker is a brand-new interpreter that inherits nothing
+conftest did, where a forked one inherits everything.
+
+`test/childenv/sitecustomize.py` is what reaches those workers. Python imports `sitecustomize`
+automatically at startup, so conftest puts that directory on `PYTHONPATH` and the children pick up
+the same shims. Order matters inside it: it must claim the `utils` namespace before ComfyUI is
+reachable, because ComfyUI's `utils/` has an `__init__.py` and a regular package ends namespace
+resolution outright — once it wins, `utils.dataset` stops existing. The same file lets
+`tools/check_comfy_signatures.py` run on a CPU box:
+
+```
+PYTHONPATH=test/childenv python tools/check_comfy_signatures.py
+```
+
+`DIFFUSION_PIPE_NUM_PROC=1` is the second. `utils/dataset.py` maps with `min(8, cpu_count())`
+workers, and a spawned one re-imports torch, deepspeed and ComfyUI before it does any work — about
+45 seconds to map a handful of rows. conftest sets it on win32 only, so a Linux run still exercises
+the real multiprocess path.
+
+DeepSpeed itself does install on Windows CPU, which makes the stub inert. The sdist omits
+`bin/deepspeed.bat`, which its own `setup.py` lists for win32, so unpack the sdist, add that file
+and `bin/ds_report.bat`, then `DS_BUILD_OPS=0 pip install . --no-build-isolation`.
+
+## "This cannot be checked without hardware" is a claim, and it needs checking too
+
+This section used to end by saying `deepspeed.initialize` does not run here, because it JIT-builds
+`deepspeed_shm_comm` and needs MSVC `cl.exe`. That is true only of the default path. Marking the
+op incompatible first is the supported way to skip it, and then a real ZeRO engine runs on gloo at
+one rank or two:
+
+```python
+for name in list(deepspeed.ops.__compatible_ops__):
+    if 'shm' in name.lower():
+        deepspeed.ops.__compatible_ops__[name] = False
+```
+
+The cost of the wrong version was not one missing test. An audit found three defects in the ZeRO
+paths — fp32 master weights never checkpointed, no stage-2 coverage, and an unverified accumulation
+fix — and filed all three as "needs a GPU" on the strength of that sentence. They were closed on
+this machine in an afternoon once someone tried. A wrong *cannot* is more expensive than a missing
+check, because a missing check invites someone to write it and a wrong cannot tells them not to
+bother.
+
+**Rule:** an impossibility claim is load-bearing in the direction that stops work, so it earns the
+same scrutiny as a correctness claim. Before writing "X requires hardware we do not have", run X.
+
+## Check the premise before building on it
+
+A request to "gather the captions the pipeline drops when an image has several" was built on a
+belief that the flow picks one caption at random. It does not: `SizeBucketDataset.cache_latents`
+expands every caption into its own `iteration_order` entry. The only place captions genuinely
+collapse is a `.txt` sidecar, read whole as one string.
+
+The tool was still worth building — for a different reason (distillation should not walk three
+million image files to find text) — but the reason changes what it should do. Read the code and
+say plainly what is and is not true before implementing, even when the request sounds definite.
+
+## A tool that reads text should not import torch
+
+`enumerate_captions` lived in `utils/dataset.py`, so a caption-only script pulled in torch,
+DeepSpeed and ComfyUI: 50 seconds of import per invocation to read text files. It now lives in
+`utils/captions.py` (standard library only), re-exported from `utils/dataset.py` so no caller
+changed.
+
+The failure that exposed this was a subprocess test failing on a missing stub. Stubbing it in
+the subprocess would have made the test pass and left the real problem in place. When a test
+fails for an environmental reason, check whether the environment is telling you something.
+
+## Augmentation belongs where the embedding is computed
+
+The diffusion stages bake shuffled caption variants into the embedding cache because the
+embedding is computed once; changing the setting needs `--regenerate_cache`. Distillation
+re-embeds every step, so it augments per sample instead and each epoch sees a fresh draw. Same
+setting names, two correct implementations — decided by where the cache boundary is, not by
+preference.
+
+Related: tag dropout must never empty a caption. The empty string is the *unconditional*
+embedding, which the trainer already produces deliberately at `UNCOND_FRACTION`; producing more
+by accident shifts the conditioning ratio with no config change to explain it.
+
+## Never extract code by text range
+
+Moving the caption helpers into `utils/captions.py` by slicing `utils/dataset.py` between two
+function names silently took `bucket_suffix`, `dedup_and_sort` and `seed_from_hash` with them.
+Those were called at twelve sites and every training run died. Move code by *name*: list what
+you intend to move, move exactly that, then check what the source still references.
+
+## A green suite can be evidence of nothing
+
+The above shipped with 182 tests passing, because no test had ever constructed a
+`DirectoryDataset`. An import test proves a module parses. Before trusting a suite on a change to
+shared code, ask which test would fail if the change were wrong — and if the answer is none,
+that is the test to write. `test/test_dataset_smoke.py` builds the real objects and AST-checks
+that every global `utils/dataset.py` loads actually resolves.
+
+## Baked-in prefixes hide the markers that follow them
+
+Training composes a caption as `caption_prefix + augment(strip_marker(raw))`. Storing the prefix
+before the marker gives `"anime, Special: red, blue"`, which no longer starts with the marker, so
+the consumer stops recognising it and trains the marker as data. When two transformations are
+ordered, anything that persists an intermediate value has to persist it at the same point in that
+order.
+
+## Read the other models before choosing a condition
+
+Per-sample caption augmentation is only safe when nothing was cached. SDXL caches nothing; Cosmos
+caches optionally; HiDream caches CLIP and T5 but tokenizes Llama3 live, so augmenting its text
+would contradict its own frozen embeddings. The right test was `not self.text_embedding_datasets`
+— a property of the data, naming no model — and it was only findable by reading all three.
+
+## Write in the codebase's voice, not a generated one
+
+Comments and configs on this branch arrived with tells that nothing else in the repo has:
+`# ---- Section ----` banner dividers, RST underline headings inside docstrings, and words
+shouted in capitals for emphasis (`the WHOLE directory`, `this string IS what the model
+tokenizes`, `MUST NOT be baked in`). None of it carries information. `examples/dataset.toml`,
+the file these configs sit beside, has no section banners at all -- just a comment above each
+setting.
+
+Match the surrounding code's density and punctuation. If a comment needs a banner to be found,
+the file wants splitting; if a word needs capitals to be believed, the sentence wants rewriting.
+
+## An init function that only sets the overrides is not an init function
+
+`ContextRefiner.init_weights()` was written to run after `__init__`, so it only set the ten
+values that differ from PyTorch's defaults. The pipeline builds the module under
+`init_empty_weights()` and materialises parameters with `torch.empty`, so the other eighteen
+kept allocator residue — measured up to 1e32, sometimes NaN, differing between machines. The
+zeroed residual branches hid it in a forward pass.
+
+Any function that runs where default init did not must cover every parameter. Delegate to each
+submodule's `reset_parameters()` rather than hand-rolling the bounds, so it stays identical to
+what PyTorch would have done.
+
+## A cache at a fixed path is a promise that its inputs never change
+
+The metadata cache is keyed by directory and model name only, and `--trust_cache` reuses it
+without looking. Adding settings that change the caption *text* meant a run that flipped one
+read back captions built under the other: raw text with the tag marker intact going into the
+text encoder, or `caption_prefix` applied twice and then shuffled into the middle of the tag
+list. Both directions, silently.
+
+When you add a setting that changes cached content, it goes in the cache path. And the suffix
+must be empty at the defaults, or you invalidate every cache in every existing install — the
+same rule `text_encoder_cache_key` already follows. Note also that the *columns* of a cached
+dataset are content: `caption_sampling` changes them, so a shared path meant a `KeyError`
+inside the dataloader after the whole latent cache had been built.
+
+## Do not assert a property you have not checked
+
+The docs, three commit messages and a docstring all claimed "the same draw selects the caption
+text and its embedding, so the two can never disagree." Measured: 8 of 9 rows disagreed, because
+the iteration-order builder shuffled the caption list and then used the post-shuffle position to
+index an embedding cache built in the original order. The bug was pre-existing; the claim was
+new, and a claim is what makes a latent bug into a relied-upon one.
+
+## Fix the path you recommend, not just the one you tested
+
+The corpus commit fixed `caption_prefix` and marker stripping for the `dataset` source and left
+the `caption_corpus` source — the one the docs recommend for large datasets — silently training
+the marker as a tag with no shuffling and no dropout. The exporter even printed the config line
+to fix it, and nothing checked that anyone had. When a setting can only come from somewhere
+else, say so at the point it is missing.
+
+## Half-supported settings are worse than unsupported ones
+
+`shuffle_tags` and `cache_shuffle_num = 1` are documented as the same thing. One gate read the
+value where the back-compat fixup had run and the other where it had not, so the two spellings
+got opposite behaviour. Resolve legacy spellings once, at the point the value is first read.
+
+## Never split a path on '/' to get its basename
+
+Running the suite on Windows for the first time turned up four separate places doing this, and
+they only ever agree with reality on a platform where the two separators are the same character.
+Two were in shipped code, one in a helper on this branch, one in a test:
+
+| Where | What it did |
+| --- | --- |
+| `utils/dataset.py` `add_captions` | `image_file.split('/')[-1]` on a disk path, so every `captions.json` lookup missed and every caption became empty. Pre-existing upstream, not from this branch. |
+| `utils/dataset.py` online-caption path | The same expression, copied from it while fixing something else. |
+| `utils/captions.py` `enumerate_captions` | `str(media_file)` for a tar member, emitting backslashes where a tar name always uses `/`. |
+| `test/test_anima_refiner.py` | `str(path).rsplit('/', 1)[-1]` to key captured writes by filename, so the assertions looked for keys that were full paths. |
+
+Two directions, one confusion. An on-disk path uses the platform separator, so take its basename
+with `os.path.basename`, which splits on `/` everywhere and additionally on `\` on Windows. A
+tar member name always uses `/` regardless of platform, so build it with `PurePath.as_posix()`
+and never with `str()`.
+
+**Rule:** `os.path.basename` for disk paths, `as_posix()` for archive members, and a literal
+`'/'` split for neither. None of these were visible on Linux, and none of them were caught by a
+suite that had only ever run there — which is the second half of the lesson: a platform you
+never run on is a platform where your tests assert nothing.
+
+## A mock proves the call was made, never that it did anything
+
+Every ZeRO test in `test/test_distill_refiner.py` monkeypatched `deepspeed.initialize` away and
+asserted against a `FakeEngine` that `backward` and `step` were called in the right order, that
+the loss was not rescaled, and that nothing clipped by hand. All of that was true. None of it
+noticed that the engine was applying one optimizer update in four.
+
+DeepSpeed advances `micro_steps` inside `step()`, never inside `backward()`, and derives the
+accumulation boundary from that counter. A loop that calls `backward()` N times and `step()`
+once therefore advances it once per *outer* step, so the boundary lands every Nth outer step.
+Measured with `gradient_accumulation_steps = 4`: one update in six, and an LR schedule that
+never left its peak. The run completes, the progress bar fills, and the artefact is
+under-trained.
+
+A fake engine cannot have this property, because the property lives in the real one.
+
+**Rule:** when the thing you depend on is a state machine, at least one test must drive the real
+one. Mocking is for what a collaborator *receives*; it can say nothing about what it *does*.
+
+## Do not fix a deliberate decision without reading why it was made
+
+A review flagged that `caption_prefix`, `cache_shuffle_num`, `cache_shuffle_delimiter` and
+`skip_empty_caption` change the cached caption text but are absent from `CAPTION_CACHE_SETTINGS`,
+so `--trust_cache` serves stale captions when one of them changes. The finding is correct. Adding
+them to the suffix is not the fix.
+
+`719aede` had already considered them and left them out on purpose: all four predate the suffix
+mechanism, so putting them in it moves the cache path of every install that uses them, throwing
+away the metadata and the latents keyed off it. A test guards that decision by name. Adding them
+turned it red immediately, which is what a test for a deliberate choice is for.
+
+The fix that satisfies both is to record the settings beside the cache and report a mismatch,
+rather than to encode them into the path.
+
+**Rule:** a test that fails on your fix is evidence about the fix, not an obstacle to it. Read
+the commit that introduced the behaviour before changing it.
+
+## Windows separators break in two directions, and grep only finds one
+
+The first pass fixed four places that took a basename by splitting on `'/'`, and concluded the
+class was cleared -- a repo-wide grep for `split('/')` returned nothing further. A fifth instance
+was still there, wearing a different shape: `tar_f.extractfile(str(image_file))`. A tar member
+name always uses forward slashes; `str()` on a `Path` emits backslashes on Windows, and
+`extractfile` matches literally, so every member inside a subdirectory raised `KeyError` during
+caching.
+
+**Rule:** search for the *concept*, not the string. `os.path.basename` for a disk path,
+`PurePath.as_posix()` for an archive member, and audit every `str(Path(...))` that is about to be
+used as a lookup key.
+
+## An encoding that does not raise is worse than one that does
+
+`open(captions_json)` uses the locale encoding. On Windows that is a codepage, and a codepage
+does not reject UTF-8 -- it decodes it into something else. Measured: a caption reading
+`1girl, 日本語, café` came back as `1girl, æ—¥æœ¬èªž, cafÃ©`, with no error anywhere. That text
+is then cached, embedded and trained on.
+
+Two of the three sites in the repo already passed `encoding='utf-8'`; the third did not, which is
+how it survived review.
+
+**Rule:** every `open()` on a text file the user wrote takes an explicit encoding. A missing one
+is not a stylistic omission, it is a silent data corruption on half the platforms you support.
+
+## Git
+
+Commits carry no Claude attribution: no `Co-Authored-By: Claude ...`, no `Claude-Session:`
+trailer.
