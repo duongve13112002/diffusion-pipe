@@ -56,6 +56,7 @@ from utils.captions import (
     read_caption_file,
     shuffle_captions,
     split_tag_prefix,
+    validate_caption_dropout_rate,
 )
 
 
@@ -372,6 +373,7 @@ CAPTION_CACHE_SETTINGS = {
     'prefix_tag_caption': '',
     'tag_dropout_rate': 0.0,
     'multiline_captions': False,
+    'enable_remove_non_latin': False,
 }
 
 
@@ -458,6 +460,8 @@ class SizeBucketDataset:
         self.online_delimiter = directory_config.get('cache_shuffle_delimiter', ', ')
         self.prefix_tag_caption = directory_config.get('prefix_tag_caption', '')
         self.tag_dropout_rate = directory_config.get('tag_dropout_rate', 0.0)
+        self.enable_remove_non_latin = directory_config.get('enable_remove_non_latin', False)
+        self.caption_dropout_rate = directory_config.get('caption_dropout_rate', None)
         if self.num_repeats <= 0:
             raise ValueError(f'num_repeats must be >0, was {self.num_repeats}')
 
@@ -612,11 +616,17 @@ class SizeBucketDataset:
             caption_number = entry['caption_number']
             entry_caption = entry['caption']
 
-        use_uncond = UNCOND_FRACTION > 0 and random.random() < UNCOND_FRACTION
+        # A directory override (including explicit zero) wins over the dataset setting. Only
+        # an absent setting falls back to the legacy training-wide probability; never draw twice.
+        dropout_rate = UNCOND_FRACTION if self.caption_dropout_rate is None else self.caption_dropout_rate
+        use_uncond = dropout_rate > 0 and random.random() < dropout_rate
         if use_uncond:
             caption = ''
         else:
-            if self.captions_dict:
+            if self.captions_dict and not self.text_embedding_datasets:
+                # A cached encoder fixes the text as well as its embedding. Reading an edited
+                # live caption here would desynchronise hybrid models such as HiDream, and a
+                # cache-shuffled caption index need not even exist in the raw caption list.
                 tar_file, image_file = entry['image_spec']
                 # Match how DirectoryDataset keys captions.json: a tar member by its full path
                 # inside the archive, a plain file by basename. Using the full on-disk path for
@@ -627,7 +637,10 @@ class SizeBucketDataset:
                 # Windows path on '/' returns the whole path and misses every lookup.
                 key = image_file if tar_file is not None else os.path.basename(image_file)
                 if key in self.captions_dict:
-                    caption = self.captions_dict[key][caption_number]
+                    # Metadata contains shuffle_skip variants per original caption, including
+                    # on-the-fly variants. The dictionary is still the unexpanded source list.
+                    raw_caption_number = caption_number // self.shuffle_skip
+                    caption = self.captions_dict[key][raw_caption_number]
                     if self._augment_at_runtime:
                         caption = preprocess_caption(
                             caption,
@@ -636,15 +649,16 @@ class SizeBucketDataset:
                             prefix_tag_caption=self.prefix_tag_caption,
                             shuffle=self.online_shuffle,
                             tag_dropout_rate=self.tag_dropout_rate,
+                            enable_remove_non_latin=self.enable_remove_non_latin,
                         )
                     else:
-                        # The cached embedding for this caption was built with the marker
-                        # stripped and caption_prefix applied. Re-shuffling here would make the
-                        # text disagree with it, so only the deterministic parts are applied.
+                        # Metadata already applied the deterministic parts, but the online
+                        # dictionary holds raw captions. Strip/filter/prefix them once here.
                         caption = preprocess_caption(
                             caption,
                             caption_prefix=self.caption_prefix,
                             prefix_tag_caption=self.prefix_tag_caption,
+                            enable_remove_non_latin=self.enable_remove_non_latin,
                         )
                 else:
                     print(f'WARNING: image {key} did not have entry in captions_dict. Using empty caption.')
@@ -663,6 +677,7 @@ class SizeBucketDataset:
                         prefix_tag_caption=self.prefix_tag_caption,
                         shuffle=self.online_shuffle,
                         tag_dropout_rate=self.tag_dropout_rate,
+                        enable_remove_non_latin=self.enable_remove_non_latin,
                     )
 
         for ds, uncond_ds in zip(self.text_embedding_datasets, self.uncond_text_embeddings):
@@ -1094,12 +1109,14 @@ class DirectoryDataset:
             'prefix_tag_caption': directory_config.get('prefix_tag_caption', dataset_config.get('prefix_tag_caption', '')),
             'tag_dropout_rate': directory_config.get('tag_dropout_rate', dataset_config.get('tag_dropout_rate', 0.0)),
             'multiline_captions': directory_config.get('multiline_captions', dataset_config.get('multiline_captions', False)),
+            'enable_remove_non_latin': directory_config['enable_remove_non_latin'],
         })
         self.grouping_keys_json_file = self.cache_dir / f'metadata/grouping_keys{self.caption_cache_suffix}.json'
         self.skip_empty_caption = directory_config.get('skip_empty_caption', dataset_config.get('skip_empty_caption', True))
         self.multiline_captions = directory_config.get('multiline_captions', dataset_config.get('multiline_captions', False))
         self.prefix_tag_caption = directory_config.get('prefix_tag_caption', dataset_config.get('prefix_tag_caption', ''))
         self.tag_dropout_rate = directory_config.get('tag_dropout_rate', dataset_config.get('tag_dropout_rate', 0.0))
+        self.enable_remove_non_latin = directory_config['enable_remove_non_latin']
         self.caption_sampling = directory_config.get('caption_sampling', dataset_config.get('caption_sampling', 'all'))
         if self.caption_sampling not in CAPTION_SAMPLING_MODES:
             raise ValueError(
@@ -1427,6 +1444,13 @@ class DirectoryDataset:
         return metadata_dataset
 
     def _set_defaults(self, directory_config, dataset_config):
+        directory_config.setdefault('enable_remove_non_latin', dataset_config.get('enable_remove_non_latin', False))
+        if not isinstance(directory_config['enable_remove_non_latin'], bool):
+            raise ValueError('enable_remove_non_latin must be a boolean')
+        if 'caption_dropout_rate' not in directory_config and 'caption_dropout_rate' in dataset_config:
+            directory_config['caption_dropout_rate'] = dataset_config['caption_dropout_rate']
+        if 'caption_dropout_rate' in directory_config:
+            validate_caption_dropout_rate(directory_config['caption_dropout_rate'])
         directory_config.setdefault('enable_ar_bucket', dataset_config.get('enable_ar_bucket', False))
         directory_config.setdefault('shuffle_tags', dataset_config.get('shuffle_tags', False))
         directory_config.setdefault('caption_prefix', dataset_config.get('caption_prefix', ''))
@@ -1447,7 +1471,8 @@ class DirectoryDataset:
                 # Already put in dataset from captions.json file.
                 captions = example['caption'][0]
             if captions is None and caption_file:
-                captions = read_caption_file(Path(caption_file), self.multiline_captions)
+                captions = read_caption_file(Path(caption_file), self.multiline_captions,
+                                             self.enable_remove_non_latin)
             if not captions:
                 captions = None
             if captions is None:
@@ -1471,11 +1496,10 @@ class DirectoryDataset:
                     self.directory_config['caption_prefix'],
                     self.prefix_tag_caption,
                     self.tag_dropout_rate,
-                    # Seeded per image so the variants are identical on every launch. These
-                    # captions are a column of the metadata dataset, and the LATENT cache is
-                    # keyed by that dataset's fingerprint -- drawing unseeded meant a full VAE
-                    # re-encode of the whole dataset on every run.
+                    # Seeded per image so the frozen variants and text-cache inputs are
+                    # identical on every launch. Image latents fingerprint other columns only.
                     seed=seed_from_hash((self.path, image_spec)),
+                    enable_remove_non_latin=self.enable_remove_non_latin,
                 )
             if self.control_path:
                 empty_return['control_file'] = []

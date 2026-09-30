@@ -174,6 +174,22 @@ draw selects the caption text and its embedding together, so the two can never d
 This also restores tag augmentation with cached embeddings: with `cache_shuffle_num = 10` the
 cache holds ten shuffled/dropped variants per caption, and each epoch draws a different one.
 
+### Whole-caption dropout and line filtering
+
+Dataset TOML supports `caption_dropout_rate` (a probability in `[0, 1]`) and
+`enable_remove_non_latin` (a boolean, default `false`), globally or per `[[directory]]`.
+Whole-caption dropout is re-drawn on every sample access, including with cached embeddings:
+the caption and every cached text encoder switch together to the conditioning for `""`.
+An explicit rate overrides the training TOML's `uncond_fraction`; an absent rate preserves it.
+Changing the rate does not invalidate caches.
+
+Line filtering removes whole lines containing the requested non-Latin Unicode ranges in
+memory before augmentation/encoding. Source caption files stay unchanged. Tag markers are
+excluded from the check, and fully filtered captions remain empty without a training prefix.
+Changing the filter flag separates caption metadata and refreshes text embeddings as needed,
+while unchanged image latents are reused. See [caption processing](./docs/caption-processing.md)
+for exact ranges, precedence, examples, cache behavior and validation commands.
+
 ### `online_captions`
 
 ```toml

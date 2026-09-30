@@ -17,6 +17,32 @@ logger = logging.getLogger(__name__)
 CAPTIONS_JSON_FILE = 'captions.json'
 
 
+def has_non_latin_script(text: str) -> bool:
+    """Detect the requested CJK, Cyrillic, Arabic and Hebrew Unicode ranges.
+
+    Latin Extended characters remain valid. This is a range check, not language detection;
+    scripts outside these seven ranges are deliberately not classified as non-Latin here.
+    """
+    for c in text:
+        cp = ord(c)
+        if (0x4E00 <= cp <= 0x9FFF
+                or 0x3400 <= cp <= 0x4DBF
+                or 0x3040 <= cp <= 0x30FF
+                or 0xAC00 <= cp <= 0xD7AF
+                or 0x0400 <= cp <= 0x04FF
+                or 0x0600 <= cp <= 0x06FF
+                or 0x0590 <= cp <= 0x05FF):
+            return True
+    return False
+
+
+def validate_caption_dropout_rate(rate):
+    """Reject invalid probabilities before any dataset caching starts."""
+    if (isinstance(rate, bool) or not isinstance(rate, (int, float))
+            or not 0 <= rate <= 1):
+        raise ValueError(f'caption_dropout_rate must be a finite number between 0 and 1, got {rate!r}')
+
+
 def tag_markers(prefix_tag_caption) -> list[str]:
     """Normalise `prefix_tag_caption` into a list of markers.
 
@@ -79,14 +105,23 @@ def preprocess_caption(
     shuffle: bool = False,
     tag_dropout_rate: float = 0.0,
     rng=random,
+    enable_remove_non_latin: bool = False,
 ) -> str:
-    """Strip the tag marker, optionally shuffle and drop tags, then apply caption_prefix.
+    """Strip markers, optionally filter lines and augment tags, then apply caption_prefix.
 
     Order matters: the marker comes off first so it is never shuffled into the middle of the
     tag list, and caption_prefix goes on last so it stays pinned to the front the way every
-    other model in this repo expects.
+    other model in this repo expects. With filtering enabled, empty bodies stay empty, even
+    when caption_prefix is set. Whole-caption dropout is handled at dataset access, never here.
     """
     body, is_tag = split_tag_prefix(caption, prefix_tag_caption)
+    if enable_remove_non_latin:
+        # Inspect lines before tag augmentation. A mixed Latin/non-Latin line is removed in
+        # full; a configured marker is an annotation and is excluded from the script check.
+        lines = (split_tag_prefix(line, prefix_tag_caption)[0] for line in body.splitlines())
+        body = '\n'.join(line for line in lines if not has_non_latin_script(line)).strip()
+        if not body:
+            return ''  # Do not turn an empty conditioning into caption_prefix alone.
     if is_tag and (shuffle or tag_dropout_rate > 0):
         tags = body.split(delimiter)
         if shuffle:
@@ -104,6 +139,7 @@ def shuffle_captions(
     prefix_tag_caption: str = '',
     tag_dropout_rate: float = 0.0,
     seed=None,
+    enable_remove_non_latin: bool = False,
 ) -> list[str]:
     """Expand captions into the variants that get embedded and cached.
 
@@ -113,14 +149,15 @@ def shuffle_captions(
     behaviour for cache_shuffle_num.
 
     `seed` makes the draws reproducible across processes. That matters more than it looks:
-    these variants become a column of the metadata dataset, whose fingerprint is what the
-    *latent* cache is keyed by. Drawing unseeded gives different captions on every launch, a
-    different fingerprint, and a full VAE re-encode of the entire dataset every single run.
+    these variants become a column of the metadata dataset used to fingerprint text caches.
+    Drawing unseeded would give different frozen captions on every launch and rebuild text
+    embeddings unnecessarily. Image latents now fingerprint the other columns only.
     Nothing is lost by fixing them -- the variants are frozen into the text embedding cache
     anyway, so redrawing them per run never produced fresh augmentation.
     """
     rng = random if seed is None else random.Random(seed)
-    if count == 0 and tag_dropout_rate <= 0 and not tag_markers(prefix_tag_caption):
+    if (count == 0 and tag_dropout_rate <= 0 and not tag_markers(prefix_tag_caption)
+            and not enable_remove_non_latin):
         return [caption_prefix + c for c in captions]
 
     variants = max(count, 1)
@@ -133,19 +170,23 @@ def shuffle_captions(
             shuffle=(count > 0),
             tag_dropout_rate=tag_dropout_rate,
             rng=rng,
+            enable_remove_non_latin=enable_remove_non_latin,
         )
         for caption in captions
         for _ in range(variants)
     ]
 
 
-def read_caption_file(path: Path, multiline_captions: bool = False) -> list[str]:
+def read_caption_file(path: Path, multiline_captions: bool = False,
+                      keep_empty_caption: bool = False) -> list[str]:
     """Read a sidecar .txt caption file.
 
     Historically the whole file is one caption, newlines included. `multiline_captions` opts a
     dataset into treating each non-empty line as a separate caption, matching what
     captions.json already allows. It is opt-in because flipping it changes the number of
     training samples for every existing dataset whose .txt files happen to wrap.
+    keep_empty_caption preserves an existing blank file as one unconditional sample when
+    filtering is enabled; it never changes the source file.
     """
     # utf-8-sig, not utf-8: a caption file saved by a Windows editor starts with a BOM,
     # and str.strip() does not remove U+FEFF -- it is not whitespace. The stray codepoint
@@ -154,7 +195,8 @@ def read_caption_file(path: Path, multiline_captions: bool = False) -> list[str]
     text = path.read_text(encoding='utf-8-sig')
     if not multiline_captions:
         return [text.strip()]
-    return [line for line in (l.strip() for l in text.splitlines()) if line]
+    captions = [line for line in (l.strip() for l in text.splitlines()) if line]
+    return captions or ([''] if keep_empty_caption else [])
 
 
 # Extensions DirectoryDataset skips when enumerating media files.
@@ -224,6 +266,9 @@ def enumerate_captions(dataset_config, apply_num_repeats=False, apply_shuffle=Tr
         multiline_captions = setting('multiline_captions', False)
         prefix_tag_caption = setting('prefix_tag_caption', '')
         tag_dropout_rate = setting('tag_dropout_rate', 0.0)
+        enable_remove_non_latin = setting('enable_remove_non_latin', False)
+        if not isinstance(enable_remove_non_latin, bool):
+            raise ValueError('enable_remove_non_latin must be a boolean')
         num_repeats = setting('num_repeats', 1) if apply_num_repeats else 1
         if not apply_shuffle:
             # Exporting a corpus: keep the captions as they are on disk so shuffling and
@@ -239,6 +284,7 @@ def enumerate_captions(dataset_config, apply_num_repeats=False, apply_shuffle=Tr
             tag_dropout_rate = 0.0
             prefix_tag_caption = ''
             caption_prefix = ''
+            enable_remove_non_latin = False  # A raw corpus keeps source text and annotations.
             if markers_seen is not None:
                 markers_seen.update(tag_markers(setting('prefix_tag_caption', '')))
 
@@ -295,14 +341,14 @@ def enumerate_captions(dataset_config, apply_num_repeats=False, apply_shuffle=Tr
                     assert isinstance(item, list), f'{CAPTIONS_JSON_FILE} must contain lists of captions'
                 return item
             if media_file.suffix == '.txt':
-                return read_caption_file(media_file, multiline_captions)
+                return read_caption_file(media_file, multiline_captions, enable_remove_non_latin)
             # DirectoryDataset disables the .txt fallback for the whole directory as soon as
             # a captions.json exists (`if has_captions_json or not os.path.exists(...)`).
             # Keeping the fallback here would feed distillation captions the diffusion
             # stages never see, which is the drift this helper exists to prevent.
             caption_file = txt_by_stem.get(media_file.stem)
             if caption_file is not None:
-                return read_caption_file(caption_file, multiline_captions)
+                return read_caption_file(caption_file, multiline_captions, enable_remove_non_latin)
             return None
 
         items = [resolve(spec) for spec in media_specs]
@@ -328,6 +374,7 @@ def enumerate_captions(dataset_config, apply_num_repeats=False, apply_shuffle=Tr
                 bar.set_postfix(ok=counts['resolved'], failed=counts['skipped'] + counts['empty'])
             directory_captions.extend(shuffle_captions(
                 item, shuffle_num, delimiter, caption_prefix, prefix_tag_caption, tag_dropout_rate,
+                enable_remove_non_latin=enable_remove_non_latin,
             ))
 
         # num_repeats may be fractional -- SizeBucketDataset accepts any value > 0 and takes

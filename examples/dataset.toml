@@ -66,6 +66,21 @@ frame_buckets = [1, 33]
 # already produces deliberately, and minting more of them would quietly change the conditioning ratio.
 # tag_dropout_rate = 0.1
 
+# Replace the entire conditioning with "" on each sample access, even with cached text embeddings.
+# Range [0, 1]. Unset falls back to uncond_fraction in the training TOML; explicit 0 disables that
+# fallback. Dataset-wide here, or override inside any [[directory]]. This does not alter metadata,
+# latent caches or text embedding caches: cached encoders select the already cached empty embedding.
+# caption_dropout_rate = 0.1
+
+# Remove whole lines containing the configured CJK, Cyrillic, Arabic or Hebrew Unicode ranges
+# from captions IN MEMORY, before tag shuffling/dropout and text encoding. Latin Extended is kept.
+# prefix_tag_caption is stripped before checking; caption_prefix is added afterwards, only if
+# some body remains. A fully filtered caption becomes "" and the image remains in the dataset.
+# Default false. May also be overridden in [[directory]]. Changing this flag separates the caption
+# metadata cache and rebuilds text embeddings as needed, including under --trust_cache, while
+# reusing unchanged image latents. See docs/caption-processing.md for the exact ranges and caveats.
+# enable_remove_non_latin = true
+
 # Marks which captions are tag lists rather than natural language. Only captions starting with this string are
 # shuffled and tag-dropped; everything else is left alone. The marker is stripped before training, so with
 # prefix_tag_caption = "Special: " the caption "Special: a, b, c" is trained as "a, b, c".

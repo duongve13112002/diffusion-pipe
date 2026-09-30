@@ -33,6 +33,49 @@
 <p class="meta">A running log of decisions taken outside the spec, forced changes, tradeoffs, and
 anything else the maintainer needs to know. Newest entry first.</p>
 
+<h2>2026-09-30 &mdash; Per-access caption dropout and in-memory non-Latin line filtering</h2>
+
+<p><strong>Request.</strong> Add <code>caption_dropout_rate</code> and
+<code>enable_remove_non_latin</code> at dataset-wide and per-directory scope, without editing
+source captions or changing image latents. Keep empty captions unconditional, including
+when a training prefix is set, and support cached, live and hybrid text encoders.</p>
+
+<h3>Sampling and preprocessing decisions</h3>
+<p>The existing unconditional-selection branch already switches every cached encoder to its
+empty-caption features. Whole-caption dropout now resolves the directory setting, then the
+dataset setting, then the legacy <code>uncond_fraction</code> and draws once per sample access.
+Explicit zero overrides the fallback; the probabilities are never stacked or frozen in cache.</p>
+<p>The filter uses the user's seven inclusive Unicode ranges. It removes whole mixed-script
+lines after excluding tag markers, before tag augmentation and text encoding. Latin Extended
+is retained. A filtered-empty body stays <code>""</code> without <code>caption_prefix</code>;
+caption elements and shuffled-variant counts remain present, so their images are retained.</p>
+
+<h3>Cache and online behavior</h3>
+<p>Only the filter flag enters the caption-settings suffix. It separates caption metadata and
+iteration orders even under <code>--trust_cache</code>. Image latents already exclude caption
+text from their fingerprint, so unchanged image rows keep their latent shards. Changing the
+dropout rate reuses metadata, latent and text caches. An explicit
+<code>--regenerate_cache</code> still rebuilds everything; adding media that were previously
+skipped, such as an empty multiline sidecar, still requires aligned image latents.</p>
+<p>A related consistency issue was exposed in the cached online path: a cache-variant index
+could exceed the raw caption-list length, or a live edit could disagree with a frozen embedding.
+Cached models now use the matching metadata caption. Fully uncached models still read and
+filter the online dictionary in RAM, mapping expanded variant indices back to their original
+caption positions first. Raw corpus exports remain raw.</p>
+
+<h3>Validation and documentation</h3>
+<p><code>test/test_caption_filter_dropout.py</code> covers real metadata, iteration order and
+SQLite shards with deterministic CPU stand-ins only for the VAE/text encoder forward calls.
+It checks Unicode endpoints, source bytes, empty captions, prefix ordering, config validation,
+legacy fallback, per-access RNG, multiple encoders, online/hybrid variants and both sampling
+modes. Reuse tests forbid recoding and compare latent shard bytes/fingerprints, including
+dropout-rate changes without <code>--trust_cache</code>. Final CPU suite: <strong>821 passed,
+1 skipped</strong> in 70.61 seconds; all <strong>73 new caption tests</strong> passed. The existing
+Cosmos batch-fill check skipped because <code>pynvml</code> is absent. Dependency consistency,
+TOML parsing, documentation links and whitespace checks passed. Real GPU training is not verified.</p>
+<p>Usage and cache caveats are in <a href="docs/caption-processing.md">caption processing</a>;
+the dataset example, README, Anima Refiner training guide and research-note index are updated.</p>
+
 <h2>2026-09-09 &mdash; Safe cache-count mismatches and two distillation save schedules</h2>
 
 <p><strong>Request.</strong> A latent cache kept across a fingerprint change contained 32,802

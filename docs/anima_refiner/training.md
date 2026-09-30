@@ -207,6 +207,16 @@ draws are cached, and set `caption_sampling = "random_per_epoch"` so a different
 epoch. VAE latents are cached either way; that is the expensive half and it does not depend on
 the caption.
 
+Whole-caption dropout is independent of that choice: dataset
+`caption_dropout_rate` re-draws on each sample access with either cached or on-the-fly
+text embeddings. Cached encoders switch to their existing empty-caption embeddings; live
+encoders receive `""`. Dataset `enable_remove_non_latin` filters whole
+non-Latin lines in memory before encoding; an all-filtered caption stays empty. Both settings
+support dataset-wide defaults and `[[directory]]` overrides. See
+[caption processing](../caption-processing.md) for prefix ordering, Unicode ranges and cache
+reuse: dropout does not invalidate caches, while filtering refreshes caption/text data and
+reuses unchanged image latents.
+
 ## Step 5: sample
 
 ```
