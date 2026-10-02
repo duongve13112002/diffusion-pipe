@@ -6,6 +6,7 @@ are the production implementations. No model downloads or GPU are needed.
 """
 
 import functools
+import gc
 import json
 import random
 
@@ -53,7 +54,8 @@ def build_directory(path, captions=None, *, global_settings=None, caches_text_em
             for name, caption in captions.items():
                 Image.new('RGB', (64, 64), (31, 42, 53)).save(path / f'{name}.png')
                 (path / f'{name}.txt').write_text(caption, encoding='utf-8')
-    config = {'resolutions': [64], **(global_settings or {})}
+    # Keep legacy/live-caption behavior covered alongside the new snapshot migration suite.
+    config = {'resolutions': [64], 'reuse_metadata_cache': False, **(global_settings or {})}
     directory = {'path': str(path), 'size_buckets': [[64, 64, 1]], **settings}
     ds = DirectoryDataset(directory, config, 'caption_test', skip_dataset_validation=True,
                           caches_text_embeddings=caches_text_embeddings)
@@ -73,6 +75,21 @@ def assert_embedding(item, caption, encoder=0):
     torch.testing.assert_close(
         item[f'embedding_{encoder}'], torch.tensor([sum(map(ord, caption)), len(caption)]))
     assert bool(item[f'attention_mask_{encoder}'][0]) == bool(caption)
+
+
+def release_legacy_directory(ds):
+    """Model a process restart before rewriting legacy Arrow/SQLite files on Windows."""
+    for bucket in ds.get_size_bucket_datasets():
+        for te in bucket.text_embedding_datasets:
+            te.flattened_captions = None
+        for cache in [bucket.latent_dataset, *[te.te_dataset for te in bucket.text_embedding_datasets],
+                      *bucket.uncond_text_embeddings]:
+            cache.con.close()
+            for handle in cache.open_files.values():
+                handle.close()
+        bucket.metadata_dataset = None
+        bucket.iteration_order = None
+    gc.collect()
 
 
 class TestScriptRanges:
@@ -291,12 +308,17 @@ class TestMetadataAndCache:
 
     @pytest.mark.parametrize('trust_cache', [False, True])
     def test_dropout_rate_changes_reuse_metadata_latents_and_text_cache(self, tmp_path, trust_cache):
-        ds = build_directory(tmp_path, ['red'], caption_dropout_rate=0.0)
+        ds = build_directory(tmp_path, ['red'], caption_dropout_rate=0.0,
+                             keep_text_embedding_cache=True)
         first = prepare(ds, encoders=1)
         latent_path = first.cache_dir / 'latents' / 'shard_0.bin'
         text_path = first.cache_dir / 'text_embeddings_0' / 'shard_0.bin'
         before = (latent_path.read_bytes(), text_path.read_bytes())
-        again = build_directory(tmp_path, caption_dropout_rate=1.0, trust_cache=trust_cache)
+        release_legacy_directory(ds)
+        # HF transform fingerprints may move between cold/warm loading even with identical
+        # strings. The legacy keep flag still validates caption content and row counts.
+        again = build_directory(tmp_path, caption_dropout_rate=1.0, trust_cache=trust_cache,
+                                keep_text_embedding_cache=True)
         assert again.caption_cache_suffix == ds.caption_cache_suffix == ''
         # None refuses to run an encoder; this only succeeds if the real caches are reused.
         second = prepare(again, encoders=1, latent_fn=None, text_fn=None, trust_cache=trust_cache)
@@ -312,6 +334,7 @@ class TestMetadataAndCache:
         latent_path = first.cache_dir / 'latents' / 'shard_0.bin'
         before = latent_path.read_bytes()
         fingerprint = first.latent_dataset.fingerprint
+        release_legacy_directory(ds)
         again = build_directory(tmp_path, enable_remove_non_latin=True, trust_cache=True)
         assert again.caption_cache_suffix != ds.caption_cache_suffix
         second = prepare(again, encoders=1, latent_fn=None, trust_cache=True)
@@ -322,6 +345,7 @@ class TestMetadataAndCache:
             item = second[i]
             assert_embedding(item, item['caption'])
         # Disabling filtering under --trust_cache must also restore the original captions.
+        release_legacy_directory(again)
         restored = build_directory(tmp_path, enable_remove_non_latin=False, trust_cache=True)
         third = prepare(restored, encoders=1, latent_fn=None, trust_cache=True)
         assert third.metadata_dataset[0]['caption'] == ['red\n制服', 'שלום']

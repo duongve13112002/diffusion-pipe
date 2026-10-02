@@ -1,5 +1,10 @@
 # Summary
 
+Dataset caching is shared across models: default `reuse_metadata_cache = true` uses frozen
+source snapshots and configuration profiles, including when `--trust_cache` is supplied.
+On-the-fly text encoding remains per-step; source caption edits require regeneration.
+See [source snapshots and cache profiles](caption-processing.md#source-snapshots-and-cache-profiles).
+
 | Model          | LoRA | Full Fine Tune | fp8/quantization |
 |----------------|------|----------------|------------------|
 |SDXL            |✅    |✅              |❌                |

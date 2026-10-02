@@ -31,7 +31,7 @@ def bounded_workers(monkeypatch):
 
 
 def build(path, *, requirement=None, global_settings=None, **settings):
-    config = {'resolutions': [64], **(global_settings or {})}
+    config = {'resolutions': [64], 'reuse_metadata_cache': False, **(global_settings or {})}
     directory = {'path': str(path), 'size_buckets': [[64, 64, 1]],
                  'shuffle_metadata': False, **settings}
     if requirement is not None:

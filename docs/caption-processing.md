@@ -130,7 +130,7 @@ path = '/data/latin-only'
 require_non_latin_caption = false
 ```
 
-Unlike line removal, selection changes the media rows used to index latents. Enabled modes
+With `reuse_metadata_cache = false`, selection changes the media rows used to index latents. Enabled modes
 therefore isolate all caches under `cache/<model>/require_non_latin_caption_true/` or
 `cache/<model>/require_non_latin_caption_false/`. Metadata, conditional/unconditional text
 embeddings, image latents, and iteration order all belong to that mode. The first run of
@@ -157,7 +157,58 @@ the filtered dataset to change selection. Metadata logs report retained/skipped 
 after selection and validation; an empty selected directory gets a warning. Caption-only
 enumeration and export also report the exact number excluded by the script condition.
 
-## Caches and online captions
+## Source snapshots and cache profiles
+
+Dataset `reuse_metadata_cache = true` is now the default, with directory overrides. This
+declares source files unchanged until an explicit `--regenerate_cache`. Both with and
+without `--trust_cache`, caption config changes choose profiles built from a snapshot of
+original captions and media attributes. Changing whole-caption dropout does not create a
+new profile; changing selection or caption preprocessing does. Runtime-only training
+settings never invalidate tensors. Sampling/repeats/batch settings still affect training
+order, epoch length, and any dropped/padded batch tail.
+
+Profiles live below `cache/<model>/profiles/<geometry>/<caption-profile>/`. They hold selected
+metadata, iteration order and compact tensor references, not full copies of selected
+latent/embedding shards. Compatible old tensors are indexed by their exact inputs:
+image/mask/control/bucket/video context for latents, and that context plus processed caption
+for text. Different VAE/text encoder identities cannot donate tensors. Unknown identities
+are not accepted when the current model declares an identity. Missing inputs are encoded
+into new shards; a cache-only load without the required encoder fails explicitly.
+Non-empty text-encoder cache keys (for example, encoding/template settings) must also match;
+an old donor without that key is conservatively encoded again, even with matching weights.
+
+Migration reads the actual SQLite/shard format from `abd164e` without moving or deleting it.
+Legacy size-bucket tensors use a shuffled row order, recovered from the saved `iteration_order`
+mapping, not guessed from metadata order. The old format does not record complete source
+geometry settings: keep bucketing/media preprocessing unchanged for the initial import;
+use regeneration when changing those settings without a known compatible source snapshot.
+The first legacy import records its declared geometry; other geometries do not borrow
+those legacy tensors. Mask/control metadata is rescanned conservatively during migration.
+Missing/incomplete/ambiguous legacy mappings are not reused. Caption manifests must agree.
+Legacy sidecars may need one read to recover raw text; JSON captions are already available
+in intermediate metadata. This one-time import/index construction is O(N), as is building
+a never-used selection/caption profile. Warm profiles avoid source enumeration, image
+dimension reads and donor-index reconstruction. This is not a measured 30M-sample benchmark;
+training still constructs its sampling/batch structures, and first profile grouping retains
+the existing in-memory grouping cost.
+
+`online_captions = true` uses the snapshot in this mode, including with uncached encoders.
+On-the-fly **encoding** still runs each step on the resulting runtime string, with fresh
+tag augmentation/dropout where configured. It does not require disk text embeddings.
+Image/caption additions, edits and deletions are invisible until regeneration. Refresh
+publishes a fresh generation and conservatively rebuilds its tensors; it preserves old
+snapshots/shards because existing runs/profiles may reference them. Do not remove a donor
+folder while a profile references it. Changing the selected dataset or caption sampling
+does not make an old dataloader checkpoint position transferable; start a new training
+run rather than assuming identical resume behavior after such changes.
+
+Set `reuse_metadata_cache = false` to retain the previous rescan/live-online-caption workflow
+and per-mode full caches. Corpus export and text-only distillation enumeration still read
+their source datasets directly; this snapshot option belongs to the image/video dataset path.
+
+## Legacy caches and online captions
+
+The following details apply with `reuse_metadata_cache = false`.
 
 | Change/path | Caption metadata / iteration order | Text embeddings | Image latents |
 | --- | --- | --- | --- |
@@ -193,6 +244,25 @@ sampling settings do not configure the separate text-only distillation trainer.
 
 ## Validation
 
+The migration matrix executes the actual dataset and cache implementations from commit
+`abd164e`, replacing only heavyweight encoder forwards and using threads for the tiny mock
+encoder transport (a dynamically loaded historical module cannot be imported by Windows
+spawn workers). It verifies JSON/sidecars, size/AR buckets, both trust settings, all three
+selection modes, line removal, dropout, cached/runtime encoding, and untouched old cache
+file hashes. Extra cases check fresh-cache donation, warm reuse, refresh generation publication,
+new resolution, changed encoder identity and runtime augmentation. All fixture/temp artifacts
+remain under the explicitly project-local pytest base directory.
+The historical matrix requires the `abd164e` Git object; shallow/source-only checkouts skip
+that matrix explicitly while current-format tests still run. Tests never fetch history or models.
+Run:
+
+```bash
+mkdir -p .tmp .cache/pip .cache/huggingface .cache/torch
+TMPDIR="$PWD/.tmp" TMP="$PWD/.tmp" TEMP="$PWD/.tmp" PIP_CACHE_DIR="$PWD/.cache/pip" \
+HF_HOME="$PWD/.cache/huggingface" TORCH_HOME="$PWD/.cache/torch" CUDA_VISIBLE_DEVICES=-1 \
+.venv/bin/python -m pytest test/test_cache_profiles.py -q --basetemp .tmp/pytest-cache-profiles
+```
+
 Whole-media selection tests use real metadata and tensor-cache paths with tiny CPU-only
 encoder maps. Run inside the project venv; no model downloads or GPU allocation are needed:
 
@@ -206,7 +276,9 @@ CUDA_VISIBLE_DEVICES=-1 \
 ```bash
 OMP_NUM_THREADS=2 MKL_NUM_THREADS=2 DIFFUSION_PIPE_NUM_PROC=1 \
 HF_HUB_OFFLINE=1 HF_DATASETS_OFFLINE=1 WANDB_MODE=disabled \
-python -m pytest test/test_caption_filter_dropout.py -q
+TMPDIR="$PWD/.tmp" TMP="$PWD/.tmp" TEMP="$PWD/.tmp" PIP_CACHE_DIR="$PWD/.cache/pip" \
+HF_HOME="$PWD/.cache/huggingface" TORCH_HOME="$PWD/.cache/torch" CUDA_VISIBLE_DEVICES=-1 \
+.venv/bin/python -m pytest test/test_caption_filter_dropout.py -q --basetemp .tmp/pytest-caption-legacy
 ```
 
 The tests use actual dataset metadata, iteration orders and SQLite tensor shards; only VAE

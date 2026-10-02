@@ -7,6 +7,15 @@
 # file for how you can do that.
 resolutions = [512]
 
+# Reuse a snapshot of media metadata and ORIGINAL captions without rescanning source files.
+# Default true, globally or per [[directory]]. Caption configuration changes create/select
+# profiles even with --trust_cache; compatible tensor shards are referenced, not copied.
+# Source edits are invisible until --regenerate_cache creates a fresh generation. This also
+# freezes online_captions; uncached/on-the-fly text encoding still runs every training step.
+# Set false for the legacy rescan/live-online-caption workflow.
+# First migration from abd164e may read sidecars and build disk indexes once.
+# reuse_metadata_cache = true
+
 # You can give resolutions as (width, height) pairs also. This doesn't do anything different, it's just
 # another way of specifying the area(s) (i.e. total number of pixels) you want to train on.
 # resolutions = [[1280, 720]]
@@ -56,7 +65,8 @@ frame_buckets = [1, 33]
 # caption_sampling = "random_per_epoch"
 
 # Drop each tag independently with this probability, as a caption augmentation. 0 (the default) disables it.
-# Applied at caching time alongside cache_shuffle_num, so changing it needs --regenerate_cache to take effect.
+# Applied at caching time alongside cache_shuffle_num. Snapshot mode selects a new caption
+# profile on change; the legacy workflow may need --regenerate_cache to take effect.
 # With cache_shuffle_num = 0 this produces one frozen draw per caption -- the dropped tags are gone
 # for good, which is permanent deletion rather than augmentation. Set cache_shuffle_num > 1 so several draws
 # are cached; caption_sampling = "random_per_epoch" then picks a different one each epoch. random_per_epoch
@@ -87,8 +97,9 @@ frame_buckets = [1, 33]
 # Unset: no selection (None internally; TOML has no null/None value).
 # Uses the same Unicode ranges as enable_remove_non_latin, excluding annotation markers.
 # May be overridden in [[directory]]. Missing captions still follow skip_empty_caption.
-# Each enabled mode has its own metadata/latent/text caches. The first run must cache that
-# subset; switching modes preserves the other caches. See docs/caption-processing.md.
+# Snapshot mode stores a selected metadata profile and references compatible latent/text
+# shards. New caption inputs need encoding; existing image latents are not copied/re-encoded.
+# With reuse_metadata_cache=false, enabled modes keep their legacy separate full caches.
 # require_non_latin_caption = true
 
 # Marks which captions are tag lists rather than natural language. Only captions starting with this string are
@@ -102,7 +113,8 @@ frame_buckets = [1, 33]
 
 # Treat each non-empty line of a .txt caption file as a separate caption, the way captions.json already allows a
 # list. Off by default: turning it on changes how many training samples a dataset with wrapped .txt files
-# produces, so it must be opted into, and needs --regenerate_cache to take effect.
+# produces, so it must be opted into. Snapshot mode selects a new profile automatically;
+# legacy trusted metadata may need --regenerate_cache to take effect.
 # multiline_captions = true
 
 # What to do when a size bucket holds a number of samples that is not a multiple of the global batch size

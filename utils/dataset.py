@@ -26,6 +26,7 @@ from comfy_api.latest import InputImpl
 
 from utils.common import is_main_process, VIDEO_EXTENSIONS, round_to_nearest_multiple
 from utils.cache import Cache
+from utils.cache_profiles import align_legacy_metadata, IndexedTextEmbeddingDataset, tensor_profile
 import comfy.model_management as mm
 
 
@@ -261,22 +262,27 @@ def _map_and_cache(dataset, map_fn, cache_dir, cache_file_prefix='', new_fingerp
         return cache
     dataset = dataset.select(range(cache_size, dataset_size), keep_in_memory=True)
 
-    # Let each worker process know its rank
-    manager = mp.Manager()
-    id_queue = manager.Queue()
+    pool = None
+    manager = None
+    if NUM_PROC == 1:
+        def wrapper(example):
+            return map_fn(example, 0)
+    else:
+        # Let each worker process know its rank.
+        manager = mp.Manager()
+        id_queue = manager.Queue()
 
-    def init(queue):
-        global rank
-        rank = queue.get()
+        def init(queue):
+            global rank
+            rank = queue.get()
 
-    for i in range(NUM_PROC):
-        id_queue.put(i)
+        for i in range(NUM_PROC):
+            id_queue.put(i)
+        pool = mp.Pool(NUM_PROC, init, (id_queue,))
 
-    pool = mp.Pool(NUM_PROC, init, (id_queue,))
-
-    def wrapper(example):
-        global rank
-        return map_fn(example, rank)
+        def wrapper(example):
+            global rank
+            return map_fn(example, rank)
 
     # Tensor slices reference the entire memory of the original tensor, and everything would be pickled and stored
     # in cache, so we do this.
@@ -303,12 +309,16 @@ def _map_and_cache(dataset, map_fn, cache_dir, cache_file_prefix='', new_fingerp
     completed_batches = cache_size // caching_batch_size
     total_batches = dataset_size // caching_batch_size
 
-    map_iter = pool.imap(wrapper, dataset.iter(batch_size=caching_batch_size))
+    map_iter = (pool.imap(wrapper, dataset.iter(batch_size=caching_batch_size)) if pool
+                else map(wrapper, dataset.iter(batch_size=caching_batch_size)))
     for batch in tqdm(map_iter, initial=completed_batches, total=total_batches):
         for example in unbatch_iter(batch):
             cache.add(example)
 
-    pool.close()
+    if pool is not None:
+        pool.close()
+        pool.join()
+        manager.shutdown()
     cache.finalize_current_shard()
     # Written only now: the manifest describes complete contents, so a run interrupted
     # part-way leaves no claim about what this cache holds.
@@ -332,7 +342,8 @@ class TextEmbeddingDataset:
 
 def _cache_text_embeddings(metadata_dataset, map_fn, i, cache_dir, regenerate_cache,
                            caching_batch_size, text_encoder_key='',
-                           keep_on_fingerprint_change=False, identity=None):
+                           keep_on_fingerprint_change=False, identity=None,
+                           profile_sources=None, profile_lookup_dir=None):
 
     def flatten_captions(example):
         result = {key: [] for key in example}
@@ -345,6 +356,37 @@ def _cache_text_embeddings(metadata_dataset, map_fn, i, cache_dir, regenerate_ca
                     result[key].append(value[i])
         return result
 
+    if profile_sources is not None:
+        flattened_path = cache_dir / f'flattened_captions_{metadata_dataset._fingerprint}'
+        if flattened_path.exists():
+            flattened_captions = datasets.load_from_disk(str(flattened_path))
+        else:
+            flattened_captions = metadata_dataset.map(
+                flatten_captions, batched=True, keep_in_memory=True,
+                remove_columns=metadata_dataset.column_names)
+            flattened_captions.save_to_disk(str(flattened_path))
+            flattened_captions = datasets.load_from_disk(str(flattened_path))
+        def donors():
+            result = []
+            for source, path in profile_sources():
+                if len(source) and isinstance(source[0]['caption'], str):
+                    result.append((source, path))
+                    continue
+                flattened_source = profile_lookup_dir / f'flattened_{source._fingerprint}'
+                if not flattened_source.exists():
+                    flattened = source.map(flatten_captions, batched=True, keep_in_memory=True,
+                                           remove_columns=source.column_names)
+                    flattened.save_to_disk(str(flattened_source))
+                result.append((datasets.load_from_disk(str(flattened_source)), path))
+            return result
+        te_dataset = tensor_profile(
+            flattened_captions, map_fn,
+            cache_dir / f'text_embeddings_{i}_{Hasher.hash([identity, text_encoder_key])}',
+            sorted(flattened_captions.column_names), identity, donors, _map_and_cache,
+            caching_batch_size=caching_batch_size, regenerate_cache=regenerate_cache,
+            encoder_key=text_encoder_key, lookup_dir=profile_lookup_dir)
+        return IndexedTextEmbeddingDataset(
+            te_dataset, flattened_captions, cache_dir / f'caption_index_{metadata_dataset._fingerprint}.sqlite')
     flattened_captions = metadata_dataset.map(flatten_captions, batched=True, keep_in_memory=True, remove_columns=metadata_dataset.column_names)
     te_dataset = _map_and_cache(
         flattened_captions,
@@ -437,7 +479,8 @@ class SizeBucketDataset:
     def __init__(self, metadata_dataset, directory_config, size_bucket, cache_base, directory_dataset):
         # Shuffle deterministically based on size bucket, so that two resolutions of the same aspect ratio get different
         # orders, which mixes data better when training on multiple resolutions at once.
-        seed = seed_from_hash(size_bucket)
+        seed = seed_from_hash(tuple(size_bucket) if getattr(directory_dataset, 'reuse_metadata_cache', False)
+                              else size_bucket)
         metadata_dataset = metadata_dataset.shuffle(seed=seed)
         self.metadata_dataset = metadata_dataset
         self.directory_config = directory_config
@@ -491,22 +534,25 @@ class SizeBucketDataset:
         # on the caption, which is only carried alongside them. Fingerprinting the caption
         # column too meant every caption setting change wiped the whole VAE cache.
         latent_columns = [c for c in self.metadata_dataset.column_names if c != 'caption']
-        self.latent_dataset = _map_and_cache(
-            self.metadata_dataset,
-            map_fn,
-            self.cache_dir,
-            cache_file_prefix='latents_',
-            regenerate_cache=regenerate_cache,
-            caching_batch_size=caching_batch_size,
-            fingerprint_columns=latent_columns,
-            # keep_latent_cache only skips a recache the fingerprint would have forced. It
-            # cannot make an incompatible cache usable -- Cache rebuilds those regardless.
-            keep_on_fingerprint_change=self.directory_config.get('keep_latent_cache', False),
-            identity=self.vae_identity,
-            # Caption edits can swap selected images without changing the subset's length.
-            content_column=('image_spec' if self.directory_config.get('require_non_latin_caption') is not None
-                            else None),
-        )
+        if getattr(self.directory_dataset, 'reuse_metadata_cache', False):
+            self.latent_dataset = tensor_profile(
+                self.metadata_dataset, map_fn,
+                self.cache_dir / f'latent_profile_{Hasher.hash(self.vae_identity)}',
+                sorted(latent_columns), self.vae_identity,
+                lambda: self.directory_dataset.legacy_tensor_sources(self.size_bucket, 'latents'),
+                _map_and_cache, caching_batch_size=caching_batch_size,
+                regenerate_cache=regenerate_cache,
+                lookup_dir=self.directory_dataset.snapshot_dir / 'tensor_lookups')
+            trust_cache = True
+        else:
+            self.latent_dataset = _map_and_cache(
+                self.metadata_dataset, map_fn, self.cache_dir, cache_file_prefix='latents_',
+                regenerate_cache=regenerate_cache, caching_batch_size=caching_batch_size,
+                fingerprint_columns=latent_columns,
+                keep_on_fingerprint_change=self.directory_config.get('keep_latent_cache', False),
+                identity=self.vae_identity,
+                content_column=('image_spec' if self.directory_config.get('require_non_latin_caption') is not None
+                                else None))
         assert len(self.latent_dataset) == len(self.metadata_dataset), (len(self.latent_dataset), len(self.metadata_dataset))
 
         suffix = self.directory_config.get('caption_cache_suffix', '')
@@ -591,6 +637,11 @@ class SizeBucketDataset:
             caching_batch_size, text_encoder_key,
             keep_on_fingerprint_change=keep_text_embedding_cache,
             identity=identity,
+            profile_sources=((lambda: self.directory_dataset.legacy_tensor_sources(
+                self.size_bucket, f'text_embeddings_{i}'))
+                if getattr(self.directory_dataset, 'reuse_metadata_cache', False) else None),
+            profile_lookup_dir=(self.directory_dataset.snapshot_dir / 'tensor_lookups'
+                                if getattr(self.directory_dataset, 'reuse_metadata_cache', False) else None),
         )
         self.text_embedding_datasets.append(te_dataset)
 
@@ -1034,12 +1085,18 @@ class ARBucketDataset:
             size_bucket = (w, h, self.ar_frames[1])
             # to make sure the directory has a unique name
             naming_size_bucket = (self.ar_frames[0],) + size_bucket
-            metadata_with_size_bucket = self.metadata_dataset.map(
-                lambda example: {'size_bucket': size_bucket},
-                cache_file_name=str(self.cache_dir / f'metadata/metadata_{bucket_suffix(naming_size_bucket)}.arrow'),
-                load_from_cache_file=(not regenerate_cache and trust_cache),
-                desc='Adding size bucket',
-            )
+            mapped_path = self.cache_dir / f'metadata/metadata_{bucket_suffix(naming_size_bucket)}.arrow'
+            if (getattr(self.directory_dataset, 'reuse_metadata_cache', False)
+                    and mapped_path.exists() and not regenerate_cache):
+                metadata_with_size_bucket = datasets.Dataset.from_file(str(mapped_path))
+            else:
+                metadata_with_size_bucket = self.metadata_dataset.map(
+                    lambda example: {'size_bucket': size_bucket},
+                    cache_file_name=str(mapped_path),
+                    load_from_cache_file=(not regenerate_cache and trust_cache),
+                    desc='Adding size bucket')
+            if getattr(self.directory_dataset, 'reuse_metadata_cache', False):
+                metadata_with_size_bucket = datasets.Dataset.from_file(str(mapped_path))
             self.size_buckets.append(
                 SizeBucketDataset(metadata_with_size_bucket, self.directory_config, naming_size_bucket, self.cache_base, self.directory_dataset)
             )
@@ -1056,6 +1113,11 @@ class ARBucketDataset:
             caching_batch_size, text_encoder_key,
             keep_on_fingerprint_change=keep_text_embedding_cache,
             identity=identity,
+            profile_sources=((lambda: self.directory_dataset.legacy_tensor_sources(
+                self.ar_frames, f'text_embeddings_{i}'))
+                if getattr(self.directory_dataset, 'reuse_metadata_cache', False) else None),
+            profile_lookup_dir=(self.directory_dataset.snapshot_dir / 'tensor_lookups'
+                                if getattr(self.directory_dataset, 'reuse_metadata_cache', False) else None),
         )
         for size_bucket_dataset in self.size_buckets:
             size_bucket_dataset.add_text_embedding_dataset(te_dataset)
@@ -1195,7 +1257,8 @@ class DirectoryDataset:
         self.frame_buckets = np.array(frame_buckets)
 
         online_captions = directory_config.get('online_captions', dataset_config.get('online_captions', False))
-        if online_captions:
+        self.reuse_metadata_cache = directory_config['reuse_metadata_cache']
+        if online_captions and not self.reuse_metadata_cache:
             captions_json = self.path / CAPTIONS_JSON_FILE
             assert captions_json.exists()
             # encoding='utf-8' is not optional: open() defaults to the locale encoding, which
@@ -1205,6 +1268,207 @@ class DirectoryDataset:
                 self.captions_dict = json.load(f)
         else:
             self.captions_dict = None
+
+        self.legacy_cache_dir = self.path / 'cache' / self.model_name
+        if self.reuse_metadata_cache:
+            geometry = {'size_buckets': self.size_buckets.tolist() if self.use_size_buckets else None,
+                        'ars': self.ars.tolist(), 'frames': self.frame_buckets.tolist(),
+                        'resolutions': self.resolutions.tolist() if not self.use_size_buckets else None,
+                        'round_to_multiple': self.round_to_multiple, 'framerate': self.framerate,
+                        'mask_path': str(self.mask_path), 'control_path': str(self.control_path),
+                        'default_mask_file': str(self.default_mask_file), 'shuffle': self.shuffle_metadata}
+            self.geometry_dir = self.legacy_cache_dir / 'profiles' / Hasher.hash(geometry)
+            self.legacy_geometry_file = self.legacy_cache_dir / 'profiles' / 'legacy_geometry.json'
+            self.import_legacy_geometry = True
+            if self.legacy_geometry_file.exists():
+                self.import_legacy_geometry = (
+                    json.loads(self.legacy_geometry_file.read_text())['geometry'] == self.geometry_dir.name)
+            self.snapshot_dir = self.geometry_dir
+            active = self.geometry_dir / 'active_snapshot.json'
+            if active.exists():
+                self.snapshot_dir = self.geometry_dir / json.loads(active.read_text())['directory']
+                if not self.snapshot_dir.resolve().is_relative_to(self.geometry_dir.resolve()):
+                    raise ValueError('Source metadata generation must remain inside its cache root')
+            self.snapshot_path = self.snapshot_dir / 'source_metadata'
+            settings = {**self._legacy_caption_settings(),
+                        'caption_settings': self.caption_cache_suffix,
+                        'require_non_latin_caption': self.require_non_latin_caption}
+            self.profile_key = Hasher.hash(settings)
+            self.cache_dir = self.snapshot_dir / self.profile_key
+            self.grouping_keys_json_file = self.cache_dir / 'metadata' / 'grouping_keys.json'
+            self.cache_dir.joinpath('metadata').mkdir(parents=True, exist_ok=True)
+            self._refresh_source = False
+
+    def legacy_tensor_sources(self, bucket, cache_name):
+        """Describe old tensor inputs without modifying their metadata or shard files."""
+        bucket = tuple(bucket)
+        grouping_key = (bucket[0], bucket[-1]) if len(bucket) == 4 else bucket
+        prefix = f'grouped_metadata_{bucket_suffix(grouping_key)}'
+        tensor_dir = (f'ar_frames_{bucket_suffix(bucket)}' if len(bucket) == 2
+                      else f'cache_{bucket_suffix(bucket)}')
+        sources = []
+        profile_prefix = 'latent_profile_' if cache_name == 'latents' else cache_name + '_'
+        for inputs in self.snapshot_dir.glob(f'*/{tensor_dir}/{profile_prefix}*/generated_*/inputs'):
+            sources.append((datasets.load_from_disk(str(inputs)), inputs.parent))
+        # A refreshed source may have changed bytes at unchanged filenames. Old inputs alone
+        # cannot prove the old tensors still apply, so do not donate across refresh generations.
+        if self.snapshot_dir != self.geometry_dir or not self.import_legacy_geometry:
+            return sources
+        for root in [self.legacy_cache_dir, *self.legacy_cache_dir.glob('require_non_latin_caption_*')]:
+            path = root / tensor_dir / cache_name
+            if not path.joinpath('metadata.db').exists():
+                continue
+            for candidate in root.joinpath('metadata').glob(prefix + '*'):
+                if not candidate.is_dir():
+                    continue
+                metadata = datasets.load_from_disk(str(candidate))
+                if len(bucket) == 4:
+                    metadata = metadata.map(lambda row: {'size_bucket': list(bucket[1:])},
+                                            keep_in_memory=True)
+                if len(bucket) != 2:
+                    suffix = candidate.name[len(prefix):]
+                    orders = list((root / tensor_dir).glob('iteration_order' + suffix + '*'))
+                    if not orders:
+                        continue
+                    try:
+                        metadata = align_legacy_metadata(
+                            metadata, orders[0], self.snapshot_dir / 'legacy_order' / tensor_dir)
+                    except ValueError:
+                        continue
+                sources.append((metadata, path))
+        return sources
+
+    def _load_source_snapshot(self):
+        if self.snapshot_path.exists():
+            print(f'[CACHE] Using source metadata snapshot: {self.snapshot_path}')
+            return datasets.load_from_disk(str(self.snapshot_path))
+
+        baseline_config = dict(self.directory_config)
+        baseline_config.update(reuse_metadata_cache=False, require_non_latin_caption=None,
+                               caption_prefix='', prefix_tag_caption='', cache_shuffle_num=0,
+                               shuffle_tags=False, tag_dropout_rate=0.0, multiline_captions=False,
+                               enable_remove_non_latin=False, skip_empty_caption=False,
+                               online_captions=False)
+        baseline = DirectoryDataset(baseline_config, self.dataset_config, self.model_name,
+                                    self.framerate, self.round_to_multiple, True,
+                                    caches_text_embeddings=True)
+        baseline.cache_dir = self.snapshot_dir / 'bootstrap'
+        baseline.cache_dir.joinpath('metadata').mkdir(parents=True, exist_ok=True)
+        intermediate = self.legacy_cache_dir / 'metadata' / 'metadata_intermediate'
+        legacy = []
+        if (not self._refresh_source and self.import_legacy_geometry
+                and self.mask_path is None and self.control_path is None and self.default_mask_file is None):
+            for candidate in self.legacy_cache_dir.joinpath('metadata').glob('grouped_metadata_*'):
+                if candidate.is_dir():
+                    legacy.append(datasets.load_from_disk(str(candidate)))
+        if not intermediate.exists() or not legacy:
+            legacy = [baseline._get_ungrouped_metadata()]
+            intermediate = baseline.cache_dir / 'metadata' / 'metadata_intermediate'
+
+        import sqlite3
+        attributes_path = self.snapshot_dir / 'legacy_attributes.sqlite'
+        with sqlite3.connect(attributes_path) as attributes:
+            attributes.execute('CREATE TABLE IF NOT EXISTS media (key TEXT PRIMARY KEY, value TEXT)')
+            attributes.execute('DELETE FROM media')
+            for old in legacy:
+                attributes.executemany('INSERT OR REPLACE INTO media VALUES (?, ?)',
+                                       ((json.dumps(row['image_spec']), json.dumps(row)) for row in old))
+            attributes.commit()
+            raw = datasets.load_from_disk(str(intermediate))
+            fallback = baseline._metadata_map_fn()
+
+            def generate_snapshot():
+                for row in raw:
+                    captions = row.get('caption')
+                    missing = not captions and not row.get('caption_file')
+                    if captions is None and row.get('caption_file'):
+                        captions = read_caption_file(Path(row['caption_file']), False, True)
+                    match = attributes.execute('SELECT value FROM media WHERE key=?',
+                                               (json.dumps(row['image_spec']),)).fetchone()
+                    old = json.loads(match[0]) if match else None
+                    compatible = old is not None and (
+                        old['size_bucket'] in self.size_buckets.tolist() if self.use_size_buckets
+                        else old['ar_bucket'] is not None and old['ar_bucket'][0] in self.ars
+                        and old['ar_bucket'][1] in self.frame_buckets)
+                    if compatible and all(old.get(k) == row.get(k) for k in ('mask_file', 'control_file')):
+                        result = old
+                        result['caption'] = captions or ['']
+                    else:
+                        batch = {key: [value] for key, value in row.items()}
+                        batch['caption'] = [captions or ['']]
+                        mapped = fallback(batch)
+                        if not mapped['image_spec']:
+                            continue
+                        result = {key: value[0] for key, value in mapped.items()}
+                    result['_caption_missing'] = missing
+                    result['_caption_sidecar'] = bool(row.get('caption_file'))
+                    yield result
+
+            iterator = iter(generate_snapshot())
+            first = next(iterator, None)
+            if first is None:
+                snapshot = datasets.Dataset.from_dict({
+                    **{key: [] for key in legacy[0].column_names},
+                    '_caption_missing': [], '_caption_sidecar': []})
+            else:
+                def nonempty_snapshot():
+                    yield first
+                    yield from iterator
+
+                snapshot = datasets.Dataset.from_generator(
+                    nonempty_snapshot, cache_dir=str(self.snapshot_dir / 'arrow'),
+                    fingerprint=Hasher.hash([str(self.snapshot_dir), raw._fingerprint]))
+        snapshot.save_to_disk(str(self.snapshot_path))
+        if self.legacy_cache_dir.joinpath('metadata').is_dir():
+            try:
+                with self.legacy_geometry_file.open('x', encoding='utf-8') as handle:
+                    json.dump({'geometry': self.geometry_dir.name}, handle)
+            except FileExistsError:
+                pass
+        active = self.geometry_dir / 'active_snapshot.json'
+        temporary = active.with_suffix('.json.tmp')
+        temporary.write_text(json.dumps({'directory': os.path.relpath(self.snapshot_dir, self.geometry_dir)}))
+        os.replace(temporary, active)
+        return datasets.load_from_disk(str(self.snapshot_path))
+
+    def _profile_metadata(self):
+        snapshot = self._load_source_snapshot()
+
+        def process(batch):
+            result = {key: [] for key in snapshot.column_names if not key.startswith('_caption_')}
+            for index in range(len(batch['image_spec'])):
+                captions = batch['caption'][index]
+                if batch['_caption_missing'][index]:
+                    captions = None
+                elif batch['_caption_sidecar'][index] and self.multiline_captions:
+                    captions = [line.strip() for line in captions[0].splitlines() if line.strip()]
+                    if not captions and self.enable_remove_non_latin:
+                        captions = ['']
+                if not captions:
+                    if self.skip_empty_caption:
+                        continue
+                    captions = ['']
+                if not caption_matches_non_latin_requirement(
+                        captions, self.require_non_latin_caption, self.prefix_tag_caption):
+                    continue
+                if self.augment_at_runtime:
+                    captions = [c for c in captions for _ in range(max(self.shuffle, 1))]
+                else:
+                    captions = shuffle_captions(
+                        captions, self.shuffle, self.shuffle_delimiter,
+                        self.directory_config['caption_prefix'], self.prefix_tag_caption,
+                        self.tag_dropout_rate, seed=seed_from_hash((self.path, batch['image_spec'][index])),
+                        enable_remove_non_latin=self.enable_remove_non_latin)
+                for key in result:
+                    result[key].append(captions if key == 'caption' else batch[key][index])
+            return result
+
+        processed = snapshot.map(process, batched=True, remove_columns=snapshot.column_names,
+                                 cache_file_name=str(self.cache_dir / 'metadata' / 'processed.arrow'),
+                                 load_from_cache_file=True, desc='Applying caption profile')
+        logger.info(f'{self.path}: caption profile retained {len(processed)} of {len(snapshot)} '
+                    'source media rows. Sources are frozen until --regenerate_cache.')
+        return processed
 
     def validate(self):
         resolutions = self.directory_config.get('resolutions', self.dataset_config.get('resolutions', []))
@@ -1260,6 +1524,29 @@ class DirectoryDataset:
         )
 
     def cache_metadata(self, regenerate_cache=False, trust_cache=False):
+        if self.reuse_metadata_cache:
+            if regenerate_cache:
+                import uuid
+                self.snapshot_dir = self.geometry_dir / ('refresh_' + uuid.uuid4().hex)
+                self.snapshot_path = self.snapshot_dir / 'source_metadata'
+                self.cache_dir = self.snapshot_dir / self.profile_key
+                self.cache_dir.joinpath('metadata').mkdir(parents=True, exist_ok=True)
+                self.grouping_keys_json_file = self.cache_dir / 'metadata' / 'grouping_keys.json'
+                self._refresh_source = True
+            else:
+                # The cache worker may have published a refreshed generation after this
+                # object was constructed on a training rank.
+                active = self.geometry_dir / 'active_snapshot.json'
+                if active.exists():
+                    directory = self.geometry_dir / json.loads(active.read_text())['directory']
+                    if not directory.resolve().is_relative_to(self.geometry_dir.resolve()):
+                        raise ValueError('Source metadata generation must remain inside its cache root')
+                    self.snapshot_dir = directory
+                    self.snapshot_path = directory / 'source_metadata'
+                    self.cache_dir = directory / self.profile_key
+                    self.cache_dir.joinpath('metadata').mkdir(parents=True, exist_ok=True)
+                    self.grouping_keys_json_file = self.cache_dir / 'metadata' / 'grouping_keys.json'
+            trust_cache = True
         def check_grouped_metadata():
             all_grouped_metadata_exists = False
             unique_grouping_keys = None
@@ -1356,6 +1643,8 @@ class DirectoryDataset:
         return unique_grouping_keys
 
     def _get_ungrouped_metadata(self, regenerate_cache=False, trust_cache=False):
+        if self.reuse_metadata_cache:
+            return self._profile_metadata()
         # This method caches some intermediate datasets so we don't have to enumerate all the files each time.
         metadata_cache_file_1 = self.cache_dir / 'metadata/metadata_intermediate'
         metadata_cache_file_2 = self.cache_dir / f'metadata/metadata{self.caption_cache_suffix}.arrow'
@@ -1474,6 +1763,9 @@ class DirectoryDataset:
         return metadata_dataset
 
     def _set_defaults(self, directory_config, dataset_config):
+        directory_config.setdefault('reuse_metadata_cache', dataset_config.get('reuse_metadata_cache', True))
+        if not isinstance(directory_config['reuse_metadata_cache'], bool):
+            raise ValueError('reuse_metadata_cache must be a boolean')
         directory_config.setdefault('require_non_latin_caption', dataset_config.get('require_non_latin_caption', None))
         validate_non_latin_caption_requirement(directory_config['require_non_latin_caption'])
         directory_config.setdefault('enable_remove_non_latin', dataset_config.get('enable_remove_non_latin', False))
@@ -1694,23 +1986,34 @@ class DirectoryDataset:
             )
         # TODO: do this separately for is_video True and False for models that support it?
         empty_caption_ds = datasets.Dataset.from_dict({'caption': [''], 'is_video': [False], 'image_spec': [(None, None)]})
-        uncond_text_embeddings_ds = _map_and_cache(
-            empty_caption_ds,
-            map_fn,
-            cache_dir=self.cache_dir,
-            cache_file_prefix=f'uncond_text_embeddings_{i}_',
-            # Same reasoning as the conditional embeddings above: this is text encoder
-            # output, so it must follow the text encoder rather than the latents. Left at
-            # None without a key, preserving the original fingerprint.
-            new_fingerprint_args=[text_encoder_key] if text_encoder_key else None,
-            # Same identity as the conditional embeddings: this is the same encoder's output,
-            # and a model whose key is deliberately empty (anima) would otherwise have nothing
-            # distinguishing two runs with different llm_path. Its conditional embeddings would
-            # rebuild while the unconditional one -- the embedding every CFG-dropped sample
-            # trains against -- came back from the old encoder.
-            identity=identity,
-            regenerate_cache=regenerate_cache,
-        )
+        if self.reuse_metadata_cache:
+            uncond_text_embeddings_ds = tensor_profile(
+                empty_caption_ds, map_fn,
+                self.snapshot_dir / f'uncond_text_embeddings_{i}_{Hasher.hash([identity, text_encoder_key])}',
+                sorted(empty_caption_ds.column_names), identity,
+                ([(empty_caption_ds, self.legacy_cache_dir / f'uncond_text_embeddings_{i}')]
+                 if self.snapshot_dir == self.geometry_dir and self.import_legacy_geometry else []),
+                _map_and_cache, regenerate_cache=regenerate_cache,
+                caching_batch_size=caching_batch_size, encoder_key=text_encoder_key,
+                lookup_dir=self.snapshot_dir / 'tensor_lookups')
+        else:
+            uncond_text_embeddings_ds = _map_and_cache(
+                empty_caption_ds,
+                map_fn,
+                cache_dir=self.cache_dir,
+                cache_file_prefix=f'uncond_text_embeddings_{i}_',
+                # Same reasoning as the conditional embeddings above: this is text encoder
+                # output, so it must follow the text encoder rather than the latents. Left at
+                # None without a key, preserving the original fingerprint.
+                new_fingerprint_args=[text_encoder_key] if text_encoder_key else None,
+                # Same identity as the conditional embeddings: this is the same encoder's output,
+                # and a model whose key is deliberately empty (anima) would otherwise have nothing
+                # distinguishing two runs with different llm_path. Its conditional embeddings would
+                # rebuild while the unconditional one -- the embedding every CFG-dropped sample
+                # trains against -- came back from the old encoder.
+                identity=identity,
+                regenerate_cache=regenerate_cache,
+            )
         self.uncond_dict = uncond_text_embeddings_ds[0]
         for size_bucket_ds in self.get_size_bucket_datasets():
             size_bucket_ds.uncond_text_embeddings.append(uncond_text_embeddings_ds)

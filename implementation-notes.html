@@ -2465,5 +2465,51 @@ raw corpus export/counts, unchanged other-mode shard hashes, trusted size/AR met
 and equal-length image changes. No dependency or submodule versions changed. GPU/full
 Linux training and the entire suite were not run; the focused logic/cache change needs
 no GPU, and a server-side CPU command is documented.</p>
+<h2>2026-10-02: Snapshot metadata and indexed tensor profiles</h2>
+<p>The requested large-dataset workflow treats source media/captions as unchanged until an
+explicit refresh. Configuration profiles separate whole-media selection and caption line
+processing from per-access caption dropout. A project-local source snapshot preserves raw
+captions, and disk-backed input indexes reference legacy SQLite tensor shards without moving
+or deleting them. First migration may read legacy sidecars once because their raw contents
+were not stored by abd164e. New text inputs need encoding; unchanged image inputs do not.</p>
+<p>Added a default-enabled reuse_metadata_cache setting with an explicit legacy opt-out.
+Snapshot mode also freezes online captions to avoid mixing a stale selection with live
+edited text. Source regeneration creates a new generation and does not donate tensors from
+an older generation whose file contents may have changed.</p>
+<p>Historical mock testing exposed the extra size-bucket shuffle: grouped metadata order
+is not latent/text shard order. Migration now recovers saved latent indices from iteration
+order and validates text content digests before donation. New profiles normalize tuple/list
+bucket keys so cold and warm loading use the same seed. AR size metadata is loaded directly
+from an existing immutable profile file to avoid unnecessary Windows Arrow overwrites.</p>
+<p>The abd164e fixture executes both historical dataset.py and cache.py from Git and uses
+thread transport for tiny mock encoder calls because a dynamically compiled historical module
+cannot be imported by Windows spawn workers. Current single-worker tensor mapping now runs
+in-process with rank zero, avoiding unnecessary manager/pool startup; multi-worker mapping
+is unchanged and joins/shuts down its transport after completion. Text profile lookup indexes
+are disk-backed rather than rebuilding a Python image-to-caption dictionary on every launch.</p>
+<p>Donor input lookup indexes and flattened donor metadata are shared by all caption profiles
+in one source generation. Completed indexes are reused rather than revalidating/rehashing
+the same legacy caption list for each selection switch. Encoder/template keys are recorded
+for new shards; a non-empty required key absent from an old cache is not assumed compatible.
+Initial legacy geometry is recorded, and mask/control migration conservatively rescans metadata.</p>
+<p>SQLite readers and open tensor-file seek offsets are process-local for DataLoader workers.
+Serialization drops open connections/files and worker reads reopen them. A pickle round-trip
+of a complete cached DirectoryDataset verifies captions, latents and embeddings after reopening.</p>
+<p>Legacy restart tests now release Arrow/SQLite references before the next run, matching a
+real process restart instead of overwriting files still mapped by the previous fixture. Their
+unchanged-text reuse case explicitly enables the legacy keep-text flag to tolerate HF transform
+fingerprint drift while retaining content/count checks. Other legacy tests explicitly opt out
+of snapshot mode, and the new migration matrix tests default snapshot behavior separately.</p>
+<p>Final validation on the completed code: 1103 passed, 2 skipped in 143.70 seconds with
+CUDA hidden, project-local venv/TEMP/TMP/pip/HF/torch caches and pytest base directory.
+This includes 213 cache-profile cases: the historical JSON/sidecar and size/AR matrix,
+both trust settings, tri-state selection, line removal, dropout, cached/on-the-fly captions,
+warm profile reuse, shared donor-index mtimes, multiple encoders, serialization/reopening,
+source refresh publication, new resolution/encoder/key rejection and incomplete-donor
+warning/regeneration without overwriting old shards. Historical fixture hashes remain unchanged.
+Mock fixtures are retained under .tmp/pytest-profiles-final-verified/abd164e_* and the report
+is .tmp/cache-profile-validation-final.xml. pip check, Python AST, dataset TOML and diff checks
+passed. No dependencies/submodule pins changed. GPU/full Linux training, native multi-process
+cache transport, model quality and a 30M-scale startup/memory benchmark were not run.</p>
 </body>
 </html>

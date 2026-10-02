@@ -2,6 +2,11 @@
 
 Date: 2026-09-30; extended 2026-10-02
 
+Update: default snapshot/profile mode supersedes the full-copy mode isolation described
+below. Those details remain accurate for `reuse_metadata_cache = false`. See
+[source-cache-profiles.md](source-cache-profiles.md) for read-only legacy tensor donation,
+raw-caption snapshots, refresh boundaries and migration tests.
+
 Task: add dataset-wide/per-directory `caption_dropout_rate` and `enable_remove_non_latin`
 without changing image latents or source caption files.
 

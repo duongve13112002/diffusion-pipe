@@ -199,8 +199,9 @@ To select whole images/videos, set dataset `require_non_latin_caption = true` to
 only media with at least one non-Latin source-caption line, or `false` to exclude any
 such media. All alternative captions follow the selected image. Omit the setting to keep
 normal behavior. This selection runs before caption processing and also applies to corpus
-export/dataset-driven distillation. Each enabled mode has separate latent and text caches;
-its first run must cache that subset.
+export/dataset-driven distillation. Configuration profiles reference compatible existing
+latent/text tensors instead of duplicating each selected subset. New caption inputs still
+need text encoding. See [cache profiles](./docs/caption-processing.md#source-snapshots-and-cache-profiles).
 
 ### `online_captions`
 
@@ -208,11 +209,15 @@ its first run must cache that subset.
 online_captions = true
 ```
 
-reads captions from `captions.json` at access time instead of from the cached metadata, so you can
+With `reuse_metadata_cache = false`, this reads captions from `captions.json` at access time instead of from the cached metadata, so you can
 edit captions without rebuilding the metadata cache. It does **not** change how many samples an
 image produces. And note the caption text only reaches the model when the model does not have a
 cached embedding for it — with text embeddings cached, editing `captions.json` changes nothing
 until you regenerate the cache.
+
+The default `reuse_metadata_cache = true` freezes source captions, including online captions,
+in a metadata snapshot until `--regenerate_cache`. On-the-fly text encoding still encodes
+the processed snapshot caption every step; it does not require a text embedding cache.
 
 ## Supported models
 See the [supported models doc](./docs/supported_models.md) for more information on how to configure each model, the options it supports, and the format of the saved LoRAs.
@@ -261,7 +266,14 @@ Latents and text embeddings are cached to disk before training happens. This way
 
 This caching also means that training LoRAs for text encoders is not currently supported.
 
-Three flags are relevant for caching. ```--cache_only``` does the caching flow, then exits without training anything. ```--regenerate_cache``` forces cache regeneration. ```--trust_cache``` will blindly load the cached metadata files, without checking if any data files have changed via the fingerprint. This can speed up loading for very large datasets (100,000+ images), but you must make sure nothing in the dataset has changed.
+`--cache_only` performs caching then exits. Default dataset `reuse_metadata_cache = true`
+reuses source metadata without rescanning files, with or without `--trust_cache`, while
+always selecting the profile for the current caption settings. Source edits require
+`--regenerate_cache`, which creates a fresh snapshot/tensor generation and preserves the
+old one. With `reuse_metadata_cache = false`, the legacy workflow remains available:
+omitting `--trust_cache` rescans sources, and supplying it trusts existing metadata.
+First migration from older caches may read sidecars and build input indexes once;
+new profiles still process metadata, so startup is not constant-time on very large datasets.
 
 ## Extra
 You can check out my [qlora-pipe](https://github.com/tdrussell/qlora-pipe) project, which is basically the same thing as this but for LLMs.

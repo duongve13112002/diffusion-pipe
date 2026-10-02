@@ -50,7 +50,8 @@ def cached_captions(ds):
 
 
 def directory_config(path, **overrides):
-    config = {'path': str(path), 'resolutions': [64], 'frame_buckets': [1], 'num_repeats': 1}
+    config = {'path': str(path), 'resolutions': [64], 'frame_buckets': [1], 'num_repeats': 1,
+              'reuse_metadata_cache': False}
     config.update(overrides)
     return config
 
@@ -784,6 +785,7 @@ class TestCacheCompatibilityManifest:
         stub.use_size_buckets = True
         stub.size_bucket_datasets = [bucket]
         stub.keep_text_embedding_cache = False
+        stub.reuse_metadata_cache = False
         stub.get_size_bucket_datasets = lambda: [bucket]
 
         DirectoryDataset.cache_text_embeddings(stub, map_fn=None, i=0, identity='llm-A')
