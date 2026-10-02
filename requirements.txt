@@ -28,6 +28,6 @@ optimum-quanto
 wheel
 ninja
 comfy-kitchen
-comfy-aimdo
+comfy-aimdo>=0.5.5
 scipy
 av>=16.0.0

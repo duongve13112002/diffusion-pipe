@@ -187,6 +187,15 @@ the first time.
 
 ## Cross-cutting couplings worth remembering
 
+- MiniMax H3's native constructor passes `gate_compress` to the training-patched
+  `DiTBlock`, which must pass it to the patched `Attention`. Both constructors must
+  retain the option and its gate projection for VSA checkpoint loading. The guard
+  now checks these native and patched signatures; `test/test_minimax_upstream_compat.py`
+  constructs a tiny native model and runs CPU backward for both option values.
+- ComfyUI at `3dd559d` imports `comfy_aimdo.storage`; its declared dependency is
+  `comfy-aimdo==0.5.5`. An older installed package can block imports before any
+  signature checks run.
+
 - **`transformer_options` is always omitted** by our ComfyUI block/refiner calls and is optional
   (default `{}`) in every ComfyUI block today. If ComfyUI ever makes it required, **all**
   ComfyUI-backed models break at once. The guard script asserts it stays optional.

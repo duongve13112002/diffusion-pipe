@@ -2393,5 +2393,34 @@ itself needed no edit. That was checked argument by argument against the 0.50.0 
     it is still sitting in the working tree.</li>
 </ul>
 
+<h2>2026-10-02: Remote branch and submodule synchronization</h2>
+<p>Fast-forwarded <code>feat/anima-refiner</code> from <code>abd164e</code> to
+<code>e61941e</code> and synchronized all submodules recursively to the recorded pins.
+Only ComfyUI moved, from <code>3216c62</code> to <code>3dd559d</code>.</p>
+<p>The required upstream audit found that MiniMax H3's native model constructor now
+always passes <code>gate_compress</code> to its DiT blocks, including when false.
+Our patched constructors did not accept it. Both constructors now accept and propagate
+the option and retain the optional gate projection in VSA checkpoint state dictionaries,
+matching upstream. Dense attention behavior is unchanged.</p>
+<p>Added native-model construction and CPU backward regression tests for both option
+values and extended the ComfyUI guard to check the native and patched constructors.
+The local venv's <code>comfy-aimdo</code> was updated from 0.5.3 to the pinned ComfyUI
+requirement 0.5.5 because the new <code>comfy.storage</code> imports its storage module.
+The minimum package version is now declared in <code>requirements.txt</code> so a
+normal dependency install updates incompatible older environments. All temporary
+files and package caches remain inside the project.</p>
+<p>Validation so far: 72 tests passed and one distributed test skipped across the
+new MiniMax regression cases and batch-fill suite; 30 ComfyUI signature checks and
+60 vendored dependency checks passed; <code>pip check</code> found no broken
+requirements. Executing the pre-fix constructors in memory reproduced the native
+constructor failure for both option values. The incoming caption suite finished
+with 70 passed and 3 failed in 949 seconds. Two reuse cases attempted to overwrite
+an Arrow file still held by the previous dataset (<code>OSError: [Errno 22]</code>);
+the filtering reuse case tried to delete an SQLite cache database still open in
+the previous dataset (<code>WinError 32</code>). These Windows cache-lifecycle
+failures are recorded separately and were not changed by this submodule API fix.
+No Linux validation was performed, so the results do not establish whether the
+same cases pass there. These checks do not qualify full model training or CUDA
+kernel numerics.</p>
 </body>
 </html>

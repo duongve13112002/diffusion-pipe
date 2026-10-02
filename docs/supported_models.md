@@ -726,6 +726,9 @@ cfg = 4
 ```
 There is a document for [MiniMax H3 notes](minimax_h3_notes.md). Read the whole thing before you train. Also look at the [MiniMax H3 example TOML](../examples/minimax_h3_example.toml).
 
+VSA checkpoints retain their optional `to_gate_compress` projection when loaded and
+saved. Training uses dense attention; retaining the projection does not enable VSA.
+
 Everything is ComfyUI format, including the saved models. You can now train LoRAs directly on quantized models, and it is recommended to use int8 convrot (faster, better quality, and less VRAM).
 
 ## Qwen-Image-2.1

@@ -190,6 +190,18 @@ def run_checks():
     record('sd1_clip.ClipTokenWeightEncoder.encode_token_weights(self, token_weight_pairs)',
            required_positional_names(sd1.ClipTokenWeightEncoder.encode_token_weights) == ['token_weight_pairs'])
 
+    # MiniMax's native model constructor calls our patched block constructors.
+    import comfy.ldm.minimax.model as minimax
+    record('minimax.Attention.__init__ keeps gate_compress optional',
+           has_default(minimax.Attention.__init__, 'gate_compress'))
+    record('minimax.DiTBlock.__init__ keeps gate_compress optional',
+           has_default(minimax.DiTBlock.__init__, 'gate_compress'))
+    from models.minimax_h3 import Attention, DiTBlock
+    record('patched minimax.Attention.__init__ accepts gate_compress',
+           has_default(Attention.__init__, 'gate_compress'))
+    record('patched minimax.DiTBlock.__init__ accepts gate_compress',
+           has_default(DiTBlock.__init__, 'gate_compress'))
+
     return results
 
 

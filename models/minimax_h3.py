@@ -68,7 +68,7 @@ comfy.ldm.minimax.model._mod_gate = _mod_gate
 
 
 class Attention(nn.Module):
-    def __init__(self, hidden, heads, head_dim, eps, dtype=None, device=None, operations=None):
+    def __init__(self, hidden, heads, head_dim, eps, gate_compress=False, dtype=None, device=None, operations=None):
         super().__init__()
         self.heads = heads
         self.head_dim = head_dim
@@ -77,6 +77,9 @@ class Attention(nn.Module):
         self.q_norm = operations.RMSNorm(head_dim, eps=eps, dtype=dtype, device=device)
         self.k_norm = operations.RMSNorm(head_dim, eps=eps, dtype=dtype, device=device)
         self.out_proj = operations.Linear(inner, hidden, bias=False, dtype=dtype, device=device)
+        self.to_gate_compress = None
+        if gate_compress:
+            self.to_gate_compress = operations.Linear(hidden, inner, bias=False, dtype=dtype, device=device)
 
     def forward(self, x, rope_freqs=None, attention_mask=None, transformer_options={}):
         b, s = x.shape[:2]
@@ -126,11 +129,12 @@ comfy.ldm.minimax.model.AdalnProj = AdalnProj
 
 class DiTBlock(nn.Module):
     def __init__(self, hidden, heads, head_dim, ffn, t_dim, eps, qk_eps,
-                 apply_silu=True, adaln_dtype=None, dtype=None, device=None, operations=None):
+                 apply_silu=True, adaln_dtype=None, gate_compress=False, dtype=None, device=None, operations=None):
         super().__init__()
         self.norm1 = operations.RMSNorm(hidden, eps=eps, dtype=dtype, device=device)
         self.norm2 = operations.RMSNorm(hidden, eps=eps, dtype=dtype, device=device)
-        self.attn = Attention(hidden, heads, head_dim, qk_eps, dtype=dtype, device=device, operations=operations)
+        self.attn = Attention(hidden, heads, head_dim, qk_eps, gate_compress=gate_compress,
+                              dtype=dtype, device=device, operations=operations)
         self.mlp = MLP(hidden, ffn, dtype=dtype, device=device, operations=operations)
         self.adaln_proj = AdalnProj(t_dim, hidden, 6, 3, apply_silu=apply_silu,
                                     dtype=adaln_dtype if adaln_dtype is not None else dtype,
