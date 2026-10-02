@@ -111,10 +111,13 @@ def main():
 
     unique = len({e['caption'] for e in entries})
     failed = stats.get('skipped', 0) + stats.get('empty', 0)
+    filtered = stats.get('filtered', 0)
     print(
-        f"Media files: {stats.get('resolved', 0) + failed} total, "
+        f"Media files: {stats.get('resolved', 0) + failed + filtered} total, "
         f"{stats.get('resolved', 0)} with captions, {failed} without"
     )
+    if filtered:
+        print(f'  {filtered} excluded by require_non_latin_caption')
     if stats.get('skipped'):
         print(f"  {stats['skipped']} skipped entirely (skip_empty_caption is on)")
     if stats.get('empty'):

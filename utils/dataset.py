@@ -50,6 +50,7 @@ def shuffle_with_seed(l, seed=None):
 from utils.captions import (
     CAPTIONS_JSON_FILE,
     NON_MEDIA_SUFFIXES,
+    caption_matches_non_latin_requirement,
     drop_tags,
     enumerate_captions,
     preprocess_caption,
@@ -57,6 +58,7 @@ from utils.captions import (
     shuffle_captions,
     split_tag_prefix,
     validate_caption_dropout_rate,
+    validate_non_latin_caption_requirement,
 )
 
 
@@ -201,6 +203,14 @@ def _map_and_cache(dataset, map_fn, cache_dir, cache_file_prefix='', new_fingerp
     if map_fn is None:
         # loading directly from cache without mapping
         assert new_fingerprint == cache.fingerprint
+        if content_column is not None:
+            recorded = cache.recorded_content_digest()
+            if (len(cache) != len(dataset)
+                    or (recorded is not None and recorded != _content_digest(dataset, content_column))):
+                raise RuntimeError(
+                    f'Cannot load {cache_dir} without an encoder: cached rows do not match '
+                    f'the current {content_column}. Rebuild this cache with its map function.'
+                )
         return cache
 
     if regenerate_cache:
@@ -493,6 +503,9 @@ class SizeBucketDataset:
             # cannot make an incompatible cache usable -- Cache rebuilds those regardless.
             keep_on_fingerprint_change=self.directory_config.get('keep_latent_cache', False),
             identity=self.vae_identity,
+            # Caption edits can swap selected images without changing the subset's length.
+            content_column=('image_spec' if self.directory_config.get('require_non_latin_caption') is not None
+                            else None),
         )
         assert len(self.latent_dataset) == len(self.metadata_dataset), (len(self.latent_dataset), len(self.metadata_dataset))
 
@@ -1091,6 +1104,10 @@ class DirectoryDataset:
         # For testing. Default if a mask is missing.
         self.default_mask_file = Path(self.directory_config['default_mask_file']) if 'default_mask_file' in self.directory_config else None
         self.cache_dir = self.path / 'cache' / self.model_name
+        self.require_non_latin_caption = directory_config['require_non_latin_caption']
+        if self.require_non_latin_caption is not None:
+            # Selection changes image rows, so isolate all row-indexed caches, not only captions.
+            self.cache_dir /= f'require_non_latin_caption_{str(self.require_non_latin_caption).lower()}'
         # Recorded in the cache manifests, not in the fingerprints, so adding them invalidates
         # nothing. Empty means the model declares no identity and every cache stays valid.
         self.vae_identity = vae_identity
@@ -1252,7 +1269,7 @@ class DirectoryDataset:
                 if self.use_size_buckets and not all(len(key) == 3 for key in unique_grouping_keys):
                     # Using size buckets but have AR keys.
                     return False, unique_grouping_keys
-                elif not all(len(key) == 2 for key in unique_grouping_keys):
+                elif not self.use_size_buckets and not all(len(key) == 2 for key in unique_grouping_keys):
                     # Using AR buckets but have size bucket keys
                     return False, unique_grouping_keys
                 all_grouped_metadata_exists = all(
@@ -1271,6 +1288,12 @@ class DirectoryDataset:
         else:
             print('Found grouped metadata cache. Directly loading it.')
             self._warn_if_caption_settings_changed()
+
+        if self.require_non_latin_caption is not None and not unique_grouping_keys:
+            logger.warning(
+                f'{self.path}: no media remain after require_non_latin_caption='
+                f'{self.require_non_latin_caption} and metadata validation.'
+            )
 
         for grouping_key in unique_grouping_keys:
             grouped_cache_dir = self.cache_dir / f'metadata/grouped_metadata_{bucket_suffix(grouping_key)}{self.caption_cache_suffix}'
@@ -1431,6 +1454,7 @@ class DirectoryDataset:
 
         metadata_map_fn = self._metadata_map_fn()
         print('Caching ungrouped metadata.')
+        input_rows = len(metadata_dataset)
         metadata_dataset = metadata_dataset.map(
             metadata_map_fn,
             cache_file_name=str(metadata_cache_file_2),
@@ -1441,9 +1465,17 @@ class DirectoryDataset:
             num_proc=NUM_PROC if NUM_PROC > 1 else None,
             remove_columns=metadata_dataset.column_names,
         )
+        if self.require_non_latin_caption is not None:
+            logger.info(
+                f'{self.path}: require_non_latin_caption={self.require_non_latin_caption}; '
+                f'retained {len(metadata_dataset)} of {input_rows} media rows, '
+                f'skipped {input_rows - len(metadata_dataset)} by caption selection or metadata validation.'
+            )
         return metadata_dataset
 
     def _set_defaults(self, directory_config, dataset_config):
+        directory_config.setdefault('require_non_latin_caption', dataset_config.get('require_non_latin_caption', None))
+        validate_non_latin_caption_requirement(directory_config['require_non_latin_caption'])
         directory_config.setdefault('enable_remove_non_latin', dataset_config.get('enable_remove_non_latin', False))
         if not isinstance(directory_config['enable_remove_non_latin'], bool):
             raise ValueError('enable_remove_non_latin must be a boolean')
@@ -1462,6 +1494,8 @@ class DirectoryDataset:
 
         def fn(example):
             empty_return = {'image_spec': [], 'mask_file': [], 'caption': [], 'ar_bucket': [], 'size_bucket': [], 'is_video': []}
+            if self.control_path:
+                empty_return['control_file'] = []
             # batch size always 1
             caption_file = example['caption_file'][0]
             image_spec = example['image_spec'][0]
@@ -1482,6 +1516,10 @@ class DirectoryDataset:
                 else:
                     logger.warning(f'Cound not find caption for {image_file}. Using empty caption.')
                     captions = ['']
+            if not caption_matches_non_latin_requirement(
+                    captions, self.require_non_latin_caption, self.prefix_tag_caption):
+                logger.debug(f'Skipping {image_file}: require_non_latin_caption={self.require_non_latin_caption}')
+                return empty_return
             if self.augment_at_runtime:
                 # Keep the captions exactly as they are on disk, marker included, and expand to
                 # the same number of variants cache_shuffle_num would have produced so the
@@ -1501,9 +1539,6 @@ class DirectoryDataset:
                     seed=seed_from_hash((self.path, image_spec)),
                     enable_remove_non_latin=self.enable_remove_non_latin,
                 )
-            if self.control_path:
-                empty_return['control_file'] = []
-
             if image_spec[0] is None:
                 tar_f = None
                 filepath_or_file = str(image_file)

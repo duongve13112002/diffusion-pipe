@@ -195,6 +195,13 @@ Changing the filter flag separates caption metadata and refreshes text embedding
 while unchanged image latents are reused. See [caption processing](./docs/caption-processing.md)
 for exact ranges, precedence, examples, cache behavior and validation commands.
 
+To select whole images/videos, set dataset `require_non_latin_caption = true` to keep
+only media with at least one non-Latin source-caption line, or `false` to exclude any
+such media. All alternative captions follow the selected image. Omit the setting to keep
+normal behavior. This selection runs before caption processing and also applies to corpus
+export/dataset-driven distillation. Each enabled mode has separate latent and text caches;
+its first run must cache that subset.
+
 ### `online_captions`
 
 ```toml

@@ -81,6 +81,16 @@ frame_buckets = [1, 33]
 # reusing unchanged image latents. See docs/caption-processing.md for the exact ranges and caveats.
 # enable_remove_non_latin = true
 
+# Select whole images/videos by their SOURCE captions, before line removal or augmentation.
+# true: keep a media item and ALL its alternative captions if ANY source line is non-Latin.
+# false: exclude the entire media item if ANY source line is non-Latin.
+# Unset: no selection (None internally; TOML has no null/None value).
+# Uses the same Unicode ranges as enable_remove_non_latin, excluding annotation markers.
+# May be overridden in [[directory]]. Missing captions still follow skip_empty_caption.
+# Each enabled mode has its own metadata/latent/text caches. The first run must cache that
+# subset; switching modes preserves the other caches. See docs/caption-processing.md.
+# require_non_latin_caption = true
+
 # Marks which captions are tag lists rather than natural language. Only captions starting with this string are
 # shuffled and tag-dropped; everything else is left alone. The marker is stripped before training, so with
 # prefix_tag_caption = "Special: " the caption "Special: a, b, c" is trained as "a, b, c".

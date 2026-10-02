@@ -1,4 +1,4 @@
-# Whole-caption dropout and non-Latin line filtering
+# Whole-caption dropout, line filtering and media selection
 
 These settings belong in the **dataset TOML**, before the first `[[directory]]` for dataset-wide
 defaults, or inside an individual `[[directory]]` to override those defaults. They apply to
@@ -88,12 +88,82 @@ element is processed independently. All-filtered captions remain samples rather 
 their images. An existing blank `.txt` also produces an empty caption with filtering enabled,
 including in multiline mode. Missing caption files still follow `skip_empty_caption`.
 
+## Whole-media selection by source captions
+
+`require_non_latin_caption` belongs in the dataset TOML, globally or per `[[directory]]`.
+It accepts `true` or `false`; omitting it globally defaults to `None` internally and preserves
+normal selection. Directories inherit the global value unless they declare an override.
+TOML has no literal `None`/`null` value. This selects whole images/videos rather than editing
+caption lines:
+
+| Setting | Media selection |
+| --- | --- |
+| `true` | Keep a media item only if at least one source line in any alternative caption contains a detected non-Latin character. Keep all its alternative captions. |
+| `false` | Exclude the entire media item if any source line in any alternative caption contains a detected non-Latin character. |
+| Unset | Do not select media by script. |
+
+For an image with `a girl`, `制服`, and `blue eyes` on separate lines, `true` keeps the
+image and all three lines, while `false` drops the image. The same rule applies to a
+`captions.json` list: one matching element selects/excludes the entire image and every
+alternative caption, including the Latin ones. It also applies with `multiline_captions`
+and `caption_sampling = 'random_per_epoch'`; a random Latin caption cannot let an excluded
+image back into training. Missing captions still follow `skip_empty_caption`; an empty
+caption has no detected non-Latin character.
+
+Selection uses the seven Unicode ranges listed above. Vietnamese/Latin Extended, emoji,
+and scripts outside those ranges (such as Thai) do not trigger it. Configured
+`prefix_tag_caption` markers are excluded from each line's check, and `caption_prefix` is
+not part of the source caption. Selection precedes line removal, tag augmentation and
+whole-caption dropout. These settings remain independent: combining `true` with
+`enable_remove_non_latin = true` first selects the multilingual images, then removes their
+offending caption lines; captions can become empty under the existing rules.
+
+```toml
+resolutions = [512]
+require_non_latin_caption = true
+
+[[directory]]
+path = '/data/multilingual'
+
+[[directory]]
+path = '/data/latin-only'
+require_non_latin_caption = false
+```
+
+Unlike line removal, selection changes the media rows used to index latents. Enabled modes
+therefore isolate all caches under `cache/<model>/require_non_latin_caption_true/` or
+`cache/<model>/require_non_latin_caption_false/`. Metadata, conditional/unconditional text
+embeddings, image latents, and iteration order all belong to that mode. The first run of
+each enabled mode builds its own cache; this costs extra disk space and does not project
+an existing full-dataset latent cache onto the subset. Switching modes preserves other
+modes' caches. Unset retains the original `cache/<model>/` paths and fingerprint inputs.
+`keep_latent_cache` cannot reuse another mode's rows. Compatible caches within a mode retain
+their normal reuse behavior, including trusted grouped metadata.
+Within enabled modes, an image-spec digest also prevents `keep_latent_cache` from retaining
+the wrong latents if caption edits swap selected images while keeping the same row count.
+Cache-only loading without an encoder refuses mismatched recorded content/row counts;
+run caching with the encoder available to regenerate the affected cache.
+
+With on-the-fly text encoding, the same source-caption selection happens before media
+caching, and kept captions are encoded during training. With cached text, only the kept
+images' captions are embedded. Selection is fixed when metadata is built, including with
+`online_captions`; it is not re-drawn per step. After source caption edits, rebuild metadata
+following the existing source-edit rules rather than trusting an old selection cache.
+
+Caption-only enumeration applies the same whole-media rule even with `apply_shuffle=False`,
+so raw corpus export and dataset-driven distillation see the same selected media. A corpus
+already flattened into independent captions has lost image boundaries: re-export it from
+the filtered dataset to change selection. Metadata logs report retained/skipped media
+after selection and validation; an empty selected directory gets a warning. Caption-only
+enumeration and export also report the exact number excluded by the script condition.
+
 ## Caches and online captions
 
 | Change/path | Caption metadata / iteration order | Text embeddings | Image latents |
 | --- | --- | --- | --- |
 | Change `caption_dropout_rate` | Reused; no frozen dropout | Reused; select unconditional at access | Reused |
 | Toggle `enable_remove_non_latin` | Separate caption-settings suffix, including under `--trust_cache` | Refresh when the caption metadata changes | Reuse when image rows, masks, controls, buckets and VAE are unchanged |
+| Set/change `require_non_latin_caption` | Separate mode directory for selected media | Separate mode directory | Separate mode directory; first run caches the selected subset |
 | On-the-fly text encoding | Caption is filtered before runtime augmentation/encoding | Encode the resulting string each access | Existing latent caching behavior |
 
 The new filter suffix is empty at its default. Caption text is excluded from the latent
@@ -122,6 +192,16 @@ text/markers: it is a source corpus, not a frozen training augmentation. The new
 sampling settings do not configure the separate text-only distillation trainer.
 
 ## Validation
+
+Whole-media selection tests use real metadata and tensor-cache paths with tiny CPU-only
+encoder maps. Run inside the project venv; no model downloads or GPU allocation are needed:
+
+```bash
+mkdir -p .tmp .cache/pip
+TMPDIR="$PWD/.tmp" TMP="$PWD/.tmp" TEMP="$PWD/.tmp" PIP_CACHE_DIR="$PWD/.cache/pip" \
+CUDA_VISIBLE_DEVICES=-1 \
+.venv/bin/python -m pytest test/test_non_latin_dataset_selection.py -q --basetemp .tmp/pytest-selection
+```
 
 ```bash
 OMP_NUM_THREADS=2 MKL_NUM_THREADS=2 DIFFUSION_PIPE_NUM_PROC=1 \

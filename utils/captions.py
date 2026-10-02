@@ -43,6 +43,11 @@ def validate_caption_dropout_rate(rate):
         raise ValueError(f'caption_dropout_rate must be a finite number between 0 and 1, got {rate!r}')
 
 
+def validate_non_latin_caption_requirement(value):
+    if value is not None and not isinstance(value, bool):
+        raise ValueError('require_non_latin_caption must be a boolean or unset (None)')
+
+
 def tag_markers(prefix_tag_caption) -> list[str]:
     """Normalise `prefix_tag_caption` into a list of markers.
 
@@ -79,6 +84,22 @@ def split_tag_prefix(caption: str, prefix_tag_caption: str = '') -> tuple[str, b
         if caption[:len(marker)].casefold() == marker.casefold():
             return caption[len(marker):].strip(), True
     return caption, prefix_tag_caption is None or not tag_markers(prefix_tag_caption)
+
+
+def caption_matches_non_latin_requirement(captions, requirement, prefix_tag_caption=''):
+    """Select the whole media item using all source captions before augmentation.
+
+    A single matching line is enough, including in any alternative caption. Annotation
+    markers are excluded, as they are for non-Latin line removal. None disables selection.
+    """
+    if requirement is None:
+        return True
+    contains_non_latin = any(
+        has_non_latin_script(split_tag_prefix(line.strip(), prefix_tag_caption)[0])
+        for caption in captions
+        for line in caption.splitlines()
+    )
+    return contains_non_latin == requirement
 
 
 def drop_tags(tags: list[str], tag_dropout_rate: float, rng=random) -> list[str]:
@@ -219,6 +240,7 @@ def enumerate_captions(dataset_config, apply_num_repeats=False, apply_shuffle=Tr
 
     `apply_shuffle=False` returns the captions as they sit on disk -- markers intact, no
     shuffling, no dropout, no caption_prefix -- for callers that augment per sample instead.
+    Whole-media `require_non_latin_caption` selection still applies to those source captions.
     Pass a set as `markers_seen` to collect the `prefix_tag_caption` values that were skipped,
     so the caller can report which markers a consumer will need to strip.
 
@@ -229,6 +251,7 @@ def enumerate_captions(dataset_config, apply_num_repeats=False, apply_shuffle=Tr
     caption found and given '' instead, which happens when skip_empty_caption is false). The
     two failure kinds are counted apart on purpose: dropping an image and training it against
     an empty caption are very different outcomes.
+    `filtered`, when present, counts media excluded by require_non_latin_caption.
 
     Deliberately single threaded. The obvious guess is that reading a few million sidecar files
     is I/O bound and threads would help; measured on 20k files it is 4x SLOWER with 4 or 8
@@ -265,6 +288,9 @@ def enumerate_captions(dataset_config, apply_num_repeats=False, apply_shuffle=Tr
         skip_empty_caption = setting('skip_empty_caption', True)
         multiline_captions = setting('multiline_captions', False)
         prefix_tag_caption = setting('prefix_tag_caption', '')
+        selection_marker = prefix_tag_caption
+        requirement = setting('require_non_latin_caption', None)
+        validate_non_latin_caption_requirement(requirement)
         tag_dropout_rate = setting('tag_dropout_rate', 0.0)
         enable_remove_non_latin = setting('enable_remove_non_latin', False)
         if not isinstance(enable_remove_non_latin, bool):
@@ -354,6 +380,8 @@ def enumerate_captions(dataset_config, apply_num_repeats=False, apply_shuffle=Tr
         items = [resolve(spec) for spec in media_specs]
 
         directory_captions = []
+        filtered_count = 0
+        selected_count = 0
         for (tar_file, media_file), item in zip(media_specs, items):
             if bar is not None:
                 bar.update(1)
@@ -367,15 +395,28 @@ def enumerate_captions(dataset_config, apply_num_repeats=False, apply_shuffle=Tr
                         bar.set_postfix(ok=counts['resolved'], failed=counts['skipped'] + counts['empty'])
                     continue
                 item = ['']
-                counts['empty'] += 1
+                count_key = 'empty'
             else:
-                counts['resolved'] += 1
+                count_key = 'resolved'
+            if not caption_matches_non_latin_requirement(item, requirement, selection_marker):
+                filtered_count += 1
+                counts['filtered'] = counts.get('filtered', 0) + 1
+                logger.debug('Skipping %s: require_non_latin_caption=%s', media_file, requirement)
+                if bar is not None:
+                    bar.set_postfix(ok=counts['resolved'], filtered=counts['filtered'])
+                continue
+            selected_count += 1
+            counts[count_key] += 1
             if bar is not None:
                 bar.set_postfix(ok=counts['resolved'], failed=counts['skipped'] + counts['empty'])
             directory_captions.extend(shuffle_captions(
                 item, shuffle_num, delimiter, caption_prefix, prefix_tag_caption, tag_dropout_rate,
                 enable_remove_non_latin=enable_remove_non_latin,
             ))
+
+        if requirement is not None:
+            logger.info('%s: require_non_latin_caption=%s selected %s media items, filtered %s',
+                        path, requirement, selected_count, filtered_count)
 
         # num_repeats may be fractional -- SizeBucketDataset accepts any value > 0 and takes
         # int(len * num_repeats), so mirror that rather than assuming an integer.

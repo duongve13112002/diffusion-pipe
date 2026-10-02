@@ -2422,5 +2422,48 @@ failures are recorded separately and were not changed by this submodule API fix.
 No Linux validation was performed, so the results do not establish whether the
 same cases pass there. These checks do not qualify full model training or CUDA
 kernel numerics.</p>
+<h2>2026-10-02: Whole-media selection by source caption script</h2>
+<p>The agreed <code>require_non_latin_caption</code> setting is tri-state: true keeps
+an image/video and every alternative caption when any source line contains a detected
+non-Latin character; false excludes that entire media item; unset preserves existing
+behavior. Directory settings override dataset settings. Selection runs before caption
+line removal, augmentation, prefix insertion and runtime unconditional dropout.</p>
+<p>Reused the existing seven-range detector and excluded configured annotation markers,
+matching caption line removal. Caption-only enumeration applies the same selection even
+when exporting raw text or supplying the distillation trainer. Source files are unchanged.</p>
+<p>Enabled modes use separate subdirectories under the existing model cache root,
+<code>require_non_latin_caption_true</code> and <code>require_non_latin_caption_false</code>.
+This isolates metadata, image latents, text embeddings and iteration order; equal-length
+opposite subsets must never reuse each other's row-indexed caches. The unset mode retains
+its existing paths and fingerprint inputs. The first run of each enabled mode needs its own
+cache and extra disk space; projecting old full-dataset latents onto a subset is outside
+this change. Existing cache compatibility checks remain in force within each mode.</p>
+<p>Moved the optional control-file column into the empty metadata result before any
+selection return, so skipped control-conditioned samples preserve the output schema.
+Metadata summaries distinguish the combined selection/validation count from caption-only
+enumeration's exact filtered count. Documentation and examples cover the option and its
+cache costs, corpus re-export requirements, and existing Unicode-range limits.</p>
+<p>Warm-cache verification exposed an existing grouped-metadata check: valid three-element
+size-bucket keys were also being tested as two-element aspect-ratio keys. Restricted that
+second check to aspect-ratio mode. Trusted size-bucket metadata can now be reused without
+an unnecessary overwrite of open Arrow files. A regression test forbids regrouping a
+warm selected dataset.</p>
+<p>Added image-spec content-digest validation for enabled selection modes. Caption edits
+can exchange one selected image for another without changing row count; the latent cache
+must rebuild in that case even when <code>keep_latent_cache</code> is true. This applies
+only to selected modes so default-mode manifests retain their existing behavior.</p>
+<p>The cache-only path (no encoder/map function) now checks recorded content and row count
+for caches that declare a content column. It fails with an actionable error rather than
+returning stale rows; regeneration requires an encoder. Normal mapped runs rebuild through
+the existing compatibility path.</p>
+<p>Final validation: 242 focused CPU tests passed in the project venv: 185 selection,
+caption-corpus, line-removal and config cases; three real-cache/warm-cache safety checks;
+and 54 legacy dataset smoke cases. Coverage includes both booleans and unset, all caption
+alternatives, multiline sidecars, JSON and tar sources, directory precedence, cached and
+runtime caption preparation, missing captions, excluded videos, control-column schema,
+raw corpus export/counts, unchanged other-mode shard hashes, trusted size/AR metadata,
+and equal-length image changes. No dependency or submodule versions changed. GPU/full
+Linux training and the entire suite were not run; the focused logic/cache change needs
+no GPU, and a server-side CPU command is documented.</p>
 </body>
 </html>

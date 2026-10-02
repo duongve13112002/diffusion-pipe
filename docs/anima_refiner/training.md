@@ -217,6 +217,14 @@ support dataset-wide defaults and `[[directory]]` overrides. See
 reuse: dropout does not invalidate caches, while filtering refreshes caption/text data and
 reuses unchanged image latents.
 
+Dataset `require_non_latin_caption = true` keeps only images/videos with at least one
+non-Latin source-caption line; `false` excludes the entire media item when any line matches.
+All alternative captions follow the image, and omission preserves normal selection.
+The rule is evaluated before line removal or augmentation and applies to both cached and
+on-the-fly text encoding. Enabled modes have separate latent/text caches; the first run
+must cache the selected subset. Dataset-driven distillation and corpus export honor the
+same selection, but an existing flat corpus must be re-exported to change its media subset.
+
 ## Step 5: sample
 
 ```

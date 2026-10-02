@@ -1,9 +1,29 @@
 # Caption filtering and per-sample unconditional conditioning
 
-Date: 2026-09-30
+Date: 2026-09-30; extended 2026-10-02
 
 Task: add dataset-wide/per-directory `caption_dropout_rate` and `enable_remove_non_latin`
 without changing image latents or source caption files.
+
+Extension: add tri-state `require_non_latin_caption` to select whole media items using
+all source caption lines. True includes a media item if any line matches; false excludes
+the entire media item if any line matches; unset keeps the existing dataset. Alternatives
+are never individually selected. Share the predicate between metadata and caption-only
+enumeration before augmentation, including raw export for distillation. Exclude configured
+annotation markers using the same rule as line removal.
+
+This changes image-row membership, so the line-removal latent reuse guarantee does not
+apply. Isolate enabled modes below the existing model cache root; preserve the legacy
+path at None. Mode-specific caches cost extra disk and initial VAE/text encoding but avoid
+destructive mode switching and incorrect reuse of equal-length, different subsets. Keep
+normal source-edit/trusted-cache rules and existing identity/fingerprint checks within a
+mode. Do not treat a flat caption corpus as if it retained image grouping information.
+For enabled modes, record an image-spec digest to reject retained latents after an
+equal-length selection change. Cache-only loads without a map function check recorded
+content and counts; mismatches require an encoder rather than returning stale tensors.
+
+Warm selected-cache tests also cover the grouped-metadata key check: size buckets use
+three-element keys and must not be rejected by the two-element aspect-ratio check.
 
 ## Code paths inspected
 
