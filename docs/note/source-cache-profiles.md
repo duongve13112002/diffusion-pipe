@@ -37,6 +37,13 @@ for other profiles/runs. A donor that changes or disappears (for example, a
 reuse_metadata_cache = false run clearing the legacy cache it lives in) makes the profile
 rebind from re-validated donors and encode only what none still holds; it is not an error.
 
+Training reads use no SQLite. Querying it per sample (two lookups per tensor plus one per
+caption) was cheap on a local disk but slow on network storage, where each query costs page
+reads and lock round trips. Referenced readers load their item/shard tables into numpy arrays
+once (about 20 bytes per item, shared copy-on-write with DataLoader workers), and the caption
+lookup keeps sorted 64-bit image-key hashes, persisted next to its SQLite table; a hash
+collision among a profile's own images falls back to that table.
+
 Implementation: utils/cache_profiles.py and utils/dataset.py. Exact installed datasets APIs
 (from_generator, map, sort, from_file, select, save_to_disk) were inspected before use. No
 dependency/submodule upgrades are involved. Tests in test/test_cache_profiles.py generate

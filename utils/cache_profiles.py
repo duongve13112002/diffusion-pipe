@@ -10,6 +10,7 @@ import sqlite3
 
 import datasets
 from datasets.fingerprint import Hasher
+import numpy as np
 import torch
 
 
@@ -77,6 +78,8 @@ class ReadOnlyCache:
             raise ValueError(f'Incompatible encoder identity in {self.path}')
         self.open_files = {}
         self.pid = os.getpid()
+        # Filled by load_index(); until then every read looks its location up in SQLite.
+        self._shard = self._offset = self._size = None
 
     def __getstate__(self):
         state = dict(self.__dict__)
@@ -86,24 +89,66 @@ class ReadOnlyCache:
     def __setstate__(self, state):
         self.__dict__.update(state)
 
-    def _ensure_reader(self):
+    def _ensure_process(self):
         # DataLoader workers must not share SQLite objects or seek offsets inherited by fork.
-        if self.con is None or self.pid != os.getpid():
+        if self.pid != os.getpid():
             self.close()
-            self.con = sqlite3.connect(self.path.joinpath('metadata.db').resolve().as_uri() + '?mode=ro', uri=True)
             self.pid = os.getpid()
+
+    def _ensure_reader(self):
+        self._ensure_process()
+        if self.con is None:
+            self.con = sqlite3.connect(self.path.joinpath('metadata.db').resolve().as_uri() + '?mode=ro', uri=True)
+
+    def load_index(self):
+        """Read the item and shard tables into arrays, as the legacy Cache keeps them in RAM.
+
+        Otherwise every sample costs two random B-tree lookups. That is cheap on a local disk
+        but means page reads and lock round trips on network storage, which made training
+        reads much slower than the legacy cache. Loaded in the parent before DataLoader
+        workers fork, the arrays are shared copy-on-write. About 20 bytes per item.
+        """
+        if self._offset is not None:
+            return
+        self._ensure_reader()
+        shard = np.full(self.count, -1, dtype=np.int64)
+        shard_index = np.empty(self.count, dtype=np.int64)
+        cursor = self.con.execute('SELECT rowid, shard, shard_index FROM items')
+        while rows := cursor.fetchmany(1 << 20):
+            rows = np.asarray(rows, dtype=np.int64)
+            position = rows[:, 0] - 1
+            if position.min() < 0 or position.max() >= self.count:
+                raise ValueError(f'Non-contiguous item rows in {self.path}')
+            shard[position] = rows[:, 1]
+            shard_index[position] = rows[:, 2]
+        if (shard < 0).any():
+            raise ValueError(f'Non-contiguous item rows in {self.path}')
+        offset = np.empty(self.count, dtype=np.int64)
+        size = np.empty(self.count, dtype=np.int64)
+        for shard_id in np.unique(shard).tolist():
+            table = np.asarray(self.con.execute(
+                f'SELECT offset, size FROM shard_{int(shard_id)} ORDER BY rowid').fetchall(), dtype=np.int64)
+            selected = shard == shard_id
+            offset[selected] = table[shard_index[selected], 0]
+            size[selected] = table[shard_index[selected], 1]
+        self._shard, self._offset, self._size = shard.astype(np.int32), offset, size
+        self.close()  # Not needed any more; workers never reopen it.
 
     def __len__(self):
         return self.count
 
     def __getitem__(self, index):
-        self._ensure_reader()
         if not 0 <= index < self.count:
             raise IndexError(index)
-        shard, shard_index = self.con.execute(
-            'SELECT shard, shard_index FROM items WHERE rowid=?', (int(index) + 1,)).fetchone()
-        offset, size = self.con.execute(
-            f'SELECT offset, size FROM shard_{int(shard)} WHERE rowid=?', (int(shard_index) + 1,)).fetchone()
+        if self._offset is not None:
+            self._ensure_process()
+            shard, offset, size = int(self._shard[index]), int(self._offset[index]), int(self._size[index])
+        else:
+            self._ensure_reader()
+            shard, shard_index = self.con.execute(
+                'SELECT shard, shard_index FROM items WHERE rowid=?', (int(index) + 1,)).fetchone()
+            offset, size = self.con.execute(
+                f'SELECT offset, size FROM shard_{int(shard)} WHERE rowid=?', (int(shard_index) + 1,)).fetchone()
         if shard not in self.open_files:
             self.open_files[shard] = open(self.path / f'shard_{shard}.bin', 'rb')
         handle = self.open_files[shard]
@@ -123,17 +168,36 @@ class IndexedCache:
     def __init__(self, references, sources):
         self.references = references
         self.sources = sources
+        # Arrays, not per-sample Arrow row reads: see ReadOnlyCache.load_index.
+        if len(references):
+            self._source = references.data.column('source').to_numpy().astype(np.int32)
+            self._index = references.data.column('index').to_numpy().astype(np.int64)
+        else:
+            self._source = np.empty(0, dtype=np.int32)
+            self._index = np.empty(0, dtype=np.int64)
+        # Only sources something points at; unmatched donors never pay for an index.
+        for source in np.unique(self._source).tolist():
+            if hasattr(sources[source], 'load_index'):
+                sources[source].load_index()
 
     def __len__(self):
-        return len(self.references)
+        return len(self._source)
 
     def __getitem__(self, index):
-        ref = self.references[int(index)]
-        return self.sources[ref['source']][ref['index']]
+        index = int(index)
+        if index < 0:
+            index += len(self._source)
+        if not 0 <= index < len(self._source):
+            raise IndexError(index)
+        return self.sources[int(self._source[index])][int(self._index[index])]
 
     def close(self):
         for source in self.sources:
             source.close()
+
+
+def _image_hash(image):
+    return int.from_bytes(hashlib.blake2b(image.encode(), digest_size=8).digest(), 'little')
 
 
 class IndexedTextEmbeddingDataset:
@@ -163,6 +227,54 @@ class IndexedTextEmbeddingDataset:
             self.lookup.execute('DELETE FROM complete')
             self.lookup.execute('INSERT INTO complete VALUES (?)', (metadata._fingerprint,))
             self.lookup.commit()
+        self._load_arrays(metadata)
+
+    def _load_arrays(self, metadata):
+        """Keep image -> first flattened row in RAM, so a sample costs no SQLite query.
+
+        Sorted 64-bit hashes of the image key, searched with numpy: about 20 bytes per image
+        instead of a Python dict. Every lookup comes from this metadata's own images, so the
+        mapping is exact unless two of them share a hash; that is checked here, and the
+        SQLite table stays the fallback for it. Persisted next to it, keyed by fingerprint.
+        """
+        self._hashes = self._starts = self._counts = None
+        arrays_path = self.path.with_name(self.path.name + '.lookup.npz')
+        try:
+            with np.load(arrays_path) as stored:
+                if str(stored['fingerprint']) == metadata._fingerprint:
+                    self._hashes, self._starts, self._counts = (
+                        stored['hashes'], stored['starts'], stored['counts'])
+                    return
+        except (OSError, KeyError, ValueError):
+            pass
+        hashes, starts, counts = [], [], []
+        previous = None
+        row = 0
+        for batch in metadata.select_columns('image_spec').iter(batch_size=100_000):
+            for image_spec in batch['image_spec']:
+                image = json.dumps(image_spec)
+                if image == previous:
+                    counts[-1] += 1
+                else:
+                    hashes.append(_image_hash(image))
+                    starts.append(row)
+                    counts.append(1)
+                previous = image
+                row += 1
+        hashes = np.asarray(hashes, dtype=np.uint64)
+        order = np.argsort(hashes, kind='stable')
+        hashes = hashes[order]
+        if len(hashes) > 1 and (hashes[1:] == hashes[:-1]).any():
+            logger.warning('%s: image key hash collision; text embedding lookups use SQLite.', self.path)
+            return
+        starts = np.asarray(starts, dtype=np.int64)[order]
+        counts = np.asarray(counts, dtype=np.int32)[order]
+        temporary = arrays_path.with_name(f'{arrays_path.name}.{os.getpid()}.tmp')
+        with open(temporary, 'wb') as handle:
+            np.savez(handle, fingerprint=np.asarray(metadata._fingerprint),
+                     hashes=hashes, starts=starts, counts=counts)
+        os.replace(temporary, arrays_path)
+        self._hashes, self._starts, self._counts = hashes, starts, counts
 
     def __getstate__(self):
         state = dict(self.__dict__)
@@ -173,6 +285,14 @@ class IndexedTextEmbeddingDataset:
         self.__dict__.update(state)
 
     def get_text_embeddings(self, image_spec, caption_number):
+        if self._hashes is not None:
+            key = np.uint64(_image_hash(json.dumps(image_spec)))
+            position = int(np.searchsorted(self._hashes, key))
+            number = int(caption_number)
+            if (position == len(self._hashes) or self._hashes[position] != key
+                    or not 0 <= number < self._counts[position]):
+                raise KeyError((image_spec, caption_number))
+            return self.te_dataset[int(self._starts[position]) + number]
         if self.lookup is None or self.pid != os.getpid():
             self.close()
             self.lookup = sqlite3.connect(self.path.resolve().as_uri() + '?mode=ro', uri=True)

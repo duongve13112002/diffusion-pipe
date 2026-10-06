@@ -442,6 +442,62 @@ def test_legacy_trusted_warm_load_keeps_latents(tmp_path):
             pytest.fail(f'trusted rerun re-encoded {len(encoded)} images')
 
 
+def test_training_reads_use_in_memory_indexes(tmp_path, monkeypatch):
+    """Per-sample reads must not query SQLite: that is slow on network storage."""
+    import utils.cache_profiles as profiles
+    from utils.cache import Cache
+
+    metadata = datasets.Dataset.from_dict({
+        'image_spec': [[None, str(tmp_path / f'{i}.png')] for i in range(7)],
+        'caption': [['c']] * 7, 'size_bucket': [[64, 64, 1]] * 7})
+    donor = current._map_and_cache(metadata, image_latents, tmp_path / 'donor')
+    donor.con.close()
+    # Several shards, so the shard/offset arrays are exercised, not just shard 0.
+    small = Cache(tmp_path / 'small', 'fp', shard_size_gb=1e-9)
+    for i in range(7):
+        small.add({'latents': torch.tensor([[i]])})
+    small.finalize_current_shard()
+    small.con.close()
+    reader = profiles.ReadOnlyCache(tmp_path / 'small')
+    expected = [reader[i]['latents'].item() for i in range(7)]
+    reader.load_index()
+    assert reader.con is None
+    monkeypatch.setattr(profiles.sqlite3, 'connect', lambda *a, **k: pytest.fail('SQLite opened on read'))
+    assert [reader[i]['latents'].item() for i in range(7)] == expected == list(range(7))
+    reader.close()
+    monkeypatch.undo()
+
+    shuffled = metadata.shuffle(seed=3)
+    profile = tensor_profile(shuffled, None, tmp_path / 'profile', ['image_spec', 'size_bucket'], None,
+                             [(metadata, donor.path)], current._map_and_cache)
+    flat = shuffled.map(lambda b: {'caption': [c for cs in b['caption'] for c in cs]}, batched=True,
+                        keep_in_memory=True)
+    text = profiles.IndexedTextEmbeddingDataset(profile, flat, tmp_path / 'index.sqlite')
+    assert text._hashes is not None
+    monkeypatch.setattr(profiles.sqlite3, 'connect', lambda *a, **k: pytest.fail('SQLite opened on read'))
+    for i, row in enumerate(shuffled):
+        stem = int(Path(row['image_spec'][1]).stem)
+        assert profile[i]['latents'].item() == stem
+        assert text.get_text_embeddings(tuple(row['image_spec']), 0)['latents'].item() == stem
+    with pytest.raises(KeyError):
+        text.get_text_embeddings((None, 'missing.png'), 0)
+    with pytest.raises(KeyError):
+        text.get_text_embeddings(tuple(shuffled[0]['image_spec']), 1)
+    monkeypatch.undo()
+
+    # A hash collision between two images falls back to the exact SQLite lookup.
+    text.close()
+    monkeypatch.setattr(profiles, '_image_hash', lambda image: 1)
+    path = tmp_path / 'index.sqlite.lookup.npz'
+    path.unlink()
+    fallback = profiles.IndexedTextEmbeddingDataset(profile, flat, tmp_path / 'index.sqlite')
+    assert fallback._hashes is None
+    assert all(fallback.get_text_embeddings(tuple(row['image_spec']), 0)['latents'].item()
+               == int(Path(row['image_spec'][1]).stem) for row in shuffled)
+    fallback.close()
+    profile.close()
+
+
 def test_single_worker_mapping_does_not_spawn_transport(tmp_path, monkeypatch):
     metadata = datasets.Dataset.from_dict({'caption': ['one', 'two']})
     monkeypatch.setattr(current.mp, 'Manager', lambda: pytest.fail('single worker spawned manager'))
