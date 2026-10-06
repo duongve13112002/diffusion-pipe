@@ -479,8 +479,11 @@ class SizeBucketDataset:
     def __init__(self, metadata_dataset, directory_config, size_bucket, cache_base, directory_dataset):
         # Shuffle deterministically based on size bucket, so that two resolutions of the same aspect ratio get different
         # orders, which mixes data better when training on multiple resolutions at once.
-        seed = seed_from_hash(tuple(size_bucket) if getattr(directory_dataset, 'reuse_metadata_cache', False)
-                              else size_bucket)
+        # tuple(): seed_from_hash hashes str(), and a grouping key read back from
+        # grouping_keys.json is a list. '[64, 64, 1]' and '(64, 64, 1)' give different orders,
+        # so a trusted warm load would reorder the rows, move the latent fingerprint and
+        # re-encode the whole bucket. A freshly grouped key is a tuple, as it always was.
+        seed = seed_from_hash(tuple(size_bucket))
         metadata_dataset = metadata_dataset.shuffle(seed=seed)
         self.metadata_dataset = metadata_dataset
         self.directory_config = directory_config

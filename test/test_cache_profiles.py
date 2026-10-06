@@ -420,6 +420,28 @@ def test_profile_rebinds_after_its_donor_changes(tmp_path, donor_change):
     assert run() == [0, 1]
 
 
+def test_legacy_trusted_warm_load_keeps_latents(tmp_path):
+    """Grouping keys read back from JSON are lists; the bucket order must not depend on that."""
+    encoded = []
+
+    def counting_latents(batch, rank):
+        encoded.extend(batch['image_spec'])
+        return image_latents(batch, rank)
+
+    new_source(tmp_path)
+    for trust in (False, True, True, False, True):
+        encoded.clear()
+        ds = build(tmp_path, reuse_metadata_cache=False)
+        ds.cache_metadata(trust_cache=trust)
+        ds.cache_latents(counting_latents, trust_cache=trust)
+        bucket = ds.get_size_bucket_datasets()[0]
+        assert all(bucket[i]['latents'].item() == int(Path(bucket[i]['image_spec'][1]).stem)
+                   for i in range(len(bucket)))
+        close_directory(ds)
+        if encoded and trust:
+            pytest.fail(f'trusted rerun re-encoded {len(encoded)} images')
+
+
 def test_single_worker_mapping_does_not_spawn_transport(tmp_path, monkeypatch):
     metadata = datasets.Dataset.from_dict({'caption': ['one', 'two']})
     monkeypatch.setattr(current.mp, 'Manager', lambda: pytest.fail('single worker spawned manager'))
