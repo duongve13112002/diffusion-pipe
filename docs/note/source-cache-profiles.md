@@ -33,7 +33,9 @@ retains the old Python grouping structures; no 30M startup/memory claim is made.
 Refresh writes a new generation and publishes its source pointer. Main-rank dataset objects
 constructed before the cache worker must reload that pointer. Tensors do not donate across
 source generations because bytes can change at the same filename. Old snapshots are preserved
-for other profiles/runs; removing a donor breaks its references and is not automatic cleanup.
+for other profiles/runs. A donor that changes or disappears (for example, a
+reuse_metadata_cache = false run clearing the legacy cache it lives in) makes the profile
+rebind from re-validated donors and encode only what none still holds; it is not an error.
 
 Implementation: utils/cache_profiles.py and utils/dataset.py. Exact installed datasets APIs
 (from_generator, map, sort, from_file, select, save_to_disk) were inspected before use. No

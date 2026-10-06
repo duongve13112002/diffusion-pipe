@@ -209,17 +209,21 @@ def tensor_profile(metadata, map_fn, path, columns, identity, sources, map_cache
                     reader = ReadOnlyCache(path / item['path'], identity, encoder_key)
                     readers.append(reader)
                     if reader.fingerprint != item['fingerprint'] or len(reader) != item['count']:
-                        raise RuntimeError('A referenced tensor cache changed; refresh/rebuild this profile.')
+                        raise RuntimeError('A referenced tensor cache changed.')
                     if reader.content_digest != item['content_digest']:
-                        raise RuntimeError('A referenced tensor input manifest changed; rebuild this profile.')
+                        raise RuntimeError('A referenced tensor input manifest changed.')
                 references = datasets.load_from_disk(str(path / binding['references']))
                 if len(references) != len(metadata):
-                    raise RuntimeError('Incomplete tensor profile; regenerate this cache.')
+                    raise RuntimeError('Incomplete tensor profile.')
                 return IndexedCache(references, readers)
-            except Exception:
+            except (RuntimeError, ValueError, OSError, sqlite3.Error, TypeError) as e:
+                # A donor is not ours to keep stable: a reuse_metadata_cache = false run clears
+                # and rebuilds the legacy cache it lives in whenever its fingerprint moves. The
+                # binding is only an index, so rebuild it from donors that are re-validated
+                # below, and encode whatever none of them still holds.
                 for reader in readers:
                     reader.close()
-                raise
+                print(f'[CACHE] Tensor profile {path} is stale ({e}); rebuilding its references.')
 
     readers = []
     lookups = []

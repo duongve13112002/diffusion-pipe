@@ -197,8 +197,10 @@ On-the-fly **encoding** still runs each step on the resulting runtime string, wi
 tag augmentation/dropout where configured. It does not require disk text embeddings.
 Image/caption additions, edits and deletions are invisible until regeneration. Refresh
 publishes a fresh generation and conservatively rebuilds its tensors; it preserves old
-snapshots/shards because existing runs/profiles may reference them. Do not remove a donor
-folder while a profile references it. Changing the selected dataset or caption sampling
+snapshots/shards because existing runs/profiles may reference them. A donor that is later
+rebuilt or removed (a `reuse_metadata_cache = false` run may clear legacy caches) makes
+the profile rebind its references and encode only inputs no remaining donor holds; never
+remove a donor while a run is reading it. Changing the selected dataset or caption sampling
 does not make an old dataloader checkpoint position transferable; start a new training
 run rather than assuming identical resume behavior after such changes.
 

@@ -388,6 +388,38 @@ def test_incomplete_donor_warns_and_regenerates_without_overwriting_it(tmp_path,
     profile.close()
 
 
+@pytest.mark.parametrize('donor_change', ['legacy_rebuild', 'donor_deleted'])
+def test_profile_rebinds_after_its_donor_changes(tmp_path, donor_change):
+    """A reuse_metadata_cache = false run may clear the legacy cache a profile references."""
+    import shutil
+
+    def run(**settings):
+        ds = build(tmp_path, **settings)
+        ds.cache_metadata()
+        ds.cache_latents(image_latents)
+        ds.cache_text_embeddings(text_map, 0)
+        bucket = ds.get_size_bucket_datasets()[0]
+        items = [bucket[i] for i in range(len(bucket))]
+        for item in items:
+            assert item['latents'].item() == int(Path(item['image_spec'][1]).stem)
+            assert_embedding(item, item['caption'])
+        close_directory(ds)
+        return sorted(item['latents'].item() for item in items)
+
+    new_source(tmp_path)
+    assert run(reuse_metadata_cache=False) == [0, 1]
+    assert run() == [0, 1]
+    if donor_change == 'legacy_rebuild':
+        Image.new('RGB', (64, 64)).save(tmp_path / '2.png')
+        tmp_path.joinpath('2.txt').write_text('green', encoding='utf-8')
+        assert run(reuse_metadata_cache=False) == [0, 1, 2]
+    else:
+        shutil.rmtree(tmp_path / 'cache' / 'migration_test' / 'cache_64x64x1')
+    # The snapshot stays frozen, so the new image is not selected, but the profile must not
+    # fail on references into a cache that another run was entitled to rebuild.
+    assert run() == [0, 1]
+
+
 def test_single_worker_mapping_does_not_spawn_transport(tmp_path, monkeypatch):
     metadata = datasets.Dataset.from_dict({'caption': ['one', 'two']})
     monkeypatch.setattr(current.mp, 'Manager', lambda: pytest.fail('single worker spawned manager'))
