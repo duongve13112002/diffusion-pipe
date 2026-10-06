@@ -11,6 +11,7 @@ import types
 import queue
 from concurrent.futures import ThreadPoolExecutor
 
+import numpy as np
 import pytest
 import torch
 import datasets
@@ -236,7 +237,7 @@ def test_selection_profiles_share_the_donor_lookup_index(tmp_path):
         ds.cache_latents(None, trust_cache=True)
         ds.cache_text_embeddings(None, 0)
         current_indices = {file.name: file.stat().st_mtime_ns
-                           for file in (ds.snapshot_dir / 'tensor_lookups').glob('*.sqlite')}
+                           for file in (ds.snapshot_dir / 'tensor_lookups').glob('*.npz')}
         if indices is not None:
             assert current_indices == indices
         indices = current_indices
@@ -496,6 +497,66 @@ def test_training_reads_use_in_memory_indexes(tmp_path, monkeypatch):
                == int(Path(row['image_spec'][1]).stem) for row in shuffled)
     fallback.close()
     profile.close()
+
+
+class CountingConnection:
+    def __init__(self, connection, counter):
+        self.connection, self.counter = connection, counter
+
+    def execute(self, *args):
+        self.counter.append(args[0])
+        return self.connection.execute(*args)
+
+    def __getattr__(self, name):
+        return getattr(self.connection, name)
+
+
+@pytest.mark.parametrize('rows', [5, 40])
+def test_profile_startup_queries_do_not_scale_with_rows(tmp_path, monkeypatch, rows):
+    """Building a profile must not issue SQLite statements per row: each is a network round trip."""
+    import sqlite3
+    import utils.cache_profiles as profiles
+
+    metadata = datasets.Dataset.from_dict({
+        'image_spec': [[None, str(tmp_path / f'{i}.png')] for i in range(rows)],
+        'caption': [[f'c{i}', f'd{i}'] for i in range(rows)], 'size_bucket': [[64, 64, 1]] * rows})
+    donor = current._map_and_cache(metadata, image_latents, tmp_path / 'donor')
+    donor.con.close()
+    statements = []
+    connect = sqlite3.connect
+    monkeypatch.setattr(profiles.sqlite3, 'connect',
+                        lambda *a, **k: CountingConnection(connect(*a, **k), statements))
+    # A different selection and order: a new profile over the same donor.
+    target = metadata.select(range(rows - 1, 0, -1))
+    profile = tensor_profile(target, None, tmp_path / 'profile', ['image_spec', 'size_bucket'], None,
+                             [(metadata, donor.path)], current._map_and_cache)
+    flat = datasets.Dataset.from_dict({
+        'image_spec': [row['image_spec'] for row in target for _ in row['caption']],
+        'caption': [caption for row in target for caption in row['caption']]})
+    # Positions stand in for embeddings: the second caption of each image follows its first.
+    text = profiles.IndexedTextEmbeddingDataset(list(range(len(flat))), flat, tmp_path / 'index.sqlite')
+    assert len(statements) <= 6, statements
+    assert not (tmp_path / 'index.sqlite').exists()
+    assert [profile[i]['latents'].item() for i in range(len(target))] == list(range(rows - 1, 0, -1))
+    assert [text.get_text_embeddings(tuple(target[i]['image_spec']), 1) for i in range(len(target))] == [
+        2 * i + 1 for i in range(len(target))]
+    profile.close()
+
+
+def test_digest_lookups_keep_the_legacy_duplicate_rules():
+    from utils.cache_profiles import DigestIndex, RowsByImage
+
+    # First value wins, as INSERT OR IGNORE kept it.
+    index = DigestIndex(np.array([b'b', b'a', b'b'], dtype='S16'), [0, 1, 2])
+    assert index.lookup(np.array([b'b', b'a', b'c'], dtype='S16')).tolist() == [0, 1, -1]
+    assert DigestIndex(np.empty(0, dtype='S16'), []).lookup(np.array([b'a'], dtype='S16')).tolist() == [-1]
+    # Last row wins across and within sources, as INSERT OR REPLACE kept it.
+    first = datasets.Dataset.from_dict({'image_spec': [[None, 'x'], [None, 'y']], 'size_bucket': [[1], [2]]})
+    second = datasets.Dataset.from_dict({'image_spec': [[None, 'x'], [None, 'x']], 'size_bucket': [[3], [4]]})
+    rows = RowsByImage([first, second]).get([[None, 'y'], (None, 'x'), [None, 'z']])
+    assert rows == [{'image_spec': [None, 'y'], 'size_bucket': [2]},
+                    {'image_spec': [None, 'x'], 'size_bucket': [4]}, None]
+    assert RowsByImage([]).get([[None, 'x']]) == [None]
 
 
 def test_single_worker_mapping_does_not_spawn_transport(tmp_path, monkeypatch):

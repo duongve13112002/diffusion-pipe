@@ -26,7 +26,8 @@ from comfy_api.latest import InputImpl
 
 from utils.common import is_main_process, VIDEO_EXTENSIONS, round_to_nearest_multiple
 from utils.cache import Cache
-from utils.cache_profiles import align_legacy_metadata, IndexedTextEmbeddingDataset, tensor_profile
+from utils.cache_profiles import (align_legacy_metadata, IndexedTextEmbeddingDataset, RowsByImage,
+                                  tensor_profile)
 import comfy.model_management as mm
 
 
@@ -1368,59 +1369,55 @@ class DirectoryDataset:
             legacy = [baseline._get_ungrouped_metadata()]
             intermediate = baseline.cache_dir / 'metadata' / 'metadata_intermediate'
 
-        import sqlite3
-        attributes_path = self.snapshot_dir / 'legacy_attributes.sqlite'
-        with sqlite3.connect(attributes_path) as attributes:
-            attributes.execute('CREATE TABLE IF NOT EXISTS media (key TEXT PRIMARY KEY, value TEXT)')
-            attributes.execute('DELETE FROM media')
-            for old in legacy:
-                attributes.executemany('INSERT OR REPLACE INTO media VALUES (?, ?)',
-                                       ((json.dumps(row['image_spec']), json.dumps(row)) for row in old))
-            attributes.commit()
-            raw = datasets.load_from_disk(str(intermediate))
-            fallback = baseline._metadata_map_fn()
+        # In RAM, not a SQLite table queried per row: that cost a lock and page-read round
+        # trip per image on network storage.
+        media = RowsByImage(legacy)
+        raw = datasets.load_from_disk(str(intermediate))
+        fallback = baseline._metadata_map_fn()
 
-            def generate_snapshot():
-                for row in raw:
-                    captions = row.get('caption')
-                    missing = not captions and not row.get('caption_file')
-                    if captions is None and row.get('caption_file'):
-                        captions = read_caption_file(Path(row['caption_file']), False, True)
-                    match = attributes.execute('SELECT value FROM media WHERE key=?',
-                                               (json.dumps(row['image_spec']),)).fetchone()
-                    old = json.loads(match[0]) if match else None
-                    compatible = old is not None and (
-                        old['size_bucket'] in self.size_buckets.tolist() if self.use_size_buckets
-                        else old['ar_bucket'] is not None and old['ar_bucket'][0] in self.ars
-                        and old['ar_bucket'][1] in self.frame_buckets)
-                    if compatible and all(old.get(k) == row.get(k) for k in ('mask_file', 'control_file')):
-                        result = old
-                        result['caption'] = captions or ['']
-                    else:
-                        batch = {key: [value] for key, value in row.items()}
-                        batch['caption'] = [captions or ['']]
-                        mapped = fallback(batch)
-                        if not mapped['image_spec']:
-                            continue
-                        result = {key: value[0] for key, value in mapped.items()}
-                    result['_caption_missing'] = missing
-                    result['_caption_sidecar'] = bool(row.get('caption_file'))
-                    yield result
+        def generate_snapshot():
+            for batch in raw.iter(batch_size=1000):
+                rows = [dict(zip(batch, values)) for values in zip(*batch.values())]
+                yield from snapshot_rows(rows, media.get([row['image_spec'] for row in rows]))
 
-            iterator = iter(generate_snapshot())
-            first = next(iterator, None)
-            if first is None:
-                snapshot = datasets.Dataset.from_dict({
-                    **{key: [] for key in legacy[0].column_names},
-                    '_caption_missing': [], '_caption_sidecar': []})
-            else:
-                def nonempty_snapshot():
-                    yield first
-                    yield from iterator
+        def snapshot_rows(rows, olds):
+            for row, old in zip(rows, olds):
+                captions = row.get('caption')
+                missing = not captions and not row.get('caption_file')
+                if captions is None and row.get('caption_file'):
+                    captions = read_caption_file(Path(row['caption_file']), False, True)
+                compatible = old is not None and (
+                    old['size_bucket'] in self.size_buckets.tolist() if self.use_size_buckets
+                    else old['ar_bucket'] is not None and old['ar_bucket'][0] in self.ars
+                    and old['ar_bucket'][1] in self.frame_buckets)
+                if compatible and all(old.get(k) == row.get(k) for k in ('mask_file', 'control_file')):
+                    result = old
+                    result['caption'] = captions or ['']
+                else:
+                    batch = {key: [value] for key, value in row.items()}
+                    batch['caption'] = [captions or ['']]
+                    mapped = fallback(batch)
+                    if not mapped['image_spec']:
+                        continue
+                    result = {key: value[0] for key, value in mapped.items()}
+                result['_caption_missing'] = missing
+                result['_caption_sidecar'] = bool(row.get('caption_file'))
+                yield result
 
-                snapshot = datasets.Dataset.from_generator(
-                    nonempty_snapshot, cache_dir=str(self.snapshot_dir / 'arrow'),
-                    fingerprint=Hasher.hash([str(self.snapshot_dir), raw._fingerprint]))
+        iterator = iter(generate_snapshot())
+        first = next(iterator, None)
+        if first is None:
+            snapshot = datasets.Dataset.from_dict({
+                **{key: [] for key in legacy[0].column_names},
+                '_caption_missing': [], '_caption_sidecar': []})
+        else:
+            def nonempty_snapshot():
+                yield first
+                yield from iterator
+
+            snapshot = datasets.Dataset.from_generator(
+                nonempty_snapshot, cache_dir=str(self.snapshot_dir / 'arrow'),
+                fingerprint=Hasher.hash([str(self.snapshot_dir), raw._fingerprint]))
         snapshot.save_to_disk(str(self.snapshot_path))
         if self.legacy_cache_dir.joinpath('metadata').is_dir():
             try:

@@ -41,8 +41,17 @@ Training reads use no SQLite. Querying it per sample (two lookups per tensor plu
 caption) was cheap on a local disk but slow on network storage, where each query costs page
 reads and lock round trips. Referenced readers load their item/shard tables into numpy arrays
 once (about 20 bytes per item, shared copy-on-write with DataLoader workers), and the caption
-lookup keeps sorted 64-bit image-key hashes, persisted next to its SQLite table; a hash
-collision among a profile's own images falls back to that table.
+lookup keeps sorted 64-bit image-key hashes in a .lookup.npz; only a hash collision among a
+profile's own images builds the exact SQLite table it then falls back to.
+
+Startup builds no SQLite row by row either. Donor lookups (tensor_lookups/<stamp>.npz), the
+snapshot's legacy media attributes and the legacy order alignment are sorted 128-bit row
+digests searched with numpy, so a new profile issues a constant handful of statements (opening
+each donor reader) rather than one or more per row. On local disk a new 200k-row latent profile
+went from 13 s to 1.6 s (first build with its donor index 22 s to 2.4 s); on network storage
+the per-row lock round trips were the larger cost. Lookup files from older versions
+(tensor_lookups/*.sqlite, legacy_attributes.sqlite, legacy_order/*/order.sqlite) are no longer
+read and may be deleted.
 
 Implementation: utils/cache_profiles.py and utils/dataset.py. Exact installed datasets APIs
 (from_generator, map, sort, from_file, select, save_to_disk) were inspected before use. No

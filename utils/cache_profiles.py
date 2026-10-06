@@ -22,6 +22,93 @@ def row_key(row, columns):
     return hashlib.sha256(json.dumps(payload, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
 
 
+def row_digests(dataset, columns, batch_size=10_000):
+    """row_key of every row, as its first 128 bits, read in Arrow batches rather than row by row."""
+    digests = []
+    for batch in dataset.select_columns(columns).iter(batch_size=batch_size):
+        for values in zip(*(batch[column] for column in columns)):
+            payload = json.dumps(dict(zip(columns, values)), sort_keys=True, ensure_ascii=False)
+            digests.append(hashlib.sha256(payload.encode()).digest()[:16])
+    return np.array(digests, dtype='S16')
+
+
+def value_digests(dataset, column, batch_size=10_000):
+    """128-bit digest of json.dumps of one column, the key the legacy lookups used."""
+    return np.array([hashlib.sha256(json.dumps(value).encode()).digest()[:16]
+                     for batch in dataset.select_columns([column]).iter(batch_size=batch_size)
+                     for value in batch[column]], dtype='S16')
+
+
+class DigestIndex:
+    """Map 128-bit row digests to integers with a sorted numpy array.
+
+    This replaces SQLite tables that were filled and then queried one row at a time. Each
+    statement is a lock and page-read round trip on network storage, so building a profile
+    for a large dataset took minutes before training could start. Here a whole profile is a
+    sort and one vectorized search, with no Python dictionary of millions of entries.
+    Duplicate keys keep their first value, as INSERT OR IGNORE did.
+    """
+
+    def __init__(self, keys, values):
+        keys, first = np.unique(np.asarray(keys, dtype='S16'), return_index=True)
+        self.keys = keys
+        self.values = np.asarray(values, dtype=np.int64)[first]
+
+    def lookup(self, keys):
+        """The value of each key, or -1 where it is absent."""
+        keys = np.asarray(keys, dtype='S16')
+        if not len(self.keys):
+            return np.full(len(keys), -1, dtype=np.int64)
+        position = np.minimum(np.searchsorted(self.keys, keys), len(self.keys) - 1)
+        return np.where(self.keys[position] == keys, self.values[position], -1)
+
+    def save(self, path):
+        temporary = path.with_name(f'{path.name}.{os.getpid()}.tmp')
+        with open(temporary, 'wb') as handle:
+            np.savez(handle, keys=self.keys, values=self.values)
+        os.replace(temporary, path)
+
+    @classmethod
+    def load(cls, path):
+        try:
+            with np.load(path) as stored:
+                index = cls.__new__(cls)
+                index.keys, index.values = stored['keys'], stored['values']
+                return index
+        except (OSError, KeyError, ValueError):
+            return None
+
+
+class RowsByImage:
+    """Rows of several datasets looked up by image_spec; a later row for an image wins."""
+
+    def __init__(self, sources):
+        self.sources = sources
+        self.offsets = np.cumsum([0] + [len(source) for source in sources])
+        keys = (np.concatenate([value_digests(source, 'image_spec') for source in sources])
+                if sources else np.empty(0, dtype='S16'))
+        # Reversed, so the first occurrence DigestIndex keeps is the last row (INSERT OR REPLACE).
+        self.index = DigestIndex(keys[::-1], np.arange(len(keys))[::-1])
+
+    def get(self, image_specs):
+        """A fresh dict per image_spec, or None, fetched in one Arrow gather per source."""
+        keys = [json.dumps(image_spec) for image_spec in image_specs]
+        found = self.index.lookup(np.array([hashlib.sha256(key.encode()).digest()[:16] for key in keys],
+                                           dtype='S16'))
+        owner = np.searchsorted(self.offsets, found, side='right') - 1
+        rows = [None] * len(keys)
+        for number, source in enumerate(self.sources):
+            wanted = np.flatnonzero((found >= 0) & (owner == number))
+            if not len(wanted):
+                continue
+            columns = source[(found[wanted] - self.offsets[number]).tolist()]
+            for position, values in zip(wanted.tolist(), zip(*columns.values())):
+                row = dict(zip(columns, values))
+                if json.dumps(row['image_spec']) == keys[position]:
+                    rows[position] = row
+        return rows
+
+
 def align_legacy_metadata(metadata, iteration_path, path):
     """Recover the actual legacy tensor order from its saved iteration mapping, not a seed guess."""
     iteration = datasets.load_from_disk(str(iteration_path))
@@ -29,30 +116,18 @@ def align_legacy_metadata(metadata, iteration_path, path):
     if path.joinpath('aligned').exists():
         return datasets.load_from_disk(str(path / 'aligned'))
     path.mkdir(parents=True, exist_ok=True)
-    with sqlite3.connect(path / 'order.sqlite') as lookup:
-        lookup.execute('CREATE TABLE IF NOT EXISTS rows (key TEXT PRIMARY KEY, idx INTEGER)')
-        lookup.execute('DELETE FROM rows')
-        for row in iteration.select_columns(['image_spec', 'latents_idx']):
-            key = json.dumps(row['image_spec'])
-            existing = lookup.execute('SELECT idx FROM rows WHERE key=?', (key,)).fetchone()
-            if existing is not None and existing[0] != row['latents_idx']:
-                raise ValueError('Ambiguous legacy latent ordering')
-            lookup.execute('INSERT OR IGNORE INTO rows VALUES (?, ?)', (key, row['latents_idx']))
-        lookup.commit()
-
-        def original_index(row):
-            match = lookup.execute('SELECT idx FROM rows WHERE key=?', (json.dumps(row['image_spec']),)).fetchone()
-            if match is None:
-                raise ValueError('Legacy iteration order does not cover its metadata')
-            return {'_legacy_index': match[0]}
-
-        ordered = metadata.map(original_index, keep_in_memory=True,
-                               new_fingerprint=Hasher.hash([metadata._fingerprint, iteration._fingerprint]))
-        ordered = ordered.sort('_legacy_index', keep_in_memory=True)
-        if any(value != index for index, value in enumerate(ordered['_legacy_index'])):
-            raise ValueError('Legacy latent indices are not a complete contiguous mapping')
-        ordered = ordered.remove_columns('_legacy_index')
-        ordered.save_to_disk(str(path / 'aligned'))
+    keys = value_digests(iteration, 'image_spec')
+    latents_idx = np.asarray(iteration['latents_idx'], dtype=np.int64)
+    order = np.argsort(keys, kind='stable')
+    keys, latents_idx = keys[order], latents_idx[order]
+    if ((keys[1:] == keys[:-1]) & (latents_idx[1:] != latents_idx[:-1])).any():
+        raise ValueError('Ambiguous legacy latent ordering')
+    original = DigestIndex(keys, latents_idx).lookup(value_digests(metadata, 'image_spec'))
+    if (original < 0).any():
+        raise ValueError('Legacy iteration order does not cover its metadata')
+    if not np.array_equal(np.sort(original), np.arange(len(metadata))):
+        raise ValueError('Legacy latent indices are not a complete contiguous mapping')
+    metadata.select(np.argsort(original), keep_in_memory=True).save_to_disk(str(path / 'aligned'))
     return datasets.load_from_disk(str(path / 'aligned'))
 
 
@@ -210,7 +285,18 @@ class IndexedTextEmbeddingDataset:
         self.path = path
         self.pid = os.getpid()
         path.parent.mkdir(parents=True, exist_ok=True)
-        self.lookup = sqlite3.connect(path)
+        self.lookup = None
+        self._load_arrays(metadata)
+        if self._hashes is None:
+            self._build_table(metadata)
+
+    def _build_table(self, metadata):
+        """The SQLite fallback, built only when the in-RAM arrays cannot be exact.
+
+        One INSERT per caption is slow on network storage, and every new caption profile
+        would pay it at startup although the arrays serve all reads.
+        """
+        self.lookup = sqlite3.connect(self.path)
         self.lookup.execute('CREATE TABLE IF NOT EXISTS captions (image TEXT, number INTEGER, idx INTEGER, '
                             'PRIMARY KEY(image, number))')
         self.lookup.execute('CREATE TABLE IF NOT EXISTS complete (fingerprint TEXT)')
@@ -227,7 +313,6 @@ class IndexedTextEmbeddingDataset:
             self.lookup.execute('DELETE FROM complete')
             self.lookup.execute('INSERT INTO complete VALUES (?)', (metadata._fingerprint,))
             self.lookup.commit()
-        self._load_arrays(metadata)
 
     def _load_arrays(self, metadata):
         """Keep image -> first flattened row in RAM, so a sample costs no SQLite query.
@@ -235,7 +320,7 @@ class IndexedTextEmbeddingDataset:
         Sorted 64-bit hashes of the image key, searched with numpy: about 20 bytes per image
         instead of a Python dict. Every lookup comes from this metadata's own images, so the
         mapping is exact unless two of them share a hash; that is checked here, and the
-        SQLite table stays the fallback for it. Persisted next to it, keyed by fingerprint.
+        SQLite table is then built as the fallback. Persisted beside its path, keyed by fingerprint.
         """
         self._hashes = self._starts = self._counts = None
         arrays_path = self.path.with_name(self.path.name + '.lookup.npz')
@@ -313,7 +398,8 @@ def tensor_profile(metadata, map_fn, path, columns, identity, sources, map_cache
                    caching_batch_size=1, regenerate_cache=False, encoder_key=None, lookup_dir=None):
     """Reference exact legacy inputs; encode only inputs absent from a compatible donor.
 
-    The on-disk lookup is built once, avoiding a 30M-entry Python dictionary. Caption,
+    Each donor's lookup is a sorted digest array built once and kept on disk, avoiding a
+    30M-entry Python dictionary and per-row SQLite queries alike. Caption,
     video/bucket/mask/control context all remain in text keys; latent keys omit caption only.
     """
     path = Path(path)
@@ -346,7 +432,7 @@ def tensor_profile(metadata, map_fn, path, columns, identity, sources, map_cache
                 print(f'[CACHE] Tensor profile {path} is stale ({e}); rebuilding its references.')
 
     readers = []
-    lookups = []
+    indexes = []
     try:
         if not regenerate_cache:
             for donor_metadata, donor_path in sources() if callable(sources) else sources:
@@ -368,54 +454,44 @@ def tensor_profile(metadata, map_fn, path, columns, identity, sources, map_cache
                                  'fingerprint': reader.fingerprint, 'columns': columns,
                                  'content_digest': reader.content_digest},
                                 ['path', 'metadata', 'fingerprint', 'columns', 'content_digest'])
-                index_path = Path(lookup_dir or path.parent / 'lookup') / f'{stamp}.sqlite'
-                index_path.parent.mkdir(parents=True, exist_ok=True)
-                lookup = sqlite3.connect(index_path)
-                lookup.execute('CREATE TABLE IF NOT EXISTS rows (key TEXT PRIMARY KEY, idx INTEGER)')
-                lookup.execute('CREATE TABLE IF NOT EXISTS complete (count INTEGER)')
-                if lookup.execute('SELECT count FROM complete').fetchone() is None:
+                index_path = Path(lookup_dir or path.parent / 'lookup') / f'{stamp}.npz'
+                index = DigestIndex.load(index_path)
+                if index is None:
                     content_column = 'caption' if 'caption' in columns else 'image_spec'
                     if reader.content_digest and reader.content_digest != Hasher.hash(list(donor_metadata[content_column])):
                         print(f'[CACHE] Donor content digest differs: {reader.path}; skipping.')
-                        lookup.close()
                         reader.close()
                         continue
-                    lookup.execute('DELETE FROM rows')
-                    lookup.executemany('INSERT OR IGNORE INTO rows VALUES (?, ?)',
-                                       ((row_key(row, columns), i) for i, row in enumerate(donor_metadata)))
-                    lookup.execute('INSERT INTO complete VALUES (?)', (len(donor_metadata),))
-                    lookup.commit()
+                    index = DigestIndex(row_digests(donor_metadata, columns), np.arange(len(donor_metadata)))
+                    index_path.parent.mkdir(parents=True, exist_ok=True)
+                    index.save(index_path)
                 readers.append(reader)
-                lookups.append(lookup)
+                indexes.append(index)
 
-        missing_indices = []
         references_token = hashlib.sha256(
             json.dumps([metadata._fingerprint, identity, encoder_key,
                         [(str(r.path), r.fingerprint, len(r), r.content_digest) for r in readers]], sort_keys=True).encode()
         ).hexdigest()[:16]
         references_path = path / f'references_{references_token}'
-
-        def references_generator():
-            missing_indices.clear()
-            for index, row in enumerate(metadata):
-                key = row_key(row, columns)
-                found = None
-                for source, lookup in enumerate(lookups):
-                    match = lookup.execute('SELECT idx FROM rows WHERE key=?', (key,)).fetchone()
-                    if match is not None:
-                        found = {'source': source, 'index': match[0]}
-                        break
-                if found is None:
-                    found = {'source': len(readers), 'index': len(missing_indices)}
-                    missing_indices.append(index)
-                yield found
-
-        # Explicit local cache_dir is also needed for the generator's intermediate Arrow files.
-        references = datasets.Dataset.from_generator(
-            references_generator, cache_dir=str(path / 'arrow'),
-            fingerprint=references_token + ('_regenerate' if regenerate_cache else ''))
-        # A cached generator may not execute: reconstruct the missing input positions from its output.
-        missing_indices = [i for i, ref in enumerate(references) if ref['source'] == len(readers)]
+        if references_path.exists():
+            # Written only once its missing inputs were encoded, as the cached generator was.
+            references = datasets.load_from_disk(str(references_path))
+            source = references.data.column('source').to_numpy()
+        else:
+            references = None
+            # The first donor holding a row wins; rows none holds are encoded, in order.
+            source = np.full(len(metadata), len(readers), dtype=np.int64)
+            index = np.zeros(len(metadata), dtype=np.int64)
+            pending = np.arange(len(metadata))
+            digests = row_digests(metadata, columns) if indexes else None
+            for number, donor in enumerate(indexes):
+                found = donor.lookup(digests[pending])
+                hit = found >= 0
+                source[pending[hit]] = number
+                index[pending[hit]] = found[hit]
+                pending = pending[~hit]
+            index[pending] = np.arange(len(pending))
+        missing_indices = np.flatnonzero(source == len(readers)).tolist()
         if missing_indices:
             if map_fn is None:
                 raise RuntimeError(f'{len(missing_indices)} inputs in {path} need an encoder; run caching first.')
@@ -437,8 +513,9 @@ def tensor_profile(metadata, map_fn, path, columns, identity, sources, map_cache
             for handle in generated.open_files.values():
                 handle.close()
             readers.append(ReadOnlyCache(generated.path, identity, encoder_key))
-        if not references_path.exists():
-            references.save_to_disk(str(references_path))
+        if references is None:
+            datasets.Dataset.from_dict({'source': source, 'index': index}).save_to_disk(str(references_path))
+            references = datasets.load_from_disk(str(references_path))
         binding = {'metadata': metadata._fingerprint, 'identity': identity, 'encoder_key': encoder_key,
                    'references': references_path.name,
                    'sources': [{'path': os.path.relpath(r.path, path), 'fingerprint': r.fingerprint,
@@ -452,6 +529,3 @@ def tensor_profile(metadata, map_fn, path, columns, identity, sources, map_cache
         for reader in readers:
             reader.close()
         raise
-    finally:
-        for lookup in lookups:
-            lookup.close()
