@@ -401,6 +401,9 @@ if __name__ == '__main__':
     elif model_type == 'qwen_image21':
         from models import qwen_image21
         model = qwen_image21.QwenImage21Pipeline(config)
+    elif model_type == 'iris':
+        from models import iris
+        model = iris.IrisPipeline(config)
     else:
         raise NotImplementedError(f'Model type {model_type} is not implemented')
 
@@ -612,7 +615,8 @@ if __name__ == '__main__':
     if blocks_to_swap := config.get('blocks_to_swap', 0):
         assert config['pipeline_stages'] == 1, 'Block swapping only works with pipeline_stages=1'
         assert 'adapter' in config, 'Block swapping only works when training LoRA'
-        assert config['model'].get('cache_text_embeddings', True), (
+        assert (config['model'].get('cache_text_embeddings', True)
+                or getattr(model, 'block_swap_supports_uncached_text_embeddings', False)), (
             'blocks_to_swap cannot be combined with cache_text_embeddings = false. Block '
             'swapping replaces PipelineModule.to with a no-op and moves only the transformer to '
             'CUDA, so a resident text encoder -- which lives on the pipeline layer, not the '
@@ -870,7 +874,12 @@ if __name__ == '__main__':
     communication_data_type = config['lora']['dtype'] if 'lora' in config else config['model']['dtype']
     model_engine.communication_data_type = communication_data_type
 
-    train_dataloader = dataset_util.PipelineDataLoader(train_data, model_engine, model_engine.gradient_accumulation_steps(), model)
+    train_dataloader = dataset_util.PipelineDataLoader(
+        train_data, model_engine, model_engine.gradient_accumulation_steps(), model,
+        # More than one worker pays off when the dataset decodes media at __getitem__ time
+        # (models with load_media_on_the_fly, e.g. iris); cached latents need only the default.
+        num_dataloader_workers=config.get('dataloader_workers', 1),
+    )
     steps_per_epoch = len(train_dataloader) // model_engine.gradient_accumulation_steps()
 
     scheduler_type = config.get('lr_scheduler', 'constant')

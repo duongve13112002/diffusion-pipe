@@ -35,6 +35,7 @@ See [source snapshots and cache profiles](caption-processing.md#source-snapshots
 |Krea 2          |✅    |✅              |✅                |
 |MiniMax H3      |✅    |✅              |✅                |
 |Qwen-Image-2.1  |✅    |✅              |✅                |
+|Iris-3B         |✅    |✅              |❌                |
 
 
 ## SDXL
@@ -750,3 +751,66 @@ timestep_sample_method = 'logit_normal'
 #merge_adapters = ['/path/to/training_adapter.safetensors']  # merges adapters into weights before training starts
 ```
 Everything is ComfyUI model format. Only T2I is currently supported. I2I edit training would require significant refactors of the dataset processing code (it assumes the text embeddings can be computed from the text prompt alone, which isn't true for this model). Qwen-Image-2.1 is a CFG-distilled model. Training it without a de-distillation adapter breaks the distillation and you will need to use CFG for inference.
+
+## Iris-3B
+[Iris-3B](https://github.com/speridlabs/iris-3b) is a 3B pixel-space diffusion transformer: no VAE,
+the model predicts a rectified-flow velocity directly over RGB pixels. The text encoder is the
+Qwen3-VL-4B language stack, read through twelve of its hidden layers. The Iris repository is
+vendored as the `submodules/iris-3b` submodule (`git submodule update --init --recursive`) and
+its own model code is used unchanged.
+```
+[model]
+type = 'iris'
+# Local directory with model.safetensors + config.yaml, or a Hugging Face repo id.
+transformer_path = 'speridlabs/iris-3b'
+dtype = 'bfloat16'
+```
+Example configs: [LoRA](../examples/iris/iris_3b_lora.toml),
+[full fine-tune](../examples/iris/iris_3b_full.toml), [dataset](../examples/iris/iris_3b_dataset.toml).
+
+LoRA, LoKr, OPLoRA and full fine-tuning are supported, as are block swap (adapters only, also
+with on-the-fly text encoding), pipeline parallelism, activation checkpointing, eval,
+`merge_adapters` and `--test_sample`. Edit/control datasets are not (Iris is text-to-image).
+
+All `[model]` options:
+
+| Key | Default | Meaning |
+|-----|---------|---------|
+| `transformer_path` | `speridlabs/iris-3b` | Directory with `model.safetensors` (+ `config.yaml`), a bare `.safetensors` file, or an HF repo id. Keys may carry a `model.diffusion_model.`/`diffusion_model.`/`transformer.`/`net.` prefix. |
+| `text_encoder_path` | `text_encoder.pretrained` of the checkpoint config | Qwen3-VL-4B directory or repo id. |
+| `dtype` | — | Base dtype. |
+| `transformer_dtype` | `dtype` | Dtype of the 2-D trunk weights. Embedders, text adapter, modulation cores, pixel head and 1-D tensors stay in `dtype`. |
+| `cache_pixels` | `false` | `false`: images are decoded and resized in the DataLoader workers each step, nothing is cached. `true`: resized pixels are cached as uint8 like any other model's latents. |
+| `cache_text_embeddings` | `false` | `false`: captions are tokenized per step and encoded on the GPU inside the pipeline (caption augmentation stays per-step). `true`: embeddings are cached once, trimmed to real tokens (still ~60 KB per token). |
+| `max_text_length` | checkpoint `text_encoder.max_length` (300) | Token budget of the caption including the chat-template suffix. Must be ≤ `model.text_len`. |
+| `text_encoder_attn_implementation` | checkpoint config | `attn_implementation` for the Qwen3-VL decoder. |
+| `attn_backend` | checkpoint config (`sdpa`) | Iris attention backend: `sdpa`, `torch_flash`, `torch_cudnn`, `fa3`, `fa4`. |
+| `timestep_sample_method` | `logit_normal` | `logit_normal` (Iris training) or `uniform`. |
+| `logit_mean`, `logit_std` | checkpoint `flow` config | Logit-normal parameters. |
+| `min_t`, `max_t` | `0`, `1` | Restrict the sampled noise levels. |
+| `shift` | checkpoint `flow.shift` | Flow shift for training and sampling. |
+| `shift_law` | `none` | `none`, `sd3` or `flux`: scale the shift with the image token count (base `flow.shift_base_tokens`). |
+| `text_adapter_lr` | optimizer `lr` | LR of `y_embedder` + `y_pos_embedding` (full fine-tune). `0` freezes them. |
+| `pixel_head_lr` | optimizer `lr` | LR of `pixel_embedder`, `pixel_blocks`, `final_layer` (full fine-tune). `0` freezes them. |
+| `adapter_target_modules` | `['MMDiTBlock', 'SingleStreamBlock']` | Block classes whose Linear layers get the adapter. |
+| `sample_steps` | checkpoint `sample.steps` | Steps for `--test_sample`. |
+| `repa_weight` | `0` | REPA alignment loss weight. `0` disables REPA entirely. |
+| `repa_layer` | checkpoint `model.repa_layer` (10) | 1-based block whose output is aligned. |
+| `repa_lr` | optimizer `lr` | LR of the REPA projector. |
+| `repa_projector_path` | — | Initial projector weights (`.safetensors`). Without it, a `repa.*` projector stored in the base checkpoint is used, else a fresh one. |
+| `repa_variant`, `repa_teacher_source`, `repa_teacher_hub`, `repa_teacher`, `repa_teacher_weights`, `repa_teacher_dim`, `repa_proj_hidden_dim`, `repa_teacher_image_size`, `repa_teacher_patch_size`, `repa_teacher_match_student`, `repa_spatial_norm_gamma` | Iris `RepaConfig` defaults (DINOv2 ViT-B/14 via torch hub) | Passed through to `iris3b.repa.REPALoss`. Training stops with an error if the teacher cannot be loaded. |
+
+Top-level `dataloader_workers` (default 1) sets the training DataLoader worker count; with the
+default on-the-fly pixels, 4 or more keeps image decoding off the critical path.
+
+Saving:
+- Full fine-tune writes Iris's own layout: `model.safetensors` (IrisDiT keys) + `config.yaml`,
+  readable by `iris3b.sampling.load_for_inference` and Iris's `scripts/sample.py`, and usable as
+  `transformer_path` again. With REPA the projector goes to `repa_projector.safetensors` beside it.
+- LoRA/LoKr write `adapter_model.safetensors` with `diffusion_model.`-prefixed keys plus
+  `adapter_config.json` (REPA projector, if any, in `repa/`). Fold one into the base weights with
+  `python -m tools.iris_merge_adapter --model speridlabs/iris-3b --adapter <save dir> --output <dir> [--strength 1.0]`,
+  which writes the same layout as a full fine-tune.
+
+fp8 `transformer_dtype` is untested and not listed as supported.
+

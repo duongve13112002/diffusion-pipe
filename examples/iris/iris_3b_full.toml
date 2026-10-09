@@ -1,0 +1,40 @@
+# Iris-3B full fine-tune. Saves model.safetensors + config.yaml in Iris's own layout, which
+# iris3b.sampling.load_for_inference and Iris's scripts/sample.py read unchanged.
+output_dir = '/data/diffusion_pipe_training_runs/iris_3b_full'
+dataset = 'examples/iris/iris_3b_dataset.toml'
+
+epochs = 20
+micro_batch_size_per_gpu = 1
+pipeline_stages = 1
+gradient_accumulation_steps = 8
+gradient_clipping = 1.0
+warmup_steps = 200
+eval_every_n_epochs = 1
+eval_micro_batch_size_per_gpu = 1
+eval_gradient_accumulation_steps = 1
+save_every_n_epochs = 2
+checkpoint_every_n_minutes = 120
+activation_checkpointing = true
+partition_method = 'parameters'
+save_dtype = 'bfloat16'
+dataloader_workers = 4
+
+[model]
+type = 'iris'
+transformer_path = 'speridlabs/iris-3b'
+dtype = 'bfloat16'
+# Separate learning rates. 0 freezes the group.
+#text_adapter_lr = 1e-5   # y_embedder (layerwise text adapter) + y_pos_embedding
+#pixel_head_lr = 2e-5     # pixel_embedder, PiT blocks and final_layer
+
+# Optional REPA alignment loss against a frozen DINOv2 teacher (Iris stage 1). Off by default.
+#repa_weight = 0.5
+#repa_layer = 10
+#repa_teacher_match_student = true
+
+[optimizer]
+type = 'adamw_optimi'
+lr = 2e-5
+betas = [0.9, 0.99]
+weight_decay = 0.01
+eps = 1e-8

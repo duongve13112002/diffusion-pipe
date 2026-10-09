@@ -474,6 +474,35 @@ def collapse_to_one_entry_per_image(iteration_order_list):
     return list(by_image.values())
 
 
+class OnTheFlyMediaDataset:
+    """Stands in for a latent cache when the model reads its media at __getitem__ time.
+
+    Row i is metadata row i decoded and resized now, with the same functions and the same
+    output layout the caching path would have stored: {latents, mask, image_spec, caption}.
+    Used by models with load_media_on_the_fly (iris), whose 'latents' are just the pixels,
+    so caching them would only duplicate the dataset on disk.
+    """
+
+    def __init__(self, metadata_dataset, media_loader, encode_fn):
+        if 'control_file' in metadata_dataset.column_names:
+            raise NotImplementedError('Reading media on the fly does not support control/edit datasets')
+        self.metadata_dataset = metadata_dataset.select_columns(['image_spec', 'mask_file', 'size_bucket', 'caption'])
+        self.media_loader = media_loader
+        self.encode_fn = encode_fn
+
+    def __len__(self):
+        return len(self.metadata_dataset)
+
+    def __getitem__(self, idx):
+        row = self.metadata_dataset[int(idx)]
+        items = self.media_loader(row['image_spec'], row['mask_file'], row['size_bucket'])
+        if len(items) != 1:
+            raise RuntimeError(f'Expected exactly one item from {row["image_spec"]}, got {len(items)}')
+        tensor, _audio, mask = items[0]
+        latents = self.encode_fn(tensor.unsqueeze(0))['latents'][0]
+        return {'latents': latents, 'mask': mask, 'image_spec': row['image_spec'], 'caption': row['caption']}
+
+
 # The smallest unit of a dataset. Represents a single size bucket from a single folder of images
 # and captions on disk. Not batched; returns individual items.
 class SizeBucketDataset:
@@ -533,6 +562,15 @@ class SizeBucketDataset:
         return getattr(self.directory_dataset, 'text_embedding_identity', '')
 
     def cache_latents(self, map_fn, regenerate_cache=False, trust_cache=False, caching_batch_size=1):
+        on_the_fly_media = getattr(self.directory_dataset, 'on_the_fly_media', None)
+        if on_the_fly_media is not None:
+            # Nothing to cache: rows are decoded from the media file when drawn. The iteration
+            # order is still built (and cached) exactly as below, indexed by the same metadata
+            # rows the decoder reads, so everything downstream is unchanged.
+            print(f'media read on the fly (nothing cached): {self.size_bucket}')
+            self.latent_dataset = OnTheFlyMediaDataset(self.metadata_dataset, *on_the_fly_media)
+            self._build_iteration_order(regenerate_cache, trust_cache)
+            return
         print(f'caching latents: {self.size_bucket}')
         # Latents depend on the image, its mask, its control image and the size bucket -- never
         # on the caption, which is only carried alongside them. Fingerprinting the caption
@@ -558,7 +596,9 @@ class SizeBucketDataset:
                 content_column=('image_spec' if self.directory_config.get('require_non_latin_caption') is not None
                                 else None))
         assert len(self.latent_dataset) == len(self.metadata_dataset), (len(self.latent_dataset), len(self.metadata_dataset))
+        self._build_iteration_order(regenerate_cache, trust_cache)
 
+    def _build_iteration_order(self, regenerate_cache, trust_cache):
         suffix = self.directory_config.get('caption_cache_suffix', '')
         if self.caption_sampling != 'all':
             suffix += '_' + self.caption_sampling
@@ -1130,9 +1170,12 @@ class ARBucketDataset:
 class DirectoryDataset:
     def __init__(self, directory_config, dataset_config, model_name, framerate=None,
                  round_to_multiple=32, skip_dataset_validation=False,
-                 caches_text_embeddings=True, vae_identity=''):
+                 caches_text_embeddings=True, vae_identity='', on_the_fly_media=None):
         self._set_defaults(directory_config, dataset_config)
         self.directory_config = directory_config
+        # (media_loader, encode_fn) for a model that reads its media at __getitem__ time instead
+        # of caching latents (see OnTheFlyMediaDataset). None for every other model.
+        self.on_the_fly_media = on_the_fly_media
         self.dataset_config = dataset_config
         if not skip_dataset_validation:
             self.validate()
@@ -1592,7 +1635,9 @@ class DirectoryDataset:
                     SizeBucketDataset(
                         metadata,
                         self.directory_config,
-                        grouping_key,
+                        # A key read back from grouping_keys.json is a list, and Dataset.post_init
+                        # groups buckets in a dict keyed by it.
+                        tuple(grouping_key),
                         self.cache_dir,
                         self,
                     )
@@ -2042,6 +2087,16 @@ class Dataset:
         if not skip_dataset_validation:
             self.model.model_specific_dataset_config_validation(self.dataset_config)
 
+        on_the_fly_media = None
+        if getattr(self.model, 'load_media_on_the_fly', False):
+            # The model has no latents worth caching (a pixel-space model's 'latents' are the
+            # pixels), so the dataset decodes each image when it is drawn, in the DataLoader
+            # worker. Both functions are required to be CPU-only for such a model.
+            on_the_fly_media = (
+                self.model.get_preprocess_media_file_fn(),
+                self.model.get_call_vae_fn(self.model.get_vae()),
+            )
+
         self.directory_datasets = []
         for directory_config in dataset_config['directory']:
             directory_dataset = DirectoryDataset(
@@ -2058,6 +2113,7 @@ class Dataset:
                 # What produced the latents. Declared per model via vae_config_keys; empty for
                 # a model that has not declared one, which keeps its caches exactly as before.
                 vae_identity=model.vae_cache_key(),
+                on_the_fly_media=on_the_fly_media,
             )
             self.directory_datasets.append(directory_dataset)
 

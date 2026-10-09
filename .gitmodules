@@ -25,3 +25,6 @@
 [submodule "submodules/ComfyUI"]
 	path = submodules/ComfyUI
 	url = https://github.com/comfyanonymous/ComfyUI
+[submodule "submodules/iris-3b"]
+	path = submodules/iris-3b
+	url = https://github.com/speridlabs/iris-3b

@@ -1,0 +1,14 @@
+# Iris is a pixel-space model trained at about one megapixel. Any resolution works as long as
+# the bucket sides are multiples of the patch size (16); diffusion-pipe rounds them for you.
+resolutions = [1024]
+enable_ar_bucket = true
+min_ar = 0.5
+max_ar = 2.0
+num_ar_buckets = 9
+
+[[directory]]
+path = '/data/datasets/my_images'
+num_repeats = 1
+# Captions are encoded on the fly by default, so caption augmentation happens per step:
+#caption_dropout_rate = 0.05
+#shuffle_tags = true
