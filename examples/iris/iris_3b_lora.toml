@@ -30,10 +30,15 @@ dataloader_workers = 4
 
 [model]
 type = 'iris'
-# A local directory with model.safetensors + config.yaml, or a Hugging Face repo id.
+# A local directory with model.safetensors + config.yaml, a single .safetensors file, or a
+# Hugging Face repo id.
 transformer_path = 'speridlabs/iris-3b'
 # Defaults to the text_encoder.pretrained of the checkpoint's config.yaml (Qwen/Qwen3-VL-4B-Instruct).
+# Also accepts a Transformers directory or a single .safetensors file:
 #text_encoder_path = '/data/models/Qwen3-VL-4B-Instruct'
+#text_encoder_path = '/data/models/qwen3_vl_4b.safetensors'
+# Config + tokenizer for a single-file text encoder. Defaults to the bundled copy.
+#text_encoder_config_path = 'configs/qwen3_vl_4b_instruct'
 dtype = 'bfloat16'
 # Pixels are read and resized on the fly (default). Set true to cache them as uint8 instead.
 #cache_pixels = false

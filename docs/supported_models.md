@@ -778,8 +778,9 @@ All `[model]` options:
 
 | Key | Default | Meaning |
 |-----|---------|---------|
-| `transformer_path` | `speridlabs/iris-3b` | Directory with `model.safetensors` (+ `config.yaml`), a bare `.safetensors` file, or an HF repo id. Keys may carry a `model.diffusion_model.`/`diffusion_model.`/`transformer.`/`net.` prefix. |
-| `text_encoder_path` | `text_encoder.pretrained` of the checkpoint config | Qwen3-VL-4B directory or repo id. |
+| `transformer_path` | `speridlabs/iris-3b` | Directory with `model.safetensors` (+ `config.yaml`), a bare `.safetensors` file, or an HF repo id. Keys may carry a `model.diffusion_model.`/`diffusion_model.`/`transformer.`/`net.` prefix. A bare file with no `config.yaml` beside it uses Iris's default config, which is the iris-3b one. |
+| `text_encoder_path` | `text_encoder.pretrained` of the checkpoint config | Qwen3-VL-4B as an HF repo id, a Transformers directory, or a single `.safetensors` file (full VLM or text tower only, any of the `model.language_model.`/`language_model.`/`model.` prefixes; the vision weights are ignored; bf16/fp32, not scaled fp8). |
+| `text_encoder_config_path` | bundled `configs/qwen3_vl_4b_instruct` | Only for a single-file `text_encoder_path`: directory (or repo id) with the Qwen3-VL `config.json` and tokenizer files. |
 | `dtype` | — | Base dtype. |
 | `transformer_dtype` | `dtype` | Dtype of the 2-D trunk weights. Embedders, text adapter, modulation cores, pixel head and 1-D tensors stay in `dtype`. |
 | `cache_pixels` | `false` | `false`: images are decoded and resized in the DataLoader workers each step, nothing is cached. `true`: resized pixels are cached as uint8 like any other model's latents. |

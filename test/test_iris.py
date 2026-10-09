@@ -419,6 +419,89 @@ def test_text_encoder_matches_iris_encoder(tiny_qwen):
     assert int(mask[2].sum()) == TEXT_LEN  # truncated caption still ends with the full suffix
 
 
+@pytest.mark.parametrize('layout', ['full_vlm', 'text_only', 'tied_lm_head'])
+def test_text_encoder_loads_from_a_single_safetensors_file(tiny_qwen, tmp_path, layout):
+    """A single file of any common layout, plus a config directory, encodes exactly like the
+    Transformers directory it came from. The vision tower in a full-VLM file is ignored."""
+    sd = safetensors.torch.load_file(str(tiny_qwen / 'model.safetensors'))
+    assert any(k.startswith('model.visual.') for k in sd)
+    if layout != 'full_vlm':
+        prefix = 'model.language_model.'
+        sd = {k[len(prefix):]: v for k, v in sd.items() if k.startswith(prefix)}
+    if layout == 'tied_lm_head':
+        sd['lm_head.weight'] = sd.pop('embed_tokens.weight')
+    single = tmp_path / 'qwen3_vl_te.safetensors'
+    safetensors.torch.save_file(sd, str(single))
+
+    config_dir = tiny_qwen
+    if layout == 'tied_lm_head':
+        # Qwen3-VL-4B ties its embeddings; the tiny model does not, so say so in a config copy.
+        import json, shutil
+        config_dir = tmp_path / 'tied_config'
+        shutil.copytree(tiny_qwen, config_dir)
+        cfg = json.loads((config_dir / 'config.json').read_text())
+        cfg['tie_word_embeddings'] = True
+        (config_dir / 'config.json').write_text(json.dumps(cfg))
+
+    reference = iris.IrisTextEncoder.from_pretrained(str(tiny_qwen), torch.float32, HIDDEN_LAYERS, TEXT_LEN)
+    ours = iris.IrisTextEncoder.from_pretrained(str(single), torch.float32, HIDDEN_LAYERS, TEXT_LEN,
+                                                config_path=str(config_dir))
+    assert not any(p.is_meta for p in ours.decoder.parameters())
+    captions = ['a cat', '', 'a red bicycle leaning on a wall']
+    emb, mask = ours.encode(captions)
+    expected_emb, expected_mask = reference.encode(captions)
+    torch.testing.assert_close(mask, expected_mask)
+    torch.testing.assert_close(emb, expected_emb, rtol=0, atol=0)
+
+
+def test_single_file_text_encoder_through_the_pipeline_config(ckpt, tiny_qwen, tmp_path):
+    path, _ = ckpt
+    single = tmp_path / 'te.safetensors'
+    safetensors.torch.save_file(safetensors.torch.load_file(str(tiny_qwen / 'model.safetensors')), str(single))
+    pipe = make_pipeline(path, text_encoder_path=single, text_encoder_config_path=str(tiny_qwen))
+    reference = make_pipeline(path, text_encoder_path=tiny_qwen)
+    emb, _ = pipe.text_encoder.encode(['a dog'])
+    expected, _ = reference.text_encoder.encode(['a dog'])
+    torch.testing.assert_close(emb, expected, rtol=0, atol=0)
+
+
+def test_single_file_text_encoder_rejects_a_mismatched_file(tiny_qwen, tmp_path):
+    sd = safetensors.torch.load_file(str(tiny_qwen / 'model.safetensors'))
+    sd = {k: v for k, v in sd.items() if '.layers.3.' not in k}
+    single = tmp_path / 'partial.safetensors'
+    safetensors.torch.save_file(sd, str(single))
+    with pytest.raises(RuntimeError, match='were not found'):
+        iris.IrisTextEncoder.from_pretrained(str(single), torch.float32, HIDDEN_LAYERS, TEXT_LEN,
+                                             config_path=str(tiny_qwen))
+
+
+def test_bundled_text_encoder_config_is_qwen3_vl_4b():
+    """configs/qwen3_vl_4b_instruct is what a bare text encoder file is built from: the 4B
+    language tower Iris's checkpoint reads 12 layers of, and a tokenizer that splits the prompt
+    template the same way as the one the tiny test models use."""
+    import transformers
+    path = iris.DEFAULT_TEXT_ENCODER_CONFIG_PATH
+    config = transformers.AutoConfig.from_pretrained(path, local_files_only=True)
+    text = config.text_config
+    raw = inference_config({})
+    assert text.model_type == 'qwen3_vl_text'
+    assert text.hidden_size == raw.text_encoder.dim == raw.model.text_dim
+    assert text.num_hidden_layers >= max(raw.text_encoder.hidden_layers)
+    assert raw.text_encoder.pretrained == 'Qwen/Qwen3-VL-4B-Instruct'
+    tok = transformers.AutoTokenizer.from_pretrained(path, local_files_only=True)
+    small = transformers.AutoTokenizer.from_pretrained(str(ROOT / 'configs' / 'qwen3_06b'), local_files_only=True)
+    for text_in in (iris.PROMPT_PREFIX, iris.PROMPT_SUFFIX, 'a red bicycle, 2 cats'):
+        assert tok.encode(text_in, add_special_tokens=False) == small.encode(text_in, add_special_tokens=False)
+    with init_empty_weights_ctx():
+        model = transformers.AutoModel.from_config(text)
+    assert sum(p.numel() for p in model.parameters()) > 3e9
+
+
+def init_empty_weights_ctx():
+    from accelerate import init_empty_weights
+    return init_empty_weights()
+
+
 def test_cached_embeddings_are_trimmed_and_pad_back_exactly(ckpt, tiny_qwen):
     path, _ = ckpt
     pipe = make_pipeline(path, text_encoder_path=tiny_qwen, cache_text_embeddings=True)

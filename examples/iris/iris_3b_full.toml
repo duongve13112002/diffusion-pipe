@@ -22,6 +22,8 @@ dataloader_workers = 4
 [model]
 type = 'iris'
 transformer_path = 'speridlabs/iris-3b'
+# See iris_3b_lora.toml for the text_encoder_path / text_encoder_config_path options.
+#text_encoder_path = '/data/models/qwen3_vl_4b.safetensors'
 dtype = 'bfloat16'
 # Separate learning rates. 0 freezes the group.
 #text_adapter_lr = 1e-5   # y_embedder (layerwise text adapter) + y_pos_embedding

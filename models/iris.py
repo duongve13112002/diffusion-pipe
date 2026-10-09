@@ -96,6 +96,69 @@ def _resolve_file(path_or_repo, filename, required=True):
     raise FileNotFoundError(f'{path_or_repo} is neither a local path nor a Hugging Face repo id')
 
 
+# Config and tokenizer of Qwen/Qwen3-VL-4B-Instruct, shipped with the repo so a bare safetensors
+# file of the text encoder works with no extra downloads.
+DEFAULT_TEXT_ENCODER_CONFIG_PATH = os.path.join(
+    os.path.abspath(os.path.dirname(__file__)), '..', 'configs', 'qwen3_vl_4b_instruct')
+# Tried in order when mapping checkpoint keys onto the bare text model. A file exported from the
+# full VLM keeps the wrapper prefixes; one exported from the text tower alone has none.
+_TEXT_ENCODER_KEY_PREFIXES = ('model.language_model.', 'language_model.model.', 'language_model.', 'model.', '')
+
+
+def _load_qwen3_vl_text_from_single_file(path, config_path, dtype, attn_implementation):
+    """(tokenizer, Qwen3-VL text model) from one safetensors file plus a config directory.
+
+    Only the language tower is built: the vision tower and any of its weights in the file are
+    never touched, since Iris reads text hidden states only.
+    """
+    import transformers
+    if config_path is None:
+        config_path = DEFAULT_TEXT_ENCODER_CONFIG_PATH
+    config_path = str(config_path)
+    local = os.path.isdir(config_path)
+    if not local and not re.fullmatch(r'[\w.-]+/[\w.-]+', config_path):
+        raise FileNotFoundError(f'text_encoder_config_path {config_path} is neither a directory nor a Hugging Face repo id')
+    tokenizer = transformers.AutoTokenizer.from_pretrained(config_path, local_files_only=local)
+    config = transformers.AutoConfig.from_pretrained(config_path, local_files_only=local)
+    text_config = getattr(config, 'text_config', config)
+    if text_config.model_type != 'qwen3_vl_text':
+        raise ValueError(f'{config_path} describes a {text_config.model_type} model, not Qwen3-VL')
+    text_config._attn_implementation = attn_implementation
+    with init_empty_weights():
+        decoder = transformers.AutoModel.from_config(text_config, attn_implementation=attn_implementation)
+
+    # state_dict() holds the parameters and persistent buffers, which is what a checkpoint stores.
+    # Non-persistent buffers (rotary inv_freq) are not on the meta device under init_empty_weights
+    # and were already computed by __init__, so they are left alone.
+    expected = set(decoder.state_dict())
+    loaded = set()
+    lm_head = None
+    for key, tensor in iterate_safetensors(path):
+        if key.endswith('scale_weight') or key.endswith('scale_input') or key.endswith('weight_scale'):
+            raise ValueError(f'{path} is a scaled fp8 checkpoint, which is not supported. Use a bf16 or fp32 file.')
+        if key.endswith('lm_head.weight'):
+            lm_head = tensor
+            continue
+        for prefix in _TEXT_ENCODER_KEY_PREFIXES:
+            if key.startswith(prefix) and key[len(prefix):] in expected:
+                target = key[len(prefix):]
+                set_module_tensor_to_device(decoder, target, device='cpu', dtype=dtype, value=tensor)
+                loaded.add(target)
+                break
+    missing = expected - loaded
+    tied = getattr(config, 'tie_word_embeddings', False) or getattr(text_config, 'tie_word_embeddings', False)
+    if missing == {'embed_tokens.weight'} and lm_head is not None and tied:
+        # Tied-embedding exports sometimes store the shared matrix only under lm_head.
+        set_module_tensor_to_device(decoder, 'embed_tokens.weight', device='cpu', dtype=dtype, value=lm_head)
+        missing = set()
+    if missing:
+        raise RuntimeError(
+            f'{len(missing)} text encoder tensors were not found in {path}, for example '
+            f'{sorted(missing)[:5]}. Check that text_encoder_config_path matches the checkpoint, or '
+            'pass a Transformers model directory as text_encoder_path instead.')
+    return tokenizer, decoder
+
+
 def load_iris_config(transformer_path):
     """The Iris inference config (model, text_encoder, flow) that belongs to a checkpoint."""
     from omegaconf import OmegaConf
@@ -200,13 +263,21 @@ class IrisTextEncoder(nn.Module):
         self.decoder.eval()
 
     @classmethod
-    def from_pretrained(cls, path, dtype, hidden_layers, max_length, attn_implementation='sdpa'):
+    def from_pretrained(cls, path, dtype, hidden_layers, max_length, attn_implementation='sdpa', config_path=None):
+        """`path` is a Hugging Face repo id, a Transformers model directory, or a single
+        safetensors file. A single file takes its architecture and tokenizer from
+        `config_path`, by default the bundled configs/qwen3_vl_4b_instruct."""
         from transformers import AutoTokenizer, Qwen3VLForConditionalGeneration
-        tokenizer = AutoTokenizer.from_pretrained(path)
-        model = Qwen3VLForConditionalGeneration.from_pretrained(
-            path, dtype=dtype, attn_implementation=attn_implementation)
-        decoder = model.get_decoder()
-        del model
+        path = str(path)
+        if os.path.isfile(path):
+            tokenizer, decoder = _load_qwen3_vl_text_from_single_file(path, config_path, dtype, attn_implementation)
+        else:
+            local = os.path.isdir(path)
+            tokenizer = AutoTokenizer.from_pretrained(path, local_files_only=local)
+            model = Qwen3VLForConditionalGeneration.from_pretrained(
+                path, dtype=dtype, attn_implementation=attn_implementation, local_files_only=local)
+            decoder = model.get_decoder()
+            del model
         num_layers = decoder.config.num_hidden_layers
         if hidden_layers and (hidden_layers[0] < 1 or hidden_layers[-1] > num_layers):
             raise ValueError(f'hidden_layers must be 1-based indices in [1, {num_layers}], got {hidden_layers}')
@@ -366,6 +437,7 @@ class IrisPipeline(BasePipeline):
                 self.hidden_layers,
                 self.max_text_length,
                 attn_implementation=self.model_config.get('text_encoder_attn_implementation', te_cfg.attn_implementation),
+                config_path=self.model_config.get('text_encoder_config_path', None),
             )
         self.pixel_encoder = PixelCacheEncoder()
         self.transformer = None
