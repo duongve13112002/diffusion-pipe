@@ -273,6 +273,10 @@ class PixelCacheEncoder:
     def load_model_if_needed(self):
         pass
 
+    def to(self, *args, **kwargs):
+        # DatasetManager moves every other submodel to the CPU before running a text encoder.
+        return self
+
 
 def pixels_to_uint8(tensor):
     """[0, 1] float pixels as decoded by PreprocessMediaFile -> uint8. Exact for PIL-decoded
@@ -307,6 +311,9 @@ class IrisPipeline(BasePipeline):
         self.transformer_path = self.model_config.get('transformer_path', DEFAULT_REPO_ID)
         self.iris_config, self.iris_raw_config = load_iris_config(self.transformer_path)
         model_cfg = self.iris_config.model
+        # What save_model writes back: a training-time attention backend (fa3, say) must not
+        # end up in the exported config, where it would bind inference to that GPU.
+        self._checkpoint_attn_backend = model_cfg.attn_backend
         if attn_backend := self.model_config.get('attn_backend', None):
             model_cfg.attn_backend = attn_backend
         self.patch_size = model_cfg.patch_size
@@ -315,17 +322,24 @@ class IrisPipeline(BasePipeline):
         self.max_text_length = self.model_config.get('max_text_length', te_cfg.max_length)
         if self.max_text_length > model_cfg.text_len:
             raise ValueError(f'max_text_length={self.max_text_length} exceeds the model text_len={model_cfg.text_len}')
+        if self.max_text_length != te_cfg.max_length and is_main_process():
+            # The trunk's joint attention does not mask pad text positions, so the number of
+            # pads is part of what the model sees, not just a truncation limit.
+            print(f'WARNING: max_text_length={self.max_text_length} differs from the checkpoint '
+                  f'text_encoder.max_length={te_cfg.max_length}. Iris attends to pad text positions, '
+                  'so outputs change even for short captions; sample with the same length.')
         self.hidden_layers = tuple(te_cfg.hidden_layers)
         self.text_encoder_path = self.model_config.get('text_encoder_path', te_cfg.pretrained)
 
         if adapter_targets := self.model_config.get('adapter_target_modules', None):
             self.adapter_target_modules = list(adapter_targets)
 
-        self.timestep_sample_method = self.model_config.get('timestep_sample_method', 'logit_normal')
+        flow_cfg = self.iris_config.flow
+        self.timestep_sample_method = self.model_config.get('timestep_sample_method', flow_cfg.timestep_sampler)
         if self.timestep_sample_method not in ('logit_normal', 'uniform'):
             raise ValueError(f'timestep_sample_method must be logit_normal or uniform, got {self.timestep_sample_method!r}')
         self.shift = float(self.model_config.get('shift', self.iris_config.flow.shift))
-        self.shift_law = self.model_config.get('shift_law', 'none')
+        self.shift_law = self.model_config.get('shift_law', flow_cfg.shift_law)
         if self.shift_law not in ('none', 'sd3', 'flux'):
             raise ValueError(f'shift_law must be none, sd3 or flux, got {self.shift_law!r}')
         self.num_train_timesteps = self.iris_config.flow.num_train_timesteps
@@ -348,7 +362,7 @@ class IrisPipeline(BasePipeline):
         if self.model_config.get('load_text_encoder', True):
             self.text_encoder = IrisTextEncoder.from_pretrained(
                 self.text_encoder_path,
-                self.model_config['dtype'],
+                self._text_encoder_dtype(te_cfg),
                 self.hidden_layers,
                 self.max_text_length,
                 attn_implementation=self.model_config.get('text_encoder_attn_implementation', te_cfg.attn_implementation),
@@ -356,11 +370,18 @@ class IrisPipeline(BasePipeline):
         self.pixel_encoder = PixelCacheEncoder()
         self.transformer = None
 
+    def _text_encoder_dtype(self, te_cfg):
+        dtype = self.model_config.get('text_encoder_dtype', te_cfg.dtype)
+        if isinstance(dtype, str):
+            dtype = {'bfloat16': torch.bfloat16, 'float16': torch.float16, 'float32': torch.float32}[dtype]
+        return dtype
+
     # ---- identities ------------------------------------------------------------------------------
 
     def text_encoder_cache_key(self, i):
         return '|'.join(str(x) for x in (
-            self.text_encoder_path, self.hidden_layers, self.max_text_length, 'trimmed-v1'))
+            self.text_encoder_path, self.hidden_layers, self.max_text_length,
+            self._text_encoder_dtype(self.iris_config.text_encoder), 'trimmed-v1'))
 
     # ---- model loading ---------------------------------------------------------------------------
 
@@ -402,6 +423,16 @@ class IrisPipeline(BasePipeline):
     def load_diffusion_model(self):
         weights = _resolve_file(self.transformer_path, 'model.safetensors')
         transformer = self.build_transformer(iterate_safetensors(weights))
+        self.transformer = transformer
+        for adapter_path in self.model_config.get('merge_adapters', []):
+            # diffusion-pipe save directories (adapter_config.json + adapter_model.safetensors);
+            # a path to the .safetensors inside one is accepted too.
+            adapter_path = Path(adapter_path)
+            if adapter_path.is_file():
+                adapter_path = adapter_path.parent
+            if is_main_process():
+                print(f'Merging adapter {adapter_path}')
+            self.load_and_fuse_adapter(str(adapter_path))
         self._finish_transformer(transformer)
 
     def _finish_transformer(self, transformer):
@@ -507,6 +538,11 @@ class IrisPipeline(BasePipeline):
         safetensors.torch.save_file(state_dict, save_dir / 'model.safetensors', metadata={'format': 'pt'})
         config = OmegaConf.to_container(OmegaConf.structured(self.iris_config))
         config = {k: config[k] for k in INFERENCE_SECTIONS}
+        config['model']['attn_backend'] = self._checkpoint_attn_backend
+        # Settings a sampler reads that training may have overridden.
+        config['flow']['shift'] = self.shift
+        config['flow']['shift_law'] = self.shift_law
+        config['text_encoder']['max_length'] = self.max_text_length
         OmegaConf.save(OmegaConf.create(config), str(save_dir / 'config.yaml'))
         if repa:
             safetensors.torch.save_file(repa, save_dir / 'repa_projector.safetensors', metadata={'format': 'pt'})
@@ -589,7 +625,11 @@ class IrisPipeline(BasePipeline):
             text = self.text_encoder.tokenize(inputs['caption'])
 
         if mask is not None:
-            mask = mask.unsqueeze(1)  # (bs, 1, h, w): masks are already at pixel resolution
+            mask = mask.unsqueeze(1)  # (bs, 1, h, w)
+            if mask.shape[-2:] != (h, w):
+                # A mask batch fill synthesised from the size bucket, before the pixels were
+                # rounded to the patch size. Real masks are already at pixel resolution.
+                mask = F.interpolate(mask.float(), size=(h, w), mode='nearest-exact')
 
         idx = self._sample_timestep_idx(bs, timestep_quantile)
         schedule = self._schedule(self._shift_for(h, w))
@@ -599,7 +639,9 @@ class IrisPipeline(BasePipeline):
 
         features = (x_t, t_model, *text)
         if self.repa is not None:
-            features += (x0,)
+            # uint8, so it is not part of the pipeline's gradient exchange (only the teacher,
+            # under no_grad, ever reads it).
+            features += (pixels if pixels.dtype == torch.uint8 else pixels_to_uint8(pixels),)
         return features, (target, mask)
 
     # ---- pipeline --------------------------------------------------------------------------------
@@ -617,7 +659,7 @@ class IrisPipeline(BasePipeline):
             else:
                 layers.append(TransformerLayer(transformer, block, i - num_double, self.offloader_single))
             if self.repa is not None and i + 1 == self.repa_layer:
-                layers.append(RepaLayer(self.repa, self.patch_size, self))
+                layers.append(RepaLayer(self.repa, self))
         if transformer.pixel_blocks is not None:
             layers.append(PixelEmbedLayer(transformer))
             for block in transformer.pixel_blocks:
@@ -695,12 +737,19 @@ class IrisPipeline(BasePipeline):
         single_blocks = blocks[num_double:]
         # A dual-stream block holds twice the parameters of a single-stream one, so a third of
         # the request goes to the dual half, and the swapper only ever exchanges blocks of the
-        # same class.
-        double_to_swap = min(blocks_to_swap // 3, max(len(double_blocks) - 2, 0))
+        # same class. A trunk with only one kind of block takes the whole request there.
+        max_double = max(len(double_blocks) - 2, 0)
+        max_single = max(len(single_blocks) - 2, 0)
+        if not single_blocks:
+            double_to_swap = blocks_to_swap
+        elif not double_blocks:
+            double_to_swap = 0
+        else:
+            double_to_swap = min(blocks_to_swap // 3, max_double)
         single_to_swap = blocks_to_swap - double_to_swap
-        assert single_to_swap <= len(single_blocks) - 2, (
-            f'Cannot swap {blocks_to_swap} blocks: at most {max(len(double_blocks) - 2, 0)} dual-stream and '
-            f'{len(single_blocks) - 2} single-stream blocks can be swapped.')
+        assert double_to_swap <= max_double and single_to_swap <= max_single, (
+            f'Cannot swap {blocks_to_swap} blocks: at most {max_double} dual-stream and '
+            f'{max_single} single-stream blocks can be swapped.')
         self.offloader_double = ModelOffloader(
             'MMDiTBlock', list(double_blocks), len(double_blocks), double_to_swap, True,
             torch.device('cuda'), self.config['reentrant_activation_checkpointing'])
@@ -775,7 +824,8 @@ class IrisPipeline(BasePipeline):
                 text = (y_batch, torch.cat([self.unconds[1], y_mask]))
             inputs = (x, t_model, *text)
             if self.repa is not None:
-                inputs += (x,)  # placeholder for the clean image; RepaLayer ignores it in eval
+                # Placeholder for the clean image; RepaLayer ignores it under no_grad.
+                inputs += (torch.zeros((x.shape[0], 1, 1, 1), dtype=torch.uint8, device=x.device),)
             out = self.pipeline_model(inputs)
             if isinstance(out, (tuple, list)):
                 out = out[0]
@@ -787,6 +837,31 @@ class IrisPipeline(BasePipeline):
         x = solver.sample(z, y, uncond, steps=steps, order=sample_cfg.order, shift=self._shift_for(h, w))
         img = (x.clamp(-1, 1) + 1) / 2
         return img.permute(0, 2, 3, 1)
+
+
+def _tie(out, *unused):
+    """`out` with a zero-weight dependency on tensors this layer does not otherwise consume.
+
+    Under pipeline parallelism every floating tensor a stage receives is given requires_grad,
+    and DeepSpeed asserts each one gets a gradient to send back. A tensor that was only
+    carried along (or whose last consumer was the previous layer) would trip that assert at a
+    stage boundary placed right before this layer. The zero term gives it a zero gradient and
+    changes nothing else.
+    """
+    for t in unused:
+        if torch.is_floating_point(t) and t.requires_grad:
+            out = out + t.reshape(-1)[:1].sum().to(out.dtype) * 0
+    return out
+
+
+def _grid_marker(height, width, patch_size, device):
+    """The patch grid, carried as the shape of a tiny uint8 tensor.
+
+    Layers after InitialLayer only need the image size, never the noisy image itself (except
+    the pixel head, which receives it separately). A shape survives a pipeline stage boundary
+    without a host sync, and a non-floating tensor is not part of the gradient exchange.
+    """
+    return torch.zeros((height // patch_size, width // patch_size), dtype=torch.uint8, device=device)
 
 
 class TextEncoderLayer(nn.Module):
@@ -816,10 +891,22 @@ class TextEncoderLayer(nn.Module):
                 te.to(x.device)
             with torch.no_grad():
                 y, y_mask = te(text_a, text_b)
-        return make_contiguous(x, t, y, y_mask, *extra)
+        outputs = make_contiguous(x, t, y, y_mask, *extra)
+        # Marked here, in the one layer that is never checkpointed, so InitialLayer's inputs
+        # already require grad when a checkpoint wrapper looks at them. Reentrant checkpointing
+        # decides from its inputs alone whether the wrapped layer's parameters get gradients.
+        for tensor in outputs:
+            if torch.is_floating_point(tensor) and not tensor.requires_grad:
+                tensor.requires_grad_(True)
+        return outputs
 
 
 class InitialLayer(nn.Module):
+    """Patch/time/text embedding and the shared modulation cores.
+
+    Output: (s, y, packed, t_emb, grid, [x if the model has a pixel head], *extra).
+    """
+
     def __init__(self, model, dtype):
         super().__init__()
         self.s_embedder = model.s_embedder
@@ -835,6 +922,9 @@ class InitialLayer(nn.Module):
 
     @torch.autocast('cuda', dtype=AUTOCAST_DTYPE)
     def forward(self, inputs):
+        # TextEncoderLayer already marked the floating inputs as requiring grad. Nothing here
+        # changes an input's metadata: non-reentrant checkpointing recomputes this layer and
+        # rejects a recomputation that sees different tensors than the first pass did.
         x, t, y, y_mask, *extra = inputs
         cfg = self.model[0].cfg
         p = cfg.patch_size
@@ -853,11 +943,9 @@ class InitialLayer(nn.Module):
         if self.y_pos_embedding is not None:
             y = y + self.y_pos_embedding[:, :y.shape[1]].to(y.dtype)
         packed = torch.cat([cond] + [core(cond) for core in self.modulation_cores.values()], dim=-1)
-        outputs = make_contiguous(s, y, packed, t_emb, x, *extra)
-        for tensor in outputs:
-            if torch.is_floating_point(tensor):
-                tensor.requires_grad_(True)
-        return outputs
+        grid = _grid_marker(x.shape[-2], x.shape[-1], p, x.device)
+        pixel_input = (x,) if self.model[0].pixel_blocks is not None else ()
+        return make_contiguous(s, y, packed, t_emb, grid, *pixel_input, *extra)
 
 
 class TransformerLayer(nn.Module):
@@ -870,42 +958,43 @@ class TransformerLayer(nn.Module):
 
     @torch.autocast('cuda', dtype=AUTOCAST_DTYPE)
     def forward(self, inputs):
-        s, y, packed, t_emb, x, *extra = inputs
+        s, y, packed, t_emb, grid, *rest = inputs
         model = self.model[0]
-        p = model.cfg.patch_size
-        grid = (x.shape[-2] // p, x.shape[-1] // p)
-        rope_img = model._fetch_rope_img(grid, s.device)
+        rope_img = model._fetch_rope_img(tuple(grid.shape), s.device)
         rope_txt = model._fetch_rope_txt(y.shape[1], s.device)
         self.offloader.wait_for_block(self.block_idx)
         s, y = self.block(s, y, packed, rope_img, rope_txt)
         self.offloader.submit_move_blocks_forward(self.block_idx)
-        return make_contiguous(s, y, packed, t_emb, x, *extra)
+        return make_contiguous(s, y, packed, t_emb, grid, *rest)
 
 
 class RepaLayer(nn.Module):
     """Representation alignment of the patch tokens after block `repa_layer` (Iris stage 1).
 
-    Consumes the clean image that prepare_inputs appended to the tuple and replaces it with this
+    Consumes the clean image (uint8, appended by prepare_inputs) and replaces it with this
     batch's REPA loss, which rides the remaining layers to the loss function. Skipped in eval and
     under no_grad (sampling), so eval losses stay the plain flow loss.
     """
 
-    def __init__(self, repa, patch_size, pipeline):
+    def __init__(self, repa, pipeline):
         super().__init__()
         self.repa = repa
-        self.patch_size = patch_size
         self.pipeline = [pipeline]
 
     @torch.autocast('cuda', dtype=AUTOCAST_DTYPE)
     def forward(self, inputs):
-        s, y, packed, t_emb, x, x0 = inputs
+        *head, clean = inputs
+        s = head[0]
+        grid = head[4]
         if self.training and torch.is_grad_enabled():
-            grid = (x.shape[-2] // self.patch_size, x.shape[-1] // self.patch_size)
-            loss = self.repa(x0, s, grid).float().reshape(1)
+            x0 = clean.float() / 127.5 - 1.0
+            # Iris runs the teacher and projector outside autocast (TrainModel.forward).
+            with torch.autocast('cuda', enabled=False):
+                loss = self.repa(x0, s, tuple(grid.shape)).float().reshape(1)
             self.pipeline[0]._last_repa_loss = loss.detach()
         else:
             loss = torch.zeros(1, device=s.device, dtype=torch.float32)
-        return make_contiguous(s, y, packed, t_emb, x, loss)
+        return make_contiguous(*head, loss)
 
 
 class PixelEmbedLayer(nn.Module):
@@ -916,11 +1005,11 @@ class PixelEmbedLayer(nn.Module):
 
     @torch.autocast('cuda', dtype=AUTOCAST_DTYPE)
     def forward(self, inputs):
-        s, y, packed, t_emb, x, *extra = inputs
+        s, y, packed, t_emb, grid, x, *extra = inputs
         s = F.silu(t_emb + s)  # timestep re-fused into every patch token
         s_cond = s.reshape(-1, s.shape[-1])
-        pixels = self.pixel_embedder(x)
-        return make_contiguous(pixels, s_cond, x, *extra)
+        pixels = _tie(self.pixel_embedder(x), y, packed)
+        return make_contiguous(pixels, s_cond, grid, *extra)
 
 
 class PiTLayer(nn.Module):
@@ -931,13 +1020,12 @@ class PiTLayer(nn.Module):
 
     @torch.autocast('cuda', dtype=AUTOCAST_DTYPE)
     def forward(self, inputs):
-        pixels, s_cond, x, *extra = inputs
+        pixels, s_cond, grid, *extra = inputs
         model = self.model[0]
-        p = model.cfg.patch_size
-        grid = (x.shape[-2] // p, x.shape[-1] // p)
-        rope_pix = model._fetch_rope_pix(grid, x.device)
-        pixels = self.block(pixels, s_cond, rope_pix, grid)
-        return make_contiguous(pixels, s_cond, x, *extra)
+        grid_hw = tuple(grid.shape)
+        rope_pix = model._fetch_rope_pix(grid_hw, pixels.device)
+        pixels = self.block(pixels, s_cond, rope_pix, grid_hw)
+        return make_contiguous(pixels, s_cond, grid, *extra)
 
 
 class FinalLayer(nn.Module):
@@ -952,17 +1040,19 @@ class FinalLayer(nn.Module):
         model = self.model[0]
         p = model.cfg.patch_size
         if model.pixel_blocks is None:
-            s, y, packed, t_emb, x, *extra = inputs
+            s, y, packed, t_emb, grid, *extra = inputs
             s = F.silu(t_emb + s)
-            folded = self.final_layer(s).transpose(1, 2)
+            folded = _tie(self.final_layer(s), y, packed).transpose(1, 2)
+            batch = s.shape[0]
         else:
-            pixels, s_cond, x, *extra = inputs
-            batch, _, height, width = x.shape
-            n_patches = (height // p) * (width // p)
-            out = self.final_layer(pixels)  # [B*L, p*p, C]
+            pixels, s_cond, grid, *extra = inputs
+            gh, gw = grid.shape
+            n_patches = gh * gw
+            batch = pixels.shape[0] // n_patches
+            out = _tie(self.final_layer(pixels), s_cond)  # [B*L, p*p, C]
             folded = out.reshape(batch, n_patches, p * p, -1).permute(0, 3, 2, 1)
             folded = folded.reshape(batch, -1, n_patches)
-        height, width = x.shape[-2:]
+        height, width = grid.shape[0] * p, grid.shape[1] * p
         out = F.fold(folded, output_size=(height, width), kernel_size=p, stride=p)
         if self.returns_repa_loss:
             return out, extra[-1]

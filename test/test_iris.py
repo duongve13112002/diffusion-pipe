@@ -458,6 +458,14 @@ def test_on_the_fly_text_encoding_matches_cached_through_the_layers(ckpt, tiny_q
     torch.testing.assert_close(outputs[0], outputs[1], rtol=1e-5, atol=1e-5)
 
 
+def test_text_encoder_loads_in_checkpoint_dtype(ckpt, tiny_qwen):
+    path, _ = ckpt
+    pipe = make_pipeline(path, text_encoder_path=tiny_qwen)
+    assert next(pipe.text_encoder.parameters()).dtype == torch.bfloat16  # text_encoder.dtype default
+    pipe = make_pipeline(path, text_encoder_path=tiny_qwen, text_encoder_dtype='float32')
+    assert next(pipe.text_encoder.parameters()).dtype == torch.float32
+
+
 def test_default_is_on_the_fly_text_and_pixels(ckpt):
     path, _ = ckpt
     pipe = make_pipeline(path)
@@ -590,7 +598,8 @@ def test_repa_trains_projector_and_matches_iris_loss(ckpt, fake_hub, tmp_path):
     ref = IrisDiT(pipe.iris_config.model)
     ref.load_state_dict({k: v.detach() for k, v in pipe.transformer.state_dict().items()})
     ref_out = ref(features[0], features[1], features[2], capture=(2,), y_mask=features[3])
-    expected_repa = pipe.repa(features[4], ref_out.features[2], (8, 12))
+    assert features[4].dtype == torch.uint8  # the clean image stays out of the gradient exchange
+    expected_repa = pipe.repa(features[4].float() / 127.5 - 1, ref_out.features[2], (8, 12))
     torch.testing.assert_close(out[1][0], expected_repa.float())
     torch.testing.assert_close(out[0], ref_out.x)
     assert pipe.get_extra_log_scalars()['train/repa_loss'] == pytest.approx(float(expected_repa))
@@ -700,8 +709,11 @@ def run_caching(model, ds, dataset_config):
     its tasks with DatasetManager._handle_task."""
     worker_ds = dataset_util.Dataset(dataset_config, model)
     manager = dataset_util.DatasetManager(model)
-    # Nothing to move between devices on CPU; _handle_task treats non-modules as lazy loaders.
-    manager.submodels = [types.SimpleNamespace(load_model_if_needed=lambda: None) for _ in manager.submodels]
+    # The real submodels, PixelCacheEncoder included (_handle_task calls .to('cpu') on it before
+    # running a text encoder). Only the torch modules' device moves are disabled: no CUDA here.
+    for submodel in manager.submodels:
+        if isinstance(submodel, torch.nn.Module):
+            submodel.to = types.MethodType(lambda self, *a, **k: self, submodel)
     q = queue.Queue()
     errors = []
 
@@ -713,7 +725,9 @@ def run_caching(model, ds, dataset_config):
             errors.append(e)
             q.put(None)
 
-    thread = threading.Thread(target=worker)
+    # Daemon: if _handle_task raises, the worker is left blocked on its pipe and must not keep
+    # the test process alive.
+    thread = threading.Thread(target=worker, daemon=True)
     thread.start()
     while (task := q.get()) is not None:
         manager._handle_task(task)
@@ -815,7 +829,7 @@ def test_sample_matches_iris_generate(ckpt, tiny_qwen, cfg_scale):
     from iris3b.sampling import generate
     from iris3b.text.qwen3_vl import Qwen3VLTextEncoder
     path, ref = ckpt
-    pipe = make_pipeline(path, text_encoder_path=tiny_qwen)
+    pipe = make_pipeline(path, text_encoder_path=tiny_qwen, text_encoder_dtype='float32')
     pipe.load_diffusion_model()
     layers = pipe.to_layers()
     pipe.pipeline_model = lambda inputs: run_layers(layers, inputs)
@@ -852,3 +866,172 @@ def test_repa_projector_loads_from_iris_checkpoint(tmp_path, fake_hub):
                          repa_projector_path=str(tmp_path / 'proj.safetensors'))
     pipe.load_diffusion_model()
     assert all(float(v.abs().sum()) == 0 for v in pipe.repa.projector.state_dict().values())
+
+
+# ---- pipeline parallelism / activation checkpointing ---------------------------------------------
+
+def _stage_split_inputs(pipe, seed=0):
+    pixels = (torch.rand(2, 3, 32, 48, generator=torch.Generator().manual_seed(seed)) * 255).round().to(torch.uint8)
+    y, y_mask = random_text(2, [3, 7])
+    torch.manual_seed(seed)
+    return pipe.prepare_inputs({'latents': pixels, 'mask': None, 'prompt_embeds': [y[0, :3], y[1, :7]]},
+                               timestep_quantile=0.4)
+
+
+PIPELINE_VARIANTS = {
+    'default': ({}, {}),
+    'no_pixel_head': ({'pixel': {'enabled': False}}, {}),
+    'repa': ({}, {'repa_weight': 0.5, 'repa_teacher_dim': 24}),
+    'repa_no_pixel_head': ({'pixel': {'enabled': False}}, {'repa_weight': 0.5, 'repa_teacher_dim': 24}),
+}
+
+
+@pytest.mark.parametrize('variant', list(PIPELINE_VARIANTS))
+def test_every_pipeline_stage_boundary_gets_gradients(tmp_path, fake_hub, variant):
+    """Emulate a DeepSpeed stage boundary after every layer: received floating tensors are
+    leaves with requires_grad, and each must end up with a gradient (engine asserts it)."""
+    model_overrides, pipe_options = PIPELINE_VARIANTS[variant]
+    write_checkpoint(tmp_path / 'ckpt', tiny_raw_config(**model_overrides))
+    pipe = make_pipeline(tmp_path / 'ckpt', cache_text_embeddings=True, **pipe_options)
+    pipe.load_diffusion_model()
+    layers = pipe.to_layers()
+    features, (target, _) = _stage_split_inputs(pipe)
+    loss_fn = pipe.get_loss_fn()
+    reference = None
+    for k in range(1, len(layers)):
+        for p in pipe.transformer.parameters():
+            p.grad = None
+        sent = run_layers(layers[:k], features)
+        received = tuple(t.detach().requires_grad_(torch.is_floating_point(t)) for t in sent)
+        loss = loss_fn(run_layers(layers[k:], received), (target, torch.tensor([])))
+        loss.backward()
+        missing = [i for i, t in enumerate(received) if torch.is_floating_point(t) and t.grad is None]
+        assert not missing, f'boundary after {type(layers[k - 1]).__name__} (#{k}): inputs {missing} got no grad'
+        if reference is None:
+            reference = loss.detach()
+        torch.testing.assert_close(loss.detach(), reference)
+
+
+@pytest.mark.parametrize('use_reentrant', [False, True])
+def test_activation_checkpointing_full_fine_tune(ckpt, use_reentrant):
+    """PipelineModule calls checkpoint(exec_func, *inputs) on each checkpointable layer."""
+    from torch.utils.checkpoint import checkpoint
+    path, _ = ckpt
+    pipe = make_pipeline(path, cache_text_embeddings=True)
+    pipe.load_diffusion_model()
+    layers = pipe.to_layers()
+    names = {type(layer).__name__ for layer in layers}
+    assert set(pipe.checkpointable_layers) <= names
+    loss_fn = pipe.get_loss_fn()
+
+    def run(checkpointed):
+        for p in pipe.transformer.parameters():
+            p.grad = None
+        features, (target, _) = _stage_split_inputs(pipe)
+        out = features
+        for layer in layers:
+            if checkpointed and type(layer).__name__ in pipe.checkpointable_layers:
+                out = checkpoint(lambda *xs, layer=layer: layer(xs), *out, use_reentrant=use_reentrant)
+            else:
+                out = layer(out)
+        loss_fn(out, (target, torch.tensor([]))).backward()
+        return {n: p.grad for n, p in pipe.transformer.named_parameters()}
+
+    plain = run(False)
+    checkpointed = run(True)
+    for name, grad in plain.items():
+        assert checkpointed[name] is not None, f'{name} got no gradient under checkpointing'
+        torch.testing.assert_close(checkpointed[name], grad, msg=lambda m: f'{name}: {m}')
+
+
+# ---- review regressions ---------------------------------------------------------------------------
+
+def test_pixel_cache_encoder_survives_text_encoder_caching_moves():
+    encoder = iris.PixelCacheEncoder()
+    assert encoder.to('cpu') is encoder
+
+
+def test_batch_fill_mask_is_resized_to_rounded_pixels(ckpt):
+    path, _ = ckpt
+    pipe = make_pipeline(path, cache_text_embeddings=True)
+    pixels = (torch.rand(2, 3, 32, 48) * 255).to(torch.uint8)
+    y, _ = random_text(2, [3, 7])
+    # Synthesised from a [50, 30, 1] size bucket; the images were rounded to 48x32.
+    mask = torch.ones(2, 30, 50, dtype=torch.float16)
+    mask[1] = 0
+    features, (target, label_mask) = pipe.prepare_inputs(
+        {'latents': pixels, 'mask': mask, 'prompt_embeds': [y[0, :3], y[1, :7]]})
+    assert label_mask.shape == (2, 1, 32, 48)
+    loss = pipe.get_loss_fn()(torch.zeros_like(target), (target, label_mask))
+    torch.testing.assert_close(loss, (target[0] ** 2).sum() / target.numel())
+
+
+def test_merge_adapters_option_fuses_before_training(ckpt, tmp_path):
+    path, ref = ckpt
+    pipe = make_pipeline(path, cache_text_embeddings=True)
+    pipe.load_diffusion_model()
+    pipe.configure_adapter(dict(ADAPTERS['lokr']))
+    with torch.no_grad():
+        for p in pipe.transformer.parameters():
+            if p.requires_grad:
+                p.add_(torch.randn_like(p) * 0.05)
+    x, t, y, y_mask = random_inputs()
+    with torch.no_grad():
+        expected = run_layers(pipe.to_layers(), (x, t, y, y_mask))
+    save_dir = tmp_path / 'adapter'
+    save_dir.mkdir()
+    pipe.save_adapter(save_dir, saved_adapter_state(pipe))
+
+    merged = make_pipeline(path, cache_text_embeddings=True,
+                           merge_adapters=[str(save_dir / 'adapter_model.safetensors')])
+    merged.load_diffusion_model()
+    assert not any('lokr' in n for n, _ in merged.transformer.named_parameters())
+    assert all(p.original_name == n for n, p in merged.transformer.named_parameters())
+    with torch.no_grad():
+        torch.testing.assert_close(run_layers(merged.to_layers(), (x, t, y, y_mask)), expected, rtol=1e-5, atol=1e-5)
+
+
+def test_exported_config_keeps_inference_settings(ckpt, tmp_path):
+    path, _ = ckpt
+    pipe = make_pipeline(path, cache_text_embeddings=True, attn_backend='fa3', shift=2.5, max_text_length=12)
+    assert pipe.iris_config.model.attn_backend == 'fa3'
+    pipe.load_diffusion_model()
+    out = tmp_path / 'saved'
+    out.mkdir()
+    pipe.save_model(out, {k: v.detach() for k, v in pipe.transformer.state_dict().items()})
+    raw = OmegaConf.to_container(OmegaConf.load(str(out / 'config.yaml')))
+    assert raw['model']['attn_backend'] == 'sdpa'
+    assert raw['flow']['shift'] == 2.5
+    assert raw['text_encoder']['max_length'] == 12
+
+
+def test_flow_defaults_follow_the_checkpoint(tmp_path):
+    raw = tiny_raw_config()
+    raw['flow'].update(timestep_sampler='uniform', shift_law='sd3')
+    write_checkpoint(tmp_path / 'ckpt', raw)
+    pipe = make_pipeline(tmp_path / 'ckpt', cache_text_embeddings=True)
+    assert pipe.timestep_sample_method == 'uniform'
+    assert pipe.shift_law == 'sd3'
+
+
+@pytest.mark.parametrize('dual_depth,expected', [(4, [('MMDiTBlock', 4, 2), ('SingleStreamBlock', 0, 0)]),
+                                                 (0, [('MMDiTBlock', 0, 0), ('SingleStreamBlock', 4, 2)])])
+def test_block_swap_single_kind_trunk(tmp_path, monkeypatch, dual_depth, expected):
+    write_checkpoint(tmp_path / 'ckpt', tiny_raw_config(dual_depth=dual_depth))
+    pipe = make_pipeline(tmp_path / 'ckpt', cache_text_embeddings=True)
+    pipe.load_diffusion_model()
+    created = []
+
+    class FakeOffloader:
+        def __init__(self, name, blocks, num_blocks, to_swap, *args, **kwargs):
+            created.append((name, num_blocks, to_swap))
+
+        def __getattr__(self, name):
+            return lambda *a, **k: None
+
+    monkeypatch.setattr(iris, 'ModelOffloader', FakeOffloader)
+    monkeypatch.setattr(pipe.transformer, 'to', lambda *a, **k: pipe.transformer)
+    pipe.enable_block_swap(2)
+    assert created == expected
+    with pytest.raises(AssertionError):
+        pipe.enable_block_swap(3)

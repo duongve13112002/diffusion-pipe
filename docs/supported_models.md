@@ -769,8 +769,10 @@ Example configs: [LoRA](../examples/iris/iris_3b_lora.toml),
 [full fine-tune](../examples/iris/iris_3b_full.toml), [dataset](../examples/iris/iris_3b_dataset.toml).
 
 LoRA, LoKr, OPLoRA and full fine-tuning are supported, as are block swap (adapters only, also
-with on-the-fly text encoding), pipeline parallelism, activation checkpointing, eval,
-`merge_adapters` and `--test_sample`. Edit/control datasets are not (Iris is text-to-image).
+with on-the-fly text encoding), pipeline parallelism (any stage split), activation checkpointing
+(reentrant or not), eval, batch fill, `merge_adapters` and `--test_sample`. Edit/control datasets
+are not (Iris is text-to-image). `merge_adapters` takes diffusion-pipe Iris adapter save
+directories (or the `adapter_model.safetensors` inside one), LoRA or LoKr.
 
 All `[model]` options:
 
@@ -782,14 +784,15 @@ All `[model]` options:
 | `transformer_dtype` | `dtype` | Dtype of the 2-D trunk weights. Embedders, text adapter, modulation cores, pixel head and 1-D tensors stay in `dtype`. |
 | `cache_pixels` | `false` | `false`: images are decoded and resized in the DataLoader workers each step, nothing is cached. `true`: resized pixels are cached as uint8 like any other model's latents. |
 | `cache_text_embeddings` | `false` | `false`: captions are tokenized per step and encoded on the GPU inside the pipeline (caption augmentation stays per-step). `true`: embeddings are cached once, trimmed to real tokens (still ~60 KB per token). |
-| `max_text_length` | checkpoint `text_encoder.max_length` (300) | Token budget of the caption including the chat-template suffix. Must be ≤ `model.text_len`. |
+| `max_text_length` | checkpoint `text_encoder.max_length` (300) | Token budget of the caption including the chat-template suffix. Must be ≤ `model.text_len`. Iris attends to pad text positions, so a different value changes outputs even for short captions (a warning is printed); it is written to the exported `config.yaml`. |
+| `text_encoder_dtype` | checkpoint `text_encoder.dtype` (`bfloat16`) | Dtype the Qwen3-VL decoder is loaded in. |
 | `text_encoder_attn_implementation` | checkpoint config | `attn_implementation` for the Qwen3-VL decoder. |
-| `attn_backend` | checkpoint config (`sdpa`) | Iris attention backend: `sdpa`, `torch_flash`, `torch_cudnn`, `fa3`, `fa4`. |
-| `timestep_sample_method` | `logit_normal` | `logit_normal` (Iris training) or `uniform`. |
+| `attn_backend` | checkpoint config (`sdpa`) | Iris attention backend for training: `sdpa`, `torch_flash`, `torch_cudnn`, `fa3`, `fa4`. Not written to the exported `config.yaml`. |
+| `timestep_sample_method` | checkpoint `flow.timestep_sampler` (`logit_normal`) | `logit_normal` or `uniform`. |
 | `logit_mean`, `logit_std` | checkpoint `flow` config | Logit-normal parameters. |
 | `min_t`, `max_t` | `0`, `1` | Restrict the sampled noise levels. |
-| `shift` | checkpoint `flow.shift` | Flow shift for training and sampling. |
-| `shift_law` | `none` | `none`, `sd3` or `flux`: scale the shift with the image token count (base `flow.shift_base_tokens`). |
+| `shift` | checkpoint `flow.shift` | Flow shift for training and sampling; written to the exported `config.yaml`. |
+| `shift_law` | checkpoint `flow.shift_law` (`none`) | `none`, `sd3` or `flux`: scale the shift with each batch's image token count (base `flow.shift_base_tokens`). |
 | `text_adapter_lr` | optimizer `lr` | LR of `y_embedder` + `y_pos_embedding` (full fine-tune). `0` freezes them. |
 | `pixel_head_lr` | optimizer `lr` | LR of `pixel_embedder`, `pixel_blocks`, `final_layer` (full fine-tune). `0` freezes them. |
 | `adapter_target_modules` | `['MMDiTBlock', 'SingleStreamBlock']` | Block classes whose Linear layers get the adapter. |

@@ -30,7 +30,6 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'
 
 import peft
 import safetensors.torch
-import torch
 
 PREFIX_RE = re.compile(r'^(model\.diffusion_model|diffusion_model|transformer|net)\.')
 
