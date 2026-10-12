@@ -74,13 +74,95 @@ def test_update_every_compounds_the_decay():
 
 def test_start_step_follows_the_weights():
     layer = nn.Linear(2, 2)
-    ema = ParameterEMA(named(layer), decay=0.99, start_step=3)
+    ema = ParameterEMA(named(layer), decay=0.5, start_step=3)
     for step in (1, 2, 3):
         with torch.no_grad():
             layer.weight.add_(1.0)
         ema.update(step)
-        torch.testing.assert_close(ema.shadow['weight'], layer.weight.detach())
-    assert ema.num_updates == 0
+        torch.testing.assert_close(ema.averaged('weight', layer.weight), layer.weight.detach())
+    # Set from the weights once, at start_step, then averaged from there.
+    torch.testing.assert_close(ema.shadow['weight'], layer.weight.detach())
+    assert ema.num_updates == 0 and not ema.following
+    start = layer.weight.detach().clone()
+    with torch.no_grad():
+        layer.weight.add_(2.0)
+    ema.update(4)
+    torch.testing.assert_close(ema.averaged('weight', layer.weight), start + 1.0)
+
+
+def test_resume_from_a_checkpoint_saved_before_start_step(tmp_path):
+    """The shadow saved during warmup is stale; the resumed run sets it from the weights."""
+    layer = nn.Linear(2, 2)
+    ema = ParameterEMA(named(layer), decay=0.5, start_step=10)
+    ema.update(4)
+    (tmp_path / 'global_step4').mkdir()
+    save_ema_checkpoint(ema, tmp_path, 'global_step4', 0)
+    with torch.no_grad():
+        layer.weight.add_(5.0)
+    # Resumed with a lower start_step: past it already, so the first update starts the average.
+    resumed = ParameterEMA(named(layer), decay=0.5, start_step=2)
+    resumed.shadow['weight'].zero_()
+    assert load_ema_checkpoint(resumed, tmp_path, 'global_step4') == (1, [])
+    assert resumed.following
+    resumed.update(5)
+    assert not resumed.following
+    torch.testing.assert_close(resumed.shadow['weight'], layer.weight.detach())
+
+
+def _offloaded(ema):
+    """Exercise the GPU-weights paths on the CPU: the code is the same, minus CUDA events."""
+    ema._offloaded = lambda: True
+    return ema
+
+
+@pytest.mark.parametrize('dtype', ['float32', 'bfloat16'])
+def test_offloaded_update_matches_the_plain_one(dtype):
+    torch.manual_seed(0)
+    a = nn.Linear(64, 64).to(torch.bfloat16)
+    b = nn.Linear(64, 64).to(torch.bfloat16)
+    b.load_state_dict(a.state_dict())
+    plain = ParameterEMA(named(a), decay=0.9, dtype=dtype)
+    offloaded = _offloaded(ParameterEMA(named(b), decay=0.9, dtype=dtype))
+    for step in range(1, 6):
+        delta = [torch.randn_like(p) for p in a.parameters()]
+        with torch.no_grad():
+            for pa, pb, d in zip(a.parameters(), b.parameters(), delta):
+                pa.add_(d)
+                pb.add_(d)
+        plain.update(step)
+        offloaded.update(step)
+    if dtype == 'float32':
+        assert offloaded._worker is not None          # still averaging in the background
+    for key in plain.shadow:
+        expected = plain.averaged(key, plain.params[key]).float()
+        actual = offloaded.averaged(key, offloaded.params[key]).float()   # waits for it
+        torch.testing.assert_close(actual, expected, atol=0.05 if dtype == 'bfloat16' else 0, rtol=0)
+    assert offloaded._worker is None and offloaded.num_updates == 5
+
+
+def test_background_update_reads_the_weights_of_its_own_step():
+    """The weights are copied before update() returns: changing them afterwards (the next
+    optimizer step) does not leak into that update."""
+    layer = nn.Linear(4, 4)
+    with torch.no_grad():
+        layer.weight.fill_(1.0)
+    ema = _offloaded(ParameterEMA(named(layer), decay=0.5))
+    with torch.no_grad():
+        layer.weight.fill_(3.0)
+    ema.update(1)
+    with torch.no_grad():
+        layer.weight.fill_(100.0)
+    torch.testing.assert_close(ema.averaged('weight', layer.weight), torch.full((4, 4), 2.0))
+
+
+def test_background_update_errors_reach_the_training_loop():
+    layer = nn.Linear(2, 2)
+    ema = _offloaded(ParameterEMA(named(layer), decay=0.5))
+    ema.shadow['weight'] = torch.zeros(3, 3)          # shape mismatch: lerp_ raises in the thread
+    ema.update(1)
+    with pytest.raises(RuntimeError, match='EMA update failed'):
+        ema.wait()
+    ema.wait()                                        # reported once
 
 
 def test_only_trainable_parameters_get_a_shadow_and_keys_match_the_saver():

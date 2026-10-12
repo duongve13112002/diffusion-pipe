@@ -114,8 +114,12 @@ save_dtype = 'bfloat16'
 # kept on data-parallel rank 0 of each pipeline stage. ema_dtype = 'bfloat16' halves that; its
 # updates are stochastically rounded, since at a 0.9999 decay they are far below bf16 precision
 # and plain rounding would leave the average stuck at the starting weights. ema_device = 'cpu'
-# keeps it in host RAM; each update then copies the weights to the host, so update every few
-# steps on large models.
+# keeps it in host RAM without stalling the training loop: an fp32 average copies the weights into
+# a pinned host buffer (another copy of the trained weights in RAM) and averages them in a
+# background thread during the next step; a bf16 average is updated on the GPU, copied up and back.
+# Those copies still take GPU time (about 0.3-1 s per update for 3B weights), so on a full
+# fine-tune update every few steps. Saving is unaffected by any of this: each save writes the
+# ema/ copy too (twice the time and disk per save), each checkpoint adds the average.
 #ema_decay = 0.9999
 #ema_update_every = 10     # optimizer steps between updates; the decay is compounded to match
 #ema_start_step = 0        # until this step the average simply equals the weights

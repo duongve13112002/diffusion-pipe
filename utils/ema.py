@@ -20,11 +20,16 @@ would in practice never leave its starting weights. ema_dtype = 'bfloat16'
 therefore rounds each update stochastically (up or down with the probabilities that keep its
 expectation exact), so it does follow the weights, with rounding noise of about one bf16 step,
 the precision of bf16 weights themselves. fp32 takes 4 bytes per parameter (12 GB for a 3B full
-fine-tune), bf16 2; hence ema_device = 'cpu' by default. With it, each update copies the weights
-to the host, so ema_update_every > 1 keeps that off the critical path on large models. An
-adapter's average is small enough for 'gpu'.
+fine-tune), bf16 2; hence ema_device = 'cpu' by default. Updates then stay off the training's
+critical path: an fp32 average copies the weights into a pinned host buffer without blocking
+(ordered on the CUDA stream, so it captures exactly this step's weights) and a background thread
+averages them while the next step trains, which takes another copy of the trained weights in
+host RAM (6 GB for 3B bf16 weights). A bf16 average is updated on the GPU instead (random
+numbers are slow on the CPU), the shadow copied up and back down one tensor at a time, again
+without blocking the host. An adapter's average is small enough for 'gpu'.
 """
 
+import threading
 from pathlib import Path
 
 import torch
@@ -79,8 +84,18 @@ def saved_key(param, is_adapter):
     return key
 
 
+def _pinned(tensor):
+    """`tensor` in page-locked memory, so copies to and from a GPU can run without blocking.
+    Unpinned (copies then block) where that is not available."""
+    try:
+        return tensor.pin_memory()
+    except RuntimeError:
+        return tensor
+
+
 class ParameterEMA:
-    """fp32 moving average of the trainable parameters among `named_parameters`."""
+    """Moving average (fp32 or stochastically rounded bf16) of the trainable parameters among
+    `named_parameters`."""
 
     def __init__(self, named_parameters, decay, update_every=1, start_step=0, device='cpu', is_adapter=False,
                  dtype='float32'):
@@ -104,6 +119,14 @@ class ParameterEMA:
             self.params[key] = p
             self.shadow[key] = p.detach().to(self.device, torch.float32, copy=True).to(self.dtype)
         self.num_updates = 0
+        # Until start_step the average is the weights themselves: averaged() returns them, and
+        # the shadow is set from them once, at start_step, instead of copied every step.
+        self.following = self.start_step > 0
+        self._offload_ready = False
+        self._staging = {}
+        self._pending = None    # CUDA event: the last update's copies are done
+        self._worker = None     # thread finishing the last fp32 update on the CPU
+        self._error = None
 
     def __len__(self):
         return len(self.shadow)
@@ -111,41 +134,119 @@ class ParameterEMA:
     def num_bytes(self):
         return sum(t.numel() * t.element_size() for t in self.shadow.values())
 
+    def _offloaded(self):
+        """Whether the shadow is in host RAM while the weights are on a GPU."""
+        return self.device.type == 'cpu' and any(p.is_cuda for p in self.params.values())
+
+    def _prepare_offload(self):
+        if self._offload_ready:
+            return
+        for key, p in self.params.items():
+            if self.dtype == torch.float32:
+                self._staging[key] = _pinned(torch.empty(p.shape, dtype=p.dtype))
+            else:
+                self.shadow[key] = _pinned(self.shadow[key])
+        self._offload_ready = True
+
+    def _record_pending(self):
+        if torch.cuda.is_available() and any(p.is_cuda for p in self.params.values()):
+            self._pending = torch.cuda.Event()
+            self._pending.record()
+
+    def wait(self):
+        """Block until the last update has landed in the shadow. Everything that reads or
+        writes the shadow calls this first."""
+        if self._worker is not None:
+            self._worker.join()
+            self._worker = None
+        if self._pending is not None:
+            self._pending.synchronize()
+            self._pending = None
+        if self._error is not None:
+            error, self._error = self._error, None
+            raise RuntimeError('EMA update failed') from error
+
     @torch.no_grad()
     def update(self, step):
         """Call after the optimizer step `step` (1-based)."""
-        if step <= self.start_step:
-            for key, p in self.params.items():
-                self.shadow[key].copy_(p.detach())
+        self.wait()
+        if step <= self.start_step or self.following:
+            self.following = step < self.start_step
+            if not self.following:
+                # start_step (or a resume from before it): the average starts at the weights.
+                if self._offloaded():
+                    self._prepare_offload()
+                for key, p in self.params.items():
+                    self.shadow[key].copy_(p.detach(), non_blocking=True)
+                self._record_pending()
             return
         if (step - self.start_step) % self.update_every:
             return
         # update_every steps of `decay`, compounded into one.
         weight = 1.0 - self.decay ** self.update_every
-        for key, p in self.params.items():
-            shadow = self.shadow[key]
-            # Moved in the parameter's own (narrower) dtype, widened where the shadow lives.
-            weights = p.detach().to(shadow.device).to(torch.float32)
-            if shadow.dtype == torch.float32:
-                shadow.lerp_(weights, weight)
+        if self._offloaded():
+            self._prepare_offload()
+            if self.dtype == torch.float32:
+                self._update_in_background(weight)
             else:
-                shadow.copy_(to_bfloat16_stochastic(shadow.float().lerp_(weights, weight)))
+                self._update_where_the_weights_are(weight)
+            self._record_pending()
+        else:
+            self._update_where_the_weights_are(weight)
         self.num_updates += 1
+
+    def _update_where_the_weights_are(self, weight):
+        for key, p in self.params.items():
+            shadow, weights = self.shadow[key], p.detach()
+            if shadow.dtype == torch.float32 and shadow.device == weights.device:
+                shadow.lerp_(weights.to(torch.float32), weight)
+                continue
+            # Copied up (if offloaded), averaged in fp32 and rounded beside the weights, copied back.
+            average = shadow.to(weights.device, non_blocking=True).to(torch.float32).lerp_(
+                weights.to(torch.float32), weight)
+            if shadow.dtype == torch.bfloat16:
+                average = to_bfloat16_stochastic(average)
+            shadow.copy_(average, non_blocking=True)
+
+    def _update_in_background(self, weight):
+        # Stream-ordered copies: they read this step's weights whatever the host does next.
+        for key, p in self.params.items():
+            self._staging[key].copy_(p.detach(), non_blocking=True)
+        copied = None
+        if torch.cuda.is_available() and any(p.is_cuda for p in self.params.values()):
+            copied = torch.cuda.Event()
+            copied.record()
+
+        def average():
+            try:
+                if copied is not None:
+                    copied.synchronize()
+                with torch.no_grad():
+                    for key, weights in self._staging.items():
+                        self.shadow[key].lerp_(weights.to(torch.float32), weight)
+            except BaseException as e:  # re-raised by wait() on the training thread
+                self._error = e
+
+        self._worker = threading.Thread(target=average, name='ema-update', daemon=True)
+        self._worker.start()
 
     def averaged(self, key, param):
         """The EMA of `param`, in its own dtype on the CPU: the shadow, or the weight itself
-        for a parameter that is not trained."""
-        shadow = self.shadow.get(key)
+        for a parameter that is not trained (or before start_step)."""
+        self.wait()
+        shadow = None if self.following else self.shadow.get(key)
         source = param.detach() if shadow is None else shadow
         return source.to(device='cpu', dtype=param.dtype)
 
     def state_dict(self):
+        self.wait()
         return {'shadow': {k: v.cpu() for k, v in self.shadow.items()}, 'num_updates': self.num_updates,
-                'decay': self.decay}
+                'decay': self.decay, 'following': self.following}
 
     def load_state_dict(self, state):
         """Restore the shadows found in `state`. Returns the keys it had none for, which keep
         their current value (the weights, when EMA was switched on after the checkpoint)."""
+        self.wait()
         saved = state['shadow']
         missing = []
         for key, shadow in self.shadow.items():
@@ -155,6 +256,7 @@ class ParameterEMA:
             else:
                 missing.append(key)
         self.num_updates = int(state.get('num_updates', 0))
+        self.following = bool(state.get('following', False))
         return missing
 
 
@@ -172,10 +274,11 @@ def load_ema_checkpoint(ema, save_root, tag):
     files = sorted((Path(save_root) / tag).glob('ema_stage_*.pt'))
     if not files:
         return 0, list(ema.shadow)
-    merged = {'shadow': {}, 'num_updates': 0}
+    merged = {'shadow': {}, 'num_updates': 0, 'following': False}
     for path in files:
         # mmap: a stage only reads the tensors it holds, not every stage's average.
         state = torch.load(path, map_location='cpu', weights_only=True, mmap=True)
         merged['shadow'].update(state['shadow'])
         merged['num_updates'] = max(merged['num_updates'], int(state.get('num_updates', 0)))
+        merged['following'] = merged['following'] or bool(state.get('following', False))
     return len(files), ema.load_state_dict(merged)

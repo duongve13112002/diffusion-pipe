@@ -785,8 +785,12 @@ Differences from Iris's own training recipe worth knowing:
   EMA is off by default; set `ema_decay = 0.9999` (top level, see the main example config) and
   each save also writes `<save dir>/ema/`, a complete Iris checkpoint (`model.safetensors` +
   `config.yaml`, usable as `transformer_path` or by Iris's sampler) or adapter directory.
-  For a 3B full fine-tune the fp32 average takes 12 GB (6 GB with `ema_dtype = 'bfloat16'`,
-  stochastically rounded): keep `ema_device = 'cpu'` and use e.g. `ema_update_every = 10`.
+  Iris updates its EMA every optimizer step, on the GPU. For a 3B full fine-tune the fp32
+  average takes 12 GB, plus a 6 GB pinned buffer it averages from in a background thread (6 GB
+  in all with `ema_dtype = 'bfloat16'`, stochastically rounded and updated on the GPU): keep
+  `ema_device = 'cpu'` and use e.g. `ema_update_every = 10`, since each update's host<->GPU
+  copies still take GPU time (about 0.3-1 s for 3B weights). With an adapter none of this
+  matters: update every step, on either device.
 - Optimizer: Iris trains with Muon + AdamW (betas 0.9/0.95, no weight decay, gradient clipping
   0.5, fp32 master weights). The examples use diffusion-pipe's usual `adamw_optimi` in bf16 with
   Kahan summation, which suits fine-tuning; any diffusion-pipe optimizer works.
