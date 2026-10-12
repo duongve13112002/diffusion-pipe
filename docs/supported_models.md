@@ -805,7 +805,24 @@ All `[model]` options:
 | `repa_variant`, `repa_teacher_source`, `repa_teacher_hub`, `repa_teacher`, `repa_teacher_weights`, `repa_teacher_dim`, `repa_proj_hidden_dim`, `repa_teacher_image_size`, `repa_teacher_patch_size`, `repa_teacher_match_student`, `repa_spatial_norm_gamma` | Iris `RepaConfig` defaults (DINOv2 ViT-B/14 via torch hub) | Passed through to `iris3b.repa.REPALoss`. Training stops with an error if the teacher cannot be loaded. |
 
 Top-level `dataloader_workers` (default 1) sets the training DataLoader worker count; with the
-default on-the-fly pixels, 4 or more keeps image decoding off the critical path.
+default on-the-fly pixels, 4 or more keeps image decoding off the critical path. It is per GPU
+process: the machine runs `dataloader_workers` x GPUs workers in total.
+
+Starting from an Anima dataset cache: Iris keeps its own cache in `<path>/cache/iris/`, so its
+first run scans the dataset again (every file, image header and caption). On a very large
+dataset that Anima or Anima refiner already scanned, the scan can be skipped:
+```
+python tools/inherit_metadata_cache.py --dataset dataset.toml --dry-run      # report only
+python tools/inherit_metadata_cache.py --dataset dataset.toml --check-all    # do it
+```
+The tool copies Anima's source metadata snapshot (file paths, masks, raw captions, aspect-ratio
+buckets; hard links where possible) into Iris's cache. Caption settings, grouping and iteration
+order are then built by Iris's own code from that snapshot on its first run. It refuses (and Iris
+scans normally) unless the bucketing settings are identical to the ones Anima was cached with
+(resolutions or size_buckets, ar buckets, frame_buckets, mask/control paths, shuffle_metadata),
+the dataset is images only, and the recorded files still exist with unchanged sizes
+(`--check-all` stats every file instead of a sample; recommended, since Iris opens the images
+during training). The Anima cache is only read. See `--help` for other donor/target models.
 
 Saving:
 - Full fine-tune writes Iris's own layout: `model.safetensors` (IrisDiT keys) + `config.yaml`,

@@ -1167,6 +1167,11 @@ class ARBucketDataset:
             size_bucket_dataset.add_text_embedding_dataset(te_dataset)
 
 
+# Default for DirectoryDataset.snapshot_geometry: use the dataset's own value. None is a real
+# framerate (an image model has none), so it cannot be the default.
+_OWN = object()
+
+
 class DirectoryDataset:
     def __init__(self, directory_config, dataset_config, model_name, framerate=None,
                  round_to_multiple=32, skip_dataset_validation=False,
@@ -1318,13 +1323,7 @@ class DirectoryDataset:
 
         self.legacy_cache_dir = self.path / 'cache' / self.model_name
         if self.reuse_metadata_cache:
-            geometry = {'size_buckets': self.size_buckets.tolist() if self.use_size_buckets else None,
-                        'ars': self.ars.tolist(), 'frames': self.frame_buckets.tolist(),
-                        'resolutions': self.resolutions.tolist() if not self.use_size_buckets else None,
-                        'round_to_multiple': self.round_to_multiple, 'framerate': self.framerate,
-                        'mask_path': str(self.mask_path), 'control_path': str(self.control_path),
-                        'default_mask_file': str(self.default_mask_file), 'shuffle': self.shuffle_metadata}
-            self.geometry_dir = self.legacy_cache_dir / 'profiles' / Hasher.hash(geometry)
+            self.geometry_dir = self.legacy_cache_dir / 'profiles' / Hasher.hash(self.snapshot_geometry())
             self.legacy_geometry_file = self.legacy_cache_dir / 'profiles' / 'legacy_geometry.json'
             self.import_legacy_geometry = True
             if self.legacy_geometry_file.exists():
@@ -1345,6 +1344,18 @@ class DirectoryDataset:
             self.grouping_keys_json_file = self.cache_dir / 'metadata' / 'grouping_keys.json'
             self.cache_dir.joinpath('metadata').mkdir(parents=True, exist_ok=True)
             self._refresh_source = False
+
+    def snapshot_geometry(self, framerate=_OWN, round_to_multiple=_OWN):
+        """The settings that decide which source metadata snapshot this directory uses. Its hash
+        names the profiles/<geometry> directory. The arguments override this dataset's own
+        values, for tools/inherit_metadata_cache.py to find another model's snapshot."""
+        return {'size_buckets': self.size_buckets.tolist() if self.use_size_buckets else None,
+                'ars': self.ars.tolist(), 'frames': self.frame_buckets.tolist(),
+                'resolutions': self.resolutions.tolist() if not self.use_size_buckets else None,
+                'round_to_multiple': self.round_to_multiple if round_to_multiple is _OWN else round_to_multiple,
+                'framerate': self.framerate if framerate is _OWN else framerate,
+                'mask_path': str(self.mask_path), 'control_path': str(self.control_path),
+                'default_mask_file': str(self.default_mask_file), 'shuffle': self.shuffle_metadata}
 
     def legacy_tensor_sources(self, bucket, cache_name):
         """Describe old tensor inputs without modifying their metadata or shard files."""
