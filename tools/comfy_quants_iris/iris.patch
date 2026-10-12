@@ -1,0 +1,891 @@
+diff --git a/configs/iris_3b_fp8.yaml b/configs/iris_3b_fp8.yaml
+new file mode 100644
+index 0000000..fe2e8be
+--- /dev/null
++++ b/configs/iris_3b_fp8.yaml
+@@ -0,0 +1,40 @@
++project:
++  name: iris-3b-fp8-e4m3-v0
++  created_by: comfy_quants
++  seed: 42
++model:
++  family: iris
++  model_id: speridlabs/iris-3b
++  revision: "<pin-this>"
++  dtype: bf16
++  source: huggingface
++  trust_remote_code: false
++  components:
++    transformer: quantize
++    text_encoder: keep_bf16
++quant:
++  algorithm: fp8_static
++  target_dtype: fp8_e4m3
++  scale:
++    granularity: per_tensor
++    axis: null
++    method: amax
++  rounding: nearest_even
++  modules:
++    include:
++      - "blocks.*"
++    # Image side of the 8 dual-stream blocks + all 16 single-stream blocks: 168 Linears.
++    # Text side (_y), every MLP down projection (w2: in_features 6826, not aligned to 16 for the FP8 matmul),
++    # modulation cores, text adapter, embedders and pixel head stay high precision.
++    exclude:
++      - "blocks.*.attn.*_y"
++      - "blocks.*.attn_gate_y"
++      - "blocks.*.mlp_y.*"
++      - "blocks.*.mlp_x.w2"
++      - "blocks.*.mlp.w2"
++  fallback:
++    on_error: keep_bf16
++artifact:
++  format: safetensors_quant
++  compatibility_target: L2
++  write_module_reports: true
+diff --git a/configs/iris_3b_fp8_e5m2.yaml b/configs/iris_3b_fp8_e5m2.yaml
+new file mode 100644
+index 0000000..7e5ed86
+--- /dev/null
++++ b/configs/iris_3b_fp8_e5m2.yaml
+@@ -0,0 +1,40 @@
++project:
++  name: iris-3b-fp8-e5m2-v0
++  created_by: comfy_quants
++  seed: 42
++model:
++  family: iris
++  model_id: speridlabs/iris-3b
++  revision: "<pin-this>"
++  dtype: bf16
++  source: huggingface
++  trust_remote_code: false
++  components:
++    transformer: quantize
++    text_encoder: keep_bf16
++quant:
++  algorithm: fp8_static
++  target_dtype: fp8_e5m2
++  scale:
++    granularity: per_tensor
++    axis: null
++    method: amax
++  rounding: nearest_even
++  modules:
++    include:
++      - "blocks.*"
++    # Image side of the 8 dual-stream blocks + all 16 single-stream blocks: 168 Linears.
++    # Text side (_y), every MLP down projection (w2: in_features 6826, not aligned to 16 for the FP8 matmul),
++    # modulation cores, text adapter, embedders and pixel head stay high precision.
++    exclude:
++      - "blocks.*.attn.*_y"
++      - "blocks.*.attn_gate_y"
++      - "blocks.*.mlp_y.*"
++      - "blocks.*.mlp_x.w2"
++      - "blocks.*.mlp.w2"
++  fallback:
++    on_error: keep_bf16
++artifact:
++  format: safetensors_quant
++  compatibility_target: L2
++  write_module_reports: true
+diff --git a/configs/iris_3b_int8_tensorwise.yaml b/configs/iris_3b_int8_tensorwise.yaml
+new file mode 100644
+index 0000000..dc85fec
+--- /dev/null
++++ b/configs/iris_3b_int8_tensorwise.yaml
+@@ -0,0 +1,40 @@
++project:
++  name: iris-3b-int8-tensorwise-v0
++  created_by: comfy_quants
++  seed: 42
++model:
++  family: iris
++  model_id: speridlabs/iris-3b
++  revision: "<pin-this>"
++  dtype: bf16
++  source: huggingface
++  trust_remote_code: false
++  components:
++    transformer: quantize
++    text_encoder: keep_bf16
++quant:
++  algorithm: int8_tensorwise
++  target_dtype: int8_tensorwise
++  scale:
++    granularity: per_channel
++    axis: out_features
++    method: amax
++  rounding: nearest_even
++  modules:
++    include:
++      - "blocks.*"
++    # Image side of the 8 dual-stream blocks + all 16 single-stream blocks: 168 Linears.
++    # Text side (_y), every MLP down projection (w2: in_features 6826, not aligned to 16 for the INT8 matmul or 256 for ConvRot),
++    # modulation cores, text adapter, embedders and pixel head stay high precision.
++    exclude:
++      - "blocks.*.attn.*_y"
++      - "blocks.*.attn_gate_y"
++      - "blocks.*.mlp_y.*"
++      - "blocks.*.mlp_x.w2"
++      - "blocks.*.mlp.w2"
++  fallback:
++    on_error: keep_bf16
++artifact:
++  format: safetensors_quant
++  compatibility_target: L2
++  write_module_reports: true
+diff --git a/configs/iris_3b_mxfp8.yaml b/configs/iris_3b_mxfp8.yaml
+new file mode 100644
+index 0000000..81c94a7
+--- /dev/null
++++ b/configs/iris_3b_mxfp8.yaml
+@@ -0,0 +1,40 @@
++project:
++  name: iris-3b-mxfp8-v0
++  created_by: comfy_quants
++  seed: 42
++model:
++  family: iris
++  model_id: speridlabs/iris-3b
++  revision: "<pin-this>"
++  dtype: bf16
++  source: huggingface
++  trust_remote_code: false
++  components:
++    transformer: quantize
++    text_encoder: keep_bf16
++quant:
++  algorithm: mxfp8
++  target_dtype: mxfp8
++  scale:
++    granularity: block
++    axis: in_features
++    method: amax
++  rounding: nearest_even
++  modules:
++    include:
++      - "blocks.*"
++    # Image side of the 8 dual-stream blocks + all 16 single-stream blocks: 168 Linears.
++    # Text side (_y), every MLP down projection (w2: in_features 6826, not aligned to the 32-block: export would fail),
++    # modulation cores, text adapter, embedders and pixel head stay high precision.
++    exclude:
++      - "blocks.*.attn.*_y"
++      - "blocks.*.attn_gate_y"
++      - "blocks.*.mlp_y.*"
++      - "blocks.*.mlp_x.w2"
++      - "blocks.*.mlp.w2"
++  fallback:
++    on_error: keep_bf16
++artifact:
++  format: safetensors_quant
++  compatibility_target: L2
++  write_module_reports: true
+diff --git a/configs/iris_3b_nvfp4.yaml b/configs/iris_3b_nvfp4.yaml
+new file mode 100644
+index 0000000..06810f1
+--- /dev/null
++++ b/configs/iris_3b_nvfp4.yaml
+@@ -0,0 +1,40 @@
++project:
++  name: iris-3b-nvfp4-v0
++  created_by: comfy_quants
++  seed: 42
++model:
++  family: iris
++  model_id: speridlabs/iris-3b
++  revision: "<pin-this>"
++  dtype: bf16
++  source: huggingface
++  trust_remote_code: false
++  components:
++    transformer: quantize
++    text_encoder: keep_bf16
++quant:
++  algorithm: nvfp4
++  target_dtype: nvfp4
++  scale:
++    granularity: block
++    axis: in_features
++    method: amax
++  rounding: nearest_even
++  modules:
++    include:
++      - "blocks.*"
++    # Image side of the 8 dual-stream blocks + all 16 single-stream blocks: 168 Linears.
++    # Text side (_y), every MLP down projection (w2: in_features 6826, not aligned to the 16-block: export would fail),
++    # modulation cores, text adapter, embedders and pixel head stay high precision.
++    exclude:
++      - "blocks.*.attn.*_y"
++      - "blocks.*.attn_gate_y"
++      - "blocks.*.mlp_y.*"
++      - "blocks.*.mlp_x.w2"
++      - "blocks.*.mlp.w2"
++  fallback:
++    on_error: keep_bf16
++artifact:
++  format: safetensors_quant
++  compatibility_target: L2
++  write_module_reports: true
+diff --git a/docs/README.md b/docs/README.md
+index a573076..3f02d29 100644
+--- a/docs/README.md
++++ b/docs/README.md
+@@ -19,6 +19,7 @@ model-family flows currently implemented for that format.
+ | Quantize the LTX-Video family (FP8/MXFP8/NVFP4) | [`quantization/ltxv.md`](quantization/ltxv.md) |
+ | Quantize the LTX-2 (2.3) family (FP8/MXFP8/NVFP4/INT8) | [`quantization/ltx2.md`](quantization/ltx2.md) |
+ | Quantize the Ideogram 4.0 family (FP8/MXFP8/NVFP4, + transcode) | [`quantization/ideogram4.md`](quantization/ideogram4.md) |
++| Quantize Iris-3B (FP8/MXFP8/NVFP4/INT8 tensorwise) | [`quantization/iris.md`](quantization/iris.md) |
+ | Export INT4 tile-pack checkpoints | [`quantization/int4.md`](quantization/int4.md) |
+ | Look up command syntax | [`cli.md`](cli.md) |
+ | Understand repository architecture | [`architecture.md`](architecture.md) |
+diff --git a/docs/quantization/README.md b/docs/quantization/README.md
+index 2c73d64..71ca3af 100644
+--- a/docs/quantization/README.md
++++ b/docs/quantization/README.md
+@@ -104,6 +104,8 @@ Format guides above are family-agnostic. For per-family flows beyond Qwen-Image,
+   keep recipe) — FP8 / MXFP8 / NVFP4 / INT8 W8A8 / INT8 tensorwise: [`ltx2.md`](ltx2.md).
+ - **Ideogram 4.0** (open-weight NextDiT/Lumina2; fp8→bf16→mxfp8 transcoding) — FP8 / MXFP8 / NVFP4:
+   [`ideogram4.md`](ideogram4.md).
++- **Iris-3B** (pixel-space hybrid MMDiT, no VAE; loads through comfy.ops custom nodes) — FP8 / MXFP8 /
++  NVFP4 / INT8 tensorwise: [`iris.md`](iris.md).
+ 
+ ## INT4
+ 
+diff --git a/docs/quantization/iris.md b/docs/quantization/iris.md
+new file mode 100644
+index 0000000..b792cf9
+--- /dev/null
++++ b/docs/quantization/iris.md
+@@ -0,0 +1,88 @@
++# Iris-3B export (FP8 / MXFP8 / NVFP4 / INT8 tensorwise)
++
++Quantize **Iris-3B** ([`speridlabs/iris-3b`](https://huggingface.co/speridlabs/iris-3b)), a
++3B pixel-space hybrid MMDiT: no VAE, the network paints RGB pixels through a small pixel head.
++Text encoder: Qwen3-VL-4B (separate file, not touched here).
++
++## Supported formats & configs
++
++| Format | Command | Config | Runs on |
++| --- | --- | --- | --- |
++| FP8 E4M3 | `export-model` | `configs/iris_3b_fp8.yaml` | any GPU (FP8 matmul on SM≥8.9) |
++| FP8 E5M2 | `export-model` | `configs/iris_3b_fp8_e5m2.yaml` | any GPU (FP8 matmul on SM≥8.9) |
++| MXFP8 | `export-model-mxfp8` | `configs/iris_3b_mxfp8.yaml` | Blackwell (SM≥10) |
++| NVFP4 | `export-model-nvfp4` | `configs/iris_3b_nvfp4.yaml` | Blackwell (SM≥10) |
++| INT8 tensorwise (+ConvRot) | `export-model-int8-tensorwise` | `configs/iris_3b_int8_tensorwise.yaml` | SM≥7.5 |
++
++INT8 W8A8 (the INT8-Fast node) and INT4 are not provided.
++
++## Loading in ComfyUI
++
++**Stock ComfyUI has no Iris model.** The artifacts keep Iris's original bare key names
++(`blocks.0.attn.q_proj_x.weight`, ...) plus the usual per-layer `comfy_quant` markers, so they
++load through a custom node that builds Iris from `comfy.ops` and detects per-layer
++quantization: [envy-ai/ComfyUI-Iris](https://github.com/envy-ai/ComfyUI-Iris)
++(`load_model` → `comfy.utils.detect_layer_quantization(sd, "")`; ComfyUI ≥ 0.37). Put the
++file in `models/diffusion_models/` and pick it in **Load Iris Model**. Loaders that wrap the
++upstream speridlabs code directly (plain `nn.Linear`) cannot read these files.
++
++## Quick start
++
++The release is **float32**, and the exporters copy every tensor they do not quantize
++verbatim, so cast it to bfloat16 first (Iris runs under bfloat16 autocast; nothing is lost):
++
++```bash
++hf download speridlabs/iris-3b --local-dir iris-3b --exclude "depth/*" "upscaler/*"
++python scripts/external/iris_fp32_to_bf16.py iris-3b/model.safetensors iris-3b-bf16/model.safetensors
++
++comfy-quants export-model \
++  --config configs/iris_3b_fp8.yaml \
++  --source iris-3b-bf16/model.safetensors \
++  --out iris-3b_fp8.safetensors --device cuda:0 --hash-output --json
++```
++
++Swap in `export-model-mxfp8`, `export-model-nvfp4` or `export-model-int8-tensorwise` with the
++matching config for the other formats. A fine-tune saved by diffusion-pipe (or its EMA) is the
++same layout: point `--source` at its `model.safetensors`.
++
++The `depth/` and `upscaler/` fine-tunes share the architecture, so the same configs export
++them, but ComfyUI-Iris only runs text-to-image.
++
++## Architecture & layer selection
++
++hidden 2560, 20 heads × 128 with 5 KV heads (GQA: k/v are 2560 → 640), SwiGLU MLP 2560 → 6826
++→ 2560. One `blocks` list: `blocks.0-7` dual-stream (image `_x`, text `_y` weights),
++`blocks.8-23` single-stream. The contract (`model_adapters/iris.py`) declares all 256 block
++Linear weights; it matches the released header exactly.
++
++Default selection (all configs), the same 168 Linears as the community INT4 ConvRot profile:
++
++- **Quantized** (1.39B params): the image side of the dual blocks (`attn.{q,k,v}_proj_x`,
++  `attn.proj_x`, `attn_gate_x`, `mlp_x.w1`, `mlp_x.w3`) and every single block
++  (`q/k/v_proj`, `attn_gate`, `attn_proj`, `mlp.w1`, `mlp.w3`). All have in-features 2560.
++- **Kept bf16**: the text side `_y` of the dual blocks; every MLP down projection `w2`
++  (in-features 6826 is not a multiple of the MXFP8/NVFP4 block size — their export would fail —
++  nor of 16, which the FP8/INT8 matmul kernels need); the shared `modulation_cores`, the text
++  adapter `y_embedder`, embedders, `pixel_blocks` and `final_layer`; norms and biases.
++
++To also quantize the text side with FP8/INT8, drop the three `_y` lines from `exclude`.
++`w2` can be added to the FP8 configs only (ComfyUI then dequantizes it for the matmul):
++remove the two `w2` lines there, never in the MXFP8/NVFP4 configs.
++
++Expected size from a bf16 source: ~4.6 GB (FP8 / MXFP8 / INT8), ~4.0 GB (NVFP4), versus
++6.0 GB bf16 / 12 GB float32. The 1.6B kept parameters (3.2 GB) dominate; quantizing the text
++side too brings FP8 to ~4.1 GB.
++
++## Verify
++
++```bash
++comfy-quants inspect --family iris --model iris-3b-bf16 --out inspect_iris --json
++python -m pytest tests/unit/test_iris_contract.py -q
++```
++
++Validated on CPU: a reduced-width Iris (same key names and structure, unaligned `w2`) built
++with ComfyUI-Iris's model code, exported with each config, then loaded strictly through
++ComfyUI-Iris's `load_model`. Every format loads as its ComfyUI layout and the quantized layers
++reproduce the bf16 matmul within the format's precision (per-layer relative error: INT8 1.2%,
++FP8 E4M3 / MXFP8 2.7%, FP8 E5M2 5.3%, NVFP4 9.3%). Image quality on the real 3B weights has not
++been measured yet: check your own prompts, especially for NVFP4.
+diff --git a/scripts/external/iris_fp32_to_bf16.py b/scripts/external/iris_fp32_to_bf16.py
+new file mode 100644
+index 0000000..b3eb54b
+--- /dev/null
++++ b/scripts/external/iris_fp32_to_bf16.py
+@@ -0,0 +1,61 @@
++#!/usr/bin/env python3
++"""Cast the released Iris-3B checkpoint (float32 EMA) to bfloat16 before quantizing.
++
++The exporters copy every tensor they do not quantize verbatim, so quantizing the float32
++release directly would leave ~1.6B kept parameters (text side, w2, modulation cores, text
++adapter, pixel head) in float32: a ~7.5 GB "FP8" file. Iris runs under bfloat16 autocast,
++so a bfloat16 source loses nothing at inference; quantizing from it instead of float32
++adds no measurable error (FP8/FP4 round far coarser than bfloat16).
++
++    python scripts/external/iris_fp32_to_bf16.py iris-3b/model.safetensors iris-3b-bf16/model.safetensors
++
++Copies ``config.yaml`` from beside the source. Tensors are read one at a time; peak host
++memory is the bfloat16 output (~6 GB).
++"""
++
++from __future__ import annotations
++
++import argparse
++import shutil
++from pathlib import Path
++
++import torch
++from safetensors import safe_open
++from safetensors.torch import save_file
++
++
++def convert(source: Path, output: Path) -> dict[str, int]:
++    if source.resolve() == output.resolve():
++        raise SystemExit("output must differ from the source")
++    output.parent.mkdir(parents=True, exist_ok=True)
++    tensors: dict[str, torch.Tensor] = {}
++    counts = {"cast": 0, "kept": 0}
++    with safe_open(str(source), framework="pt", device="cpu") as handle:
++        metadata = handle.metadata() or {}
++        for name in handle.keys():
++            tensor = handle.get_tensor(name)
++            if tensor.dtype in (torch.float32, torch.float64, torch.float16):
++                tensor = tensor.to(torch.bfloat16)
++                counts["cast"] += 1
++            else:
++                counts["kept"] += 1
++            tensors[name] = tensor.contiguous()
++    save_file(tensors, str(output), metadata=metadata)
++    config = source.parent / "config.yaml"
++    if config.is_file() and not (output.parent / "config.yaml").exists():
++        shutil.copy2(config, output.parent / "config.yaml")
++    return counts
++
++
++def main(argv: list[str] | None = None) -> int:
++    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
++    parser.add_argument("source", type=Path, help="Iris model.safetensors (float32)")
++    parser.add_argument("output", type=Path, help="bfloat16 model.safetensors to write")
++    args = parser.parse_args(argv)
++    counts = convert(args.source, args.output)
++    print(f"wrote {args.output}: {counts['cast']} tensors cast to bfloat16, {counts['kept']} copied")
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/src/comfy_quants/__init__.py b/src/comfy_quants/__init__.py
+index b584436..f8e5707 100644
+--- a/src/comfy_quants/__init__.py
++++ b/src/comfy_quants/__init__.py
+@@ -38,6 +38,7 @@ from comfy_quants.model_adapters import flux2 as _flux2_adapter  # noqa: E402,F4
+ from comfy_quants.model_adapters import ltxv as _ltxv_adapter  # noqa: E402,F401
+ from comfy_quants.model_adapters import ltx2 as _ltx2_adapter  # noqa: E402,F401
+ from comfy_quants.model_adapters import ideogram4 as _ideogram4_adapter  # noqa: E402,F401
++from comfy_quants.model_adapters import iris as _iris_adapter  # noqa: E402,F401
+ 
+ 
+ def list_model_adapters() -> list[str]:
+diff --git a/src/comfy_quants/comfy/artifact_contracts.py b/src/comfy_quants/comfy/artifact_contracts.py
+index f880e60..ed6493a 100644
+--- a/src/comfy_quants/comfy/artifact_contracts.py
++++ b/src/comfy_quants/comfy/artifact_contracts.py
+@@ -120,6 +120,17 @@ _STOCK_DIT_CONTRACTS: dict[str, dict[str, Any]] = {
+         "model_contract_schema": "ideogram4_static_contract.v1",
+         "owner_module": "comfy_quants.model_adapters.ideogram4",
+     },
++    "iris": {
++        "schema_version": "iris_contract.v1",
++        "family": "iris",
++        "artifact_target": "comfyui",
++        "export_name": "Iris-3B",
++        # Stock ComfyUI has no Iris model; custom nodes that build it from comfy.ops
++        # (bare original keys) consume these artifacts.
++        "consumer_layout": "ComfyUI custom node (comfy.ops Iris, bare keys)",
++        "model_contract_schema": "iris_static_contract.v1",
++        "owner_module": "comfy_quants.model_adapters.iris",
++    },
+ }
+ 
+ 
+diff --git a/src/comfy_quants/formats/fp8_e4m3.py b/src/comfy_quants/formats/fp8_e4m3.py
+index 67b0488..b8c2ad5 100644
+--- a/src/comfy_quants/formats/fp8_e4m3.py
++++ b/src/comfy_quants/formats/fp8_e4m3.py
+@@ -26,7 +26,7 @@ FP8_E4M3_FORMAT = QuantFormatSpec(
+     category="floating_point",
+     scale_required=True,
+     default_scale_granularity="per_tensor",
+-    compatible_families=("qwen_image", "qwen_image_edit", "anima", "anima_14b", "flux", "flux2", "ltxv", "ltx2", "ideogram4"),
++    compatible_families=("qwen_image", "qwen_image_edit", "anima", "anima_14b", "flux", "flux2", "ltxv", "ltx2", "ideogram4", "iris"),
+     notes=(
+         "Default FP8 format for Qwen image exports.",
+         "Reusable across model adapters; not owned by any single Qwen adapter.",
+diff --git a/src/comfy_quants/formats/fp8_e5m2.py b/src/comfy_quants/formats/fp8_e5m2.py
+index f1afdcf..a1cc430 100644
+--- a/src/comfy_quants/formats/fp8_e5m2.py
++++ b/src/comfy_quants/formats/fp8_e5m2.py
+@@ -26,7 +26,7 @@ FP8_E5M2_FORMAT = QuantFormatSpec(
+     category="floating_point",
+     scale_required=True,
+     default_scale_granularity="per_tensor",
+-    compatible_families=("qwen_image", "qwen_image_edit", "anima", "anima_14b", "flux", "flux2", "ltxv", "ltx2", "ideogram4"),
++    compatible_families=("qwen_image", "qwen_image_edit", "anima", "anima_14b", "flux", "flux2", "ltxv", "ltx2", "ideogram4", "iris"),
+     notes=(
+         "FP8 E5M2 checkpoint format for Qwen image exports.",
+         "Reusable across model adapters; not owned by any single Qwen adapter.",
+diff --git a/src/comfy_quants/formats/int8_tensorwise.py b/src/comfy_quants/formats/int8_tensorwise.py
+index 0853eef..62150c2 100644
+--- a/src/comfy_quants/formats/int8_tensorwise.py
++++ b/src/comfy_quants/formats/int8_tensorwise.py
+@@ -65,6 +65,7 @@ INT8_TENSORWISE_FORMAT = QuantFormatSpec(
+         "ltxv",
+         "ltx2",
+         "ideogram4",
++        "iris",
+     ),
+     notes=(
+         "Stock-ComfyUI int8: symmetric per-row int8 weights + dynamic int8 activations (runtime).",
+diff --git a/src/comfy_quants/formats/mxfp8.py b/src/comfy_quants/formats/mxfp8.py
+index d2ad377..81797af 100644
+--- a/src/comfy_quants/formats/mxfp8.py
++++ b/src/comfy_quants/formats/mxfp8.py
+@@ -42,7 +42,7 @@ MXFP8_FORMAT = QuantFormatSpec(
+     category="floating_point_block_scaled",
+     scale_required=True,
+     default_scale_granularity="block",
+-    compatible_families=("qwen_image", "qwen_image_edit", "qwen_image_layered", "anima", "anima_14b", "flux", "flux2", "ltxv", "ltx2", "ideogram4"),
++    compatible_families=("qwen_image", "qwen_image_edit", "qwen_image_layered", "anima", "anima_14b", "flux", "flux2", "ltxv", "ltx2", "ideogram4", "iris"),
+     notes=(
+         "MXFP8: float8_e4m3fn weights + per-32-element E8M0 block scale (OCP microscaling).",
+         "weight_scale stored as uint8 in the cuBLAS to_blocked swizzle; loaded as float8_e8m0fnu.",
+diff --git a/src/comfy_quants/formats/nvfp4.py b/src/comfy_quants/formats/nvfp4.py
+index 6bdb395..4384c38 100644
+--- a/src/comfy_quants/formats/nvfp4.py
++++ b/src/comfy_quants/formats/nvfp4.py
+@@ -41,7 +41,7 @@ NVFP4_FORMAT = QuantFormatSpec(
+     category="floating_point_block_scaled",
+     scale_required=True,
+     default_scale_granularity="block",
+-    compatible_families=("qwen_image", "qwen_image_edit", "qwen_image_layered", "anima", "anima_14b", "flux", "flux2", "ltxv", "ltx2", "ideogram4"),
++    compatible_families=("qwen_image", "qwen_image_edit", "qwen_image_layered", "anima", "anima_14b", "flux", "flux2", "ltxv", "ltx2", "ideogram4", "iris"),
+     notes=(
+         "NVFP4: FP4-E2M1 weights packed 2/byte (uint8) + per-block-16 fp8 scale + per-tensor fp32 scale.",
+         "weight_scale (block) stored as float8_e4m3fn in the cuBLAS to_blocked swizzle.",
+diff --git a/src/comfy_quants/model_adapters/iris.py b/src/comfy_quants/model_adapters/iris.py
+new file mode 100644
+index 0000000..0ad84c3
+--- /dev/null
++++ b/src/comfy_quants/model_adapters/iris.py
+@@ -0,0 +1,174 @@
++"""Iris-3B model adapter (pixel-space hybrid MMDiT, speridlabs/iris-3b).
++
++Authored from the released ``speridlabs/iris-3b`` ``model.safetensors`` header (639 tensors,
++float32) and its source (``iris3b/models/dit.py``, ``iris3b/nn/attention.py``). No VAE:
++the network outputs RGB pixels through a small pixel head.
++
++One ``blocks`` list holds both block kinds: ``blocks.0-7`` are dual-stream (MMDiT) blocks
++with separate image (``_x``) and text (``_y``) weights, ``blocks.8-23`` are single-stream
++blocks. Every Linear is ``hidden -> hidden`` (2560) except GQA k/v (640 out: 5 KV heads x
++128) and the SwiGLU MLP (``w1``/``w3``: 2560 -> 6826, ``w2``: 6826 -> 2560). Attention
++output projections carry a bias, which stays high precision beside the quantized weight.
++
++Artifacts keep the original bare key names, so they load in ComfyUI through custom nodes
++that build Iris from ``comfy.ops`` and detect per-layer quantization (e.g. envy-ai's
++ComfyUI-Iris, ``comfy.utils.detect_layer_quantization(sd, "")``). Stock ComfyUI has no
++Iris model.
++
++Default selection follows the community INT4 ConvRot profile: quantize the image side of
++the dual-stream blocks and all single-stream blocks (attention projections, content gates
++and MLP ``w1``/``w3``); keep the text side, every ``w2`` (in-features 6826 is not a
++multiple of the MXFP8/NVFP4 block sizes or of 16 for the FP8/INT8 matmul kernels), the
++shared modulation cores, the text adapter, the embedders and the pixel head high precision.
++"""
++
++from __future__ import annotations
++
++from comfy_quants.comfy.stock_dit_contract import stock_dit_artifact_contract_metadata
++from comfy_quants.core.policy import QuantPolicy
++from comfy_quants.model_adapters.base import ModelSource
++from comfy_quants.model_adapters.stock_dit_contract import (
++    BlockGroup,
++    StockDitContract,
++    build_stock_dit_graph,
++    kept_component,
++    linear,
++    summarize_stock_dit_graph,
++)
++
++CONTRACT_SCHEMA_VERSION = "iris_static_contract.v1"
++
++_HIDDEN = 2560
++_HEAD_DIM = 128
++_NUM_HEADS = 20
++_NUM_KV_HEADS = 5
++_MLP = 6826  # int(2560 * 8/3), SwiGLU hidden
++_DUAL_BLOCKS = 8
++_SINGLE_BLOCKS = 16
++_PIXEL_BLOCKS = 4
++
++# Image side of the dual blocks + all single blocks, MLP down projections excluded.
++DEFAULT_INCLUDE = ("blocks.*",)
++DEFAULT_EXCLUDE = (
++    "blocks.*.attn.*_y",
++    "blocks.*.attn_gate_y",
++    "blocks.*.mlp_y.*",
++    "blocks.*.mlp_x.w2",
++    "blocks.*.mlp.w2",
++)
++
++
++def _dims() -> dict[str, int]:
++    return {
++        "X": _HIDDEN,  # 2560
++        "KV": _NUM_KV_HEADS * _HEAD_DIM,  # 640 (GQA k/v)
++        "MLP": _MLP,  # 6826
++    }
++
++
++def _swiglu(prefix: str) -> tuple:
++    return (
++        linear(f"{prefix}.w1", "MLP", "X", module_type="SwiGLULinear"),
++        linear(f"{prefix}.w2", "X", "MLP", notes="in_features 6826: not block-format aligned"),
++        linear(f"{prefix}.w3", "MLP", "X", module_type="SwiGLULinear"),
++    )
++
++
++def _dual_block_modules() -> tuple:
++    p = "blocks.{block}"
++    modules = []
++    for stream in ("x", "y"):  # x = image tokens, y = text tokens
++        modules += [
++            linear(f"{p}.attn.q_proj_{stream}", "X", "X"),
++            linear(f"{p}.attn.k_proj_{stream}", "KV", "X"),
++            linear(f"{p}.attn.v_proj_{stream}", "KV", "X"),
++            linear(f"{p}.attn.proj_{stream}", "X", "X"),
++            linear(f"{p}.attn_gate_{stream}", "X", "X", module_type="GateLinear"),
++            *_swiglu(f"{p}.mlp_{stream}"),
++        ]
++    return tuple(modules)
++
++
++def _single_block_modules() -> tuple:
++    p = "blocks.{block}"
++    return (
++        linear(f"{p}.q_proj", "X", "X"),
++        linear(f"{p}.k_proj", "KV", "X"),
++        linear(f"{p}.v_proj", "KV", "X"),
++        linear(f"{p}.attn_gate", "X", "X", module_type="GateLinear"),
++        linear(f"{p}.attn_proj", "X", "X"),
++        *_swiglu(f"{p}.mlp"),
++    )
++
++
++def _extra_components() -> tuple:
++    return (
++        kept_component("s_embedder", "PatchEmbedder", "transformer", "16x16 pixel patch embedding kept high precision"),
++        kept_component("t_embedder", "TimestepEmbedder", "transformer", "timestep embedding kept high precision"),
++        kept_component("y_embedder", "LayerwiseTextEmbedder", "transformer", "Qwen3-VL text adapter kept high precision"),
++        kept_component("y_pos_embedding", "Parameter", "transformer", "text position embedding kept high precision"),
++        kept_component("modulation_cores", "SharedModulation", "transformer", "shared adaLN cores kept high precision"),
++        kept_component("pixel_embedder", "Linear", "transformer", "pixel head input kept high precision"),
++        kept_component("pixel_blocks", "PixelBlock", "transformer", "pixel head kept high precision"),
++        kept_component("final_layer", "FinalLayer", "transformer", "RGB output layer kept high precision"),
++    )
++
++
++def build_iris_static_contract() -> StockDitContract:
++    return StockDitContract(
++        family="iris",
++        schema_version=CONTRACT_SCHEMA_VERSION,
++        preferred_format="fp8_e4m3",
++        dims=_dims(),
++        block_groups=(
++            BlockGroup(prefix="blocks", count=_DUAL_BLOCKS, modules=_dual_block_modules()),
++            BlockGroup(prefix="blocks", count=_SINGLE_BLOCKS, modules=_single_block_modules(), start=_DUAL_BLOCKS),
++        ),
++        extra_components=_extra_components(),
++        metadata={
++            "export_name": "Iris-3B",
++            "architecture": "iris_hybrid_mmdit_pixel",
++            "hidden_size": _HIDDEN,
++            "num_heads": _NUM_HEADS,
++            "num_kv_heads": _NUM_KV_HEADS,
++            "head_dim": _HEAD_DIM,
++            "mlp_hidden": _MLP,
++            "dual_blocks": _DUAL_BLOCKS,
++            "single_blocks": _SINGLE_BLOCKS,
++            "pixel_blocks": _PIXEL_BLOCKS,
++            "text_encoder": "qwen3vl_4b",
++            "vae": None,
++            "supported_model_ids": ("speridlabs/iris-3b",),
++        },
++    )
++
++
++class IrisAdapter:
++    """Adapter for Iris-3B text-to-image (and its same-architecture depth/upscaler fine-tunes)."""
++
++    family = "iris"
++    supported_model_ids = ["speridlabs/iris-3b"]
++
++    def inspect(self, source: ModelSource):
++        contract = build_iris_static_contract()
++        graph = build_stock_dit_graph(
++            contract,
++            source,
++            artifact_metadata=stock_dit_artifact_contract_metadata("iris"),
++        )
++        return summarize_stock_dit_graph(graph, self.__class__.__name__), graph
++
++    def default_policy(self, target_dtype: str = "fp8_e4m3") -> QuantPolicy:
++        return QuantPolicy(
++            name="iris_default",
++            algorithm="fp8_static",
++            target_dtype=target_dtype,
++            include=list(DEFAULT_INCLUDE),
++            exclude=list(DEFAULT_EXCLUDE),
++            keep_components=["text_encoder"],
++        )
++
++
++from comfy_quants.registry.global_registry import registry  # noqa: E402
++
++registry.register_adapter(IrisAdapter())
+diff --git a/src/comfy_quants/model_adapters/registry.py b/src/comfy_quants/model_adapters/registry.py
+index 850a8ce..b0d0673 100644
+--- a/src/comfy_quants/model_adapters/registry.py
++++ b/src/comfy_quants/model_adapters/registry.py
+@@ -12,6 +12,7 @@ from comfy_quants.model_adapters import flux2 as _flux2_adapter  # noqa: F401
+ from comfy_quants.model_adapters import ltxv as _ltxv_adapter  # noqa: F401
+ from comfy_quants.model_adapters import ltx2 as _ltx2_adapter  # noqa: F401
+ from comfy_quants.model_adapters import ideogram4 as _ideogram4_adapter  # noqa: F401
++from comfy_quants.model_adapters import iris as _iris_adapter  # noqa: F401
+ from comfy_quants.registry.global_registry import registry
+ 
+ 
+diff --git a/src/comfy_quants/model_adapters/stock_dit_contract.py b/src/comfy_quants/model_adapters/stock_dit_contract.py
+index f6ab235..828f5cf 100644
+--- a/src/comfy_quants/model_adapters/stock_dit_contract.py
++++ b/src/comfy_quants/model_adapters/stock_dit_contract.py
+@@ -83,11 +83,24 @@ def kept_component(name: str, module_type: str, component: str, notes: str) -> M
+ 
+ @dataclass(frozen=True)
+ class BlockGroup:
+-    """A repeated transformer block group (``{prefix}.{block}.*``)."""
++    """A repeated transformer block group (``{prefix}.{block}.*``).
++
++    ``start`` offsets the block indices, for architectures whose block kinds share one
++    prefix (Iris: ``blocks.0-7`` dual-stream, ``blocks.8-23`` single-stream).
++    """
+ 
+     prefix: str
+     count: int
+     modules: tuple[ModuleContract, ...]
++    start: int = 0
++
++    @property
++    def indices(self) -> range:
++        return range(self.start, self.start + self.count)
++
++    @property
++    def summary_key(self) -> str:
++        return self.prefix if self.start == 0 else f"{self.prefix}[{self.start}:{self.start + self.count}]"
+ 
+     def to_dict(self) -> dict[str, Any]:
+         return asdict(self)
+@@ -163,7 +176,7 @@ def _contract_summary(contract: StockDitContract) -> dict[str, Any]:
+         "contract_mode": contract.contract_mode,
+         "preferred_format": contract.preferred_format,
+         "architecture": contract.metadata.get("architecture"),
+-        "block_groups": {group.prefix: group.count for group in contract.block_groups},
++        "block_groups": {group.summary_key: group.count for group in contract.block_groups},
+         "block_count": contract.block_count,
+         "dims": contract.dimensions(),
+     }
+@@ -178,7 +191,7 @@ def build_stock_dit_graph(
+     dims = contract.dimensions()
+     modules: list[ModuleSpec] = []
+     for group in contract.block_groups:
+-        for block in range(group.count):
++        for block in group.indices:
+             modules.extend(_module_spec(module, dims, block=block) for module in group.modules)
+     modules.extend(_module_spec(module, dims) for module in contract.extra_components)
+ 
+diff --git a/tests/unit/test_iris_contract.py b/tests/unit/test_iris_contract.py
+new file mode 100644
+index 0000000..fe4b70b
+--- /dev/null
++++ b/tests/unit/test_iris_contract.py
+@@ -0,0 +1,131 @@
++import unittest
++from pathlib import Path
++
++from comfy_quants.algorithms.tensor_index import TensorIndexOptions, build_quant_tensor_index
++from comfy_quants.core.config import load_quant_config
++from comfy_quants.model_adapters.base import ModelSource
++from comfy_quants.model_adapters.iris import build_iris_static_contract
++from comfy_quants.model_adapters.registry import get_adapter
++from comfy_quants.model_adapters.stock_dit_contract import BlockGroup
++
++CONFIGS = Path(__file__).resolve().parents[2] / "configs"
++IRIS_CONFIGS = {
++    "iris_3b_fp8.yaml": ("fp8_e4m3", "per_tensor", None, None),
++    "iris_3b_fp8_e5m2.yaml": ("fp8_e5m2", "per_tensor", None, None),
++    "iris_3b_mxfp8.yaml": ("mxfp8", "block", "in_features", 32),
++    "iris_3b_nvfp4.yaml": ("nvfp4", "block", "in_features", 16),
++    "iris_3b_int8_tensorwise.yaml": ("int8_tensorwise", "per_channel", "out_features", None),
++}
++
++
++def _graph():
++    _insp, graph = get_adapter("iris").inspect(ModelSource(family="iris", model_id="speridlabs/iris-3b"))
++    return graph
++
++
++def _index(target_dtype, granularity, axis, block_size=None, include=None, exclude=None):
++    adapter = get_adapter("iris")
++    policy = adapter.default_policy(target_dtype)
++    if include is not None:
++        policy.include = include
++    if exclude is not None:
++        policy.exclude = exclude
++    return build_quant_tensor_index(
++        _graph(),
++        policy,
++        TensorIndexOptions(
++            algorithm=policy.algorithm,
++            algorithm_version="0.1.0",
++            target_dtype=target_dtype,
++            scale_granularity=granularity,
++            scale_axis=axis,
++            scale_method="amax",
++            rounding="nearest_even",
++            compatibility_level="L2",
++            scale_block_size=block_size,
++            scale_dtype="float8_e4m3fn" if granularity == "block" else "fp32",
++        ),
++    )
++
++
++class TestIrisContract(unittest.TestCase):
++    def test_contract(self):
++        c = build_iris_static_contract()
++        self.assertEqual(c.family, "iris")
++        self.assertEqual(c.schema_version, "iris_static_contract.v1")
++        self.assertEqual([(g.prefix, g.start, g.count) for g in c.block_groups], [("blocks", 0, 8), ("blocks", 8, 16)])
++        self.assertEqual(c.dimensions(), {"X": 2560, "KV": 640, "MLP": 6826})
++
++    def test_block_group_offset(self):
++        group = BlockGroup(prefix="blocks", count=16, modules=(), start=8)
++        self.assertEqual(list(group.indices), list(range(8, 24)))
++        self.assertEqual(group.summary_key, "blocks[8:24]")
++        self.assertEqual(BlockGroup(prefix="layers", count=3, modules=()).summary_key, "layers")
++        summary = _graph().metadata["model_contract"]["block_groups"]
++        self.assertEqual(summary, {"blocks": 8, "blocks[8:24]": 16})
++
++    def test_graph_matches_released_checkpoint(self):
++        # Names and shapes from the speridlabs/iris-3b model.safetensors header.
++        by_name = {t.name: t.shape for m in _graph().modules for t in m.tensors}
++        self.assertEqual(len(by_name), 8 * 16 + 16 * 8)  # every 2D Linear weight of blocks.0-23
++        expected = {
++            "blocks.0.attn.q_proj_x.weight": [2560, 2560],
++            "blocks.0.attn.k_proj_x.weight": [640, 2560],
++            "blocks.7.attn.v_proj_y.weight": [640, 2560],
++            "blocks.3.attn.proj_y.weight": [2560, 2560],
++            "blocks.0.attn_gate_x.weight": [2560, 2560],
++            "blocks.0.mlp_x.w1.weight": [6826, 2560],
++            "blocks.0.mlp_y.w2.weight": [2560, 6826],
++            "blocks.8.q_proj.weight": [2560, 2560],
++            "blocks.8.k_proj.weight": [640, 2560],
++            "blocks.23.attn_gate.weight": [2560, 2560],
++            "blocks.23.attn_proj.weight": [2560, 2560],
++            "blocks.23.mlp.w3.weight": [6826, 2560],
++        }
++        for name, shape in expected.items():
++            self.assertEqual(by_name[name], shape, name)
++        self.assertNotIn("blocks.8.attn.q_proj_x.weight", by_name)
++        self.assertNotIn("blocks.7.q_proj.weight", by_name)
++        self.assertNotIn("blocks.24.q_proj.weight", by_name)
++
++    def test_default_selection_is_image_side_without_w2(self):
++        idx = _index("fp8_e4m3", "per_tensor", None)
++        sel = {row["name"] for row in idx["tensors"]}
++        # dual: q/k/v/proj/gate/w1/w3 of the image stream; single: q/k/v/gate/proj/w1/w3
++        self.assertEqual(len(sel), 8 * 7 + 16 * 7)
++        self.assertIn("blocks.0.attn.q_proj_x.weight", sel)
++        self.assertIn("blocks.0.attn_gate_x.weight", sel)
++        self.assertIn("blocks.0.mlp_x.w3.weight", sel)
++        self.assertIn("blocks.8.attn_proj.weight", sel)
++        for name in sel:
++            self.assertNotIn("_y.", name)
++            self.assertNotIn(".w2.", name)
++            self.assertNotIn("modulation_cores", name)
++            self.assertNotIn("pixel", name)
++            self.assertNotIn("y_embedder", name)
++        by_name = {t.name: t.shape for m in _graph().modules for t in m.tensors}
++        for name in sel:
++            self.assertEqual(by_name[name][1] % 256, 0, name)  # MXFP8, NVFP4 and ConvRot aligned
++
++    def test_text_side_can_be_opted_in(self):
++        idx = _index("fp8_e4m3", "per_tensor", None, exclude=["blocks.*.mlp_x.w2", "blocks.*.mlp_y.w2", "blocks.*.mlp.w2"])
++        self.assertEqual(len(idx["tensors"]), 8 * 14 + 16 * 7)
++
++    def test_configs_build(self):
++        for config_name, (target_dtype, granularity, axis, block_size) in IRIS_CONFIGS.items():
++            with self.subTest(config=config_name):
++                cfg = load_quant_config(CONFIGS / config_name)
++                self.assertEqual(cfg.model.family, "iris")
++                self.assertEqual(cfg.quant.target_dtype, target_dtype)
++                self.assertEqual(cfg.quant.scale.granularity, granularity)
++                idx = _index(target_dtype, granularity, axis, block_size,
++                             include=cfg.quant.modules["include"], exclude=cfg.quant.modules["exclude"])
++                self.assertEqual(idx["format"]["name"], target_dtype)
++                self.assertEqual(len(idx["tensors"]), 168)
++                if block_size:
++                    for row in idx["tensors"]:
++                        self.assertEqual(row["scale"]["block_size"], block_size)
++
++
++if __name__ == "__main__":
++    unittest.main()

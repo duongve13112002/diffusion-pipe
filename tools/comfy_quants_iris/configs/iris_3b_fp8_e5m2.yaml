@@ -1,0 +1,40 @@
+project:
+  name: iris-3b-fp8-e5m2-v0
+  created_by: comfy_quants
+  seed: 42
+model:
+  family: iris
+  model_id: speridlabs/iris-3b
+  revision: "<pin-this>"
+  dtype: bf16
+  source: huggingface
+  trust_remote_code: false
+  components:
+    transformer: quantize
+    text_encoder: keep_bf16
+quant:
+  algorithm: fp8_static
+  target_dtype: fp8_e5m2
+  scale:
+    granularity: per_tensor
+    axis: null
+    method: amax
+  rounding: nearest_even
+  modules:
+    include:
+      - "blocks.*"
+    # Image side of the 8 dual-stream blocks + all 16 single-stream blocks: 168 Linears.
+    # Text side (_y), every MLP down projection (w2: in_features 6826, not aligned to 16 for the FP8 matmul),
+    # modulation cores, text adapter, embedders and pixel head stay high precision.
+    exclude:
+      - "blocks.*.attn.*_y"
+      - "blocks.*.attn_gate_y"
+      - "blocks.*.mlp_y.*"
+      - "blocks.*.mlp_x.w2"
+      - "blocks.*.mlp.w2"
+  fallback:
+    on_error: keep_bf16
+artifact:
+  format: safetensors_quant
+  compatibility_target: L2
+  write_module_reports: true
