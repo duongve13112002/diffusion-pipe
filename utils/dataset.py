@@ -1400,6 +1400,9 @@ class DirectoryDataset:
         if self.snapshot_path.exists():
             print(f'[CACHE] Using source metadata snapshot: {self.snapshot_path}')
             return datasets.load_from_disk(str(self.snapshot_path))
+        print(f'[CACHE] No source metadata snapshot at {self.snapshot_path}: scanning {self.path} once '
+              '(later runs reuse it). tools/inherit_metadata_cache.py can give this model another '
+              "model's snapshot instead; run it with this same dataset config.")
 
         baseline_config = dict(self.directory_config)
         baseline_config.update(reuse_metadata_cache=False, require_non_latin_caption=None,
