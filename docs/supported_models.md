@@ -770,9 +770,30 @@ Example configs: [LoRA](../examples/iris/iris_3b_lora.toml),
 
 LoRA, LoKr, OPLoRA and full fine-tuning are supported, as are block swap (adapters only, also
 with on-the-fly text encoding), pipeline parallelism (any stage split), activation checkpointing
-(reentrant or not), eval, batch fill, `merge_adapters` and `--test_sample`. Edit/control datasets
-are not (Iris is text-to-image). `merge_adapters` takes diffusion-pipe Iris adapter save
-directories (or the `adapter_model.safetensors` inside one), LoRA or LoKr.
+(reentrant, non-reentrant or `'unsloth'`), `compile`, eval, masks, batch fill, `merge_adapters` and
+`--test_sample`. Edit/control datasets are not (Iris is text-to-image), nor are Iris's `depth/` and
+`upscaler/` checkpoints (refused at load). `merge_adapters` takes diffusion-pipe Iris adapter save
+directories (or the `adapter_model.safetensors` inside one), LoRA or LoKr; with an fp8
+`transformer_dtype` they are merged first and the trunk is cast afterwards.
+
+Differences from Iris's own training recipe worth knowing:
+- Caption dropout: Iris trains with 10% of captions dropped for classifier-free guidance.
+  diffusion-pipe's default is 0, so set `caption_dropout_rate = 0.1` in the dataset config (as the
+  example does) unless you never sample with CFG. The dropped caption encodes exactly like
+  Iris's empty-prompt null, cached or not.
+- No EMA: diffusion-pipe keeps no EMA weights. Iris itself trains with EMA (decay 0.9999) and the
+  released weights are the EMA; a full fine-tune here saves the raw weights.
+- Optimizer: Iris trains with Muon + AdamW (betas 0.9/0.95, no weight decay, gradient clipping
+  0.5, fp32 master weights). The examples use diffusion-pipe's usual `adamw_optimi` in bf16 with
+  Kahan summation, which suits fine-tuning; any diffusion-pipe optimizer works.
+- `flux_shift`, `sigmoid_scale` and `text_encoder_fp8` are refused rather than ignored: use
+  `shift_law`, `logit_std` and `cache_text_embeddings` instead.
+
+With `cache_text_embeddings = false` the Qwen3-VL-4B text encoder (about 8 GB in bf16) lives on
+the first pipeline stage's GPU but is not counted by `partition_method`; with more than one
+pipeline stage, give stage 0 fewer layers with `partition_method = 'manual'` / `partition_split` if it runs
+out of memory, or cache the embeddings. `train/repa_loss` is the mean over the step's
+micro-batches and data-parallel ranks, whichever stage REPA runs on.
 
 All `[model]` options:
 
@@ -782,27 +803,28 @@ All `[model]` options:
 | `text_encoder_path` | `text_encoder.pretrained` of the checkpoint config | Qwen3-VL-4B as an HF repo id, a Transformers directory, or a single `.safetensors` file (full VLM or text tower only, any of the `model.language_model.`/`language_model.`/`model.` prefixes; the vision weights are ignored; bf16/fp32, not scaled fp8). |
 | `text_encoder_config_path` | bundled `configs/qwen3_vl_4b_instruct` | Only for a single-file `text_encoder_path`: directory (or repo id) with the Qwen3-VL `config.json` and tokenizer files. |
 | `dtype` | — | Base dtype. |
-| `transformer_dtype` | `dtype` | Dtype of the 2-D trunk weights. Embedders, text adapter, modulation cores, pixel head and 1-D tensors stay in `dtype`. |
+| `transformer_dtype` | `dtype` | Dtype of the 2-D trunk weights. Embedders, text adapter, modulation cores, pixel head and 1-D tensors stay in `dtype`. An fp8 value requires an `[adapter]` (refused for a full fine-tune). |
 | `cache_pixels` | `false` | `false`: images are decoded and resized in the DataLoader workers each step, nothing is cached. `true`: resized pixels are cached as uint8 like any other model's latents. |
 | `cache_text_embeddings` | `false` | `false`: captions are tokenized per step and encoded on the GPU inside the pipeline (caption augmentation stays per-step). `true`: embeddings are cached once, trimmed to real tokens (still ~60 KB per token). |
 | `max_text_length` | checkpoint `text_encoder.max_length` (300) | Token budget of the caption including the chat-template suffix. Must be ≤ `model.text_len`. Iris attends to pad text positions, so a different value changes outputs even for short captions (a warning is printed); it is written to the exported `config.yaml`. |
-| `text_encoder_dtype` | checkpoint `text_encoder.dtype` (`bfloat16`) | Dtype the Qwen3-VL decoder is loaded in. |
+| `text_encoder_dtype` | checkpoint `text_encoder.dtype` (`bfloat16`) | Dtype the Qwen3-VL decoder is loaded and run in (`bfloat16`/`bf16`, `float16`/`fp16`, `float32`/`fp32`), also during on-the-fly encoding. |
+| `on_caption_overflow` | checkpoint `text_encoder.on_caption_overflow` (`warn`) | A caption longer than `max_text_length`: `warn` (truncate, say so once), `silent` (truncate) or `error`. |
 | `text_encoder_attn_implementation` | checkpoint config | `attn_implementation` for the Qwen3-VL decoder. |
 | `attn_backend` | checkpoint config (`sdpa`) | Iris attention backend for training: `sdpa`, `torch_flash`, `torch_cudnn`, `fa3`, `fa4`. Not written to the exported `config.yaml`. |
 | `timestep_sample_method` | checkpoint `flow.timestep_sampler` (`logit_normal`) | `logit_normal` or `uniform`. |
 | `logit_mean`, `logit_std` | checkpoint `flow` config | Logit-normal parameters. |
-| `min_t`, `max_t` | `0`, `1` | Restrict the sampled noise levels. |
+| `min_t`, `max_t` | `0`, `1` | Bounds on the shifted noise level σ' the model is trained at, the same meaning as for Wan: the sampler is truncated to that range, keeping its shape. With `shift_law` they apply after each batch's shift. |
 | `shift` | checkpoint `flow.shift` (4.0) | Flow shift for training and sampling; a full fine-tune writes it to the exported `config.yaml`. An adapter does not store it: pass the same value to the merge tool with `--shift`. |
-| `shift_law` | checkpoint `flow.shift_law` (`none`) | `none`, `sd3` or `flux`: scale the shift with each batch's image token count (base `flow.shift_base_tokens`). Merge tool: `--shift-law`. |
+| `shift_law` | checkpoint `flow.shift_law` (`none`) | `none`, `sd3` or `flux`: scale the shift with each batch's image token count (base `flow.shift_base_tokens`). Merge tool: `--shift-law`. Iris's own `scripts/sample.py` uses `flow.shift` as is and ignores the law, so pass it the shift for your sampling resolution. |
 | `text_adapter_lr` | optimizer `lr` | LR of `y_embedder` + `y_pos_embedding` (full fine-tune). `0` freezes them. |
 | `pixel_head_lr` | optimizer `lr` | LR of `pixel_embedder`, `pixel_blocks`, `final_layer` (full fine-tune). `0` freezes them. |
 | `adapter_target_modules` | `['MMDiTBlock', 'SingleStreamBlock']` | Block classes whose Linear layers get the adapter. |
-| `sample_steps` | checkpoint `sample.steps` | Steps for `--test_sample`. |
+| `sample_steps` | `100` (Iris's sampler default) | Steps for `--test_sample`. |
 | `repa_weight` | `0` | REPA alignment loss weight. `0` disables REPA entirely. |
 | `repa_layer` | checkpoint `model.repa_layer` (10) | 1-based block whose output is aligned. |
 | `repa_lr` | optimizer `lr` | LR of the REPA projector. |
-| `repa_projector_path` | — | Initial projector weights (`.safetensors`). Without it, a `repa.*` projector stored in the base checkpoint is used, else a fresh one. |
-| `repa_variant`, `repa_teacher_source`, `repa_teacher_hub`, `repa_teacher`, `repa_teacher_weights`, `repa_teacher_dim`, `repa_proj_hidden_dim`, `repa_teacher_image_size`, `repa_teacher_patch_size`, `repa_teacher_match_student`, `repa_spatial_norm_gamma` | Iris `RepaConfig` defaults (DINOv2 ViT-B/14 via torch hub) | Passed through to `iris3b.repa.REPALoss`. Training stops with an error if the teacher cannot be loaded. |
+| `repa_projector_path` | — | Initial projector weights (`.safetensors`). Without it, a `repa.*` projector stored in the base checkpoint is used, then a `repa_projector.safetensors` beside it (what a full fine-tune here saves), else a fresh one. |
+| `repa_variant`, `repa_teacher_source`, `repa_teacher_hub`, `repa_teacher`, `repa_teacher_weights`, `repa_teacher_dim`, `repa_proj_hidden_dim`, `repa_teacher_image_size`, `repa_teacher_patch_size`, `repa_teacher_match_student`, `repa_spatial_norm_gamma` | Iris `RepaConfig` defaults (DINOv2 ViT-B/14 via torch hub) | Passed through to `iris3b.repa.REPALoss`. Rank 0 downloads the teacher first, the other ranks then load it from the cache. Training stops with an error if the teacher cannot be loaded. |
 
 Top-level `dataloader_workers` (default 1) sets the training DataLoader worker count; with the
 default on-the-fly pixels, 4 or more keeps image decoding off the critical path. It is per GPU
@@ -841,8 +863,8 @@ Saving:
   `transformer_path` again. With REPA the projector goes to `repa_projector.safetensors` beside it.
 - LoRA/LoKr write `adapter_model.safetensors` with `diffusion_model.`-prefixed keys plus
   `adapter_config.json` (REPA projector, if any, in `repa/`). Fold one into the base weights with
-  `python -m tools.iris_merge_adapter --model speridlabs/iris-3b --adapter <save dir> --output <dir> [--strength 1.0] [--shift S --shift-law L]`
-  (the shift options only if training changed them),
+  `python -m tools.iris_merge_adapter --model speridlabs/iris-3b --adapter <save dir> --output <dir> [--strength 1.0] [--shift S --shift-law L] [--max-text-length N]`
+  (the last three only if the training config changed `shift`, `shift_law` or `max_text_length`),
   which writes the same layout as a full fine-tune.
 
 fp8 `transformer_dtype` is untested and not listed as supported.

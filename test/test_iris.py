@@ -363,10 +363,11 @@ def test_adapter_trains_saves_reloads_and_merges(ckpt, tmp_path, kind):
 
 
 @pytest.mark.parametrize('flags, expected', [
-    ([], (3.0, 'none')),                                   # the base checkpoint's, copied as is
-    (['--shift', '2.5', '--shift-law', 'sd3'], (2.5, 'sd3')),
-    (['--shift-law', 'flux'], (3.0, 'flux')),
-], ids=['default', 'both', 'law_only'])
+    ([], (3.0, 'none', None)),                             # the base checkpoint's, copied as is
+    (['--shift', '2.5', '--shift-law', 'sd3'], (2.5, 'sd3', None)),
+    (['--shift-law', 'flux'], (3.0, 'flux', None)),
+    (['--max-text-length', '12'], (3.0, 'none', 12)),
+], ids=['default', 'both', 'law_only', 'text_length'])
 def test_merge_tool_writes_the_shift_training_used(ckpt, tmp_path, flags, expected):
     """An adapter carries no flow settings: a LoRA trained with its own `shift` needs it
     written to the merged config.yaml, or Iris's sampler uses the base checkpoint's."""
@@ -383,11 +384,18 @@ def test_merge_tool_writes_the_shift_training_used(ckpt, tmp_path, flags, expect
     out = tmp_path / 'merged'
     iris_merge_adapter.main(['--model', str(path), '--adapter', str(save_dir), '--output', str(out), *flags])
     written = inference_config(OmegaConf.to_container(OmegaConf.load(out / 'config.yaml')))
-    assert (written.flow.shift, written.flow.shift_law) == expected
+    shift, law, max_length = expected
+    assert (written.flow.shift, written.flow.shift_law) == (shift, law)
     base = OmegaConf.to_container(OmegaConf.load(path / 'config.yaml'))
     merged = OmegaConf.to_container(OmegaConf.load(out / 'config.yaml'))
-    # Only the flow keys asked for change.
-    assert merged['model'] == base['model'] and merged['text_encoder'] == base['text_encoder']
+    # Only the keys asked for change.
+    assert merged['model'] == base['model']
+    if max_length is None:
+        assert merged['text_encoder'] == base['text_encoder']
+    else:
+        assert written.text_encoder.max_length == max_length
+        assert {k: v for k, v in merged['text_encoder'].items() if k != 'max_length'} == \
+            {k: v for k, v in base['text_encoder'].items() if k != 'max_length'}
 
 
 def test_merge_tool_rejects_adapter_for_a_different_model(ckpt, tmp_path):
@@ -651,10 +659,41 @@ def test_timestep_sampling_matches_iris_sampler_distribution(ckpt):
     assert abs(ours.float().mean() - theirs.float().mean()) < 10
     assert abs(ours.float().std() - theirs.float().std()) < 10
 
-    uniform = make_pipeline(path, cache_text_embeddings=True, timestep_sample_method='uniform',
-                            min_t=0.2, max_t=0.4)
-    idx = uniform._sample_timestep_idx(5000)
-    assert idx.min() >= 200 and idx.max() < 400
+
+
+@pytest.mark.parametrize('method', ['logit_normal', 'uniform'])
+@pytest.mark.parametrize('min_t, max_t', [(0.875, 1.0), (0.0, 0.875), (0.2, 0.4)])
+def test_min_max_t_bound_the_shifted_noise_level(ckpt, method, min_t, max_t):
+    """min_t / max_t mean what they mean for Wan: bounds on the shifted sigma the model is
+    trained at, with the sampler's shape kept (the same as rejecting samples outside them)."""
+    path, _ = ckpt
+    pipe = make_pipeline(path, cache_text_embeddings=True, timestep_sample_method=method,
+                         min_t=min_t, max_t=max_t)
+    sigmas = FlowSchedule(1000, 3.0).sigmas
+    torch.manual_seed(0)
+    idx = pipe._sample_timestep_idx(40000, shift=3.0)
+    assert sigmas[idx].min() >= min_t and (sigmas[idx].max() < max_t or max_t == 1.0)
+
+    free = make_pipeline(path, cache_text_embeddings=True, timestep_sample_method=method)
+    pool = free._sample_timestep_idx(400000)
+    kept = pool[(sigmas[pool] >= min_t) & ((sigmas[pool] < max_t) | (max_t == 1.0))]
+    assert abs(sigmas[idx].mean() - sigmas[kept].mean()) < 0.01
+    assert abs(sigmas[idx].std() - sigmas[kept].std()) < 0.01
+    for q in (0.0, 0.5, 1.0):
+        s = sigmas[pipe._sample_timestep_idx(1, quantile=q, shift=3.0)]
+        assert min_t <= s.item() and (s.item() < max_t or max_t == 1.0)
+
+
+def test_min_max_t_follow_the_batch_shift(ckpt):
+    """prepare_inputs passes the resolved shift, so a high-noise range stays high-noise at
+    every resolution under shift_law."""
+    path, _ = ckpt
+    pipe = make_pipeline(path, cache_text_embeddings=True, shift_law='sd3', min_t=0.9)
+    shift = pipe._shift_for(64, 96)
+    idx = pipe._sample_timestep_idx(2000, shift=shift)
+    assert FlowSchedule(1000, shift).sigmas[idx].min() >= 0.9
+    with pytest.raises(ValueError, match='leave no timestep'):
+        make_pipeline(path, cache_text_embeddings=True, min_t=0.5, max_t=0.5)._sample_timestep_idx(1)
 
 
 def test_loss_fn_masks_and_adds_repa(ckpt):
@@ -757,6 +796,23 @@ def test_repa_trains_projector_and_matches_iris_loss(ckpt, fake_hub, tmp_path):
     pipe.save_model(save, dict(sd))
     assert not any(k.startswith('repa.') for k in safetensors.torch.load_file(str(save / 'model.safetensors')))
     assert (save / 'repa_projector.safetensors').exists()
+    # Continuing from that export picks the projector back up instead of a random one.
+    again = make_pipeline(save, cache_text_embeddings=True, repa_weight=0.5, repa_teacher_dim=24,
+                          repa_teacher_match_student=True)
+    again.load_diffusion_model()
+    for k, v in pipe.repa.projector.state_dict().items():
+        torch.testing.assert_close(again.repa.projector.state_dict()[k], v.detach().to(torch.float32))
+
+
+def test_repa_log_scalar_is_the_mean_over_micro_batches(ckpt):
+    path, _ = ckpt
+    pipe = make_pipeline(path, cache_text_embeddings=True)
+    pipe.repa_weight = 0.5
+    assert pipe.get_extra_log_scalars() == {}        # a rank that never ran RepaLayer
+    pipe._record_repa_loss(torch.tensor([1.0]))
+    pipe._record_repa_loss(torch.tensor([3.0]))
+    assert pipe.get_extra_log_scalars() == {'train/repa_loss': 2.0}
+    assert pipe.get_extra_log_scalars() == {}        # reset every step
 
 
 def test_repa_with_adapter_keeps_projector_out_of_adapter_file(ckpt, fake_hub, tmp_path):
@@ -1168,3 +1224,99 @@ def test_block_swap_single_kind_trunk(tmp_path, monkeypatch, dual_depth, expecte
     assert created == expected
     with pytest.raises(AssertionError):
         pipe.enable_block_swap(3)
+
+
+# ---- config guards ---------------------------------------------------------------------------------
+
+@pytest.mark.parametrize('task', [{'name': 'restoration', 'sigma': 0.5, 'tile': 1024}, {'name': 'depth'}])
+def test_task_checkpoints_are_refused(tmp_path, task):
+    """depth/ and upscaler/ share the architecture; the upscaler would otherwise load and be
+    trained as a text-to-image model without a word."""
+    raw = tiny_raw_config()
+    write_checkpoint(tmp_path / 'ckpt', {**raw, 'task': task})
+    with pytest.raises(ValueError, match=task['name']):
+        make_pipeline(tmp_path / 'ckpt', cache_text_embeddings=True)
+
+
+@pytest.mark.parametrize('name, expected', [('bf16', torch.bfloat16), ('bfloat16', torch.bfloat16),
+                                            ('fp32', torch.float32), ('float16', torch.float16)])
+def test_text_encoder_dtype_names(ckpt, name, expected):
+    path, _ = ckpt
+    pipe = make_pipeline(path, cache_text_embeddings=True, text_encoder_dtype=name)
+    assert pipe._text_encoder_dtype(pipe.iris_config.text_encoder) == expected
+
+
+def test_text_encoder_dtype_rejects_unknown_names(ckpt):
+    path, _ = ckpt
+    pipe = make_pipeline(path, cache_text_embeddings=True, text_encoder_dtype='float8')
+    with pytest.raises(ValueError, match='text_encoder_dtype'):
+        pipe._text_encoder_dtype(pipe.iris_config.text_encoder)
+
+
+@pytest.mark.parametrize('mode', ['warn', 'silent', 'error'])
+def test_on_caption_overflow(ckpt, tiny_qwen, mode, capsys):
+    path, _ = ckpt
+    pipe = make_pipeline(path, text_encoder_path=tiny_qwen, cache_text_embeddings=True,
+                         max_text_length=12, on_caption_overflow=mode)
+    long = ' '.join(['word'] * 50)
+    if mode == 'error':
+        with pytest.raises(ValueError, match='on_caption_overflow'):
+            pipe.text_encoder.tokenize([long])
+        return
+    ids, mask = pipe.text_encoder.tokenize([long])
+    assert pipe.text_encoder.overflow_rows == 1
+    assert ('truncated' in capsys.readouterr().out) == (mode == 'warn')
+
+
+def test_on_caption_overflow_rejects_unknown_values(ckpt):
+    path, _ = ckpt
+    with pytest.raises(ValueError, match='on_caption_overflow'):
+        make_pipeline(path, cache_text_embeddings=True, on_caption_overflow='truncate')
+
+
+def test_fp8_full_fine_tune_is_refused(ckpt):
+    path, _ = ckpt
+    pipe = make_pipeline(path, cache_text_embeddings=True, transformer_dtype=torch.float8_e4m3fn)
+    with pytest.raises(ValueError, match='needs an \\[adapter\\]'):
+        pipe.load_diffusion_model()
+
+
+def test_merge_adapters_then_fp8(ckpt, tmp_path):
+    """Adapters merge at `dtype`, then the trunk is cast: fp8 cannot be merged into directly."""
+    path, _ = ckpt
+    pipe = make_pipeline(path, cache_text_embeddings=True)
+    pipe.load_diffusion_model()
+    pipe.configure_adapter(dict(ADAPTERS['lora']))
+    with torch.no_grad():
+        for p in pipe.transformer.parameters():
+            if p.requires_grad:
+                p.add_(torch.randn_like(p) * 0.05)
+    save_dir = tmp_path / 'adapter'
+    save_dir.mkdir()
+    pipe.save_adapter(save_dir, saved_adapter_state(pipe))
+    full = make_pipeline(path, cache_text_embeddings=True, merge_adapters=[str(save_dir)])
+    full.load_diffusion_model()
+
+    fp8 = make_pipeline(path, cache_text_embeddings=True, merge_adapters=[str(save_dir)],
+                        transformer_dtype=torch.float8_e4m3fn)
+    fp8.config['adapter'] = dict(ADAPTERS['lora'])
+    fp8.load_diffusion_model()
+    reference = dict(full.transformer.named_parameters())
+    cast = 0
+    for name, p in fp8.transformer.named_parameters():
+        if p.dtype == torch.float8_e4m3fn:
+            cast += 1
+            torch.testing.assert_close(p.float(), reference[name].to(torch.float8_e4m3fn).float())
+        else:
+            torch.testing.assert_close(p, reference[name])
+    assert cast
+
+
+@pytest.mark.parametrize('key, value, hint', [('flux_shift', True, 'shift_law'), ('sigmoid_scale', 1.5, 'logit_std'),
+                                              ('text_encoder_fp8', True, 'cache_text_embeddings')])
+def test_generic_keys_iris_does_not_use_are_refused(ckpt, key, value, hint):
+    path, _ = ckpt
+    with pytest.raises(ValueError, match=hint):
+        make_pipeline(path, cache_text_embeddings=True, **{key: value})
+    make_pipeline(path, cache_text_embeddings=True, **{key: {'flux_shift': False, 'sigmoid_scale': 1.0,
+                                                              'text_encoder_fp8': False}[key]})

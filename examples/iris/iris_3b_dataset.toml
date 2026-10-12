@@ -6,9 +6,12 @@ min_ar = 0.5
 max_ar = 2.0
 num_ar_buckets = 9
 
+# Iris was trained with 10% of captions dropped for classifier-free guidance; keep doing so
+# unless you never sample with CFG. (diffusion-pipe's own default is 0.)
+caption_dropout_rate = 0.1
+
 [[directory]]
 path = '/data/datasets/my_images'
 num_repeats = 1
 # Captions are encoded on the fly by default, so caption augmentation happens per step:
-#caption_dropout_rate = 0.05
 #shuffle_tags = true

@@ -15,10 +15,11 @@ Usage:
 repo id. --adapter is a save directory written by diffusion-pipe (adapter_config.json plus
 adapter_model.safetensors). The adapter type, rank and targets are read from the json.
 
-The adapter does not record the flow shift it was trained with, so config.yaml keeps the base
-checkpoint's flow.shift / flow.shift_law (Iris 3B: 4.0 / none). If the training config set
-`shift` or `shift_law`, pass the same values with --shift / --shift-law so the merged model
-samples the way it was trained.
+The adapter does not record the flow shift or text length it was trained with, so config.yaml
+keeps the base checkpoint's flow.shift / flow.shift_law / text_encoder.max_length (Iris 3B:
+4.0 / none / 300). If the training config set `shift`, `shift_law` or `max_text_length`, pass
+the same values with --shift / --shift-law / --max-text-length so the merged model samples the
+way it was trained (Iris attends to pad text positions, so max_length changes outputs).
 
 Only iris3b, peft and safetensors are imported: nothing from diffusion-pipe's model stack,
 so this runs on a machine without CUDA.
@@ -126,10 +127,10 @@ def merge(model_path, adapter_dir, strength=1.0):
     return state_dict, config_file, cfg
 
 
-def write_config(path, config_file, cfg, shift=None, shift_law=None):
+def write_config(path, config_file, cfg, shift=None, shift_law=None, max_text_length=None):
     """The base checkpoint's config.yaml, with the sampling settings training overrode."""
     from omegaconf import OmegaConf
-    if shift is None and shift_law is None and config_file is not None:
+    if shift is None and shift_law is None and max_text_length is None and config_file is not None:
         shutil.copyfile(config_file, path)
         return
     if config_file is not None:
@@ -143,6 +144,8 @@ def write_config(path, config_file, cfg, shift=None, shift_law=None):
         flow['shift'] = float(shift)
     if shift_law is not None:
         flow['shift_law'] = shift_law
+    if max_text_length is not None:
+        config.setdefault('text_encoder', {})['max_length'] = int(max_text_length)
     OmegaConf.save(OmegaConf.create(config), str(path))
 
 
@@ -158,13 +161,16 @@ def main(argv=None):
     parser.add_argument('--shift-law', choices=['none', 'sd3', 'flux'], default=None,
                         help="flow.shift_law to write: the training config's `shift_law`, if it set one "
                              "(default: keep the base checkpoint's).")
+    parser.add_argument('--max-text-length', type=int, default=None,
+                        help="text_encoder.max_length to write: the training config's `max_text_length`, if it "
+                             "set one (default: keep the base checkpoint's).")
     args = parser.parse_args(argv)
 
     state_dict, config_file, cfg = merge(args.model, args.adapter, args.strength)
     out = Path(args.output)
     out.mkdir(parents=True, exist_ok=True)
     safetensors.torch.save_file(state_dict, str(out / 'model.safetensors'), metadata={'format': 'pt'})
-    write_config(out / 'config.yaml', config_file, cfg, args.shift, args.shift_law)
+    write_config(out / 'config.yaml', config_file, cfg, args.shift, args.shift_law, args.max_text_length)
     print(f'Wrote {len(state_dict)} tensors to {out / "model.safetensors"}')
 
 

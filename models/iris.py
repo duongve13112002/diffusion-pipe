@@ -22,6 +22,7 @@ the pipeline with the hidden states. Each block's adaLN module is retargeted to 
 slice of that tensor and add its own bias, which is exactly what it computed before.
 """
 
+import contextlib
 import os
 import re
 import sys
@@ -37,7 +38,7 @@ from accelerate import init_empty_weights
 from accelerate.utils import set_module_tensor_to_device
 
 from models.base import BasePipeline, PreprocessMediaFile, make_contiguous
-from utils.common import AUTOCAST_DTYPE, is_main_process, iterate_safetensors
+from utils.common import AUTOCAST_DTYPE, is_main_process, iterate_safetensors, zero_first
 from utils.offloading import ModelOffloader
 
 from iris3b.config import RepaConfig, inference_config
@@ -164,6 +165,12 @@ def load_iris_config(transformer_path):
     from omegaconf import OmegaConf
     config_file = _resolve_file(transformer_path, 'config.yaml', required=False)
     raw = {} if config_file is None else OmegaConf.to_container(OmegaConf.load(str(config_file)))
+    if task := raw.get('task'):
+        # The depth and upscaler (restoration) checkpoints share the architecture but are
+        # trained on another task; the upscaler would even load and train silently as T2I.
+        name = task.get('name', task) if isinstance(task, dict) else task
+        raise ValueError(f'{config_file} is an Iris {name!r} task checkpoint; only the text-to-image '
+                         'model is supported (speridlabs/iris-3b without depth/ or upscaler/).')
     return inference_config(raw), raw
 
 
@@ -259,6 +266,9 @@ class IrisTextEncoder(nn.Module):
         self.pad_id = int(pad_id)
         self.overflow_rows = 0
         self._warned_overflow = False
+        # Iris's text_encoder.on_caption_overflow: warn (truncate, say so once), silent
+        # (truncate quietly) or error.
+        self.on_caption_overflow = 'warn'
         self.decoder.requires_grad_(False)
         self.decoder.eval()
 
@@ -284,7 +294,8 @@ class IrisTextEncoder(nn.Module):
         return cls(decoder, tokenizer, hidden_layers, max_length)
 
     def tokenize(self, captions):
-        caption_ids = self.tokenizer(list(captions), add_special_tokens=False)['input_ids']
+        captions = list(captions)
+        caption_ids = self.tokenizer(captions, add_special_tokens=False)['input_ids']
         start = self.prefix_len
         stop = start + self.max_length
         input_ids = torch.full((len(caption_ids), stop), self.pad_id, dtype=torch.long)
@@ -294,7 +305,12 @@ class IrisTextEncoder(nn.Module):
             n = min(len(ids), self.caption_budget)
             if len(ids) > self.caption_budget:
                 self.overflow_rows += 1
-                if not self._warned_overflow and is_main_process():
+                if self.on_caption_overflow == 'error':
+                    raise ValueError(
+                        f'A caption tokenized to {len(ids)} tokens, over the {self.caption_budget} that '
+                        f'max_text_length={self.max_length} leaves (on_caption_overflow = error): '
+                        f'{captions[row][:200]!r}')
+                if self.on_caption_overflow == 'warn' and not self._warned_overflow and is_main_process():
                     self._warned_overflow = True
                     print(f'WARNING: a caption tokenized to {len(ids)} tokens and was truncated to '
                           f'{self.caption_budget} (max_text_length={self.max_length} minus the '
@@ -400,6 +416,9 @@ class IrisPipeline(BasePipeline):
                   f'text_encoder.max_length={te_cfg.max_length}. Iris attends to pad text positions, '
                   'so outputs change even for short captions; sample with the same length.')
         self.hidden_layers = tuple(te_cfg.hidden_layers)
+        self.on_caption_overflow = self.model_config.get('on_caption_overflow', te_cfg.on_caption_overflow)
+        if self.on_caption_overflow not in ('warn', 'silent', 'error'):
+            raise ValueError(f'on_caption_overflow must be warn, silent or error, got {self.on_caption_overflow!r}')
         self.text_encoder_path = self.model_config.get('text_encoder_path', te_cfg.pretrained)
 
         if adapter_targets := self.model_config.get('adapter_target_modules', None):
@@ -413,6 +432,15 @@ class IrisPipeline(BasePipeline):
         self.shift_law = self.model_config.get('shift_law', flow_cfg.shift_law)
         if self.shift_law not in ('none', 'sd3', 'flux'):
             raise ValueError(f'shift_law must be none, sd3 or flux, got {self.shift_law!r}')
+        # Generic diffusion-pipe keys with an Iris equivalent: refuse rather than ignore them.
+        unsupported = {
+            'flux_shift': ("shift_law = 'flux' (or 'sd3') scales Iris's shift with resolution", False),
+            'sigmoid_scale': ('logit_std sets the spread of the logit-normal sampler', 1.0),
+            'text_encoder_fp8': ('no fp8 text encoder; cache_text_embeddings = true frees it after caching', False),
+        }
+        for key, (hint, neutral) in unsupported.items():
+            if key in self.model_config and self.model_config[key] != neutral:
+                raise ValueError(f'{key} is not used by Iris: {hint}.')
         self.num_train_timesteps = self.iris_config.flow.num_train_timesteps
         if self.iris_config.flow.prediction != 'v':
             raise NotImplementedError('Only velocity-prediction Iris checkpoints are supported')
@@ -423,7 +451,7 @@ class IrisPipeline(BasePipeline):
         if self.repa_weight > 0 and not 1 <= self.repa_layer <= model_cfg.depth:
             raise ValueError(f'repa_layer must be in [1, {model_cfg.depth}], got {self.repa_layer}')
         self.repa = None
-        self._last_repa_loss = None
+        self._repa_loss_sum = None
         self._checkpoint_repa_state = None
 
         self.offloader_double = ModelOffloader('dummy', [], 0, 0, True, torch.device('cuda'), False, debug=False)
@@ -439,13 +467,18 @@ class IrisPipeline(BasePipeline):
                 attn_implementation=self.model_config.get('text_encoder_attn_implementation', te_cfg.attn_implementation),
                 config_path=self.model_config.get('text_encoder_config_path', None),
             )
+            self.text_encoder.on_caption_overflow = self.on_caption_overflow
         self.pixel_encoder = PixelCacheEncoder()
         self.transformer = None
 
     def _text_encoder_dtype(self, te_cfg):
         dtype = self.model_config.get('text_encoder_dtype', te_cfg.dtype)
         if isinstance(dtype, str):
-            dtype = {'bfloat16': torch.bfloat16, 'float16': torch.float16, 'float32': torch.float32}[dtype]
+            names = {'bfloat16': torch.bfloat16, 'bf16': torch.bfloat16, 'float16': torch.float16,
+                     'fp16': torch.float16, 'float32': torch.float32, 'fp32': torch.float32}
+            if dtype not in names:
+                raise ValueError(f'text_encoder_dtype must be one of {sorted(names)}, got {dtype!r}')
+            dtype = names[dtype]
         return dtype
 
     # ---- identities ------------------------------------------------------------------------------
@@ -462,10 +495,11 @@ class IrisPipeline(BasePipeline):
             self._schedules[shift] = FlowSchedule(self.num_train_timesteps, shift)
         return self._schedules[shift]
 
-    def build_transformer(self, state_dict_iter=None):
+    def build_transformer(self, state_dict_iter=None, transformer_dtype=None):
         """IrisDiT on CPU, weights from the checkpoint (or freshly initialised when None)."""
         dtype = self.model_config['dtype']
-        transformer_dtype = self.model_config.get('transformer_dtype', dtype)
+        if transformer_dtype is None:
+            transformer_dtype = self.model_config.get('transformer_dtype', dtype)
         if state_dict_iter is None:
             transformer = IrisDiT(self.iris_config.model).to(dtype)
             return transformer
@@ -493,10 +527,19 @@ class IrisPipeline(BasePipeline):
         return transformer
 
     def load_diffusion_model(self):
+        dtype = self.model_config['dtype']
+        transformer_dtype = self.model_config.get('transformer_dtype', dtype)
+        low_precision = transformer_dtype != dtype
+        if low_precision and transformer_dtype.itemsize == 1 and 'adapter' not in self.config:
+            raise ValueError(f'transformer_dtype = {transformer_dtype} needs an [adapter]: a full fine-tune '
+                             'cannot update fp8 weights. Use the same dtype as `dtype` for full fine-tuning.')
+        merge_adapters = self.model_config.get('merge_adapters', [])
         weights = _resolve_file(self.transformer_path, 'model.safetensors')
-        transformer = self.build_transformer(iterate_safetensors(weights))
+        # Adapters merge into weights at `dtype`; the cast to transformer_dtype comes after.
+        transformer = self.build_transformer(iterate_safetensors(weights),
+                                             transformer_dtype=dtype if merge_adapters else None)
         self.transformer = transformer
-        for adapter_path in self.model_config.get('merge_adapters', []):
+        for adapter_path in merge_adapters:
             # diffusion-pipe save directories (adapter_config.json + adapter_model.safetensors);
             # a path to the .safetensors inside one is accepted too.
             adapter_path = Path(adapter_path)
@@ -505,6 +548,10 @@ class IrisPipeline(BasePipeline):
             if is_main_process():
                 print(f'Merging adapter {adapter_path}')
             self.load_and_fuse_adapter(str(adapter_path))
+        if merge_adapters and low_precision:
+            for name, p in transformer.named_parameters():
+                if not (any(k in name for k in KEEP_IN_HIGH_PRECISION) or p.ndim == 1):
+                    p.data = p.data.to(transformer_dtype)
         self._finish_transformer(transformer)
 
     def _finish_transformer(self, transformer):
@@ -536,7 +583,11 @@ class IrisPipeline(BasePipeline):
             'repa_spatial_norm_gamma': 'spatial_norm_gamma',
         }
         kwargs = {dst: self.model_config[src] for src, dst in keys.items() if src in self.model_config}
-        repa = REPALoss(RepaConfig(weight=self.repa_weight, **kwargs), student_dim)
+        # Rank 0 first: concurrent torch.hub loads race on the download/extraction and corrupt
+        # it (Iris's own trainer guards this call the same way). Every rank still checks
+        # availability itself, after the barrier, so none is left waiting on another.
+        with zero_first() if torch.distributed.is_initialized() else contextlib.nullcontext():
+            repa = REPALoss(RepaConfig(weight=self.repa_weight, **kwargs), student_dim)
         if not repa.available:
             raise RuntimeError(
                 'repa_weight > 0 but the REPA teacher could not be loaded (see the warning above). '
@@ -547,6 +598,10 @@ class IrisPipeline(BasePipeline):
         elif self._checkpoint_repa_state:
             # An Iris training export that still carries its projector: continue from it.
             state = self._checkpoint_repa_state
+        elif os.path.isdir(self.transformer_path) and \
+                (exported := Path(self.transformer_path) / 'repa_projector.safetensors').is_file():
+            # A full fine-tune saved by this pipeline writes the projector beside model.safetensors.
+            state = safetensors.torch.load_file(str(exported))
         if state is not None:
             load_repa_projector(repa, state)
         self._checkpoint_repa_state = None
@@ -661,22 +716,50 @@ class IrisPipeline(BasePipeline):
             y_mask[i, :n] = 1
         return y, y_mask
 
-    def _sample_timestep_idx(self, bs, quantile=None):
+    def _sample_timestep_idx(self, bs, quantile=None, shift=None):
+        """Grid indices from the configured sampler. min_t / max_t bound the SHIFTED noise level
+        sigma' the model actually sees, as min_t / max_t do for every other model (Wan's
+        slice_t_distribution): the sampler is truncated to those grid points, keeping its shape."""
         n = self.num_train_timesteps
-        if self.timestep_sample_method == 'logit_normal':
-            mean = float(self.model_config.get('logit_mean', self.iris_config.flow.logit_mean))
-            std = float(self.model_config.get('logit_std', self.iris_config.flow.logit_std))
-            if quantile is not None:
-                z = torch.distributions.Normal(mean, std).icdf(torch.full((bs,), float(quantile)))
-            else:
-                z = torch.randn(bs) * std + mean
-            u = torch.sigmoid(z)
-        else:
-            u = torch.full((bs,), float(quantile)) if quantile is not None else torch.rand(bs)
         min_t = float(self.model_config.get('min_t', 0.0))
         max_t = float(self.model_config.get('max_t', 1.0))
-        u = min_t + u * (max_t - min_t)
-        return (u * n).long().clamp(0, n - 1)
+        if min_t <= 0.0 and max_t >= 1.0:
+            # Unrestricted: exactly Iris's own sampler (and random stream).
+            if self.timestep_sample_method == 'logit_normal':
+                mean, std = self._logit_normal_params()
+                if quantile is not None:
+                    z = torch.distributions.Normal(mean, std).icdf(torch.full((bs,), float(quantile)))
+                else:
+                    z = torch.randn(bs) * std + mean
+                u = torch.sigmoid(z)
+            else:
+                u = torch.full((bs,), float(quantile)) if quantile is not None else torch.rand(bs)
+            return (u * n).long().clamp(0, n - 1)
+
+        sigmas = self._schedule(self.shift if shift is None else shift).sigmas.double()
+        start = int(torch.searchsorted(sigmas, min_t).item())
+        end = int(torch.searchsorted(sigmas, max_t).item()) if max_t < 1.0 else n
+        if end <= start:
+            raise ValueError(f'min_t={min_t}, max_t={max_t} leave no timestep at shift {shift}')
+        # idx = floor(u * n) lies in [start, end) exactly when u lies in [start/n, end/n): sample
+        # u by inverse CDF restricted to that interval.
+        lo, hi = torch.tensor(start / n, dtype=torch.float64), torch.tensor(end / n, dtype=torch.float64)
+        q = (torch.full((bs,), float(quantile), dtype=torch.float64) if quantile is not None
+             else torch.rand(bs, dtype=torch.float64))
+        if self.timestep_sample_method == 'logit_normal':
+            mean, std = self._logit_normal_params()
+            normal = torch.distributions.Normal(torch.tensor(mean, dtype=torch.float64),
+                                                torch.tensor(std, dtype=torch.float64))
+            cdf_lo, cdf_hi = normal.cdf(torch.logit(lo)), normal.cdf(torch.logit(hi))
+            u = torch.sigmoid(normal.icdf((cdf_lo + q * (cdf_hi - cdf_lo)).clamp(1e-12, 1 - 1e-12)))
+        else:
+            u = lo + q * (hi - lo)
+        return (u * n).long().clamp(start, end - 1)
+
+    def _logit_normal_params(self):
+        mean = float(self.model_config.get('logit_mean', self.iris_config.flow.logit_mean))
+        std = float(self.model_config.get('logit_std', self.iris_config.flow.logit_std))
+        return mean, std
 
     def _shift_for(self, height, width):
         tokens = (height // self.patch_size) * (width // self.patch_size)
@@ -703,8 +786,9 @@ class IrisPipeline(BasePipeline):
                 # rounded to the patch size. Real masks are already at pixel resolution.
                 mask = F.interpolate(mask.float(), size=(h, w), mode='nearest-exact')
 
-        idx = self._sample_timestep_idx(bs, timestep_quantile)
-        schedule = self._schedule(self._shift_for(h, w))
+        shift = self._shift_for(h, w)
+        idx = self._sample_timestep_idx(bs, timestep_quantile, shift)
+        schedule = self._schedule(shift)
         noise = torch.randn_like(x0)
         x_t, t_model = schedule.add_noise(x0, noise, idx)
         target = noise - x0
@@ -794,10 +878,29 @@ class IrisPipeline(BasePipeline):
             return loss
         return loss_fn
 
+    def _record_repa_loss(self, loss):
+        # Summed on whichever rank runs RepaLayer (a later pipeline stage, usually), averaged
+        # over every micro-batch and data-parallel rank when the step is logged.
+        if self._repa_loss_sum is None:
+            self._repa_loss_sum = torch.zeros(2, dtype=torch.float64, device=loss.device)
+        self._repa_loss_sum[0] += loss.double().sum()
+        self._repa_loss_sum[1] += 1
+
     def get_extra_log_scalars(self):
-        if self._last_repa_loss is None:
+        """train/repa_loss: the mean REPA loss of the step. train.py calls this on every rank each
+        step, so the reduction below is a collective every rank joins."""
+        if self.repa_weight <= 0:
             return {}
-        return {'train/repa_loss': float(self._last_repa_loss)}
+        totals = self._repa_loss_sum
+        self._repa_loss_sum = None
+        if torch.distributed.is_initialized():
+            device = torch.device('cuda', torch.cuda.current_device()) if torch.cuda.is_available() else 'cpu'
+            totals = (torch.zeros(2, dtype=torch.float64, device=device) if totals is None
+                      else totals.to(device))
+            torch.distributed.all_reduce(totals)
+        if totals is None or totals[1] == 0:
+            return {}
+        return {'train/repa_loss': float(totals[0] / totals[1])}
 
     # ---- block swap ------------------------------------------------------------------------------
 
@@ -961,7 +1064,9 @@ class TextEncoderLayer(nn.Module):
             te = self.text_encoder[0]
             if next(te.parameters()).device != x.device:
                 te.to(x.device)
-            with torch.no_grad():
+            # Outside the layer's autocast, like Iris's trainer and like caching / --test_sample:
+            # the encoder runs in its own text_encoder_dtype.
+            with torch.no_grad(), torch.autocast('cuda', enabled=False):
                 y, y_mask = te(text_a, text_b)
         outputs = make_contiguous(x, t, y, y_mask, *extra)
         # Marked here, in the one layer that is never checkpointed, so InitialLayer's inputs
@@ -1063,7 +1168,7 @@ class RepaLayer(nn.Module):
             # Iris runs the teacher and projector outside autocast (TrainModel.forward).
             with torch.autocast('cuda', enabled=False):
                 loss = self.repa(x0, s, tuple(grid.shape)).float().reshape(1)
-            self.pipeline[0]._last_repa_loss = loss.detach()
+            self.pipeline[0]._record_repa_loss(loss.detach())
         else:
             loss = torch.zeros(1, device=s.device, dtype=torch.float32)
         return make_contiguous(*head, loss)
