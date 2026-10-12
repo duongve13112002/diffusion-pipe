@@ -15,6 +15,11 @@ Usage:
 repo id. --adapter is a save directory written by diffusion-pipe (adapter_config.json plus
 adapter_model.safetensors). The adapter type, rank and targets are read from the json.
 
+The adapter does not record the flow shift it was trained with, so config.yaml keeps the base
+checkpoint's flow.shift / flow.shift_law (Iris 3B: 4.0 / none). If the training config set
+`shift` or `shift_law`, pass the same values with --shift / --shift-law so the merged model
+samples the way it was trained.
+
 Only iris3b, peft and safetensors are imported: nothing from diffusion-pipe's model stack,
 so this runs on a machine without CUDA.
 """
@@ -121,25 +126,45 @@ def merge(model_path, adapter_dir, strength=1.0):
     return state_dict, config_file, cfg
 
 
-def main():
+def write_config(path, config_file, cfg, shift=None, shift_law=None):
+    """The base checkpoint's config.yaml, with the sampling settings training overrode."""
+    from omegaconf import OmegaConf
+    if shift is None and shift_law is None and config_file is not None:
+        shutil.copyfile(config_file, path)
+        return
+    if config_file is not None:
+        config = OmegaConf.to_container(OmegaConf.load(str(config_file)))
+    else:
+        from iris3b.config import INFERENCE_SECTIONS
+        full = OmegaConf.to_container(OmegaConf.structured(cfg))
+        config = {k: full[k] for k in INFERENCE_SECTIONS}
+    flow = config.setdefault('flow', {})
+    if shift is not None:
+        flow['shift'] = float(shift)
+    if shift_law is not None:
+        flow['shift_law'] = shift_law
+    OmegaConf.save(OmegaConf.create(config), str(path))
+
+
+def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('--model', default='speridlabs/iris-3b', help='Base checkpoint directory or HF repo id.')
     parser.add_argument('--adapter', required=True, help='diffusion-pipe adapter save directory.')
     parser.add_argument('--output', required=True, help='Directory to write model.safetensors and config.yaml to.')
     parser.add_argument('--strength', type=float, default=1.0, help='Adapter multiplier (default 1.0).')
-    args = parser.parse_args()
+    parser.add_argument('--shift', type=float, default=None,
+                        help="flow.shift to write to config.yaml: the training config's `shift`, if it set one "
+                             "(default: keep the base checkpoint's).")
+    parser.add_argument('--shift-law', choices=['none', 'sd3', 'flux'], default=None,
+                        help="flow.shift_law to write: the training config's `shift_law`, if it set one "
+                             "(default: keep the base checkpoint's).")
+    args = parser.parse_args(argv)
 
     state_dict, config_file, cfg = merge(args.model, args.adapter, args.strength)
     out = Path(args.output)
     out.mkdir(parents=True, exist_ok=True)
     safetensors.torch.save_file(state_dict, str(out / 'model.safetensors'), metadata={'format': 'pt'})
-    if config_file is not None:
-        shutil.copyfile(config_file, out / 'config.yaml')
-    else:
-        from omegaconf import OmegaConf
-        from iris3b.config import INFERENCE_SECTIONS
-        config = OmegaConf.to_container(OmegaConf.structured(cfg))
-        OmegaConf.save(OmegaConf.create({k: config[k] for k in INFERENCE_SECTIONS}), str(out / 'config.yaml'))
+    write_config(out / 'config.yaml', config_file, cfg, args.shift, args.shift_law)
     print(f'Wrote {len(state_dict)} tensors to {out / "model.safetensors"}')
 
 

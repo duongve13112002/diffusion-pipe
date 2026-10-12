@@ -362,6 +362,34 @@ def test_adapter_trains_saves_reloads_and_merges(ckpt, tmp_path, kind):
             torch.testing.assert_close(v - base[k], (merged[k] - base[k]) * 0.5, rtol=1e-4, atol=1e-6, msg=k)
 
 
+@pytest.mark.parametrize('flags, expected', [
+    ([], (3.0, 'none')),                                   # the base checkpoint's, copied as is
+    (['--shift', '2.5', '--shift-law', 'sd3'], (2.5, 'sd3')),
+    (['--shift-law', 'flux'], (3.0, 'flux')),
+], ids=['default', 'both', 'law_only'])
+def test_merge_tool_writes_the_shift_training_used(ckpt, tmp_path, flags, expected):
+    """An adapter carries no flow settings: a LoRA trained with its own `shift` needs it
+    written to the merged config.yaml, or Iris's sampler uses the base checkpoint's."""
+    sys.path.insert(0, str(ROOT))
+    from tools import iris_merge_adapter
+
+    path, _ = ckpt
+    pipe = make_pipeline(path, cache_text_embeddings=True)
+    pipe.load_diffusion_model()
+    pipe.configure_adapter(dict(ADAPTERS['lora']))
+    save_dir = tmp_path / 'adapter'
+    save_dir.mkdir()
+    pipe.save_adapter(save_dir, saved_adapter_state(pipe))
+    out = tmp_path / 'merged'
+    iris_merge_adapter.main(['--model', str(path), '--adapter', str(save_dir), '--output', str(out), *flags])
+    written = inference_config(OmegaConf.to_container(OmegaConf.load(out / 'config.yaml')))
+    assert (written.flow.shift, written.flow.shift_law) == expected
+    base = OmegaConf.to_container(OmegaConf.load(path / 'config.yaml'))
+    merged = OmegaConf.to_container(OmegaConf.load(out / 'config.yaml'))
+    # Only the flow keys asked for change.
+    assert merged['model'] == base['model'] and merged['text_encoder'] == base['text_encoder']
+
+
 def test_merge_tool_rejects_adapter_for_a_different_model(ckpt, tmp_path):
     from tools import iris_merge_adapter
     path, _ = ckpt

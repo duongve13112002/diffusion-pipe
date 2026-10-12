@@ -47,6 +47,7 @@ dtype = 'bfloat16'
 #cache_text_embeddings = false
 # Flow-matching timestep sampling, defaults match Iris's own training.
 timestep_sample_method = 'logit_normal'
+# The adapter does not store shift: pass the same --shift/--shift-law to tools.iris_merge_adapter.
 #shift = 4.0            # default: flow.shift from the checkpoint config
 #shift_law = 'none'     # none | sd3 | flux (resolution-dependent shift)
 #attn_backend = 'sdpa'  # sdpa | torch_flash | torch_cudnn | fa3 | fa4

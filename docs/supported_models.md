@@ -792,8 +792,8 @@ All `[model]` options:
 | `timestep_sample_method` | checkpoint `flow.timestep_sampler` (`logit_normal`) | `logit_normal` or `uniform`. |
 | `logit_mean`, `logit_std` | checkpoint `flow` config | Logit-normal parameters. |
 | `min_t`, `max_t` | `0`, `1` | Restrict the sampled noise levels. |
-| `shift` | checkpoint `flow.shift` | Flow shift for training and sampling; written to the exported `config.yaml`. |
-| `shift_law` | checkpoint `flow.shift_law` (`none`) | `none`, `sd3` or `flux`: scale the shift with each batch's image token count (base `flow.shift_base_tokens`). |
+| `shift` | checkpoint `flow.shift` (4.0) | Flow shift for training and sampling; a full fine-tune writes it to the exported `config.yaml`. An adapter does not store it: pass the same value to the merge tool with `--shift`. |
+| `shift_law` | checkpoint `flow.shift_law` (`none`) | `none`, `sd3` or `flux`: scale the shift with each batch's image token count (base `flow.shift_base_tokens`). Merge tool: `--shift-law`. |
 | `text_adapter_lr` | optimizer `lr` | LR of `y_embedder` + `y_pos_embedding` (full fine-tune). `0` freezes them. |
 | `pixel_head_lr` | optimizer `lr` | LR of `pixel_embedder`, `pixel_blocks`, `final_layer` (full fine-tune). `0` freezes them. |
 | `adapter_target_modules` | `['MMDiTBlock', 'SingleStreamBlock']` | Block classes whose Linear layers get the adapter. |
@@ -841,7 +841,8 @@ Saving:
   `transformer_path` again. With REPA the projector goes to `repa_projector.safetensors` beside it.
 - LoRA/LoKr write `adapter_model.safetensors` with `diffusion_model.`-prefixed keys plus
   `adapter_config.json` (REPA projector, if any, in `repa/`). Fold one into the base weights with
-  `python -m tools.iris_merge_adapter --model speridlabs/iris-3b --adapter <save dir> --output <dir> [--strength 1.0]`,
+  `python -m tools.iris_merge_adapter --model speridlabs/iris-3b --adapter <save dir> --output <dir> [--strength 1.0] [--shift S --shift-law L]`
+  (the shift options only if training changed them),
   which writes the same layout as a full fine-tune.
 
 fp8 `transformer_dtype` is untested and not listed as supported.
