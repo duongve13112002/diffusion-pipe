@@ -10,8 +10,8 @@ from torch import nn
 
 from utils import ema as ema_util
 from utils import saver as saver_util
-from utils.ema import (ParameterEMA, apply_ema_config_defaults, load_ema_checkpoint, save_ema_checkpoint,
-                       to_bfloat16_stochastic)
+from utils.ema import (ParameterEMA, apply_ema_config_defaults, load_ema_checkpoint, load_ema_weights,
+                       save_ema_checkpoint, to_bfloat16_stochastic)
 
 
 def named(module, prefix=''):
@@ -347,3 +347,107 @@ def test_checkpoint_loads_across_an_ema_dtype_change(tmp_path):
     bf16 = ParameterEMA(named(layer), decay=0.5, dtype='bfloat16')
     assert load_ema_checkpoint(bf16, tmp_path, 'global_step1') == (1, [])
     torch.testing.assert_close(bf16.shadow['weight'], fp32.shadow['weight'].to(torch.bfloat16))
+
+
+def test_init_path_validation(tmp_path):
+    import safetensors.torch
+    safetensors.torch.save_file({'w': torch.zeros(1)}, str(tmp_path / 'model.safetensors'))
+    config = {'ema_decay': 0.9, 'ema_init_path': str(tmp_path)}
+    assert apply_ema_config_defaults(config) is True
+    for bad in ({'ema_init_path': str(tmp_path / 'nope')}, {'ema_init_path': ''},
+                {'ema_init_path': str(tmp_path), 'ema_start_step': 100}, {'ema_init_path': 3}):
+        with pytest.raises(ValueError):
+            apply_ema_config_defaults({'ema_decay': 0.9, **bad})
+    with pytest.raises(ValueError):    # EMA off
+        apply_ema_config_defaults({'ema_init_path': str(tmp_path)})
+    (tmp_path / 'a.safetensors').write_bytes(b'')
+    (tmp_path / 'model.safetensors').unlink()
+    (tmp_path / 'b.safetensors').write_bytes(b'')
+    with pytest.raises(ValueError, match='single'):
+        apply_ema_config_defaults({'ema_decay': 0.9, 'ema_init_path': str(tmp_path)})
+
+
+@pytest.mark.parametrize('dtype', ['float32', 'bfloat16'])
+def test_init_path_starts_the_average_from_a_saved_ema(tmp_path, dtype):
+    import safetensors.torch
+    model = nn.Sequential(nn.Linear(3, 3))
+    params = named(model)
+    model[0].bias.requires_grad_(False)        # frozen: no shadow, so the save need not have it
+    safetensors.torch.save_file({'0.weight': torch.full((3, 3), 2.0, dtype=torch.bfloat16)},
+                                str(tmp_path / 'model.safetensors'))
+    ema = ParameterEMA(params, decay=0.5, dtype=dtype)
+    assert load_ema_weights(ema, tmp_path) == 1
+    torch.testing.assert_close(ema.averaged('0.weight', model[0].weight), torch.full((3, 3), 2.0))
+    with torch.no_grad():
+        model[0].weight.fill_(4.0)
+    ema.update(1)
+    torch.testing.assert_close(ema.averaged('0.weight', model[0].weight), torch.full((3, 3), 3.0))
+
+
+def test_init_path_reads_an_adapter_save_with_its_prefix(tmp_path):
+    import safetensors.torch
+    model = nn.Sequential(nn.Linear(2, 2))
+    params = named(model)
+    model[0].weight.original_name = '0.lora_A.default.weight'
+    ema = ParameterEMA(params, decay=0.9, is_adapter=True)
+    safetensors.torch.save_file({'diffusion_model.0.lora_A.weight': torch.ones(2, 2),
+                                 'diffusion_model.0.bias': torch.zeros(2)},
+                                str(tmp_path / 'adapter_model.safetensors'))
+    assert load_ema_weights(ema, tmp_path / 'adapter_model.safetensors') == 2
+    torch.testing.assert_close(ema.shadow['0.lora_A.weight'], torch.ones(2, 2))
+
+
+def test_init_path_reads_the_repa_projector_saved_beside_the_model(tmp_path):
+    import safetensors.torch
+    model = nn.ModuleDict({'blocks': nn.Linear(2, 2), 'repa': nn.Linear(2, 2)})
+    params = named(model)
+    ema = ParameterEMA(params, decay=0.9)
+    safetensors.torch.save_file({'blocks.weight': torch.ones(2, 2), 'blocks.bias': torch.ones(2)},
+                                str(tmp_path / 'model.safetensors'))
+    safetensors.torch.save_file({'weight': torch.full((2, 2), 7.0), 'bias': torch.ones(2)},
+                                str(tmp_path / 'repa_projector.safetensors'))
+    assert load_ema_weights(ema, tmp_path) == 4
+    torch.testing.assert_close(ema.shadow['repa.weight'], torch.full((2, 2), 7.0))
+
+
+@pytest.mark.parametrize('case', ['missing', 'shape', 'adapter_for_full', 'full_for_adapter'])
+def test_init_path_of_another_format_is_an_error_and_changes_nothing(tmp_path, case):
+    import safetensors.torch
+    model = nn.Sequential(nn.Linear(3, 3))
+    params = named(model)
+    is_adapter = case == 'full_for_adapter'
+    if is_adapter:
+        model[0].weight.original_name = '0.lora_A.default.weight'
+    saved = {'missing': {'0.weight': torch.zeros(3, 3)},
+             'shape': {'0.weight': torch.zeros(4, 3), '0.bias': torch.zeros(3)},
+             'adapter_for_full': {'diffusion_model.0.lora_A.weight': torch.zeros(3, 3),
+                                  'diffusion_model.0.lora_B.weight': torch.zeros(3, 3)},
+             'full_for_adapter': {'0.weight': torch.zeros(3, 3), '0.bias': torch.zeros(3),
+                                  '1.weight': torch.zeros(3, 3)}}[case]
+    safetensors.torch.save_file(saved, str(tmp_path / 'model.safetensors'))
+    ema = ParameterEMA(params, decay=0.9, is_adapter=is_adapter)
+    before = {k: v.clone() for k, v in ema.shadow.items()}
+    with pytest.raises(ValueError, match='not a save of the model being trained') as error:
+        load_ema_weights(ema, tmp_path)
+    if case == 'adapter_for_full':
+        assert 'adapter save, but this run is a full fine-tune' in str(error.value)
+    if case == 'full_for_adapter':
+        assert 'full model save, but this run trains an adapter' in str(error.value)
+    for key, value in before.items():
+        torch.testing.assert_close(ema.shadow[key], value)
+
+
+def test_init_path_ends_following_and_survives_a_checkpoint(tmp_path):
+    import safetensors.torch
+    model = nn.Sequential(nn.Linear(2, 2))
+    params = named(model)
+    safetensors.torch.save_file({'0.weight': torch.full((2, 2), 5.0), '0.bias': torch.zeros(2)},
+                                str(tmp_path / 'model.safetensors'))
+    ema = ParameterEMA(params, decay=0.9)
+    load_ema_weights(ema, tmp_path)
+    assert not ema.following
+    (tmp_path / 'global_step1').mkdir()
+    save_ema_checkpoint(ema, tmp_path, 'global_step1', 0)
+    resumed = ParameterEMA(named(model), decay=0.9)
+    load_ema_checkpoint(resumed, tmp_path, 'global_step1')
+    torch.testing.assert_close(resumed.shadow['0.weight'], torch.full((2, 2), 5.0))

@@ -32,7 +32,7 @@ from utils.unsloth_utils import unsloth_checkpoint
 from utils.pipeline import ManualPipelineModule
 from utils.oplora import OPLoRAProjector, apply_oplora_config_defaults
 from utils.lr_schedule import create_lr_scheduler
-from utils.ema import ParameterEMA, apply_ema_config_defaults, load_ema_checkpoint
+from utils.ema import ParameterEMA, apply_ema_config_defaults, load_ema_checkpoint, load_ema_weights
 from utils.optimizer_factory import resolve_optimizer_class
 
 # needed for broadcasting Queue in dataset.py
@@ -966,6 +966,13 @@ if __name__ == '__main__':
                 print(f'WARNING: stage {model_engine.grid.get_pipe_parallel_rank()}: checkpoint {tag} has no EMA for '
                       f'{len(missing)} of {len(ema)} parameters (EMA was off or the run changed); their average '
                       'starts from the current weights.')
+            if config.get('ema_init_path') and holds_ema:
+                print(f'Resuming: the EMA comes from checkpoint {tag}; ema_init_path is not used.')
+        elif config.get('ema_init_path'):
+            loaded = load_ema_weights(ema, config['ema_init_path'])
+            if holds_ema:
+                print(f'EMA (stage {model_engine.grid.get_pipe_parallel_rank()}): all {loaded} tensors start '
+                      f'from {config["ema_init_path"]}')
         if holds_ema:
             print(f'EMA (stage {model_engine.grid.get_pipe_parallel_rank()}): {len(ema)} tensors, '
                   f'{ema.num_bytes() / 1024**3:.2f} GB {config["ema_dtype"]} on {ema.device}, decay {config["ema_decay"]}, '

@@ -125,6 +125,9 @@ save_dtype = 'bfloat16'
 #ema_start_step = 0        # until this step the average simply equals the weights
 #ema_device = 'cpu'        # 'cpu' or 'gpu' (fine for adapters)
 #ema_dtype = 'float32'     # or 'bfloat16'
+#ema_init_path = '/path/to/previous_run/epoch10/ema'  # start the average from a saved EMA instead of
+#                          # the weights: a save (or its .safetensors) of this same model and adapter
+#                          # settings, else an error. Ignored when resuming from a checkpoint.
 # Batch size for caching latents and text embeddings. Increasing can lead to higher GPU utilization during caching phase but uses more memory.
 caching_batch_size = 1
 

@@ -791,6 +791,10 @@ Differences from Iris's own training recipe worth knowing:
   `ema_device = 'cpu'` and use e.g. `ema_update_every = 10`, since each update's host<->GPU
   copies still take GPU time (about 0.3-1 s for 3B weights). With an adapter none of this
   matters: update every step, on either device.
+  `ema_init_path` starts the average from a saved EMA (e.g. a previous run's `<save dir>/ema/`)
+  instead of the starting weights, for continuing from that run's raw weights; it must be a save of
+  the same model and adapter settings (every trained parameter, same shapes) or training stops
+  with an error. A resumed run takes its checkpoint's average instead.
 - Optimizer: Iris trains with Muon + AdamW (betas 0.9/0.95, no weight decay, gradient clipping
   0.5, fp32 master weights). The examples use diffusion-pipe's usual `adamw_optimi` in bf16 with
   Kahan summation, which suits fine-tuning; any diffusion-pipe optimizer works.

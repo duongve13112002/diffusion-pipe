@@ -5,6 +5,14 @@
     ema_start_step = 0        # until this step the average just follows the weights
     ema_device = 'cpu'        # 'cpu' or 'gpu': where the average lives
     ema_dtype = 'float32'     # or 'bfloat16': half the memory, stochastically rounded
+    ema_init_path = '...'     # start the average from a saved EMA instead of the weights
+
+ema_init_path takes a model or adapter save (a directory, e.g. a previous run's ema/, or the
+.safetensors inside it) and starts the average there, so fine-tuning from a run's raw weights
+keeps that run's average rather than restarting it from those weights. It must be a save of
+the run being trained: every trained parameter, by name and shape (an adapter save for an
+adapter run, a full save for a full fine-tune), or training stops with an error. A resumed run
+uses its checkpoint's average instead.
 
 Every trainable parameter gets a shadow copy, updated after each optimizer step as
 shadow = decay * shadow + (1 - decay) * weight. Frozen parameters have no shadow: their EMA is
@@ -37,7 +45,7 @@ import torch
 DEVICES = ('cpu', 'gpu')
 DTYPES = {'float32': torch.float32, 'bfloat16': torch.bfloat16}
 EMA_SUBDIR = 'ema'
-_OPTION_KEYS = ('ema_update_every', 'ema_start_step', 'ema_device', 'ema_dtype')
+_OPTION_KEYS = ('ema_update_every', 'ema_start_step', 'ema_device', 'ema_dtype', 'ema_init_path')
 
 
 def apply_ema_config_defaults(config):
@@ -64,7 +72,101 @@ def apply_ema_config_defaults(config):
     dtype = config.setdefault('ema_dtype', 'float32')
     if dtype not in DTYPES:
         raise ValueError(f'ema_dtype must be one of {tuple(DTYPES)}, got {dtype!r}')
+    init_path = config.get('ema_init_path')
+    if init_path is not None:
+        if not isinstance(init_path, str) or not init_path:
+            raise ValueError(f'ema_init_path must be a path, got {init_path!r}')
+        if start > 0:
+            raise ValueError('ema_init_path and ema_start_step > 0 contradict each other: before ema_start_step '
+                             'the average is the weights. Remove one of them.')
+        resolve_ema_init_file(init_path)
     return True
+
+
+# Trained parameters a save writes to a file of their own (name prefix -> files, relative to the
+# save directory, holding them without the prefix): Iris's REPA projector.
+_COMPANION_FILES = {'repa.': ('repa_projector.safetensors', 'repa/repa_projector.safetensors')}
+
+
+def resolve_ema_init_file(path):
+    """The .safetensors file of a model or adapter save: `path` itself, or the one file in it."""
+    path = Path(path)
+    if path.is_file():
+        return path
+    if not path.is_dir():
+        raise ValueError(f'ema_init_path {str(path)!r} does not exist')
+    for name in ('model.safetensors', 'adapter_model.safetensors'):
+        if (path / name).is_file():
+            return path / name
+    files = sorted(path.glob('*.safetensors'))
+    if len(files) != 1:
+        raise ValueError(f'ema_init_path {str(path)!r}: expected model.safetensors, adapter_model.safetensors or '
+                         f'a single .safetensors file, found {[f.name for f in files]}')
+    return files[0]
+
+
+def load_ema_weights(ema, path):
+    """Start `ema`'s average from the save at `path` (see resolve_ema_init_file). Every trained
+    parameter must be there, matched by name (exactly, or by its longest dotted suffix when the
+    save adds a prefix such as an adapter's 'diffusion_model.') with the same shape; otherwise
+    ValueError and nothing is changed. Returns the number of tensors loaded."""
+    from contextlib import ExitStack
+    from safetensors import safe_open
+    ema.wait()
+    file = resolve_ema_init_file(path)
+    with ExitStack() as stack:
+        handles = {'': stack.enter_context(safe_open(str(file), framework='pt', device='cpu'))}
+        for prefix, names in _COMPANION_FILES.items():
+            for name in names:
+                if (file.parent / name).is_file():
+                    handles[prefix] = stack.enter_context(
+                        safe_open(str(file.parent / name), framework='pt', device='cpu'))
+                    break
+        by_suffix = {}
+        for prefix, handle in handles.items():
+            for name in handle.keys():
+                parts = (prefix + name).split('.')
+                for i in range(len(parts)):
+                    by_suffix.setdefault('.'.join(parts[i:]), []).append((prefix, name))
+
+        plan, missing, wrong_shape = {}, [], []
+        for key, shadow in ema.shadow.items():
+            found = by_suffix.get(key, [])
+            exact = [(prefix, name) for prefix, name in found if prefix + name == key]
+            found = exact or found
+            if not found:
+                missing.append(key)
+                continue
+            if len(found) > 1:
+                raise ValueError(f'ema_init_path {file}: {key} matches several tensors: '
+                                 f'{[prefix + name for prefix, name in found]}')
+            prefix, name = found[0]
+            shape = list(handles[prefix].get_slice(name).get_shape())
+            if shape != list(shadow.shape):
+                wrong_shape.append(f'{prefix + name} {shape} (trained {key} is {list(shadow.shape)})')
+            plan[key] = found[0]
+        if missing or wrong_shape:
+            saved = [prefix + name for prefix, handle in handles.items() for name in handle.keys()]
+            adapter_save = any('lora_' in name or 'lokr_' in name for name in saved)
+            kind = ''
+            if adapter_save and not ema.is_adapter:
+                kind = ' It is an adapter save, but this run is a full fine-tune.'
+            elif ema.is_adapter and not adapter_save:
+                kind = ' It is a full model save, but this run trains an adapter.'
+            problems = []
+            if missing:
+                problems.append(f'{len(missing)} of {len(ema.shadow)} trained parameters are not in it '
+                                f'(e.g. {missing[:3]})')
+            if wrong_shape:
+                problems.append(f'{len(wrong_shape)} have another shape (e.g. {wrong_shape[:3]})')
+            raise ValueError(f'ema_init_path {file} is not a save of the model being trained: '
+                             f'{"; ".join(problems)}.{kind} Point it at the ema/ directory (or its .safetensors) '
+                             'of a run with this model and these adapter settings.')
+        for key, (prefix, name) in plan.items():
+            ema.shadow[key].copy_(handles[prefix].get_tensor(name).to(torch.float32))
+    if plan:
+        ema.following = False
+    return len(plan)
 
 
 def to_bfloat16_stochastic(x):
