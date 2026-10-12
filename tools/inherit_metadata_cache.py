@@ -46,6 +46,10 @@ from pathlib import Path
 import toml
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+# diffusion-pipe's utils/ is a namespace package; ComfyUI's utils/ is a regular one and would
+# win the name wherever it sits on sys.path ("No module named 'utils.dataset'"). Importing a
+# light module from ours first pins it in sys.modules, as models/base.py does.
+import utils.captions  # noqa: E402,F401
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'submodules' / 'ComfyUI'))
 
 REQUIRED_COLUMNS = {'image_spec', 'mask_file', 'caption', 'ar_bucket', 'size_bucket', 'is_video',
@@ -334,6 +338,8 @@ def main(argv=None):
     _force_comfy_cpu_if_needed()
     if args.donor == args.target:
         parser.error('--from and --to name the same cache directory')
+    if not Path(args.dataset).is_file():
+        parser.error(f'--dataset {args.dataset!r}: no such file; pass the dataset .toml (the file, not its directory)')
     with open(args.dataset) as f:
         dataset_config = toml.load(f)
 

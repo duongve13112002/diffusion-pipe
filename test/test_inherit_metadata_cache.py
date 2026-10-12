@@ -268,3 +268,31 @@ def test_refuses_when_the_volume_is_mounted_somewhere_else(tmp_path, capsys):
     assert tool.main(['--dataset', str(file)]) == 1
     assert 'no longer exist' in capsys.readouterr().out
     assert not list((new_mount / 'cache' / 'iris').rglob('source_metadata'))
+
+
+def test_runs_as_a_script_from_anywhere(tmp_path):
+    """Run as `python tools/inherit_metadata_cache.py` from another directory, in a fresh
+    interpreter without the test shims: ComfyUI's regular utils/ package must not shadow
+    diffusion-pipe's namespace utils/ ("No module named 'utils.dataset'")."""
+    import os
+    import subprocess
+    script = Path(tool.__file__).resolve()
+    code = (
+        'import runpy, sys\n'
+        f'sys.argv = [{str(script)!r}]\n'
+        f'ns = runpy.run_path({str(script)!r}, run_name="inherit_tool")\n'
+        'ns["_force_comfy_cpu_if_needed"]()\n'
+        'import utils.dataset\n'
+        'print("ok", utils.dataset.__file__)\n'
+    )
+    env = {k: v for k, v in os.environ.items() if k != 'PYTHONPATH'}
+    result = subprocess.run([sys.executable, '-c', code], cwd=tmp_path, env=env, capture_output=True, text=True,
+                            timeout=600)
+    assert result.returncode == 0, result.stderr[-2000:]
+    assert str(script.parent.parent / 'utils' / 'dataset.py') in result.stdout
+
+
+def test_missing_dataset_file_is_a_clear_error(tmp_path, capsys):
+    with pytest.raises(SystemExit):
+        tool.main(['--dataset', str(tmp_path / 'dataset_new')])
+    assert 'no such file; pass the dataset .toml' in capsys.readouterr().err
