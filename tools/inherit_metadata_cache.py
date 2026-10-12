@@ -40,6 +40,7 @@ import os
 import random
 import shutil
 import sys
+import time
 import uuid
 from pathlib import Path
 
@@ -71,6 +72,15 @@ def _force_comfy_cpu_if_needed():
     comfy.cli_args.args.cpu = True
 
 
+_START = time.monotonic()
+
+
+def log(message):
+    """Progress on stderr, as it happens: on network storage a step can take minutes."""
+    elapsed = time.monotonic() - _START
+    print(f'[{int(elapsed) // 60:02d}:{elapsed % 60:04.1f}] {message}', file=sys.stderr, flush=True)
+
+
 class Plan:
     def __init__(self, path):
         self.path = path
@@ -82,6 +92,7 @@ class Plan:
 
     def note(self, message):
         self.messages.append(message)
+        log(f'{self.path}: {message}')
 
     def __str__(self):
         head = {'ready': 'READY', 'skip': 'SKIP ', 'error': 'ERROR'}[self.status]
@@ -102,6 +113,8 @@ def find_donor_snapshot(target, donor, donor_framerates, round_to_multiple):
     """Every source_metadata of `donor` whose geometry equals the target's but for framerate."""
     from datasets.fingerprint import Hasher
     profiles = target.path / 'cache' / donor / 'profiles'
+    log(f'{target.path}: looking for the {donor} snapshot under {profiles} '
+        f'({len(donor_framerates)} candidate framerate(s))')
     found = []
     for framerate in donor_framerates:
         geometry_dir = profiles / Hasher.hash(target.snapshot_geometry(
@@ -165,18 +178,29 @@ def check_snapshot(plan, snapshot, sample, header_sample, seed=0, check_all=Fals
         plan.note('donor snapshot contains videos; only image datasets can be inherited.')
         return False
 
+    from concurrent.futures import ThreadPoolExecutor
+    from tqdm import tqdm
     indices = random.Random(seed).sample(range(plan.rows), min(plan.rows, sample))
-    rows = snapshot.select(indices)
-    gone, moved = [], []
-    headers_checked = 0
-    for row in rows:
+    rows = list(snapshot.select(indices))
+    log(f'{plan.path}: checking {len(rows)} sampled files still exist (and up to {header_sample} image sizes)')
+
+    def present(row):
         tar_file, image_file = row['image_spec'][0], row['image_spec'][1]
         location = Path(tar_file) if tar_file else Path(image_file)
         if not location.exists():
-            gone.append(str(location))
-            continue
+            return str(location)
         if row['mask_file'] and not Path(row['mask_file']).exists():
-            gone.append(row['mask_file'])
+            return row['mask_file']
+        return None
+
+    with ThreadPoolExecutor(threads) as pool:
+        absent = list(tqdm(pool.map(present, rows), total=len(rows), desc='Sampled files'))
+    gone, moved = [], []
+    headers_checked = 0
+    for row, missing_path in zip(rows, absent):
+        tar_file, image_file = row['image_spec'][0], row['image_spec'][1]
+        if missing_path is not None:
+            gone.append(missing_path)
             continue
         if tar_file or headers_checked >= header_sample:
             continue
@@ -212,6 +236,7 @@ def plan_directory(directory_config, dataset_config, donor, target_model, round_
                    donor_framerate=None, force=False, sample=2000, header_sample=200, check_all=False,
                    threads=32):
     from utils.dataset import DirectoryDataset
+    log(f"{directory_config.get('path')}: reading the directory's dataset settings")
     plan = Plan(directory_config.get('path'))
     target = DirectoryDataset(copy.deepcopy(directory_config), copy.deepcopy(dataset_config), target_model,
                               framerate=None, round_to_multiple=round_to_multiple,
@@ -251,6 +276,7 @@ def plan_directory(directory_config, dataset_config, donor, target_model, round_
     plan.note(f'donor snapshot: {source} (donor framerate {framerate}).')
 
     import datasets
+    log(f'{plan.path}: loading the donor snapshot')
     if not check_snapshot(plan, datasets.load_from_disk(str(source)), sample, header_sample,
                           check_all=check_all, threads=threads):
         return plan
@@ -290,6 +316,7 @@ def apply_plan(plan, donor):
     snapshot_path = snapshot_dir / 'source_metadata'
     snapshot_dir.mkdir(parents=True, exist_ok=True)
     staging = snapshot_dir / ('.source_metadata.' + uuid.uuid4().hex)
+    log(f'{plan.path}: publishing the snapshot to {snapshot_path} (hard links, or a copy across filesystems)')
     try:
         shutil.copytree(plan.donor_snapshot, staging, copy_function=_link_or_copy)
         if snapshot_path.exists():
@@ -335,7 +362,6 @@ def main(argv=None):
                         help='Replace an existing target snapshot by publishing a new generation.')
     args = parser.parse_args(argv)
 
-    _force_comfy_cpu_if_needed()
     if args.donor == args.target:
         parser.error('--from and --to name the same cache directory')
     if not Path(args.dataset).is_file():
@@ -343,10 +369,17 @@ def main(argv=None):
     with open(args.dataset) as f:
         dataset_config = toml.load(f)
 
-    plans = [plan_directory(d, dataset_config, args.donor, args.target, args.round_to_multiple,
-                            args.from_framerate, args.force, args.sample, check_all=args.check_all,
-                            threads=args.threads)
-             for d in dataset_config['directory']]
+    log('importing torch, datasets and ComfyUI (can take a minute on network storage)')
+    _force_comfy_cpu_if_needed()
+    import utils.dataset  # noqa: F401
+    directories = dataset_config['directory']
+    plans = []
+    for number, d in enumerate(directories, start=1):
+        log(f"directory {number}/{len(directories)}: {d.get('path')}")
+        plans.append(plan_directory(d, dataset_config, args.donor, args.target, args.round_to_multiple,
+                                    args.from_framerate, args.force, args.sample, check_all=args.check_all,
+                                    threads=args.threads))
+    print()
     for plan in plans:
         print(plan)
     ready = [p for p in plans if p.status == 'ready']
