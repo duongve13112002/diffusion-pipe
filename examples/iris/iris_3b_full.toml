@@ -18,6 +18,11 @@ activation_checkpointing = true
 partition_method = 'parameters'
 save_dtype = 'bfloat16'
 dataloader_workers = 4
+# EMA like Iris's own training (its released weights are the EMA). Each save also writes
+# <save dir>/ema/, a complete Iris checkpoint. 12 GB of host RAM for the fp32 average.
+#ema_decay = 0.9999
+#ema_update_every = 10
+#ema_device = 'cpu'
 
 [model]
 type = 'iris'

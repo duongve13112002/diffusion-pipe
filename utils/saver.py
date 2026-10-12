@@ -9,6 +9,7 @@ from deepspeed import comm as dist
 from deepspeed.utils.logging import logger
 
 from utils.common import is_main_process
+from utils.ema import EMA_SUBDIR, save_ema_checkpoint
 
 
 def convert_state_dict_dtype(state_dict, dtype):
@@ -101,8 +102,12 @@ def need_to_checkpoint(config, epoch=None):
 
 
 class Saver:
-    def __init__(self, args, config, is_adapter, save_root, model, train_dataloader, model_engine, pipeline_model):
+    def __init__(self, args, config, is_adapter, save_root, model, train_dataloader, model_engine, pipeline_model,
+                 ema=None):
         self.args = args
+        # utils.ema.ParameterEMA, or None. When set, every save also writes its average to
+        # <save dir>/ema/ and every checkpoint carries it.
+        self.ema = ema
         self.config = config
         self.is_adapter = is_adapter
         self.save_root = Path(save_root)
@@ -111,10 +116,12 @@ class Saver:
         self.model_engine = model_engine
         self.pipeline_model = pipeline_model
 
-    def save_adapter(self, name):
+    def save_adapter(self, name, ema=False):
         dp_id = self.model_engine.grid.get_data_parallel_rank()
         stage_id = self.model_engine.grid.get_pipe_parallel_rank()
         save_dir = self.save_root / name
+        if ema:
+            save_dir = save_dir / EMA_SUBDIR
         tmp_dir = save_dir / 'tmp'
         if dp_id == 0 and stage_id == 0:
             os.makedirs(tmp_dir, exist_ok=False)
@@ -127,7 +134,8 @@ class Saver:
                         logger.warning(f'WARNING: parameter {name} requires_grad but does not have original_name. Not saving it.')
                         continue
                     # TODO: maybe this needs to change if we ever have non-lora adapters?
-                    partial_state_dict[p.original_name.replace('.default', '').replace('.modules_to_save', '')] = p.detach()
+                    key = p.original_name.replace('.default', '').replace('.modules_to_save', '')
+                    partial_state_dict[key] = self.ema.averaged(key, p) if ema else p.detach()
                     if 'save_dtype' in self.config:
                         convert_state_dict_dtype(partial_state_dict, self.config['save_dtype'])
             torch.save(partial_state_dict, tmp_dir / f'state_dict_{stage_id}.bin')
@@ -140,17 +148,23 @@ class Saver:
             shutil.copy(self.args.config, save_dir)
             shutil.rmtree(tmp_dir)
 
-    def save_full_model(self, name):
+    def save_full_model(self, name, ema=False):
         dp_id = self.model_engine.grid.get_data_parallel_rank()
         stage_id = self.model_engine.grid.get_pipe_parallel_rank()
         save_dir = self.save_root / name
+        if ema:
+            save_dir = save_dir / EMA_SUBDIR
         tmp_dir = save_dir / 'tmp'
         if dp_id == 0 and stage_id == 0:
             os.makedirs(tmp_dir, exist_ok=False)
         dist.barrier()
         if dp_id == 0:
             # With BF16_Optimizer, we get pickle errors unless we do p.detach(). I have no idea why.
-            partial_state_dict = {p.original_name: p.detach() for p in self.pipeline_model.parameters() if hasattr(p, 'original_name')}
+            if ema:
+                partial_state_dict = {p.original_name: self.ema.averaged(p.original_name, p)
+                                      for p in self.pipeline_model.parameters() if hasattr(p, 'original_name')}
+            else:
+                partial_state_dict = {p.original_name: p.detach() for p in self.pipeline_model.parameters() if hasattr(p, 'original_name')}
             if 'save_dtype' in self.config:
                 convert_state_dict_dtype(partial_state_dict, self.config['save_dtype'])
             torch.save(partial_state_dict, tmp_dir / f'state_dict_{stage_id}.bin')
@@ -166,14 +180,17 @@ class Saver:
     def save_model(self, name):
         if is_main_process():
             print(f'Saving model to directory {name}')
-        if self.is_adapter:
-            self.save_adapter(name)
-        else:
-            self.save_full_model(name)
+        save = self.save_adapter if self.is_adapter else self.save_full_model
+        save(name)
+        if self.ema is not None:
+            save(name, ema=True)
 
     def save_checkpoint(self, step, examples):
+        # DeepSpeed's own default tag, spelled out so the EMA file lands beside it.
+        tag = f'global_step{self.model_engine.global_steps}'
         self.model_engine.save_checkpoint(
             self.save_root,
+            tag=tag,
             client_state={
                 'step': step,
                 'examples': examples,
@@ -182,6 +199,11 @@ class Saver:
             save_latest=True,
             exclude_frozen_parameters=True
         )
+        if self.ema is not None:
+            # The average lives on data-parallel rank 0 of each stage; each writes its own.
+            if self.model_engine.grid.get_data_parallel_rank() == 0:
+                save_ema_checkpoint(self.ema, self.save_root, tag, self.model_engine.grid.get_pipe_parallel_rank())
+            dist.barrier()
 
     def process_epoch(self, epoch, step, examples):
         checkpointed, saved = False, False

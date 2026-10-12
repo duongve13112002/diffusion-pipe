@@ -1320,3 +1320,39 @@ def test_generic_keys_iris_does_not_use_are_refused(ckpt, key, value, hint):
         make_pipeline(path, cache_text_embeddings=True, **{key: value})
     make_pipeline(path, cache_text_embeddings=True, **{key: {'flux_shift': False, 'sigmoid_scale': 1.0,
                                                               'text_encoder_fp8': False}[key]})
+
+
+def test_ema_save_is_a_loadable_iris_checkpoint(ckpt, tmp_path, monkeypatch):
+    """With ema_decay, each save also writes <dir>/ema/ in Iris's layout: a transformer_path
+    whose weights are the average, as Iris's own released weights are."""
+    import types
+    from utils import saver as saver_util
+    from utils.ema import ParameterEMA
+    monkeypatch.setattr(saver_util, 'dist', types.SimpleNamespace(barrier=lambda: None))
+    monkeypatch.setattr(saver_util, 'is_main_process', lambda: True)
+
+    path, _ = ckpt
+    pipe = make_pipeline(path, cache_text_embeddings=True)
+    pipe.load_diffusion_model()
+    module = torch.nn.ModuleList(pipe.to_layers())
+    ema = ParameterEMA(module.named_parameters(), decay=0.5)
+    with torch.no_grad():
+        for p in module.parameters():
+            p.add_(torch.randn_like(p) * 0.1)
+    ema.update(1)
+
+    grid = types.SimpleNamespace(get_data_parallel_rank=lambda: 0, get_pipe_parallel_rank=lambda: 0)
+    config_file = tmp_path / 'train.toml'
+    config_file.write_text('')
+    saver = saver_util.Saver(types.SimpleNamespace(config=str(config_file)), {}, False, tmp_path / 'run', pipe,
+                             None, types.SimpleNamespace(grid=grid), module, ema=ema)
+    saver.save_model('epoch1')
+
+    averaged = make_pipeline(tmp_path / 'run' / 'epoch1' / 'ema', cache_text_embeddings=True)
+    averaged.load_diffusion_model()
+    raw = make_pipeline(tmp_path / 'run' / 'epoch1', cache_text_embeddings=True)
+    raw.load_diffusion_model()
+    trained = dict(pipe.transformer.named_parameters())
+    for name, p in averaged.transformer.named_parameters():
+        torch.testing.assert_close(p, ema.shadow[name])
+        torch.testing.assert_close(dict(raw.transformer.named_parameters())[name], trained[name])

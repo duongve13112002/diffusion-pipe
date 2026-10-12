@@ -32,6 +32,7 @@ from utils.unsloth_utils import unsloth_checkpoint
 from utils.pipeline import ManualPipelineModule
 from utils.oplora import OPLoRAProjector, apply_oplora_config_defaults
 from utils.lr_schedule import create_lr_scheduler
+from utils.ema import ParameterEMA, apply_ema_config_defaults, load_ema_checkpoint
 from utils.optimizer_factory import resolve_optimizer_class
 
 # needed for broadcasting Queue in dataset.py
@@ -151,6 +152,10 @@ def set_config_defaults(config):
         # preserved. Validation and defaults live in utils.oplora so they can be
         # unit-tested without importing the training stack.
         apply_oplora_config_defaults(adapter_config)
+
+    # EMA of the trained weights (utils/ema.py): validated here so a typo fails before any
+    # model is loaded.
+    apply_ema_config_defaults(config)
 
     config.setdefault('logging_steps', 1)
     config.setdefault('eval_datasets', [])
@@ -943,9 +948,33 @@ if __name__ == '__main__':
         if is_main_process():
             print(oplora_projector.describe())
 
+    ema = None
+    if 'ema_decay' in config:
+        # After the optimizer (get_param_groups may freeze zero-lr groups) and after a resume
+        # restored the weights. Only data-parallel rank 0 of each stage keeps the average: the
+        # replicas hold identical weights and only those ranks save.
+        holds_ema = model_engine.grid.get_data_parallel_rank() == 0
+        ema = ParameterEMA(
+            pipeline_model.named_parameters() if holds_ema else [],
+            config['ema_decay'], config['ema_update_every'], config['ema_start_step'],
+            config['ema_device'], is_adapter=is_adapter,
+        )
+        if resume_from_checkpoint:
+            tag = (Path(run_dir) / 'latest').read_text().strip()
+            found, missing = load_ema_checkpoint(ema, run_dir, tag)
+            if holds_ema and missing:
+                print(f'WARNING: stage {model_engine.grid.get_pipe_parallel_rank()}: checkpoint {tag} has no EMA for '
+                      f'{len(missing)} of {len(ema)} parameters (EMA was off or the run changed); their average '
+                      'starts from the current weights.')
+        if holds_ema:
+            print(f'EMA (stage {model_engine.grid.get_pipe_parallel_rank()}): {len(ema)} tensors, '
+                  f'{ema.num_bytes() / 1024**3:.2f} GB fp32 on {ema.device}, decay {config["ema_decay"]}, '
+                  f'every {config["ema_update_every"]} step(s), from step {config["ema_start_step"]}')
+
     epoch = train_dataloader.epoch
     tb_writer = SummaryWriter(log_dir=run_dir) if is_main_process() else None
-    saver = utils.saver.Saver(args, config, is_adapter, run_dir, model, train_dataloader, model_engine, pipeline_model)
+    saver = utils.saver.Saver(args, config, is_adapter, run_dir, model, train_dataloader, model_engine, pipeline_model,
+                              ema=ema)
 
     disable_block_swap_for_eval = config.get('disable_block_swap_for_eval', False)
     if config['eval_before_first_step'] and not resume_from_checkpoint:
@@ -961,6 +990,8 @@ if __name__ == '__main__':
         loss = model_engine.train_batch(iterator).item()
         if oplora_projector is not None:
             oplora_projector.project()
+        if ema is not None:
+            ema.update(step)
         epoch_loss += loss
         num_steps += 1
         train_dataloader.sync_epoch()

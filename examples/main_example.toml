@@ -105,6 +105,18 @@ partition_method = 'parameters'
 
 # dtype for saving the LoRA or model, if different from training dtype
 save_dtype = 'bfloat16'
+
+# EMA (exponential moving average) of the trained weights, for any model and for full fine-tunes
+# and adapters alike. Off unless ema_decay is set. Each save then also writes <save dir>/ema/, in
+# the same format as the normal save (load it the same way), and checkpoints carry the average so
+# a resumed run continues it. Evaluation still uses the raw weights.
+# The average is fp32: 4 bytes per trained parameter (12 GB for a 3B full fine-tune), kept on
+# data-parallel rank 0 of each pipeline stage. ema_device = 'cpu' keeps it in host RAM; each
+# update then copies the weights to the host, so update every few steps on large models.
+#ema_decay = 0.9999
+#ema_update_every = 10     # optimizer steps between updates; the decay is compounded to match
+#ema_start_step = 0        # until this step the average simply equals the weights
+#ema_device = 'cpu'        # 'cpu' or 'gpu' (fine for adapters)
 # Batch size for caching latents and text embeddings. Increasing can lead to higher GPU utilization during caching phase but uses more memory.
 caching_batch_size = 1
 
