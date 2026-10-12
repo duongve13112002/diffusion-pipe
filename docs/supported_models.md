@@ -858,6 +858,18 @@ the dataset is images only, and the recorded files still exist with unchanged si
 (`--check-all` stats every file instead of a sample; recommended, since Iris opens the images
 during training). The Anima cache is only read. See `--help` for other donor/target models.
 
+With `reuse_metadata_cache = false` (the legacy `metadata/` cache, loaded without a scan only
+under `--trust_cache`) the tool copies Anima's legacy `metadata/` instead: the file list, grouped
+metadata and grouping keys, so `train.py --trust_cache` with Iris loads them directly. Those hold
+captions already processed (prefix, shuffle variants, tag dropout), so on top of the checks above
+the tool refuses unless Anima's recorded caption settings equal Iris's and its buckets and masks
+are Iris's. Run it with the same dataset config Iris trains with, and add
+`--cache-text-embeddings` if Iris's training config sets `cache_text_embeddings = true`: with
+`cache_shuffle_num` or tag dropout, a model that caches no text embeddings augments captions every
+step and so needs metadata Anima (which caches them) did not write. Anima metadata written before
+caption settings were recorded (`caption_settings*.json` absent) is refused too. An existing Iris
+`metadata/` is kept unless `--force`, which moves it aside as `metadata.replaced_<time>`.
+
 On Kubernetes / shared volumes (NFS, CephFS, EFS, Filestore, Azure Files): run the tool once, as
 a Job or from one pod, before the training pods start, with the volume mounted at the same
 mountPath Anima trained with: the snapshot records absolute file paths, so a different mount

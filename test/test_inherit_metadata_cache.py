@@ -310,3 +310,133 @@ def test_reports_progress_while_it_works(tmp_path, capsys):
                   'checking', 'publishing the snapshot'):
         assert stage in err, stage
     assert any(line.startswith('[00:') and 'importing torch' in line for line in err.splitlines())
+
+
+# reuse_metadata_cache = false: the legacy metadata/ directory, trusted with --trust_cache.
+
+LEGACY = {'reuse_metadata_cache': False}
+
+
+def forbid_any_scan(monkeypatch):
+    def guarded(self, *args, **kwargs):
+        raise AssertionError('the inherited legacy metadata should make the media scan unnecessary')
+    monkeypatch.setattr(current.DirectoryDataset, '_get_ungrouped_metadata', guarded)
+
+
+def cache_legacy_donor(path, geometry, cached=True, **settings):
+    donor = build(path, 'anima', 16, cached, geometry, **LEGACY, **settings)
+    donor.cache_metadata()
+    return donor
+
+
+@pytest.mark.parametrize('geometry', [SIZE_BUCKETS, AR_BUCKETS], ids=['size', 'ar'])
+@pytest.mark.parametrize('captions', [{}, {'caption_prefix': 'photo, ', 'cache_shuffle_num': 2}],
+                         ids=['plain', 'prefix_shuffle'])
+def test_legacy_metadata_is_inherited_and_trusted_without_scanning(tmp_path, monkeypatch, geometry, captions):
+    data = tmp_path / 'data'
+    make_source(data)
+    cache_legacy_donor(data, geometry, **captions)
+    # Anima caches text embeddings; with cache_shuffle_num that bakes the shuffled variants in,
+    # which an Iris that caches none would augment per step instead.
+    flags = ['--cache-text-embeddings'] if captions else []
+    file = write_toml(tmp_path, data, geometry, **LEGACY, **captions)
+    assert tool.main(['--dataset', str(file), *flags]) == 0
+
+    cached = bool(captions)
+    fresh = build(data, 'iris_fresh', None, cached, geometry, **LEGACY, **captions)
+    fresh.cache_metadata()
+
+    forbid_any_scan(monkeypatch)
+    iris = build(data, 'iris', None, cached, geometry, **LEGACY, **captions)
+    iris.cache_metadata(trust_cache=True)
+    assert grouped_rows(iris) == grouped_rows(fresh) and grouped_rows(iris)
+    metadata = data / 'cache' / 'iris' / 'metadata'
+    assert json.loads((metadata / 'inherited_from.json').read_text())['donor_model'] == 'anima'
+    assert not list((data / 'cache' / 'iris').glob('.metadata.*'))
+    # The donor is untouched and still loads from its own cache.
+    again = build(data, 'anima', 16, True, geometry, **LEGACY, **captions)
+    again.cache_metadata(trust_cache=True)
+    assert grouped_rows(again) == grouped_rows(iris)
+
+
+@pytest.mark.parametrize('change', ['caption_prefix', 'augmentation', 'resolution', 'deleted', 'mask',
+                                    'snapshot_donor', 'no_donor'])
+def test_legacy_refuses_metadata_built_differently(tmp_path, change, capsys):
+    data = tmp_path / 'data'
+    make_source(data)
+    donor_settings = {'cache_shuffle_num': 2} if change == 'augmentation' else {}
+    if change == 'snapshot_donor':
+        cache_donor(data, SIZE_BUCKETS)
+    elif change != 'no_donor':
+        cache_legacy_donor(data, SIZE_BUCKETS, **donor_settings)
+    geometry, settings = SIZE_BUCKETS, dict(donor_settings)
+    if change == 'caption_prefix':
+        settings['caption_prefix'] = 'photo, '
+    elif change == 'resolution':
+        geometry = {'size_buckets': [[64, 64, 1], [96, 64, 1]]}
+    elif change == 'deleted':
+        (data / '0.png').unlink()
+    elif change == 'mask':
+        masks = tmp_path / 'masks'
+        masks.mkdir()
+        Image.new('L', (64, 64)).save(masks / '0.png')
+        settings['mask_path'] = str(masks)
+    # 'augmentation': the donor cached embeddings and baked the shuffles in; this Iris does not
+    # cache them, so it needs raw captions to augment per step.
+    file = write_toml(tmp_path, data, geometry, **LEGACY, **settings)
+    assert tool.main(['--dataset', str(file)]) == 1
+    out = capsys.readouterr().out
+    assert '[ERROR]' in out
+    assert not (data / 'cache' / 'iris' / 'metadata' / 'inherited_from.json').exists()
+    expected = {'caption_prefix': 'caption_prefix', 'augmentation': '--cache-text-embeddings',
+                'resolution': 'buckets', 'deleted': 'missing', 'mask': 'mask_path',
+                'snapshot_donor': 'reuse_metadata_cache = true', 'no_donor': 'no anima legacy metadata'}[change]
+    assert expected in out
+
+
+def test_legacy_existing_metadata_is_kept_unless_forced(tmp_path, monkeypatch, capsys):
+    data = tmp_path / 'data'
+    make_source(data)
+    cache_legacy_donor(data, SIZE_BUCKETS)
+    build(data, 'iris', None, False, SIZE_BUCKETS, **LEGACY).cache_metadata()
+    metadata = data / 'cache' / 'iris' / 'metadata'
+    file = write_toml(tmp_path, data, SIZE_BUCKETS, **LEGACY)
+
+    assert tool.main(['--dataset', str(file)]) == 0
+    assert '[SKIP ]' in capsys.readouterr().out
+    assert not (metadata / 'inherited_from.json').exists()
+
+    assert tool.main(['--dataset', str(file), '--dry-run', '--force']) == 0
+    assert not (metadata / 'inherited_from.json').exists()
+
+    assert tool.main(['--dataset', str(file), '--force']) == 0
+    assert (metadata / 'inherited_from.json').exists()
+    assert len(list((data / 'cache' / 'iris').glob('metadata.replaced_*'))) == 1
+    forbid_any_scan(monkeypatch)
+    iris = build(data, 'iris', None, False, SIZE_BUCKETS, **LEGACY)
+    iris.cache_metadata(trust_cache=True)
+    assert len(grouped_rows(iris)) == len(SIZES)
+
+
+def test_legacy_partial_target_metadata_needs_force(tmp_path, capsys):
+    data = tmp_path / 'data'
+    make_source(data)
+    cache_legacy_donor(data, SIZE_BUCKETS)
+    metadata = data / 'cache' / 'iris' / 'metadata'
+    (metadata / 'metadata_intermediate').mkdir(parents=True)
+    file = write_toml(tmp_path, data, SIZE_BUCKETS, **LEGACY)
+    assert tool.main(['--dataset', str(file)]) == 1
+    assert 'unfinished' in capsys.readouterr().out
+    assert tool.main(['--dataset', str(file), '--force']) == 0
+    assert (metadata / 'inherited_from.json').exists()
+
+
+def test_legacy_empty_target_metadata_dir_is_filled(tmp_path):
+    """Constructing the dataset creates an empty metadata/; that is not a scan to protect."""
+    data = tmp_path / 'data'
+    make_source(data)
+    cache_legacy_donor(data, SIZE_BUCKETS)
+    (data / 'cache' / 'iris' / 'metadata').mkdir(parents=True)
+    file = write_toml(tmp_path, data, SIZE_BUCKETS, **LEGACY)
+    assert tool.main(['--dataset', str(file)]) == 0
+    assert (data / 'cache' / 'iris' / 'metadata' / 'inherited_from.json').exists()

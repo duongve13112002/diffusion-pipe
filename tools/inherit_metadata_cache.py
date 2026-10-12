@@ -26,6 +26,16 @@ Nothing is copied unless the two snapshots would be identical:
     training hours later.
 The donor cache is only read. Use --dry-run to see the verdict for every directory first.
 
+With reuse_metadata_cache = false (the legacy cache, trusted with --trust_cache) there is no
+snapshot. The tool then copies the donor's legacy metadata/ instead -- the file list, the
+grouped metadata and the grouping keys -- so the target's --trust_cache run loads it without
+scanning. That metadata already holds the captions as processed by the caption settings, so it
+is copied only when the donor's recorded caption settings equal the target's, its buckets are
+the target's buckets and its masks the target's masks, on top of the file checks above. Pass
+--cache-text-embeddings when the target's training config sets cache_text_embeddings = true:
+whether captions are augmented per step or when cached depends on it. The target's own
+per-bucket and text embedding caches are built on its first run, as always.
+
 Defaults are for Iris inheriting from Anima / Anima refiner, which share the 'anima' cache
 directory. Both round to multiples of 16. Like the snapshot itself, the result reflects the
 files as they were when the donor scanned them; run training with --regenerate_cache to
@@ -53,8 +63,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import utils.captions  # noqa: E402,F401
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'submodules' / 'ComfyUI'))
 
-REQUIRED_COLUMNS = {'image_spec', 'mask_file', 'caption', 'ar_bucket', 'size_bucket', 'is_video',
-                    '_caption_missing', '_caption_sidecar'}
+LEGACY_COLUMNS = {'image_spec', 'mask_file', 'caption', 'ar_bucket', 'size_bucket', 'is_video'}
+REQUIRED_COLUMNS = LEGACY_COLUMNS | {'_caption_missing', '_caption_sidecar'}
 # Tried when --from-framerate is not given. Only the hash depends on it for an image dataset.
 CANDIDATE_FRAMERATES = [None, *range(1, 241)]
 
@@ -89,6 +99,9 @@ class Plan:
         self.target = None
         self.donor_snapshot = None
         self.rows = 0
+        self.legacy = False          # reuse_metadata_cache = false: copy metadata/, not a snapshot
+        self.legacy_entries = []     # names in the donor's metadata/ to copy
+        self.replace_existing = False
 
     def note(self, message):
         self.messages.append(message)
@@ -158,12 +171,13 @@ def missing_files(snapshot, threads=32, batch_size=10000):
     return gone
 
 
-def check_snapshot(plan, snapshot, sample, header_sample, seed=0, check_all=False, threads=32):
+def check_snapshot(plan, snapshot, sample, header_sample, seed=0, check_all=False, threads=32,
+                   required=REQUIRED_COLUMNS):
     """Refuse a snapshot that is malformed, holds videos, or no longer matches the files."""
     import pyarrow.compute as pc
     from PIL import Image
     target = plan.target
-    missing = REQUIRED_COLUMNS - set(snapshot.column_names)
+    missing = required - set(snapshot.column_names)
     if missing:
         plan.note(f'donor snapshot lacks columns {sorted(missing)}; it was written by a different version.')
         return False
@@ -234,21 +248,19 @@ def check_snapshot(plan, snapshot, sample, header_sample, seed=0, check_all=Fals
 
 def plan_directory(directory_config, dataset_config, donor, target_model, round_to_multiple,
                    donor_framerate=None, force=False, sample=2000, header_sample=200, check_all=False,
-                   threads=32):
+                   threads=32, caches_text_embeddings=False):
     from utils.dataset import DirectoryDataset
     log(f"{directory_config.get('path')}: reading the directory's dataset settings")
     plan = Plan(directory_config.get('path'))
     target = DirectoryDataset(copy.deepcopy(directory_config), copy.deepcopy(dataset_config), target_model,
                               framerate=None, round_to_multiple=round_to_multiple,
-                              skip_dataset_validation=True, caches_text_embeddings=False)
+                              skip_dataset_validation=True, caches_text_embeddings=caches_text_embeddings)
     plan.target = target
-    if not target.reuse_metadata_cache:
-        plan.note('reuse_metadata_cache = false for this directory, so no snapshot is used. Nothing to do.')
-        plan.status = 'skip'
-        return plan
     if target.frame_buckets.tolist() != [1]:
         plan.note(f'frame_buckets = {target.frame_buckets.tolist()}: only image datasets can be inherited.')
         return plan
+    if not target.reuse_metadata_cache:
+        return plan_legacy_directory(plan, donor, target_model, force, sample, header_sample, check_all, threads)
     if target.snapshot_path.exists() and not force:
         plan.note(f'{target_model} already has a snapshot at {target.snapshot_path}. Pass --force to replace '
                   'it with a new generation.')
@@ -283,6 +295,164 @@ def plan_directory(directory_config, dataset_config, donor, target_model, round_
     plan.note(f'will write {target.geometry_dir}')
     plan.status = 'ready'
     return plan
+
+
+def _grouped_name(key, suffix):
+    from utils.dataset import bucket_suffix
+    return f'grouped_metadata_{bucket_suffix(key)}{suffix}'
+
+
+def _legacy_complete(metadata_dir, suffix):
+    keys_file = metadata_dir / f'grouping_keys{suffix}.json'
+    if not keys_file.is_file():
+        return False
+    keys = json.loads(keys_file.read_text())
+    return all((metadata_dir / _grouped_name(key, suffix)).is_dir() for key in keys)
+
+
+def _bucket_mismatch(target, keys):
+    """Grouping keys the target's bucketing would never produce, or None when all fit."""
+    import numpy as np
+    bad = []
+    for key in keys:
+        if target.use_size_buckets:
+            ok = len(key) == 3 and any(list(key) == [int(x) for x in b] for b in target.size_buckets.tolist())
+        else:
+            ok = (len(key) == 2 and int(key[1]) in target.frame_buckets.tolist()
+                  and bool(np.isclose(target.ars, float(key[0]), rtol=0, atol=1e-6).any()))
+        if not ok:
+            bad.append(key)
+    return bad or None
+
+
+def plan_legacy_directory(plan, donor, target_model, force, sample, header_sample, check_all, threads):
+    """reuse_metadata_cache = false: plan copying the donor's legacy metadata/ into the target's."""
+    import re
+    import datasets
+    from utils.dataset import LEGACY_CAPTION_SETTINGS
+    target = plan.target
+    plan.legacy = True
+    suffix = target.caption_cache_suffix
+    target_metadata = target.cache_dir / 'metadata'
+    if _legacy_complete(target_metadata, suffix) and not force:
+        plan.note(f'{target_model} already has legacy metadata at {target_metadata}. Pass --force to replace it '
+                  '(the old one is kept as metadata.replaced_<time>).')
+        plan.status = 'skip'
+        return plan
+    if target_metadata.is_dir() and any(target_metadata.iterdir()):
+        if not force:
+            plan.note(f'{target_metadata} holds metadata from an unfinished or different scan. Pass --force to '
+                      'replace it (kept as metadata.replaced_<time>), or let training rebuild it.')
+            return plan
+        plan.replace_existing = True
+
+    relative = target.cache_dir.relative_to(target.path / 'cache' / target_model)
+    donor_metadata = target.path / 'cache' / donor / relative / 'metadata'
+    log(f'{target.path}: looking for {donor} legacy metadata in {donor_metadata}')
+    keys_file = donor_metadata / f'grouping_keys{suffix}.json'
+    if not keys_file.is_file():
+        others = sorted(p.name for p in donor_metadata.glob('grouping_keys*.json')) if donor_metadata.is_dir() else []
+        if others:
+            plan.note(f'{donor_metadata} has {others} but not {keys_file.name}: the donor cached captions under '
+                      'other caption settings (prefix, shuffle, dropout, multiline, non-Latin filter, or caption '
+                      'augmentation, which follows cache_text_embeddings: see --cache-text-embeddings).')
+        elif (target.path / 'cache' / donor / 'profiles').is_dir():
+            plan.note(f'{donor} was cached with reuse_metadata_cache = true (profiles/), not legacy metadata: '
+                      'nothing to copy for a reuse_metadata_cache = false target.')
+        else:
+            plan.note(f'no {donor} legacy metadata at {donor_metadata}.')
+        return plan
+    keys = json.loads(keys_file.read_text())
+    missing = [key for key in keys if not (donor_metadata / _grouped_name(key, suffix)).is_dir()]
+    if missing:
+        plan.note(f'{donor_metadata}: grouped metadata missing for buckets {missing[:3]}; the donor scan did not '
+                  'finish.')
+        return plan
+    bad = _bucket_mismatch(target, keys)
+    if bad:
+        plan.note(f'donor buckets {bad[:3]} are not among this dataset\'s buckets: the bucketing settings changed '
+                  'since the donor cached it.')
+        return plan
+
+    settings_file = donor_metadata / f'caption_settings{suffix}.json'
+    if not settings_file.is_file():
+        plan.note(f'{settings_file.name} is missing: the donor cache predates caption-settings tracking, so it '
+                  'cannot be shown to hold captions processed like the target\'s. Let training rebuild it.')
+        return plan
+    recorded = json.loads(settings_file.read_text())
+    current = target._legacy_caption_settings()
+    changed = {k: (recorded.get(k, LEGACY_CAPTION_SETTINGS.get(k)), v) for k, v in current.items()
+               if recorded.get(k, LEGACY_CAPTION_SETTINGS.get(k)) != v}
+    if changed:
+        plan.note('the donor captions were processed with other settings: '
+                  + ', '.join(f'{k} {was!r} (donor) vs {now!r}' for k, (was, now) in sorted(changed.items())))
+        return plan
+
+    log(f'{plan.path}: loading the donor\'s grouped metadata ({len(keys)} buckets)')
+    grouped = datasets.concatenate_datasets(
+        [datasets.load_from_disk(str(donor_metadata / _grouped_name(key, suffix))) for key in keys])
+    masks = {m for m in grouped.select_columns(['mask_file'])['mask_file'] if m}
+    expected = target.mask_path is not None or target.default_mask_file is not None
+    foreign = [m for m in masks if Path(m).parent != target.mask_path
+               and (target.default_mask_file is None or Path(m) != target.default_mask_file)]
+    if bool(masks) != expected or foreign:
+        plan.note('donor metadata and this dataset disagree about mask_path / default_mask_file'
+                  + (f', e.g. {sorted(foreign)[:2]}' if foreign else '') + '.')
+        return plan
+    if not check_snapshot(plan, grouped, sample, header_sample, check_all=check_all, threads=threads,
+                          required=LEGACY_COLUMNS):
+        return plan
+
+    pattern = re.compile(rf'^(metadata_intermediate|metadata_with_captions\.arrow|'
+                         rf'metadata{re.escape(suffix)}(_\d+_of_\d+)?\.arrow|'
+                         rf'{re.escape(keys_file.name)}|{re.escape(settings_file.name)})$')
+    grouped_names = {_grouped_name(key, suffix) for key in keys}
+    plan.legacy_entries = sorted(p.name for p in donor_metadata.iterdir()
+                                 if p.name in grouped_names or pattern.match(p.name))
+    plan.donor_snapshot = donor_metadata
+    plan.note(f'will write {target_metadata} ({len(plan.legacy_entries)} entries from {donor_metadata})')
+    plan.status = 'ready'
+    return plan
+
+
+def apply_legacy_plan(plan, donor):
+    """Publish the donor's legacy metadata/ as the target's, in one rename. Returns the path, or
+    None when the target's metadata appeared meanwhile (another pod, or a training run)."""
+    target = plan.target
+    target_metadata = target.cache_dir / 'metadata'
+    target.cache_dir.mkdir(parents=True, exist_ok=True)
+    staging = target.cache_dir / ('.metadata.' + uuid.uuid4().hex)
+    log(f'{plan.path}: publishing legacy metadata to {target_metadata} (hard links, or a copy across filesystems)')
+    try:
+        staging.mkdir()
+        for name in plan.legacy_entries:
+            source = plan.donor_snapshot / name
+            if source.is_dir():
+                shutil.copytree(source, staging / name, copy_function=_link_or_copy)
+            else:
+                _link_or_copy(source, staging / name)
+        (staging / 'inherited_from.json').write_text(json.dumps({
+            'donor_model': donor, 'donor_metadata': str(plan.donor_snapshot), 'rows': plan.rows,
+            'created': datetime.datetime.now().isoformat(timespec='seconds'),
+        }, indent=2))
+        if target_metadata.exists():
+            if plan.replace_existing or _legacy_complete(target_metadata, target.caption_cache_suffix):
+                stamp = datetime.datetime.now().strftime('%Y%m%d-%H%M%S')
+                os.replace(target_metadata, target.cache_dir / f'metadata.replaced_{stamp}')
+            elif not any(target_metadata.iterdir()):
+                target_metadata.rmdir()
+            else:
+                return None
+        try:
+            os.replace(staging, target_metadata)
+        except OSError:
+            if target_metadata.exists():
+                return None
+            raise
+    finally:
+        if staging.exists():
+            shutil.rmtree(staging, ignore_errors=True)
+    return target_metadata
 
 
 def _link_or_copy(src, dst):
@@ -359,7 +529,11 @@ def main(argv=None):
                              'storage (NFS, CephFS, EFS), where each check is a round trip.')
     parser.add_argument('--dry-run', action='store_true', help='Check and report; no metadata is written (empty cache directories may be created).')
     parser.add_argument('--force', action='store_true',
-                        help='Replace an existing target snapshot by publishing a new generation.')
+                        help='Replace an existing target snapshot by publishing a new generation (legacy '
+                             'metadata: the old metadata/ is kept as metadata.replaced_<time>).')
+    parser.add_argument('--cache-text-embeddings', action='store_true',
+                        help="The target's training config sets cache_text_embeddings = true (Iris default: false). "
+                             'Only matters with reuse_metadata_cache = false.')
     args = parser.parse_args(argv)
 
     if args.donor == args.target:
@@ -378,7 +552,7 @@ def main(argv=None):
         log(f"directory {number}/{len(directories)}: {d.get('path')}")
         plans.append(plan_directory(d, dataset_config, args.donor, args.target, args.round_to_multiple,
                                     args.from_framerate, args.force, args.sample, check_all=args.check_all,
-                                    threads=args.threads))
+                                    threads=args.threads, caches_text_embeddings=args.cache_text_embeddings))
     print()
     for plan in plans:
         print(plan)
@@ -388,9 +562,9 @@ def main(argv=None):
         print(f'\nDry run: {len(ready)} ready, {len(errors)} refused, {len(plans) - len(ready) - len(errors)} skipped.')
         return 1 if errors else 0
     for plan in ready:
-        path = apply_plan(plan, args.donor)
+        path = (apply_legacy_plan if plan.legacy else apply_plan)(plan, args.donor)
         if path is None:
-            print(f'[SKIP ] {plan.path}\n        another process published a {args.target} snapshot '
+            print(f'[SKIP ] {plan.path}\n        another process published {args.target} metadata '
                   'while this one was copying; keeping it.')
         else:
             print(f'Wrote {path}')
