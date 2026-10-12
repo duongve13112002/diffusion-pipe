@@ -141,7 +141,7 @@ def missing_files(snapshot, threads=32, batch_size=10000):
     return gone
 
 
-def check_snapshot(plan, snapshot, sample, header_sample, seed=0, check_all=False):
+def check_snapshot(plan, snapshot, sample, header_sample, seed=0, check_all=False, threads=32):
     """Refuse a snapshot that is malformed, holds videos, or no longer matches the files."""
     import pyarrow.compute as pc
     from PIL import Image
@@ -191,7 +191,7 @@ def check_snapshot(plan, snapshot, sample, header_sample, seed=0, check_all=Fals
     plan.note(f'{plan.rows} images in the donor snapshot. Sampled {len(indices)}: {len(gone)} missing; '
               f'{headers_checked} image sizes compared to their recorded buckets: {len(moved)} differ.')
     if check_all and not gone:
-        gone = missing_files(snapshot)
+        gone = missing_files(snapshot, threads=threads)
         plan.note(f'--check-all: {len(gone)} of {plan.rows} recorded files are missing.')
     if gone:
         plan.note(f'{len(gone)} sampled files no longer exist, e.g. {gone[:3]}. The dataset changed '
@@ -205,7 +205,8 @@ def check_snapshot(plan, snapshot, sample, header_sample, seed=0, check_all=Fals
 
 
 def plan_directory(directory_config, dataset_config, donor, target_model, round_to_multiple,
-                   donor_framerate=None, force=False, sample=2000, header_sample=200, check_all=False):
+                   donor_framerate=None, force=False, sample=2000, header_sample=200, check_all=False,
+                   threads=32):
     from utils.dataset import DirectoryDataset
     plan = Plan(directory_config.get('path'))
     target = DirectoryDataset(copy.deepcopy(directory_config), copy.deepcopy(dataset_config), target_model,
@@ -247,7 +248,7 @@ def plan_directory(directory_config, dataset_config, donor, target_model, round_
 
     import datasets
     if not check_snapshot(plan, datasets.load_from_disk(str(source)), sample, header_sample,
-                          check_all=check_all):
+                          check_all=check_all, threads=threads):
         return plan
     plan.note(f'will write {target.geometry_dir}')
     plan.status = 'ready'
@@ -261,8 +262,18 @@ def _link_or_copy(src, dst):
         shutil.copy2(src, dst)
 
 
+def _write_active(geometry_dir, snapshot_dir):
+    # A unique temporary name: two pods publishing at once must not rename each other's file.
+    active = geometry_dir / 'active_snapshot.json'
+    temporary = geometry_dir / f'.active_snapshot.{uuid.uuid4().hex}.tmp'
+    temporary.write_text(json.dumps({'directory': os.path.relpath(snapshot_dir, geometry_dir)}))
+    os.replace(temporary, active)
+
+
 def apply_plan(plan, donor):
-    """Publish the donor snapshot as the target's active source metadata."""
+    """Publish the donor snapshot as the target's active source metadata. Returns the published
+    path, or None when another process (another pod running this tool, or the target model's
+    own first scan) published a snapshot there first."""
     target = plan.target
     geometry_dir = target.geometry_dir
     if target.snapshot_path.exists():
@@ -275,16 +286,25 @@ def apply_plan(plan, donor):
     snapshot_path = snapshot_dir / 'source_metadata'
     snapshot_dir.mkdir(parents=True, exist_ok=True)
     staging = snapshot_dir / ('.source_metadata.' + uuid.uuid4().hex)
-    shutil.copytree(plan.donor_snapshot, staging, copy_function=_link_or_copy)
-    os.replace(staging, snapshot_path)
+    try:
+        shutil.copytree(plan.donor_snapshot, staging, copy_function=_link_or_copy)
+        if snapshot_path.exists():
+            return None
+        try:
+            os.replace(staging, snapshot_path)
+        except OSError:
+            # Renaming onto a directory someone else just filled fails rather than merging.
+            if snapshot_path.exists():
+                return None
+            raise
+    finally:
+        if staging.exists():
+            shutil.rmtree(staging, ignore_errors=True)
     (snapshot_dir / 'inherited_from.json').write_text(json.dumps({
         'donor_model': donor, 'donor_snapshot': str(plan.donor_snapshot), 'rows': plan.rows,
         'created': datetime.datetime.now().isoformat(timespec='seconds'),
     }, indent=2))
-    active = geometry_dir / 'active_snapshot.json'
-    temporary = active.with_suffix('.json.tmp')
-    temporary.write_text(json.dumps({'directory': os.path.relpath(snapshot_dir, geometry_dir)}))
-    os.replace(temporary, active)
+    _write_active(geometry_dir, snapshot_dir)
     return snapshot_path
 
 
@@ -303,6 +323,9 @@ def main(argv=None):
     parser.add_argument('--check-all', action='store_true',
                         help='Check that every recorded file still exists, not just a sample. Recommended for '
                              'pixel-space models (Iris), which open the images during training.')
+    parser.add_argument('--threads', type=int, default=32,
+                        help='Parallel existence checks for --check-all (default 32). Raise it on network '
+                             'storage (NFS, CephFS, EFS), where each check is a round trip.')
     parser.add_argument('--dry-run', action='store_true', help='Check and report; no metadata is written (empty cache directories may be created).')
     parser.add_argument('--force', action='store_true',
                         help='Replace an existing target snapshot by publishing a new generation.')
@@ -315,7 +338,8 @@ def main(argv=None):
         dataset_config = toml.load(f)
 
     plans = [plan_directory(d, dataset_config, args.donor, args.target, args.round_to_multiple,
-                            args.from_framerate, args.force, args.sample, check_all=args.check_all)
+                            args.from_framerate, args.force, args.sample, check_all=args.check_all,
+                            threads=args.threads)
              for d in dataset_config['directory']]
     for plan in plans:
         print(plan)
@@ -326,7 +350,11 @@ def main(argv=None):
         return 1 if errors else 0
     for plan in ready:
         path = apply_plan(plan, args.donor)
-        print(f'Wrote {path}')
+        if path is None:
+            print(f'[SKIP ] {plan.path}\n        another process published a {args.target} snapshot '
+                  'while this one was copying; keeping it.')
+        else:
+            print(f'Wrote {path}')
     print(f'\n{len(ready)} inherited, {len(errors)} refused, {len(plans) - len(ready) - len(errors)} skipped.')
     if errors:
         print('Refused directories are scanned normally on the first training run.')

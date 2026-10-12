@@ -824,6 +824,17 @@ the dataset is images only, and the recorded files still exist with unchanged si
 (`--check-all` stats every file instead of a sample; recommended, since Iris opens the images
 during training). The Anima cache is only read. See `--help` for other donor/target models.
 
+On Kubernetes / shared volumes (NFS, CephFS, EFS, Filestore, Azure Files): run the tool once, as
+a Job or from one pod, before the training pods start, with the volume mounted at the same
+mountPath Anima trained with: the snapshot records absolute file paths, so a different mount
+point is refused as "files no longer exist". Where hard links are refused (SMB shares, donor and
+target cache on separate mounts, a donor cache owned by another UID) the snapshot is copied
+instead. If two pods run it at once, the one that finishes second keeps the first one's snapshot;
+do not put `--force` in an initContainer, since every pod start would publish a new generation.
+`--threads` (default 32) sets the parallel existence checks of `--check-all`; raise it on network
+storage. The tool publishes by renaming a directory: mountpoint-s3 cannot rename at all, and
+gcsfuse renames directories only on hierarchical-namespace buckets or with `--rename-dir-limit`.
+
 Saving:
 - Full fine-tune writes Iris's own layout: `model.safetensors` (IrisDiT keys) + `config.yaml`,
   readable by `iris3b.sampling.load_for_inference` and Iris's `scripts/sample.py`, and usable as

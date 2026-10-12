@@ -208,3 +208,63 @@ def test_check_all_finds_a_missing_file_the_sample_skipped(tmp_path, capsys):
     out = capsys.readouterr().out
     assert '--check-all: 1 of 5 recorded files are missing' in out and '3.png' in out
     assert '[READY]' in sampled or '[ERROR]' in sampled
+
+
+def test_a_snapshot_published_by_another_pod_during_the_copy_is_kept(tmp_path, monkeypatch):
+    """Two pods (or a pod and the target's own first scan) publishing at once: the loser
+    leaves the winner's snapshot alone and no staging directory behind."""
+    data = tmp_path / 'data'
+    make_source(data)
+    cache_donor(data, SIZE_BUCKETS)
+    file = write_toml(tmp_path, data, SIZE_BUCKETS)
+    dataset_config = toml.load(file)
+    plan = tool.plan_directory(dataset_config['directory'][0], dataset_config, 'anima', 'iris', 16)
+    assert plan.status == 'ready'
+
+    real_copytree = tool.shutil.copytree
+
+    def copytree_while_another_pod_wins(src, dst, **kwargs):
+        result = real_copytree(src, dst, **kwargs)
+        real_copytree(src, plan.target.snapshot_path)       # the other pod finishes first
+        (plan.target.geometry_dir / 'winner').write_text('')
+        return result
+    monkeypatch.setattr(tool.shutil, 'copytree', copytree_while_another_pod_wins)
+    assert tool.apply_plan(plan, 'anima') is None
+    geometry_dir = plan.target.geometry_dir
+    assert (geometry_dir / 'winner').exists() and plan.target.snapshot_path.is_dir()
+    assert not list(geometry_dir.glob('.source_metadata.*')) and not list(geometry_dir.glob('*.tmp'))
+
+
+def test_falls_back_to_copying_where_hard_links_are_not_supported(tmp_path, monkeypatch):
+    """SMB shares (Azure Files), separate mounts for donor and target, or a donor cache owned by
+    another UID refuse os.link; the snapshot is copied instead and works the same."""
+    data = tmp_path / 'data'
+    make_source(data)
+    cache_donor(data, SIZE_BUCKETS)
+    file = write_toml(tmp_path, data, SIZE_BUCKETS)
+
+    def no_links(src, dst):
+        raise OSError(18, 'Invalid cross-device link')
+    monkeypatch.setattr(tool.os, 'link', no_links)
+    assert tool.main(['--dataset', str(file)]) == 0
+    forbid_media_scan(monkeypatch)
+    iris = build(data, 'iris', None, False, SIZE_BUCKETS)
+    iris.cache_metadata()
+    assert len(grouped_rows(iris)) == len(SIZES)
+    copied = next(iris.snapshot_path.glob('*.arrow'))
+    assert copied.stat().st_nlink == 1
+
+
+def test_refuses_when_the_volume_is_mounted_somewhere_else(tmp_path, capsys):
+    """The snapshot records absolute paths. A PVC mounted at another mountPath than the one the
+    donor ran with would point training at files that are not there, so it is refused."""
+    old_mount = tmp_path / 'mnt_a' / 'data'
+    make_source(old_mount)
+    cache_donor(old_mount, SIZE_BUCKETS)
+    new_mount = tmp_path / 'mnt_b' / 'data'
+    new_mount.parent.mkdir()
+    old_mount.rename(new_mount)
+    file = write_toml(tmp_path, new_mount, SIZE_BUCKETS)
+    assert tool.main(['--dataset', str(file)]) == 1
+    assert 'no longer exist' in capsys.readouterr().out
+    assert not list((new_mount / 'cache' / 'iris').rglob('source_metadata'))
