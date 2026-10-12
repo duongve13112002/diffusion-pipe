@@ -419,6 +419,28 @@ def test_text_encoder_matches_iris_encoder(tiny_qwen):
     assert int(mask[2].sum()) == TEXT_LEN  # truncated caption still ends with the full suffix
 
 
+@pytest.mark.parametrize('prefix', ['', 'model.diffusion_model.'])
+def test_transformer_path_accepts_a_single_safetensors_file(ckpt, tmp_path, prefix):
+    """transformer_path can name the weights file itself, under any filename and with a
+    ComfyUI-style prefix; config.yaml is read from beside it, Iris's defaults otherwise."""
+    path, ref = ckpt
+    folder = tmp_path / 'comfy_models'
+    folder.mkdir()
+    sd = safetensors.torch.load_file(str(path / 'model.safetensors'))
+    single = folder / 'my_iris_finetune.safetensors'
+    safetensors.torch.save_file({prefix + k: v for k, v in sd.items()}, str(single))
+    (folder / 'config.yaml').write_text((path / 'config.yaml').read_text())
+    pipe = make_pipeline(single)
+    pipe.load_diffusion_model()
+    got = pipe.transformer.state_dict()
+    for k, v in ref.state_dict().items():
+        torch.testing.assert_close(got[k].float(), v.float(), rtol=0, atol=0, msg=k)
+    lone = tmp_path / 'lone.safetensors'
+    lone.write_bytes(single.read_bytes())
+    cfg, raw = iris.load_iris_config(lone)
+    assert raw == {} and cfg == inference_config({})
+
+
 @pytest.mark.parametrize('layout', ['full_vlm', 'text_only', 'tied_lm_head'])
 def test_text_encoder_loads_from_a_single_safetensors_file(tiny_qwen, tmp_path, layout):
     """A single file of any common layout, plus a config directory, encodes exactly like the
