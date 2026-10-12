@@ -110,13 +110,17 @@ save_dtype = 'bfloat16'
 # and adapters alike. Off unless ema_decay is set. Each save then also writes <save dir>/ema/, in
 # the same format as the normal save (load it the same way), and checkpoints carry the average so
 # a resumed run continues it. Evaluation still uses the raw weights.
-# The average is fp32: 4 bytes per trained parameter (12 GB for a 3B full fine-tune), kept on
-# data-parallel rank 0 of each pipeline stage. ema_device = 'cpu' keeps it in host RAM; each
-# update then copies the weights to the host, so update every few steps on large models.
+# The average is fp32 by default: 4 bytes per trained parameter (12 GB for a 3B full fine-tune),
+# kept on data-parallel rank 0 of each pipeline stage. ema_dtype = 'bfloat16' halves that; its
+# updates are stochastically rounded, since at a 0.9999 decay they are far below bf16 precision
+# and plain rounding would leave the average stuck at the starting weights. ema_device = 'cpu'
+# keeps it in host RAM; each update then copies the weights to the host, so update every few
+# steps on large models.
 #ema_decay = 0.9999
 #ema_update_every = 10     # optimizer steps between updates; the decay is compounded to match
 #ema_start_step = 0        # until this step the average simply equals the weights
 #ema_device = 'cpu'        # 'cpu' or 'gpu' (fine for adapters)
+#ema_dtype = 'float32'     # or 'bfloat16'
 # Batch size for caching latents and text embeddings. Increasing can lead to higher GPU utilization during caching phase but uses more memory.
 caching_batch_size = 1
 

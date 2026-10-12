@@ -10,7 +10,8 @@ from torch import nn
 
 from utils import ema as ema_util
 from utils import saver as saver_util
-from utils.ema import ParameterEMA, apply_ema_config_defaults, load_ema_checkpoint, save_ema_checkpoint
+from utils.ema import (ParameterEMA, apply_ema_config_defaults, load_ema_checkpoint, save_ema_checkpoint,
+                       to_bfloat16_stochastic)
 
 
 def named(module, prefix=''):
@@ -23,10 +24,12 @@ def test_config_defaults_and_validation():
     assert apply_ema_config_defaults({}) is False
     config = {'ema_decay': 0.999}
     assert apply_ema_config_defaults(config) is True
-    assert config == {'ema_decay': 0.999, 'ema_update_every': 1, 'ema_start_step': 0, 'ema_device': 'cpu'}
+    assert config == {'ema_decay': 0.999, 'ema_update_every': 1, 'ema_start_step': 0, 'ema_device': 'cpu',
+                      'ema_dtype': 'float32'}
     for bad in ({'ema_decay': 1.0}, {'ema_decay': 0}, {'ema_decay': True}, {'ema_decay': '0.9'},
                 {'ema_decay': 0.9, 'ema_update_every': 0}, {'ema_decay': 0.9, 'ema_start_step': -1},
-                {'ema_decay': 0.9, 'ema_device': 'cuda'}, {'ema_update_every': 10}):
+                {'ema_decay': 0.9, 'ema_device': 'cuda'}, {'ema_decay': 0.9, 'ema_dtype': 'float16'},
+                {'ema_update_every': 10}, {'ema_dtype': 'bfloat16'}):
         with pytest.raises(ValueError):
             apply_ema_config_defaults(dict(bad))
 
@@ -218,3 +221,47 @@ def test_saver_without_ema_is_unchanged(tmp_path, no_barrier):
     saver.save_checkpoint(3, 24)
     assert list(model.saves) == [tmp_path / 'run' / 'step3']
     assert not list((tmp_path / 'run').rglob('ema*'))
+
+
+def test_stochastic_rounding_is_unbiased():
+    torch.manual_seed(0)
+    x = torch.full((200000,), 1.001)        # between the bf16 neighbours 1.0 and 1.0078125
+    rounded = to_bfloat16_stochastic(x)
+    assert set(rounded.unique().tolist()) == {1.0, 1.0078125}
+    assert abs(rounded.float().mean().item() - 1.001) < 2e-4
+    exact = torch.tensor([0.0, 1.0, -2.5, 3.140625])  # already bf16: unchanged
+    assert torch.equal(to_bfloat16_stochastic(exact).float(), exact)
+
+
+def test_bf16_average_follows_the_weights_where_rounding_to_nearest_would_not():
+    """At decay 0.9999 each update is 1e-4 of the gap, under half a bf16 step unless the gap is
+    ~20x the weights' magnitude: rounded to nearest, a bf16 average at 1 with weights at 2 never
+    moves. Stochastic rounding keeps it on the fp32 average's course, within bf16 noise."""
+    torch.manual_seed(0)
+    layer = nn.Linear(256, 256, bias=False)
+    with torch.no_grad():
+        layer.weight.fill_(1.0)
+    exact = ParameterEMA(named(layer), decay=0.9999)
+    half = ParameterEMA(named(layer), decay=0.9999, dtype='bfloat16')
+    assert half.shadow['weight'].dtype == torch.bfloat16 and half.num_bytes() * 2 == exact.num_bytes()
+    with torch.no_grad():
+        layer.weight.fill_(2.0)
+    nearest = torch.ones(1, dtype=torch.bfloat16)
+    for step in range(1, 2001):
+        exact.update(step)
+        half.update(step)
+        nearest = nearest.float().lerp_(torch.full((1,), 2.0), 1e-4).to(torch.bfloat16)
+    target = exact.shadow['weight'].mean().item()
+    assert abs(target - (2 - 0.9999 ** 2000)) < 1e-4
+    assert abs(half.shadow['weight'].float().mean().item() - target) < 0.005
+    assert nearest.item() == 1.0
+
+
+def test_checkpoint_loads_across_an_ema_dtype_change(tmp_path):
+    layer = nn.Linear(3, 3)
+    fp32 = ParameterEMA(named(layer), decay=0.5)
+    (tmp_path / 'global_step1').mkdir()
+    save_ema_checkpoint(fp32, tmp_path, 'global_step1', 0)
+    bf16 = ParameterEMA(named(layer), decay=0.5, dtype='bfloat16')
+    assert load_ema_checkpoint(bf16, tmp_path, 'global_step1') == (1, [])
+    torch.testing.assert_close(bf16.shadow['weight'], fp32.shadow['weight'].to(torch.bfloat16))

@@ -3,20 +3,26 @@
     ema_decay = 0.9999        # turns EMA on
     ema_update_every = 1      # optimizer steps between updates (decay is compounded to match)
     ema_start_step = 0        # until this step the average just follows the weights
-    ema_device = 'cpu'        # 'cpu' or 'gpu': where the fp32 average lives
+    ema_device = 'cpu'        # 'cpu' or 'gpu': where the average lives
+    ema_dtype = 'float32'     # or 'bfloat16': half the memory, stochastically rounded
 
-Every trainable parameter gets an fp32 shadow copy, updated after each optimizer step as
+Every trainable parameter gets a shadow copy, updated after each optimizer step as
 shadow = decay * shadow + (1 - decay) * weight. Frozen parameters have no shadow: their EMA is
 the weight itself. Each save then also writes `<save dir>/ema/`, in exactly the layout of the
 normal save (the model's own save_model / save_adapter), so it loads anywhere the normal one
 does. Training checkpoints carry the shadow too, so a resumed run continues the same average.
 
 The shadow is kept on data-parallel rank 0 of each pipeline stage only, the ranks that save:
-every data-parallel replica holds identical weights. It is fp32 because a 0.9999 decay moves
-the average by 1e-4 of the difference per step, below bf16's resolution. For a full fine-tune
-that is 4 bytes per parameter (12 GB for a 3B model), hence ema_device = 'cpu' by default; with
-it, each update copies the weights to the host, so ema_update_every > 1 keeps that off the
-critical path on large models. An adapter's average is small enough for 'gpu'.
+every data-parallel replica holds identical weights. It is fp32 by default because a 0.9999
+decay moves the average by 1e-4 of the gap to the weights per step, under half a bf16 step
+unless that gap is about 20x the weights' own magnitude: rounded to nearest, a bf16 average
+would in practice never leave its starting weights. ema_dtype = 'bfloat16'
+therefore rounds each update stochastically (up or down with the probabilities that keep its
+expectation exact), so it does follow the weights, with rounding noise of about one bf16 step,
+the precision of bf16 weights themselves. fp32 takes 4 bytes per parameter (12 GB for a 3B full
+fine-tune), bf16 2; hence ema_device = 'cpu' by default. With it, each update copies the weights
+to the host, so ema_update_every > 1 keeps that off the critical path on large models. An
+adapter's average is small enough for 'gpu'.
 """
 
 from pathlib import Path
@@ -24,8 +30,9 @@ from pathlib import Path
 import torch
 
 DEVICES = ('cpu', 'gpu')
+DTYPES = {'float32': torch.float32, 'bfloat16': torch.bfloat16}
 EMA_SUBDIR = 'ema'
-_OPTION_KEYS = ('ema_update_every', 'ema_start_step', 'ema_device')
+_OPTION_KEYS = ('ema_update_every', 'ema_start_step', 'ema_device', 'ema_dtype')
 
 
 def apply_ema_config_defaults(config):
@@ -49,7 +56,19 @@ def apply_ema_config_defaults(config):
     device = config.setdefault('ema_device', 'cpu')
     if device not in DEVICES:
         raise ValueError(f'ema_device must be one of {DEVICES}, got {device!r}')
+    dtype = config.setdefault('ema_dtype', 'float32')
+    if dtype not in DTYPES:
+        raise ValueError(f'ema_dtype must be one of {tuple(DTYPES)}, got {dtype!r}')
     return True
+
+
+def to_bfloat16_stochastic(x):
+    """fp32 -> bf16, rounding up or down at random with the probabilities that make the
+    result equal x in expectation. bf16 is the top 16 bits of fp32: add uniform noise below
+    them and truncate."""
+    bits = x.contiguous().view(torch.int32)
+    noise = torch.randint_like(bits, 0, 1 << 16)
+    return ((bits + noise) & -65536).view(torch.float32).to(torch.bfloat16)
 
 
 def saved_key(param, is_adapter):
@@ -63,8 +82,10 @@ def saved_key(param, is_adapter):
 class ParameterEMA:
     """fp32 moving average of the trainable parameters among `named_parameters`."""
 
-    def __init__(self, named_parameters, decay, update_every=1, start_step=0, device='cpu', is_adapter=False):
+    def __init__(self, named_parameters, decay, update_every=1, start_step=0, device='cpu', is_adapter=False,
+                 dtype='float32'):
         self.decay = float(decay)
+        self.dtype = DTYPES[dtype] if isinstance(dtype, str) else dtype
         self.update_every = int(update_every)
         self.start_step = int(start_step)
         self.is_adapter = is_adapter
@@ -81,7 +102,7 @@ class ParameterEMA:
             if key is None or key in self.params:
                 continue
             self.params[key] = p
-            self.shadow[key] = p.detach().to(self.device, torch.float32, copy=True)
+            self.shadow[key] = p.detach().to(self.device, torch.float32, copy=True).to(self.dtype)
         self.num_updates = 0
 
     def __len__(self):
@@ -104,7 +125,11 @@ class ParameterEMA:
         for key, p in self.params.items():
             shadow = self.shadow[key]
             # Moved in the parameter's own (narrower) dtype, widened where the shadow lives.
-            shadow.lerp_(p.detach().to(shadow.device).to(torch.float32), weight)
+            weights = p.detach().to(shadow.device).to(torch.float32)
+            if shadow.dtype == torch.float32:
+                shadow.lerp_(weights, weight)
+            else:
+                shadow.copy_(to_bfloat16_stochastic(shadow.float().lerp_(weights, weight)))
         self.num_updates += 1
 
     def averaged(self, key, param):
@@ -125,6 +150,7 @@ class ParameterEMA:
         missing = []
         for key, shadow in self.shadow.items():
             if key in saved:
+                # Across an ema_dtype change too: fp32 -> bf16 rounds to nearest, once.
                 shadow.copy_(saved[key])
             else:
                 missing.append(key)

@@ -957,7 +957,7 @@ if __name__ == '__main__':
         ema = ParameterEMA(
             pipeline_model.named_parameters() if holds_ema else [],
             config['ema_decay'], config['ema_update_every'], config['ema_start_step'],
-            config['ema_device'], is_adapter=is_adapter,
+            config['ema_device'], is_adapter=is_adapter, dtype=config['ema_dtype'],
         )
         if resume_from_checkpoint:
             tag = (Path(run_dir) / 'latest').read_text().strip()
@@ -968,7 +968,7 @@ if __name__ == '__main__':
                       'starts from the current weights.')
         if holds_ema:
             print(f'EMA (stage {model_engine.grid.get_pipe_parallel_rank()}): {len(ema)} tensors, '
-                  f'{ema.num_bytes() / 1024**3:.2f} GB fp32 on {ema.device}, decay {config["ema_decay"]}, '
+                  f'{ema.num_bytes() / 1024**3:.2f} GB {config["ema_dtype"]} on {ema.device}, decay {config["ema_decay"]}, '
                   f'every {config["ema_update_every"]} step(s), from step {config["ema_start_step"]}')
 
     epoch = train_dataloader.epoch
