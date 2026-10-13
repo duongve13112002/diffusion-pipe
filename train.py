@@ -605,7 +605,8 @@ if __name__ == '__main__':
         shutil.copy(args.config, run_dir)
         shutil.copy(config['dataset'], run_dir)
         for eval_dataset in config['eval_datasets']:
-            shutil.copy(eval_dataset['config'], run_dir)
+            # Same two forms the loader accepts: a path, or {name, config}.
+            shutil.copy(eval_dataset if isinstance(eval_dataset, str) else eval_dataset['config'], run_dir)
     dist.barrier()
 
     # WandB logging
