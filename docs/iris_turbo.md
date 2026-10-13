@@ -17,6 +17,13 @@ images. diffusion-pipe adds the pieces around it:
 | `examples/iris/turbo/stage1_6step.yaml`, `stage2_4step.yaml` | Iris's two stage configs laid out for 8 GPUs and a persistent volume. |
 | `examples/iris/turbo/run_turbo.sh` | Prompts, both stages and the export in one restartable command. |
 | `examples/iris/turbo/k8s_job.yaml` | A Kubernetes Job running that script on one 8-GPU node with a PVC. |
+| `tools/iris_turbo_lora.py`, `examples/iris/turbo/lora.toml` | Turbo as a LoRA on one GPU or several: see [Turbo as a LoRA](#turbo-as-a-lora). |
+
+**Two ways.** The full distillation reproduces Iris's release and needs a node of 8 large GPUs
+(H200-class). [Turbo as a LoRA](#turbo-as-a-lora) uses the same objective, but trains a rank-64
+adapter on one frozen copy of the model. It runs on a single GPU, uses more GPUs if you have
+them, and gives a ~230 MB adapter instead of a 6 GB model. Expect it to be somewhat behind the
+full distillation in quality: an adapter has less room to change the model.
 
 ## What you need
 
@@ -336,6 +343,130 @@ pass `resume_from=<work_dir>/checkpoints/step_XXXXXXXX.pth` yourself.
 - **Disk.** Iris keeps every checkpoint: 16 saves, about 1.3 TB, for stage 1. `--keep-last 2`
   keeps two plus the one being written. Stage 2 needs stage 1's final checkpoint, which is always
   kept. Once stage 2 has written its first checkpoint, stage 1's checkpoints can go.
+
+## Turbo as a LoRA
+
+`tools/iris_turbo_lora.py` distills with Iris's TDM objective and few-step rollout
+(`iris3b.distill.objective` and `sampler`, the code behind the released Turbo), but the student
+and the fake score network are LoRA adapters on **one** frozen copy of the teacher:
+
+| Adapter | Acts as |
+|---|---|
+| none (adapters off) | the teacher: the model you distill, frozen |
+| `student` | the few-step student, trained against the teacher's guided target |
+| `fake` | the fake score network, trained on the student's samples |
+| `ema` | the moving average of the student, which is what gets exported and previewed |
+
+The base weights are held once, in bf16 by default. Teacher and fake share them, so the lower
+precision cannot bias the teacher-minus-fake difference the student learns from. The adapters
+and their optimizer states stay in float32.
+
+### Running it
+
+```bash
+# the prompts, as for the full distillation (see Prompts), plus general prompts
+python tools/iris_turbo_prompts.py --dataset dataset.toml --extra-prompts general.txt \
+    --output /data/turbo_lora/prompts.txt
+# edit teacher / prompts_file / output_dir in a copy of examples/iris/turbo/lora.toml, then
+python tools/iris_turbo_lora.py --config my_lora.toml                                      # one GPU
+torchrun --standalone --nproc_per_node=4 tools/iris_turbo_lora.py --config my_lora.toml    # 4 GPUs
+```
+
+- **Restarts.** Run the same command again after any interruption. It continues from the newest
+  readable checkpoint in `output_dir/checkpoints`, sets aside one torn by a crash (`*.torn`),
+  and exits at once when the run is finished. To train longer, raise `max_steps` and run it
+  again.
+- **What a resume may change.** Paths, `max_steps`, the learning rates, `max_grad_norm`, saving,
+  logging and preview settings, `text_encoder` and `activation_checkpointing`. Anything else,
+  the GPU count, the prompts file content or the teacher's weights is refused: use a new
+  `output_dir`.
+- **Overrides.** `--set key=value` overrides any key, e.g. `--set max_steps=3000` or
+  `--set adapter.rank=32`.
+- **Warm start.** `init_from` takes a checkpoint of another LoRA run: its EMA student and its fake
+  network, with fresh optimizers. Use it to continue at a lower learning rate after a run that
+  started to degrade, or for a 6-step stage followed by a 4-step one, as Iris did.
+
+### Several GPUs
+
+Every GPU holds the whole model. After each update the adapters' gradients are averaged across
+the GPUs, so the replicas stay identical and the global batch is
+`batch_size` × `gradient_accumulation_steps` × GPUs. The learning rates are not scaled for you.
+More GPUs give a less noisy update, and the same number of `max_steps` finishes sooner. A
+resume needs the same GPU count.
+
+`gradient_accumulation_steps` gives a single GPU the same larger batch at the cost of time.
+
+### Memory
+
+These are estimates; the tool has not been profiled on every card.
+
+| | |
+|---|---|
+| Base model, bf16 (the embedders and pixel head stay float32) | ~6 GB |
+| Text encoder (Qwen3-VL-4B, bf16), `text_encoder = 'gpu'` | ~8 GB |
+| Student, fake and EMA adapters at rank 64, with gradients and AdamW states | ~4 GB |
+| Activations at 1024², batch 1, `activation_checkpointing = 'full'` | several GB |
+
+That is roughly 24-28 GB with the text encoder on the GPU (a 32 GB card or larger) and roughly
+16-20 GB with `text_encoder = 'offload'`, which keeps the encoder in CPU memory and moves it to
+the GPU once per update. A community DMD2 LoRA of the same size measured ~18 GB on an RTX 5090
+with its text encoder on another GPU. Lower `adapter.rank` saves a little; `base_dtype =
+'float32'` adds ~6 GB.
+
+### Output and using the adapter
+
+```
+output_dir/
+  adapters/step_00000100/        adapter_model.safetensors, adapter_config.json, distill.yaml
+  checkpoints/step_00000100.pt   training state (adapters, EMA, optimizers, prompt cursor, RNG)
+  samples/step_00000100/         previews of sample_prompts with the EMA student
+  config.toml                    the settings of the run
+```
+
+- The adapter is the EMA student in diffusion-pipe's LoRA format, bf16 by default (~230 MB at
+  rank 64). Each one is written to a scratch name and renamed, before the training checkpoint
+  of the same step, so neither is ever half-written.
+- `distill.yaml` holds the few-step schedule and records the teacher it was distilled from.
+- Training checkpoints are about 3 GB at rank 64; `keep_last` (default 2) keeps the newest.
+  Every exported adapter is kept.
+
+Merge an adapter into **the same model it was distilled from** and sample with Iris's sampler,
+which reads `distill.yaml` from the merged directory:
+
+```bash
+python -m tools.iris_merge_adapter --model /data/iris_full/my-run/epoch6/ema \
+    --adapter /data/turbo_lora/run1/adapters/step_00002000 --output /data/my-iris-turbo-lora
+python submodules/iris-3b/scripts/sample.py --checkpoint /data/my-iris-turbo-lora --prompt "a red fox in snow"
+```
+
+The merge tool copies the adapter's `distill.yaml`, and warns if `--model` is not the teacher
+recorded there. An adapter distilled from your fine-tune does not transfer to another model.
+
+### Settings
+
+`examples/iris/turbo/lora.toml` explains every key. The defaults are a starting point, not a
+tuned recipe:
+
+| Key | Default | Note |
+|---|---|---|
+| `sigmas` | `[1.0, 0.938, 0.833, 0.625]` | Iris's 4-step Turbo schedule. Six steps (`[1.0, 0.926, 0.833, 0.714, 0.556, 0.333]`) are easier to learn. |
+| `cfg_scale` | 3.5 | The guidance baked into the student. Use the scale your model samples best at. |
+| `learning_rate` / `fake_learning_rate` | 2e-5 / 1e-4 | The fake network learns 5x faster; Iris's recipe uses 5x and 10x. A community DMD2 LoRA collapsed at 5e-5 and was stable at 2.5e-5. |
+| `fake_updates` | 2 | Fake updates per student update. The fake network must keep up with the student. |
+| `ema_decay` | 0.99 | Per student update. The exported adapter is the EMA. |
+| `max_steps` | 2000 | Student updates. Pick the adapter by its previews, not the last one by default. |
+| `adapter.rank` | 64 | For both the student and (`fake_rank`) the fake network. |
+| `adapter.target_modules` | every linear layer but the text adapter | Class names or top-level modules of `IrisDiT`. |
+
+**Watch the previews.** Distillation losses do not show quality: the student and the fake
+network chase each other. `samples/step_00000000` is the teacher sampled in the student's 4
+steps, the starting point. If later previews lose contrast or dissolve into texture, take an
+earlier adapter, and continue from its checkpoint with `init_from` at a lower `learning_rate`.
+
+The log is one JSON line per `log_every` updates: `generator_loss`, `fake_loss`, both gradient
+norms, `dm_rms` (the size of the teacher-minus-fake signal), `cfg_rms`, seconds per step and an
+ETA. A non-finite loss or gradient stops the run before any update is applied; lower the learning
+rates before running it again.
 
 ## What Turbo trades away
 

@@ -912,7 +912,8 @@ CFG. Iris's TDM distillation trainer ships in the submodule, and diffusion-pipe 
 model you trained here can be distilled the same way: a prompts file built from your training
 captions (`tools/iris_turbo_prompts.py`), a launcher with checks, safe restarts and checkpoint
 pruning (`tools/iris_turbo_distill.py`), stage configs for 8 GPUs, a one-command script and a
-Kubernetes Job (`examples/iris/turbo/`). See [Iris-3B Turbo](iris_turbo.md) for the full guide:
+Kubernetes Job (`examples/iris/turbo/`). For a single GPU, `tools/iris_turbo_lora.py` distills
+into a LoRA instead. See [Iris-3B Turbo](iris_turbo.md) for the full guide:
 ```
 TEACHER=/pvc/runs/iris_full/<run>/epoch6/ema DATASET=/pvc/configs/dataset.toml OUT=/pvc/turbo \
     bash examples/iris/turbo/run_turbo.sh

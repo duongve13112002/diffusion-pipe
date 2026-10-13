@@ -172,6 +172,18 @@ def main(argv=None):
     safetensors.torch.save_file(state_dict, str(out / 'model.safetensors'), metadata={'format': 'pt'})
     write_config(out / 'config.yaml', config_file, cfg, args.shift, args.shift_law, args.max_text_length)
     print(f'Wrote {len(state_dict)} tensors to {out / "model.safetensors"}')
+    adapter_distill = Path(args.adapter) / 'distill.yaml'
+    if adapter_distill.is_file():
+        # A Turbo LoRA (tools/iris_turbo_lora.py): the merged model samples with its few-step schedule.
+        from omegaconf import OmegaConf
+        recorded = OmegaConf.load(str(adapter_distill)).get('lora_teacher')
+        shutil.copyfile(adapter_distill, out / 'distill.yaml')
+        print(f'Copied {adapter_distill}: a Turbo LoRA, so the merged model samples with its few-step schedule '
+              'and no CFG.')
+        if recorded and str(recorded) != str(args.model):
+            print(f'NOTE: this adapter was distilled from {recorded}; --model is {args.model}. A Turbo LoRA only '
+                  'works on the model it was distilled from.')
+        return
     distill = resolve_file(args.model, 'distill.yaml', required=False) if Path(args.model).exists() else None
     if distill is None:
         # A reused output directory must not keep the schedule of an earlier Turbo merge.
