@@ -148,10 +148,9 @@ def fine_tune(tmp_path):
 
 
 def test_a_diffusion_pipe_save_is_a_valid_teacher(fine_tune):
-    raw, params, size = distill.check_teacher(str(fine_tune))
+    raw, params = distill.check_teacher(str(fine_tune))
     weights = safetensors.torch.load_file(str(fine_tune / 'model.safetensors'))
     assert params == sum(t.numel() for t in weights.values())
-    assert size == (fine_tune / 'model.safetensors').stat().st_size
     assert raw['model']['attn_backend'] == 'sdpa'
 
 
@@ -234,7 +233,7 @@ def test_pth_teachers(fine_tune, tmp_path):
     weights = safetensors.torch.load_file(str(fine_tune / 'model.safetensors'))
     training = tmp_path / 'training.pth'
     torch.save({'config': raw, 'state_dict': weights, 'state_dict_ema': weights}, training)
-    _, params, _ = distill.check_teacher(str(training))
+    _, params = distill.check_teacher(str(training))
     assert params == sum(t.numel() for t in weights.values())
     student = tmp_path / 'student.pth'
     torch.save({'config': raw, 'state_dict_ema': weights, 'distill_format_version': 1}, student)
@@ -316,13 +315,35 @@ def test_a_fresh_run_does_not_overwrite_checkpoints(tmp_path):
         distill.resolve_run(cfg, checkpoints, 'sha', auto_resume=False)
     assert distill.resolve_run(cfg, checkpoints, 'sha', auto_resume=True) == \
         str((checkpoints / 'step_00000200.pth').resolve())
-    # latest.pth dangling (the volume mounted elsewhere): the newest step file
+    # latest.pth dangling (the volume mounted elsewhere): still the newest step file
     (checkpoints / 'latest.pth').unlink()
     (checkpoints / 'latest.pth').symlink_to('/elsewhere/step_00000200.pth')
-    assert distill.resolve_run(cfg, checkpoints, 'sha', auto_resume=True) == str(checkpoints / 'step_00000200.pth')
+    assert distill.resolve_run(cfg, checkpoints, 'sha', auto_resume=True) == \
+        str((checkpoints / 'step_00000200.pth').resolve())
     with pytest.raises(distill.PreflightError, match='mounted at another path'):
         distill.resolve_run(stage_config(tmp_path, f'resume_from={checkpoints / "latest.pth"}'),
                             checkpoints, 'sha', auto_resume=False)
+
+
+def test_auto_resume_skips_a_torn_checkpoint_and_a_lagging_latest(tmp_path):
+    checkpoints = tmp_path / 'run' / 'checkpoints'
+    cfg = stage_config(tmp_path)
+    for step in (100, 200, 300):
+        write_distill_checkpoint(checkpoints / f'step_{step:08d}.pth', step)
+    # latest.pth one save behind (the pod died between Iris's rename and relink)
+    (checkpoints / 'latest.pth').unlink()
+    (checkpoints / 'latest.pth').symlink_to((checkpoints / 'step_00000200.pth').resolve())
+    assert distill.resolve_run(cfg, checkpoints, 'sha', True) == str((checkpoints / 'step_00000300.pth').resolve())
+    # the newest one zero-filled by a node crash
+    size = (checkpoints / 'step_00000300.pth').stat().st_size
+    (checkpoints / 'step_00000300.pth').write_bytes(bytes(size))
+    assert distill.resolve_run(cfg, checkpoints, 'sha', True) == str((checkpoints / 'step_00000200.pth').resolve())
+    assert (checkpoints / 'step_00000300.pth.torn').exists() and not (checkpoints / 'step_00000300.pth').exists()
+    # an explicit resume_from of a torn file is a clear refusal, not a traceback
+    (checkpoints / 'step_00000200.pth').write_bytes(b'cut')
+    with pytest.raises(distill.PreflightError, match='cannot read'):
+        distill.resolve_run(stage_config(tmp_path, f'resume_from={checkpoints / "step_00000200.pth"}'),
+                            checkpoints, 'sha', False)
 
 
 def test_resume_must_match_gpus_prompts_and_be_the_newest(tmp_path, monkeypatch):
@@ -481,15 +502,17 @@ def test_checkpoints_on_disk(max_steps, save_every, keep_last, expected, tmp_pat
 
 
 def test_memory_warnings(tmp_path, capsys, monkeypatch):
-    monkeypatch.setenv('LOCAL_WORLD_SIZE', '4')
     fsdp2 = stage_config(tmp_path, 'strategy=fsdp2')
-    distill.check_host_memory(fsdp2, checkpoint_size=84e9, teacher_bytes=12e9, limit=80e9)
-    out = capsys.readouterr().out
-    assert 'gathers each checkpoint' in out and 'loads the teacher' not in out
-    distill.check_host_memory(fsdp2, checkpoint_size=84e9, teacher_bytes=12e9, limit=512e9)
+    distill.check_host_memory(fsdp2, checkpoint_size=84e9, limit=80e9)
+    assert 'gathers each checkpoint' in capsys.readouterr().out
+    distill.check_host_memory(fsdp2, checkpoint_size=84e9, limit=512e9)
+    distill.check_host_memory(stage_config(tmp_path), checkpoint_size=84e9, limit=40e9)
     assert capsys.readouterr().out == ''
-    distill.check_host_memory(stage_config(tmp_path), checkpoint_size=84e9, teacher_bytes=12e9, limit=40e9)
-    assert 'loads the teacher' in capsys.readouterr().out
+    def full(*args, **kwargs):
+        raise OSError(28, 'No space left on device')
+    monkeypatch.setattr(distill, 'write_speed', full)
+    distill.check_write_speed(tmp_path, 84e9, 120)
+    assert 'No space left' in capsys.readouterr().out
 
 
 # ---- launcher -------------------------------------------------------------------------------------
@@ -562,3 +585,25 @@ def test_upstream_configs_load(tmp_path):
         cfg = distill.load_config(IRIS_CONFIGS / name, ['teacher=t', 'prompts_file=p'])
         assert cfg.betas == [0.0, 0.999]
     assert os.path.isfile(ROOT / 'submodules' / 'iris-3b' / 'scripts' / 'export_distilled.py')
+
+
+def test_launcher_exits_cleanly_for_a_finished_run_and_unexpected_errors(fine_tune, tmp_path, monkeypatch, capsys):
+    prompts = tmp_path / 'prompts.txt'
+    prompts.write_text('a prompt\n', encoding='utf-8')
+    from iris3b.distill.trainer import PromptStream
+    checkpoints = tmp_path / 'run' / 'checkpoints'
+    write_distill_checkpoint(checkpoints / 'step_00001600.pth', 1600, PromptStream.from_file(prompts).sha256)
+    argv = ['--config', str(IRIS_CONFIGS / 'turbo_stage1_6step.yaml'), f'teacher={fine_tune}',
+            f'prompts_file={prompts}', f'work_dir={tmp_path / "run"}', '--skip-write-test', '--auto-resume']
+    assert run_launcher(monkeypatch, argv) == []
+    assert 'already reached max_steps=1600' in capsys.readouterr().out
+    (cfg, _, _), = run_launcher(monkeypatch, [*argv, 'max_steps=2000'])
+    assert cfg.resume_from.endswith('step_00001600.pth')
+
+    def broken(*args, **kwargs):
+        raise KeyError('model')
+    monkeypatch.setattr(distill, 'check_prompts', broken)
+    with pytest.raises(SystemExit, match="preflight failed: KeyError: 'model'"):
+        run_launcher(monkeypatch, argv)
+    with pytest.raises(SystemExit):
+        run_launcher(monkeypatch, [*argv, '--skip-preflight'])

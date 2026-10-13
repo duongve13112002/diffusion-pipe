@@ -17,21 +17,24 @@ tools/iris_merge_adapter.py, or an Iris training .pth. Around the trainer it add
 - The process group is created here with a 2 hour timeout (--nccl-timeout-minutes) instead of
   Iris's 30 minutes: rank 0 writes each ~84 GB checkpoint while the other ranks wait, and on a
   network volume slower than ~47 MB/s that alone exceeds 30 minutes.
-- Checks on rank 0 before any weights load, whose outcome every rank shares, so a bad setup
-  stops the whole job at once with one message:
+- Checks on rank 0 before any weights load, whose outcome every rank shares. These stop the
+  whole job at once with one message:
   - the teacher is a text-to-image model, not a Turbo export or student, and its attn_backend
-    can run Iris's masked text adapter;
-  - prompts_file is non-empty UTF-8; init_from and resume_from are distillation checkpoints,
-    and a resume matches this GPU count and prompts file;
+    can run Iris's masked text adapter (sdpa, unless the text adapter is linear);
+  - prompts_file is non-empty UTF-8; init_from and resume_from are readable distillation
+    checkpoints, and a resume matches this GPU count and prompts file;
   - the checkpoint directory accepts a file, a symlink and a rename over an existing entry
-    (Iris points latest.pth at the newest checkpoint that way; some network volumes refuse);
-  - its write speed, timed with 1 GiB, keeps a checkpoint save inside the timeout;
-  - free space, the pod's memory limit (fsdp2 gathers the whole checkpoint into rank 0's CPU
-    memory to save it) and /dev/shm.
+    (Iris points latest.pth at the newest checkpoint that way; some network volumes refuse).
+  These only warn: the write speed (timed with 1 GiB) against the timeout, free space, the
+  pod's memory limit (fsdp2 gathers the whole checkpoint into rank 0's CPU memory to save it),
+  /dev/shm and GPU memory.
 - A work_dir that already holds checkpoints is not silently overwritten from step 0, which is
-  what Iris does when a pod restarts with the same command. --auto-resume continues from
-  latest.pth instead (from the newest step_*.pth if latest.pth dangles because the volume is
-  mounted elsewhere), so the same command works for the first start and every restart.
+  what Iris does when a pod restarts with the same command. --auto-resume continues from the
+  newest step_*.pth that loads instead, so the same command works for the first start and
+  every restart. It does not rely on latest.pth, which lags one save behind when a pod dies
+  between the rename and the relink, and dangles when the volume is mounted elsewhere. A
+  step file left incomplete by a node crash is renamed to *.torn and skipped. A run that
+  already reached max_steps exits at once instead of loading everything to save again.
 - --keep-last N (default 2) deletes older step_*.pth after each save, never the one latest.pth
   points at. Iris keeps all of them: 16 saves, about 1.3 TB, for stage 1 at save_every 100.
   0 keeps every checkpoint. A failed delete is reported and does not stop training.
@@ -107,7 +110,11 @@ def load_config(config_path, overrides):
 
 def load_payload(path):
     """A .pth's top-level dict; mmap reads only the pickle, not the tensors."""
-    return torch.load(str(path), map_location='cpu', mmap=True, weights_only=False)
+    try:
+        return torch.load(str(path), map_location='cpu', mmap=True, weights_only=False)
+    except Exception as error:
+        raise PreflightError(f'cannot read {path} ({type(error).__name__}: {error}); it may be incomplete, '
+                             'e.g. written when a node crashed') from error
 
 
 # ---- teacher ------------------------------------------------------------------------------------
@@ -127,7 +134,7 @@ def check_inference_config(raw, where):
 
 
 def check_teacher(teacher):
-    """(raw config, parameter count or None, bytes of weights a rank loads to CPU or None)."""
+    """(raw config, parameter count or None)."""
     from omegaconf import OmegaConf
     path = Path(teacher)
     if not path.exists():
@@ -143,7 +150,7 @@ def check_teacher(teacher):
         check_inference_config(payload.get('config'), f'teacher {teacher}')
         state = payload.get('state_dict_ema') or payload.get('state_dict') or {}
         params = sum(t.numel() for k, t in state.items() if not k.startswith('repa.')) or None
-        return payload['config'], params, None if params is None else params * 4
+        return payload['config'], params
     for name in ('model.safetensors', 'config.yaml'):
         if not (path / name).is_file():
             raise PreflightError(
@@ -155,7 +162,7 @@ def check_teacher(teacher):
             'base Iris-3B or your fine-tune of it.')
     raw = OmegaConf.to_container(OmegaConf.load(str(path / 'config.yaml')))
     check_inference_config(raw, f'teacher {path / "config.yaml"}')
-    return raw, parameter_count(path / 'model.safetensors'), (path / 'model.safetensors').stat().st_size
+    return raw, parameter_count(path / 'model.safetensors')
 
 
 def parameter_count(weights):
@@ -214,12 +221,23 @@ def checkpoint_steps(directory):
 
 
 def newest_checkpoint(checkpoints):
-    """What --auto-resume continues from: latest.pth's target, else the newest step_*.pth."""
-    latest = Path(checkpoints) / 'latest.pth'
-    if latest.exists():
-        return latest.resolve()
-    found = checkpoint_steps(checkpoints)
-    return found[-1][1] if found else None
+    """What --auto-resume continues from: the newest step_*.pth in `checkpoints` that loads.
+
+    Not latest.pth: Iris repoints it after renaming the step file into place, so a pod killed
+    in between leaves it one save behind, and after a move of the volume it dangles. A step file
+    that does not load (a node crash before the data reached the disk) is renamed to *.torn,
+    so the resume and pruning stop seeing it.
+    """
+    for _, path in reversed(checkpoint_steps(checkpoints)):
+        try:
+            load_payload(path)
+        except PreflightError as error:
+            torn = path.with_name(path.name + '.torn')
+            path.replace(torn)
+            log(f'WARNING: {error}. Renamed it to {torn.name}; delete it once the run continues.')
+            continue
+        return path.resolve()
+    return None
 
 
 def resolve_run(cfg, checkpoints, prompts_sha, auto_resume):
@@ -232,8 +250,13 @@ def resolve_run(cfg, checkpoints, prompts_sha, auto_resume):
                 f'{checkpoints} already holds {existing[-1][1].name}. Iris would start over from step 0 and '
                 f'overwrite it. Pass resume_from={checkpoints / "latest.pth"} (or --auto-resume) to continue, '
                 'or a new work_dir to start over.')
-        resume_from = str(newest_checkpoint(checkpoints))
-        log(f'--auto-resume: continuing from {resume_from}')
+        newest = newest_checkpoint(checkpoints)
+        if newest is None:
+            log('--auto-resume: no readable checkpoint left; starting over')
+            resume_from = ''
+        else:
+            resume_from = str(newest)
+            log(f'--auto-resume: continuing from {resume_from}')
     if not resume_from:
         if cfg.init_from:
             payload = check_distill_checkpoint(cfg.init_from, 'init_from')
@@ -249,13 +272,18 @@ def resolve_run(cfg, checkpoints, prompts_sha, auto_resume):
         raise PreflightError(f'resume_from {resume_from} was trained on another prompts file; resume with the '
                              f'same {cfg.prompts_file} it used (do not regenerate it between runs).')
     step = payload.get('generator_updates', 0)
-    newer = [path.name for found_step, path in existing if found_step > step]
+    newer = [path.name for found_step, path in checkpoint_steps(checkpoints) if found_step > step]
     if newer:
         raise PreflightError(
-            f'{checkpoints} holds {", ".join(newer)}, newer than the resume point (step {step}), from a run '
-            'that went further. Resuming would overwrite them one by one and pruning would keep the wrong '
-            'ones: move them out of the directory first.')
+            f'{checkpoints} holds {", ".join(newer)}, newer than the resume point (step {step}): from a run '
+            'that went further, or incomplete after a crash. Resuming would overwrite them one by one and '
+            'pruning would keep the wrong ones: move them out of the directory first.')
     return resume_from
+
+
+def finished(resume_from, cfg):
+    """True when the checkpoint to resume already reached max_steps (a pod restarted after the end)."""
+    return bool(resume_from) and load_payload(resume_from).get('generator_updates', 0) >= cfg.max_steps
 
 
 # ---- storage, memory ----------------------------------------------------------------------------
@@ -352,7 +380,11 @@ def check_space(cfg, checkpoints, keep_last, checkpoint_size):
 
 
 def check_write_speed(checkpoints, checkpoint_size, timeout_minutes):
-    speed = write_speed(checkpoints)
+    try:
+        speed = write_speed(checkpoints)
+    except OSError as error:
+        log(f'WARNING: a 1 GiB test write into {checkpoints} failed ({error}); checkpoints will fail the same way')
+        return
     seconds = checkpoint_size / speed
     log(f'{checkpoints} writes {speed / 1e6:.0f} MB/s: a checkpoint takes about {seconds / 60:.1f} min '
         f'(process group timeout {timeout_minutes} min)')
@@ -379,21 +411,16 @@ def memory_limit():
     return min(limits) if limits else None
 
 
-def check_host_memory(cfg, checkpoint_size, teacher_bytes, limit):
-    if limit is None:
+def check_host_memory(cfg, checkpoint_size, limit):
+    """fsdp2 gathers each checkpoint into rank 0's CPU memory before writing it. (The teacher
+    file each rank loads is memory-mapped, so the ranks share one page-cache copy of it.)"""
+    if limit is None or cfg.strategy != 'fsdp2':
         return
-    local = int(os.environ.get('LOCAL_WORLD_SIZE', world_size()))
-    needs = []
-    if teacher_bytes:
-        needs.append((local * teacher_bytes, f'every rank loads the teacher to CPU at start ({local} x '
-                                             f'{teacher_bytes / GB:.0f} GB)'))
-    if cfg.strategy == 'fsdp2':
-        needs.append((checkpoint_size * MEMORY_MARGIN,
-                      'fsdp2 gathers each checkpoint into rank 0\'s CPU memory before writing it'))
-    for needed, reason in needs:
-        if needed > limit:
-            log(f'WARNING: {reason}: about {needed / GB:.0f} GB, above this pod\'s memory limit of '
-                f'{limit / GB:.0f} GB. Expect the pod to be OOM-killed; raise the limit.')
+    needed = checkpoint_size * MEMORY_MARGIN
+    if needed > limit:
+        log(f'WARNING: fsdp2 gathers each checkpoint into rank 0\'s CPU memory before writing it: about '
+            f'{needed / GB:.0f} GB, above this pod\'s memory limit of {limit / GB:.0f} GB. Expect the pod '
+            'to be OOM-killed at the first save; raise the limit.')
 
 
 def check_shm(minimum=GIB):
@@ -462,18 +489,21 @@ def install_pruning(keep_last):
 def preflight(cfg, args):
     """Rank 0's checks. Returns the decisions every rank applies: {'resume_from': ...}."""
     check_gpu_memory(cfg)
-    raw, params, teacher_bytes = check_teacher(cfg.teacher)
+    raw, params = check_teacher(cfg.teacher)
     prompts_sha = check_prompts(cfg.prompts_file)
     checkpoints = check_work_dir(cfg.work_dir)
     for path in remove_stale_temporaries(checkpoints):
         log(f'removed {path}, left by an interrupted save')
     resume_from = resolve_run(cfg, checkpoints, prompts_sha, args.auto_resume)
+    if finished(resume_from, cfg):
+        return {'done': f'{resume_from} already reached max_steps={cfg.max_steps}; nothing to do. '
+                        'Raise max_steps to train further.'}
     if params is not None:
         checkpoint_size = params * 4 * FP32_COPIES_PER_CHECKPOINT
         check_space(cfg, checkpoints, args.keep_last, checkpoint_size)
         if not args.skip_write_test:
             check_write_speed(checkpoints, checkpoint_size, args.nccl_timeout_minutes)
-        check_host_memory(cfg, checkpoint_size, teacher_bytes, memory_limit())
+        check_host_memory(cfg, checkpoint_size, memory_limit())
     check_shm()
     for path in remove_broken_null_cache():
         log(f'removed {path}, an unreadable empty-prompt cache')
@@ -521,6 +551,8 @@ def main(argv=None):
     parser.add_argument('--skip-write-test', action='store_true', help='Do not time a 1 GiB write into work_dir.')
     parser.add_argument('--skip-preflight', action='store_true', help='Run the trainer without the checks above.')
     args = parser.parse_intermixed_args(argv)
+    if args.skip_preflight and args.auto_resume:
+        parser.error('--auto-resume is part of the preflight; it cannot be combined with --skip-preflight')
 
     try:
         cfg = load_config(args.config, args.overrides)
@@ -530,6 +562,9 @@ def main(argv=None):
         torch.backends.cuda.enable_cudnn_sdp(False)
         log("PyTorch's cuDNN attention kernel is off (--allow-cudnn-attention keeps it)")
     created = init_process_group(cfg, args.nccl_timeout_minutes)
+    if world_size() > 1 and not torch.distributed.is_initialized():
+        raise SystemExit(f'[iris_turbo_distill] WORLD_SIZE is {world_size()} but CUDA is not available, so no '
+                         'process group can be created. Are the GPUs allocated to this pod?')
     try:
         if not args.skip_preflight:
             decision = None
@@ -538,9 +573,16 @@ def main(argv=None):
                     decision = preflight(cfg, args)
                 except PreflightError as error:
                     decision = {'error': str(error)}
+                except Exception as error:  # every rank must hear about it, not only rank 0
+                    import traceback
+                    traceback.print_exc()
+                    decision = {'error': f'preflight failed: {type(error).__name__}: {error}'}
             decision = share(decision)
             if 'error' in decision:
-                raise SystemExit(f'[iris_turbo_distill] {decision["error"]}')
+                raise SystemExit(f'[iris_turbo_distill] {decision["error"]}' if is_main_process() else 1)
+            if 'done' in decision:
+                log(decision['done'])
+                return
             cfg.resume_from = decision['resume_from']
         install_pruning(args.keep_last)
 

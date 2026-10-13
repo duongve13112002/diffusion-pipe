@@ -969,23 +969,28 @@ version of your own model, first train it here as usual, then distill the result
    - **Longer timeout.** The process group timeout is 2 hours (`--nccl-timeout-minutes`)
      instead of Iris's 30 minutes. The other ranks wait while rank 0 writes each checkpoint, and
      a volume slower than ~47 MB/s needs more than 30 minutes for one.
-   - **Checks on rank 0 before any weights load**, which stop every rank with one message:
+   - **Checks on rank 0 before any weights load.** A failed check stops every rank:
      - The teacher is a text-to-image model, not a Turbo export or student.
      - The teacher's `attn_backend` is `sdpa`. Iris applies a forced kernel to the masked
        text adapter too, and it fails there.
      - `prompts_file` is non-empty UTF-8.
-     - `init_from` and `resume_from` are distillation checkpoints, and a resume matches the GPU
-       count and prompts file.
+     - `init_from` and `resume_from` are readable distillation checkpoints, and a resume
+       matches the GPU count and prompts file.
      - The checkpoint directory accepts a symlink and a rename over an existing entry. Iris
        repoints `latest.pth` that way, and some volumes refuse it (e.g. mountpoint-s3, SMB
        without `mfsymlinks`). Without this check, the run would only fail at its first save.
-     - Rank 0 times a 1 GiB write into the directory and prints how long a checkpoint takes.
-     - Free disk space, the pod's memory limit and `/dev/shm`.
+
+     These only warn: the time a checkpoint write takes (from a timed 1 GiB write), free disk
+     space, the pod's memory limit, `/dev/shm` and GPU memory.
    - **Restarts.** A `work_dir` that already holds checkpoints is never restarted from step 0,
-     which is what Iris does when a pod restarts with the same command. With `--auto-resume`,
-     the launcher continues from `latest.pth`, or from the newest `step_*.pth` if `latest.pth`
-     dangles. That makes the same command right for the first start and every restart.
-     Without it, the launcher stops and asks for `resume_from`.
+     which is what Iris does when a pod restarts with the same command. Without
+     `--auto-resume`, the launcher stops and asks for `resume_from`. With it, the launcher
+     continues from the newest `step_*.pth` that loads:
+     - This does not rely on `latest.pth`, which lags one save behind if a pod dies at the
+       wrong moment and dangles when the volume is mounted elsewhere.
+     - A file left incomplete by a node crash is renamed to `*.torn` and skipped.
+     - A run that already reached `max_steps` exits at once.
+     - The same command is therefore right for the first start and for every restart.
    - **Pruning.** A checkpoint is about 84 GB: the FP32 student, EMA, fake network and both
      AdamW states. Iris keeps every one, which is 16 saves (about 1.3 TB) for stage 1.
      - `--keep-last N` (default 2) deletes older `step_*.pth` after each save, never the one
@@ -1005,22 +1010,23 @@ version of your own model, first train it here as usual, then distill the result
      again while stage 1's two checkpoints stay; delete stage 1's older one once stage 2 has
      started.
    - **Mount path.** Mount the volume at the same path in every pod. `latest.pth` is a symlink
-     to an absolute path, so it dangles under another mount path; pass the `step_*.pth` file
-     itself then.
+     to an absolute path, so it dangles under another mount path. `--auto-resume` does not need
+     it, but for an explicit `resume_from` or for `export_distilled.py`, pass the `step_*.pth`
+     file itself then.
    - **Restarts.** Keep `--auto-resume` in the pod command, so a rescheduled pod continues
      instead of stopping.
    - **Text encoder.** Set `HF_HOME` to a directory on the volume and download the text encoder
      once before the first run (`hf download Qwen/Qwen3-VL-4B-Instruct`, about 9 GB). Otherwise
      every rank downloads it at the same time.
    - **Pod memory.** `strategy=fsdp2` gathers each checkpoint into rank 0's CPU memory before
-     writing it (about 84 GB). At start every rank also loads the teacher to CPU (about 12 GB
-     each). A pod limit below about 150 GB gets OOM-killed, which looks like a random rank
-     dying.
+     writing it: about 92 GB, plus each process's own baseline. A pod limit below that gets
+     OOM-killed at the first save, which looks like a random rank dying.
    - **Shared memory.** Mount a memory-backed `emptyDir` at `/dev/shm`. Kubernetes' 64 MB
      default is too small for NCCL.
-   - **Node crash.** Iris writes checkpoints without fsync. After a node crash, the newest one
-     can be incomplete; resume from the previous one, which `--keep-last 2` keeps. Do not use
-     `--keep-last 1`.
+   - **Node crash.** Iris writes checkpoints without fsync, so after a node crash the newest one
+     can be incomplete. `--auto-resume` sets it aside and resumes from the previous one, which
+     `--keep-last 2` keeps. Do not use `--keep-last 1`. With an explicit `resume_from`, move the
+     incomplete file out of the directory first.
 
 Iris's README sets out what Turbo trades away. It is slightly better on prompt following, but
 weaker on long rendered text and less varied across seeds.
