@@ -22,6 +22,7 @@ dataloader_workers = 4
 # <save dir>/ema/, a complete Iris checkpoint. 18 GB of host RAM for the fp32 average (12 GB, plus
 # a 6 GB pinned copy of the weights it averages from in the background), 6 GB with
 # ema_dtype = 'bfloat16'. Iris updates every step on the GPU; here every 10 keeps the copies cheap.
+# Turn it on for a run you mean to distill into a Turbo model: its ema/ is the teacher (docs/iris_turbo.md).
 #ema_decay = 0.9999
 #ema_update_every = 10
 #ema_device = 'cpu'

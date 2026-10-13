@@ -1,0 +1,63 @@
+# Iris-3B Turbo distillation as a Kubernetes Job on one 8 x H200 node with a persistent volume.
+# Adapt the image, the PVC name, the node selector and the paths, then:
+#   kubectl apply -f examples/iris/turbo/k8s_job.yaml
+#   kubectl logs -f job/iris-turbo
+#
+# The container runs run_turbo.sh, which skips finished steps and resumes the stages from their
+# newest readable checkpoint, so Kubernetes may restart or reschedule the pod at any point.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: iris-turbo
+spec:
+  backoffLimit: 6               # restarts after a crash, OOM or eviction; each one resumes
+  template:
+    spec:
+      restartPolicy: OnFailure
+      # nodeSelector:
+      #   nvidia.com/gpu.product: NVIDIA-H200
+      containers:
+        - name: distill
+          image: your-registry/diffusion-pipe:latest    # diffusion-pipe with the iris-3b submodule
+          workingDir: /workspace/diffusion-pipe         # the repository root
+          command: [bash, examples/iris/turbo/run_turbo.sh]
+          env:
+            - name: TEACHER                   # your fine-tune; its ema/ if trained with ema_decay
+              value: /pvc/runs/iris_full/my-run/epoch6/ema
+            - name: DATASET                   # what it was trained on, for the prompts file
+              value: /pvc/configs/dataset.toml
+            - name: OUT
+              value: /pvc/turbo
+            - name: HF_HOME                   # text encoder downloaded once, onto the volume
+              value: /pvc/hf
+            # - name: HF_TOKEN
+            #   valueFrom: {secretKeyRef: {name: hf-token, key: token}}
+          resources:
+            limits:
+              nvidia.com/gpu: 8
+              # fsdp2 gathers each ~84 GB checkpoint into rank 0's CPU memory to save it, on top
+              # of eight processes holding the text encoder and their CUDA context. A lower
+              # limit gets the pod OOM-killed at its first save, at step 100.
+              memory: 400Gi
+              cpu: "64"
+            requests:
+              nvidia.com/gpu: 8
+              memory: 400Gi
+              cpu: "32"
+          volumeMounts:
+            # Same mount path in every pod: latest.pth is an absolute symlink.
+            - name: data
+              mountPath: /pvc
+            - name: dshm
+              mountPath: /dev/shm
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            # ~260 GB free for stage 1 (two kept checkpoints and the one being written), about
+            # as much again during stage 2. Needs symlinks and rename-over-existing, which the
+            # launcher tests before training (mountpoint-s3 and SMB without mfsymlinks fail).
+            claimName: training-data
+        - name: dshm                          # Kubernetes' 64 MB /dev/shm is too small for NCCL
+          emptyDir:
+            medium: Memory
+            sizeLimit: 32Gi

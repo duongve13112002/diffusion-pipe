@@ -1,0 +1,44 @@
+# Iris-3B Turbo from your own Iris model, stage 2 (the released schedule): a 4-step student
+# warm-started from stage 1. Iris's recipe (submodules/iris-3b/configs/iris3b/turbo_stage2_4step.yaml)
+# laid out for 8 x H200 and a persistent volume:
+#
+#   torchrun --nproc_per_node=8 tools/iris_turbo_distill.py --auto-resume \
+#       --config examples/iris/turbo/stage2_4step.yaml \
+#       teacher=/pvc/runs/iris_full/<run>/epoch6/ema prompts_file=/pvc/turbo/prompts.txt \
+#       init_from=/pvc/turbo/stage1/checkpoints/step_00001600.pth
+#   python submodules/iris-3b/scripts/export_distilled.py \
+#       /pvc/turbo/stage2/checkpoints/step_00000500.pth /pvc/turbo/export --dtype bf16
+#
+# The teacher stays the same model as in stage 1. init_from is stage 1's final checkpoint: the
+# student starts from its EMA (init_weights: ema) and the fake network from stage 1's, with fresh
+# optimizers, counters and prompt order. It is ignored when the run resumes.
+teacher: ''
+prompts_file: ''
+work_dir: /pvc/turbo/stage2
+init_from: /pvc/turbo/stage1/checkpoints/step_00001600.pth
+init_weights: ema
+seed: 76
+
+# The recipe's global batch is 16 (8 per GPU on 2 GPUs). On 8 GPUs that is 2 per GPU; keep
+# batch_size x GPUs = 16, since the learning rates below were set for it.
+batch_size: 2
+height: 1024
+width: 1024
+resolutions: [[1024, 1024], [752, 1344], [896, 1344], [896, 1200], [1200, 896], [1344, 896], [1344, 752]]
+max_steps: 500
+fake_updates: 1
+learning_rate: 2.5e-7
+fake_learning_rate: 2.5e-6
+betas: [0.0, 0.999]
+weight_decay: 0.0
+max_grad_norm: 1.0
+ema_decay: 0.9995    # the released Turbo is this EMA after 500 student updates
+activation_checkpointing: full
+strategy: fsdp2
+save_every: 100
+log_every: 10
+
+dmd:
+  sigmas: [1.0, 0.938, 0.833, 0.625]
+  cfg_scale: 3.5
+  sigma_min: 0.01

@@ -607,3 +607,122 @@ def test_launcher_exits_cleanly_for_a_finished_run_and_unexpected_errors(fine_tu
         run_launcher(monkeypatch, argv)
     with pytest.raises(SystemExit):
         run_launcher(monkeypatch, [*argv, '--skip-preflight'])
+
+
+# ---- examples/iris/turbo ------------------------------------------------------------------------
+
+EXAMPLES = ROOT / 'examples' / 'iris' / 'turbo'
+
+
+@pytest.mark.parametrize('stage, global_batch', [('stage1_6step', 64), ('stage2_4step', 16)])
+def test_example_configs_are_the_recipe_on_eight_gpus(stage, global_batch):
+    from dataclasses import asdict
+    overrides = ['teacher=t', 'prompts_file=p']
+    ours = asdict(distill.load_config(EXAMPLES / f'{stage}.yaml', overrides))
+    iris = asdict(distill.load_config(IRIS_CONFIGS / f'turbo_{stage}.yaml', overrides))
+    changed = {key for key in iris if ours[key] != iris[key]}
+    assert changed <= {'work_dir', 'init_from', 'strategy', 'batch_size'}
+    assert ours['strategy'] == 'fsdp2'
+    assert ours['batch_size'] * 8 == global_batch
+    assert ours['work_dir'].startswith('/pvc/turbo/')
+    if ours['init_from']:
+        assert ours['init_from'] == '/pvc/turbo/stage1/checkpoints/step_00001600.pth'
+
+
+def test_k8s_job_example():
+    yaml = pytest.importorskip('yaml')
+    job = yaml.safe_load((EXAMPLES / 'k8s_job.yaml').read_text())
+    spec = job['spec']['template']['spec']
+    container, = spec['containers']
+    assert container['command'][-1] == 'examples/iris/turbo/run_turbo.sh'
+    assert container['resources']['limits']['nvidia.com/gpu'] == 8
+    mounts = {mount['name']: mount['mountPath'] for mount in container['volumeMounts']}
+    volumes = {volume['name']: volume for volume in spec['volumes']}
+    assert mounts['dshm'] == '/dev/shm' and volumes['dshm']['emptyDir']['medium'] == 'Memory'
+    assert 'persistentVolumeClaim' in volumes['data']
+    env = {item['name']: item.get('value') for item in container['env']}
+    assert env['OUT'].startswith(mounts['data']) and env['HF_HOME'].startswith(mounts['data'])
+
+
+@pytest.fixture
+def run_script(tmp_path, dataset):
+    """run_turbo.sh with torchrun and the export stubbed: each call is logged and writes what the
+    real one would leave behind; everything else (the prompts tool) runs for real."""
+    import shutil
+    import subprocess
+    if shutil.which('bash') is None:
+        pytest.skip('needs bash')
+    bin_dir, log = tmp_path / 'bin', tmp_path / 'calls.log'
+    bin_dir.mkdir()
+    (bin_dir / 'python').write_text(f'''#!/usr/bin/env bash
+if [ "$1" = -c ] && [[ "$2" == *device_count* ]]; then echo 8; exit 0; fi
+if [[ "${{1:-}}" == *export_distilled.py ]]; then
+    echo "export $*" >> {log}; mkdir -p "$3"; echo weights > "$3/model.safetensors"; exit ${{FAIL_EXPORT:-0}}
+fi
+exec {sys.executable} "$@"
+''')
+    (bin_dir / 'torchrun').write_text(f'''#!/usr/bin/env bash
+echo "torchrun $*" >> {log}
+for a in "$@"; do case $a in work_dir=*) wd=${{a#work_dir=}};; esac; done
+mkdir -p "$wd/checkpoints"
+case $wd in *stage1) last=00001600;; *) last=00000500;; esac
+touch "$wd/checkpoints/step_00000100.pth" "$wd/checkpoints/step_$last.pth"
+exit ${{FAIL_TORCHRUN:-0}}
+''')
+    for stub in bin_dir.iterdir():
+        stub.chmod(0o755)
+    teacher = tmp_path / 'teacher'
+    teacher.mkdir()
+    (teacher / 'config.yaml').write_text(f'text_encoder:\n  name: qwen3_vl\n  pretrained: {teacher}\n')
+    out = tmp_path / 'out'
+
+    def run(**env):
+        log.write_text('')
+        full = {**os.environ, 'PATH': f'{bin_dir}{os.pathsep}{os.environ["PATH"]}', 'TEACHER': str(teacher),
+                'DATASET': str(dataset), 'OUT': str(out), **env}
+        result = subprocess.run(['bash', str(EXAMPLES / 'run_turbo.sh')], cwd=ROOT, env=full,
+                                capture_output=True, text=True)
+        return result, log.read_text().splitlines()
+    return run, out
+
+
+def test_run_turbo_script(run_script):
+    run, out = run_script
+    result, calls = run()
+    assert result.returncode == 0, result.stderr
+    assert (out / 'prompts.txt').read_text(encoding='utf-8').strip()
+    stage1, stage2, export = calls
+    assert '--auto-resume' in stage1 and 'stage1_6step.yaml' in stage1 and 'batch_size=8' in stage1
+    assert f'work_dir={out}/stage1 ' in stage1 + ' '
+    assert 'stage2_4step.yaml' in stage2 and 'batch_size=2' in stage2
+    assert f'init_from={out}/stage1/checkpoints/step_00001600.pth' in stage2
+    assert f'{out}/stage2/checkpoints/step_00000500.pth {out}/export.partial --dtype bf16' in export
+    assert (out / 'export' / 'model.safetensors').is_file() and not (out / 'export.partial').exists()
+
+    # a restart: the prompts and the export are kept, both stages are relaunched to auto-resume
+    prompts_before = (out / 'prompts.txt').read_bytes()
+    result, calls = run(DATASET='')
+    assert result.returncode == 0, result.stderr
+    assert [call.split()[0] for call in calls] == ['torchrun', 'torchrun']
+    assert (out / 'prompts.txt').read_bytes() == prompts_before
+
+
+def test_run_turbo_script_failures(run_script):
+    run, out = run_script
+    result, calls = run(FAIL_EXPORT='1')
+    assert result.returncode != 0
+    assert not (out / 'export').exists() and (out / 'export.partial').exists()
+    result, calls = run()  # the half-written export is redone, not taken as finished
+    assert result.returncode == 0 and calls[-1].startswith('export')
+    assert (out / 'export' / 'model.safetensors').is_file() and not (out / 'export.partial').exists()
+
+    result, calls = run(FAIL_TORCHRUN='1', OUT=str(out.parent / 'other'))
+    assert result.returncode != 0 and len(calls) == 1  # a failed stage 1 never starts stage 2
+
+    result, calls = run(NGPU='3')
+    assert result.returncode != 0 and 'BATCH1' in result.stderr and calls == []
+    result, calls = run(NGPU='4')
+    assert result.returncode == 0 and 'batch_size=16' in calls[0] and 'batch_size=4' in calls[1]
+
+    result, calls = run(OUT=str(out.parent / 'empty'), DATASET='')
+    assert result.returncode != 0 and 'DATASET' in result.stderr

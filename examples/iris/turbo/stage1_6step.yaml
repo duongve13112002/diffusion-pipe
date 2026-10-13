@@ -1,0 +1,43 @@
+# Iris-3B Turbo from your own Iris model, stage 1: a 6-step student. Iris's released recipe
+# (submodules/iris-3b/configs/iris3b/turbo_stage1_6step.yaml) laid out for 8 x H200 and a
+# persistent volume. Run it with tools/iris_turbo_distill.py, or let run_turbo.sh do both stages:
+#
+#   torchrun --nproc_per_node=8 tools/iris_turbo_distill.py --auto-resume \
+#       --config examples/iris/turbo/stage1_6step.yaml \
+#       teacher=/pvc/runs/iris_full/<run>/epoch6/ema prompts_file=/pvc/turbo/prompts.txt
+#
+# Keys are Iris's DistillConfig (iris3b/distill/config.py); any of them can be overridden on the
+# command line as key=value. teacher and prompts_file are left for the command line.
+teacher: ''          # your fine-tune: a diffusion-pipe save dir (its ema/ with EMA on), or a merged LoRA
+prompts_file: ''     # from tools/iris_turbo_prompts.py; do not regenerate it during a run
+work_dir: /pvc/turbo/stage1
+seed: 62
+
+# Global batch = batch_size x GPUs. The recipe's is 64: 8 per GPU on 8 GPUs (16 on 4, 32 on 2).
+batch_size: 8
+height: 1024
+width: 1024
+# about one megapixel; every global batch draws one bucket
+resolutions: [[1024, 1024], [752, 1344], [896, 1344], [896, 1200], [1200, 896], [1344, 896], [1344, 752]]
+max_steps: 1600      # student updates; each one and its fake update read 2 x 64 prompts
+fake_updates: 1
+learning_rate: 1.0e-6
+fake_learning_rate: 5.0e-6
+betas: [0.0, 0.999]
+weight_decay: 0.0
+max_grad_norm: 1.0
+ema_decay: 0.999
+activation_checkpointing: full
+# ddp needs ~160 GB per GPU at batch 8, more than an H200 has. fsdp2 shards student, fake network,
+# EMA and optimizer states over the GPUs and keeps the global batch. Its saves gather the whole
+# checkpoint (~84 GB) into rank 0's CPU memory: give the pod well over 100 GB.
+strategy: fsdp2
+# ~84 GB per checkpoint; the launcher keeps the newest 2 (--keep-last). Each save also has to
+# finish inside the process group timeout (--nccl-timeout-minutes, 120 by default).
+save_every: 100
+log_every: 10
+
+dmd:
+  sigmas: [1.0, 0.926, 0.833, 0.714, 0.556, 0.333]
+  cfg_scale: 3.5     # guidance distilled into the student; the base model's usual CFG
+  sigma_min: 0.01

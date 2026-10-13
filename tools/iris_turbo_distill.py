@@ -538,7 +538,7 @@ def share(decision):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument('--config', required=True, help="An Iris distillation YAML (submodules/iris-3b/configs/iris3b/turbo_*.yaml).")
+    parser.add_argument('--config', required=True, help="An Iris distillation YAML: examples/iris/turbo/stage*.yaml or submodules/iris-3b/configs/iris3b/turbo_*.yaml.")
     parser.add_argument('overrides', nargs='*', metavar='KEY=VALUE', help='Overrides merged onto the YAML, as in Iris.')
     parser.add_argument('--auto-resume', action='store_true',
                         help='Continue from work_dir/checkpoints when it holds checkpoints and resume_from is unset.')
