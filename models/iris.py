@@ -46,6 +46,7 @@ from iris3b.flow.schedule import FlowSchedule, resolution_shift
 from iris3b.flow.solver import FlowDPMSolver
 from iris3b.models.blocks.single_stream import SingleStreamBlock
 from iris3b.models.dit import IrisDiT
+from iris3b.nn.attention import SelfAttention
 from iris3b.nn.modulation import SharedCoreBias, SharedCoreModulation
 
 
@@ -403,7 +404,7 @@ class IrisPipeline(BasePipeline):
         self._checkpoint_attn_backend = model_cfg.attn_backend
         if attn_backend := self.model_config.get('attn_backend', None):
             model_cfg.attn_backend = attn_backend
-        if (model_cfg.attn_backend == 'sdpa' and not self.model_config.get('allow_cudnn_attention', False)
+        if (model_cfg.attn_backend != 'torch_cudnn' and not self.model_config.get('allow_cudnn_attention', False)
                 and hasattr(torch.backends.cuda, 'enable_cudnn_sdp')):
             # PyTorch picks cuDNN for this attention on Hopper, and its backward returns NaN for
             # some real Iris activations (torch 2.12 / cuDNN 9.20, H200: a few samples per batch
@@ -563,6 +564,13 @@ class IrisPipeline(BasePipeline):
 
     def _finish_transformer(self, transformer):
         cfg = transformer.cfg
+        if cfg.attn_backend != 'sdpa' and transformer.y_embedder is not None:
+            # The text adapter's refiner always attends with a padding mask, which the forced
+            # kernels (torch_flash, torch_cudnn, fa3, fa4) refuse. It is a small share of the
+            # compute: leave it to sdpa, and the forced kernel to the trunk and pixel blocks.
+            for module in transformer.y_embedder.modules():
+                if isinstance(module, SelfAttention):
+                    module.backend = 'sdpa'
         if cfg.modulation not in ('per_block', 'shared_bias', 'shared_lowrank'):
             raise NotImplementedError(f'modulation={cfg.modulation} is not supported')
         last = transformer.blocks[-1]

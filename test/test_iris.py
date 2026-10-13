@@ -1362,6 +1362,7 @@ def test_ema_save_is_a_loadable_iris_checkpoint(ckpt, tmp_path, monkeypatch):
     ({}, False),
     ({'allow_cudnn_attention': True}, True),
     ({'attn_backend': 'torch_cudnn'}, True),
+    ({'attn_backend': 'fa3'}, False),  # the text adapter still runs sdpa
 ])
 def test_cudnn_attention_is_off_unless_asked_for(ckpt, model_config, enabled):
     path, _ = ckpt
@@ -1372,3 +1373,21 @@ def test_cudnn_attention_is_off_unless_asked_for(ckpt, model_config, enabled):
         assert torch.backends.cuda.cudnn_sdp_enabled() is enabled
     finally:
         torch.backends.cuda.enable_cudnn_sdp(before)
+
+
+@pytest.mark.parametrize('backend', ['torch_flash', 'fa3'])
+def test_forced_attention_backend_leaves_the_masked_text_adapter_on_sdpa(ckpt, backend):
+    """flash / fa3 / cudnn take no attention mask; the text adapter's refiner always passes one."""
+    path, ref = ckpt
+    pipe = make_pipeline(path, cache_text_embeddings=True, attn_backend=backend)
+    pipe.load_diffusion_model()
+    from iris3b.nn.attention import SelfAttention
+    adapter = [m.backend for m in pipe.transformer.y_embedder.modules() if isinstance(m, SelfAttention)]
+    blocks = {m.backend for m in pipe.transformer.blocks.modules() if isinstance(getattr(m, 'backend', None), str)}
+    assert adapter and set(adapter) == {'sdpa'} and blocks == {backend}
+    if backend == 'torch_flash':  # fa3 needs a Hopper GPU
+        layers = pipe.to_layers()
+        x, t, y, y_mask = random_inputs()
+        with torch.no_grad():
+            torch.testing.assert_close(run_layers(layers, (x, t, y, y_mask)), ref(x, t, y, y_mask=y_mask).x,
+                                       rtol=0, atol=1e-5)

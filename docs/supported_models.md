@@ -822,8 +822,8 @@ All `[model]` options:
 | `text_encoder_dtype` | checkpoint `text_encoder.dtype` (`bfloat16`) | Dtype the Qwen3-VL decoder is loaded and run in (`bfloat16`/`bf16`, `float16`/`fp16`, `float32`/`fp32`), also during on-the-fly encoding. |
 | `on_caption_overflow` | checkpoint `text_encoder.on_caption_overflow` (`warn`) | A caption longer than `max_text_length`: `warn` (truncate, say so once), `silent` (truncate) or `error`. |
 | `text_encoder_attn_implementation` | checkpoint config | `attn_implementation` for the Qwen3-VL decoder. |
-| `attn_backend` | checkpoint config (`sdpa`) | Iris attention backend for training: `sdpa`, `torch_flash`, `torch_cudnn`, `fa3`, `fa4`. Not written to the exported `config.yaml`. |
-| `allow_cudnn_attention` | `false` | With `attn_backend = 'sdpa'`, let PyTorch use its cuDNN attention kernel. Off by default: on H200 (torch 2.12, cuDNN 9.20) its backward gives NaN gradients for some real samples where flash and math are finite. `attn_backend = 'torch_cudnn'` still forces it. |
+| `attn_backend` | checkpoint config (`sdpa`) | Iris attention backend for training: `sdpa`, `torch_flash`, `torch_cudnn`, `fa3`, `fa4`. A forced kernel runs the trunk and pixel blocks; the text adapter, whose attention is always masked, stays on `sdpa`. Not written to the exported `config.yaml`. |
+| `allow_cudnn_attention` | `false` | Let PyTorch's `sdpa` use its cuDNN attention kernel. Off by default: on H200 (torch 2.12, cuDNN 9.20) its backward gives NaN gradients for some real samples where flash and math are finite. `attn_backend = 'torch_cudnn'` still forces it. |
 | `timestep_sample_method` | checkpoint `flow.timestep_sampler` (`logit_normal`) | `logit_normal` or `uniform`. |
 | `logit_mean`, `logit_std` | checkpoint `flow` config | Logit-normal parameters. |
 | `min_t`, `max_t` | `0`, `1` | Bounds on the shifted noise level σ' the model is trained at, the same meaning as for Wan: the sampler is truncated to that range, keeping its shape. With `shift_law` they apply after each batch's shift. |

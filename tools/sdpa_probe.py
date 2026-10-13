@@ -6,13 +6,18 @@
 Iris attention is grouped-query (20 query heads, 5 key/value heads, head_dim 128) over the text
 and image tokens of a sample: text_len 300 + (height/16) * (width/16) patches, so a 608x432
 bucket is 300 + 38*27 = 1326 tokens. For every kernel F.scaled_dot_product_attention can use
-(flash, efficient, cudnn, math) and the one it picks by itself (default), this runs forward and
-backward in bfloat16 with the training layout, and compares the output and the q/k/v gradients
-with a float32 reference. A kernel that gives NaN or a large error here is a kernel bug at that
-shape, independent of the model and the data: set [model] attn_backend to one that passes.
+(flash, efficient, cudnn, math), the one it picks by itself (default) and FlashAttention 3 when
+installed (fa3), this runs forward and backward in bfloat16 with the training layout, compares the
+output and the q/k/v gradients with a float32 reference, and times forward+backward. A kernel that
+gives NaN or a large error here is a kernel bug at that shape, independent of the model and the
+data: set [model] attn_backend to one that passes. Passing here does not clear a kernel of bugs
+that only real activations trigger (cuDNN's on Iris did not show on random data): train.py
+--nan_check replays the failing layer with each kernel for those.
 """
 
 import argparse
+import time
+from importlib import import_module
 
 import torch
 import torch.nn.functional as F
@@ -25,7 +30,18 @@ BACKENDS = {
     'math': SDPBackend.MATH,
 }
 # How [model] attn_backend selects each kernel (see iris3b.nn.attention.scaled_dot_product).
-CONFIG_NAME = {'default': "'sdpa'", 'flash': "'torch_flash'", 'cudnn': "'torch_cudnn'"}
+# diffusion-pipe keeps PyTorch's cuDNN kernel off for 'sdpa', so 'default' there is flash.
+CONFIG_NAME = {'default': "'sdpa'", 'flash': "'torch_flash'", 'cudnn': "'torch_cudnn'", 'fa3': "'fa3'"}
+
+
+def fa3_function():
+    """FlashAttention 3 (Hopper), under the module names iris3b.nn.attention looks for."""
+    for name in ('flash_attn_3.flash_attn_interface', 'flash_attn_interface'):
+        try:
+            return import_module(name).flash_attn_func
+        except (ImportError, OSError):
+            continue
+    raise RuntimeError('FlashAttention 3 is not installed (flash_attn_3 / flash_attn_interface)')
 
 
 def make_inputs(batch, tokens, heads, kv_heads, head_dim, gain, device, seed):
@@ -48,6 +64,9 @@ def run(q, k, v, grad, backend):
     q, k, v = (t.detach().requires_grad_() for t in (q, k, v))
     if backend == 'default':
         out = F.scaled_dot_product_attention(q, k, v, enable_gqa=True)
+    elif backend == 'fa3':
+        out = fa3_function()(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), pack_gqa=True)
+        out = (out[0] if isinstance(out, tuple) else out).transpose(1, 2)
     else:
         with sdpa_kernel(BACKENDS[backend]):
             out = F.scaled_dot_product_attention(q, k, v, enable_gqa=True)
@@ -92,8 +111,10 @@ def main(argv=None):
     parser.add_argument('--head-dim', type=int, default=128)
     parser.add_argument('--gain', type=float, nargs='+', default=[1.0, 4.0],
                         help='Scale of the normalized q and k (the q_norm/k_norm weights); larger means sharper attention.')
-    parser.add_argument('--backends', nargs='+', default=['default', *BACKENDS],
-                        choices=['default', *BACKENDS])
+    parser.add_argument('--backends', nargs='+', default=['default', *BACKENDS, 'fa3'],
+                        choices=['default', *BACKENDS, 'fa3'])
+    parser.add_argument('--timing-iterations', type=int, default=5,
+                        help='Time forward+backward of each correct kernel over this many runs (CUDA only; 0 skips).')
     parser.add_argument('--reference-chunk', type=int, default=4)
     parser.add_argument('--seed', type=int, default=0)
     parser.add_argument('--device', default='cuda:0')
@@ -125,7 +146,16 @@ def main(argv=None):
                 verdicts = [compare(name, value, r) for name, value, r in
                             zip(('out', 'dq', 'dk', 'dv'), outputs[backend], ref)]
                 ok = all(passed for _, passed in verdicts)
-                print(f'  {backend:9s} {"ok  " if ok else "FAIL"}  ' + ', '.join(text for text, _ in verdicts))
+                timing = ''
+                if device.type == 'cuda' and args.timing_iterations > 0:
+                    run(q, k, v, grad, backend)  # warm-up
+                    torch.cuda.synchronize(device)
+                    start = time.perf_counter()
+                    for _ in range(args.timing_iterations):
+                        run(q, k, v, grad, backend)
+                    torch.cuda.synchronize(device)
+                    timing = f'  [{(time.perf_counter() - start) / args.timing_iterations * 1000:.1f} ms fwd+bwd]'
+                print(f'  {backend:9s} {"ok  " if ok else "FAIL"}  ' + ', '.join(text for text, _ in verdicts) + timing)
                 if ok:
                     passed.add(backend)
                 else:
@@ -139,7 +169,8 @@ def main(argv=None):
             del q, k, v, grad, ref, outputs
     print()
     if not failures:
-        print('=> Every kernel is correct at these shapes: the NaN is not an attention kernel bug.')
+        print('=> Every kernel is correct at these shapes on random inputs. A failure that depends on the '
+              'real activations needs train.py --nan_check, which replays the layer with each kernel.')
         return 0
     for tokens, gain, backend in failures:
         print(f'=> {backend} FAILS at {tokens} tokens (gain {gain})')
