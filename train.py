@@ -54,6 +54,7 @@ parser.add_argument('--reset_optimizer_params', action='store_true')
 parser.add_argument('--regenerate_cache', action='store_true', help='Force regenerate cache.')
 parser.add_argument('--cache_only', action='store_true', help='Cache model inputs then exit.')
 parser.add_argument('--trust_cache', action='store_true', help='Trust source metadata in the legacy cache workflow. Snapshot mode reuses sources automatically and always applies current caption configuration profiles.')
+parser.add_argument('--nan_check', action='store_true', help='Stop at the first NaN/inf in a layer output, gradient, loss or weight, and report the layer, step and images. Slow; for debugging.')
 parser.add_argument('--i_know_what_i_am_doing', action='store_true', help="Skip certain checks and overrides. You may end up using settings that won't work.")
 parser.add_argument('--master_port', type=int, default=29500, help='Master port for distributed training')
 parser.add_argument('--dump_dataset', type=Path, default=None, help='Decode cached latents and dump the dataset to this directory.')
@@ -673,6 +674,12 @@ if __name__ == '__main__':
         **additional_pipeline_module_kwargs
     )
     model.pipeline_model = pipeline_model
+    nan_check = None
+    if args.nan_check:
+        from utils.nan_check import NanCheck
+        nan_check = NanCheck(pipeline_model, model, get_rank())
+        if is_main_process():
+            print('--nan_check: every layer output, gradient and weight is checked (slow)')
     parameters_to_train = [p for p in pipeline_model.parameters() if p.requires_grad]
 
     if config['compile']:
@@ -1000,7 +1007,11 @@ if __name__ == '__main__':
     while True:
         model_engine.reset_activation_shape()
         iterator = get_data_iterator_for_step(train_dataloader, model_engine)
+        if nan_check is not None:
+            nan_check.before_step(step)
         loss = model_engine.train_batch(iterator).item()
+        if nan_check is not None:
+            nan_check.after_step(step, loss)
         if oplora_projector is not None:
             oplora_projector.project()
         if ema is not None:
