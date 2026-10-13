@@ -31,8 +31,9 @@ def _describe_tensor(tensor):
             f'dtype {tensor.dtype}, max |finite| {peak:.4g}')
 
 
-def describe_batch(inputs):
-    """A short, printable account of a dataloader batch: what to look at when it is the cause."""
+def describe_batch(inputs, tokenizer=None):
+    """A short, printable account of a dataloader batch: what to look at when it is the cause.
+    With the model's tokenizer, caption lengths are also given in tokens (before truncation)."""
     lines = []
     latents = inputs.get('latents')
     if torch.is_tensor(latents):
@@ -44,6 +45,12 @@ def describe_batch(inputs):
     if captions is not None:
         lengths = [len(c) for c in captions]
         lines.append(f'caption lengths (chars) {lengths}')
+        if tokenizer is not None:
+            try:
+                tokens = [len(ids) for ids in tokenizer(list(captions), add_special_tokens=False)['input_ids']]
+                lines.append(f'caption lengths (tokens, before truncation) {tokens}')
+            except Exception as error:  # a description must never be what stops training
+                lines.append(f'caption tokens unavailable: {error}')
     specs = inputs.get('image_spec')
     if specs is not None:
         names = [str(Path(spec[1]).name) if isinstance(spec, (list, tuple)) else str(spec) for spec in specs]
@@ -65,10 +72,11 @@ class NanCheck:
                 self.handles.append(p.register_post_accumulate_grad_hook(partial(self._after_grad, name)))
         self.parameters = [(name, p) for name, p in pipeline_model.named_parameters()]
         original = model.prepare_inputs
+        tokenizer = getattr(getattr(model, 'text_encoder', None), 'tokenizer', None)
 
         def prepare_inputs(inputs, *args, **kwargs):
             # Kept per pulled batch: with gradient accumulation a step consumes several.
-            self.batches = (self.batches + [describe_batch(inputs)])[-4:]
+            self.batches = (self.batches + [describe_batch(inputs, tokenizer)])[-4:]
             return original(inputs, *args, **kwargs)
         model.prepare_inputs = prepare_inputs
 

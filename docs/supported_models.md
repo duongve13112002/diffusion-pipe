@@ -885,6 +885,12 @@ A NaN loss: `python tools/iris_nan_check.py --config <training config>` runs the
 dtype, text encoder and a few dataset images on one GPU and stops at the first non-finite value:
 in the checkpoint, the text embeddings, a named layer of the forward pass, a gradient, or the
 weights after one of `--steps N` optimizer steps (full learning rate, the config's optimizer).
+In the real (multi-GPU) run, `train.py --nan_check` does the same checks on every rank and stops
+at the first non-finite layer output, gradient, loss or weight, naming the step, rank and batch
+images. A NaN gradient that first appears inside a block's attention while its forward was finite
+points at the attention kernel: `python tools/sdpa_probe.py --batch-size <micro batch>` checks
+every PyTorch attention kernel at the run's shapes, and `[model] attn_backend` selects one that
+passes (`'torch_flash'`, `'torch_cudnn'`, `'fa3'`; default `'sdpa'` lets PyTorch pick).
 
 Saving:
 - Full fine-tune writes Iris's own layout: `model.safetensors` (IrisDiT keys) + `config.yaml`,

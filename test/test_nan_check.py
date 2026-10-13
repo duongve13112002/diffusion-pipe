@@ -87,3 +87,14 @@ def test_non_finite_loss_without_a_local_cause_is_reported():
     pipeline, check, features = setup(Scale(1.0))
     with pytest.raises(NonFiniteError, match='loss is nan although no layer output'):
         check.after_step(7, float('nan'))
+
+
+def test_caption_lengths_in_tokens_with_the_model_tokenizer():
+    from utils.nan_check import describe_batch
+
+    def tokenizer(captions, add_special_tokens):
+        assert add_special_tokens is False
+        return {'input_ids': [c.split() for c in captions]}
+    lines = describe_batch({'caption': ['a b c', '', 'word']}, tokenizer)
+    assert 'caption lengths (chars) [5, 0, 4]' in lines
+    assert 'caption lengths (tokens, before truncation) [3, 0, 1]' in lines
