@@ -111,6 +111,9 @@ def main(argv=None):
     parser.add_argument('--config', required=True, help='The training config (.toml).')
     parser.add_argument('--batch-size', type=int, default=4)
     parser.add_argument('--steps', type=int, default=5, help='Optimizer steps for stage 4 (0 skips it).')
+    parser.add_argument('--forward-only', action='store_true',
+                        help="Forward pass only, without autograd: what the run's micro_batch_size_per_gpu "
+                             'fits in memory without activation checkpointing. Skips backward and stage 4.')
     parser.add_argument('--resolution', type=int, default=None,
                         help="Side of the square-equivalent size (default: the dataset's first resolution).")
     parser.add_argument('--quantile', type=float, default=None,
@@ -207,10 +210,17 @@ def main(argv=None):
             say(f'      {i:3d} {type(layer).__name__:<18} max |out| {peak:.4g}')
             for j, t in enumerate(outputs):
                 if torch.is_tensor(t) and (report := finite_report(f'layer {i} {type(layer).__name__} output {j}', t)):
+                    if t.ndim and t.shape[0] == len(samples):
+                        rows = [k for k in range(len(samples)) if not torch.isfinite(t[k]).all()]
+                        report += f'; images {[samples[k][0].name for k in rows[:8]]}'
                     return None, report
         return out, None
 
-    out, report = forward()
+    if args.forward_only:
+        with torch.no_grad():
+            out, report = forward()
+    else:
+        out, report = forward()
     if report:
         say('      NON-FINITE ' + report)
         say('=> The forward pass produces NaN/inf at the layer above, with finite weights and inputs.')
@@ -220,6 +230,9 @@ def main(argv=None):
     if not torch.isfinite(loss):
         say('=> The loss is NaN/inf although every layer output is finite.')
         return 1
+    if args.forward_only:
+        say(f'=> The forward pass and the loss are finite at batch size {len(samples)}.')
+        return 0
     loss.backward()
     params = [(n, p) for layer in layers for n, p in layer.named_parameters() if p.requires_grad]
     bad = [f'{getattr(p, "original_name", n)}' for n, p in params if p.grad is not None and not torch.isfinite(p.grad).all()]

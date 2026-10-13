@@ -67,3 +67,9 @@ def test_forward_nan_is_located_at_its_layer(tmp_path, tiny_qwen):  # noqa: F811
     assert code == 1
     assert 'NON-FINITE layer' in out and 'FinalLayer' in out.split('NON-FINITE layer')[1].splitlines()[0]
     assert 'forward pass produces NaN/inf' in out
+
+
+def test_forward_only_stops_after_the_loss(tmp_path, tiny_qwen):  # noqa: F811
+    code, out = run(setup(tmp_path, tiny_qwen), '--forward-only')
+    assert code == 0, out
+    assert 'forward pass and the loss are finite at batch size 2' in out and '[4/4]' not in out
