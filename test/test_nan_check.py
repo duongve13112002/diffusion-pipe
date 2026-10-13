@@ -98,3 +98,40 @@ def test_caption_lengths_in_tokens_with_the_model_tokenizer():
     lines = describe_batch({'caption': ['a b c', '', 'word']}, tokenizer)
     assert 'caption lengths (chars) [5, 0, 4]' in lines
     assert 'caption lengths (tokens, before truncation) [3, 0, 1]' in lines
+
+
+class SqrtLinear(nn.Module):
+    """Finite forward; the gradient is infinite for a sample whose pre-activation is exactly 0."""
+
+    def __init__(self):
+        super().__init__()
+        self.linear = nn.Linear(3, 3, bias=False)
+        with torch.no_grad():
+            self.linear.weight.copy_(torch.eye(3))
+
+    def forward(self, inputs):
+        x, label = inputs
+        return self.linear(x).abs().sqrt(), label
+
+
+def test_non_finite_gradient_is_replayed_per_sample(capsys):
+    pipeline, check, _ = setup(Scale(1.0), SqrtLinear(), Scale(1.0))
+    latents = torch.tensor([[1.0, 2.0, 3.0], [0.0, 1.0, 1.0]])  # sample 1 hits sqrt(0)
+    check.batches, check.names = [['latents (2, 3)']], ['one.png', 'two.png']
+    out = run(pipeline, (latents, torch.zeros(1)))
+    with pytest.raises(NonFiniteError) as error:
+        out[0].sum().backward()
+    message = str(error.value)
+    assert 'gradient of 1.linear.weight is non-finite' in message
+    assert 'replay of layer 1 SqrtLinear with its recorded inputs:' in message
+    assert "whole batch, default kernel: NaN/inf in ['linear.weight', 'input 0']" in message
+    assert 'each sample alone, default kernel: 1 of 2 non-finite' in message
+    assert "sample 1 two.png: NaN/inf in ['linear.weight', 'input 0']" in message
+
+
+def test_replay_reports_a_gradient_that_arrives_non_finite():
+    pipeline, check, features = setup(Scale(1.0), Scale(1.0))
+    out = run(pipeline, features)
+    with pytest.raises(NonFiniteError) as error:
+        (out[0].sum() * float('nan')).backward()
+    assert 'the gradient arriving at its outputs [0] is already non-finite' in str(error.value)
