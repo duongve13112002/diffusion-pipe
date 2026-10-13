@@ -123,6 +123,11 @@ def test_prompts_tool_refuses_to_write_nothing(tmp_path):
     assert not (tmp_path / 'out.txt').exists()
 
 
+def test_prompts_drop_captions_that_are_not_valid_unicode():
+    prompts, report = prompts_tool.build_prompts(['fine', 'bad \ud800 one'], shuffle=False)
+    assert prompts == ['fine'] and report['unencodable'] == 1
+
+
 # ---- teacher ------------------------------------------------------------------------------------
 
 @pytest.fixture
@@ -143,9 +148,11 @@ def fine_tune(tmp_path):
 
 
 def test_a_diffusion_pipe_save_is_a_valid_teacher(fine_tune):
-    assert distill.check_teacher(str(fine_tune)) is not None
+    raw, params, size = distill.check_teacher(str(fine_tune))
     weights = safetensors.torch.load_file(str(fine_tune / 'model.safetensors'))
-    assert distill.parameter_count(str(fine_tune)) == sum(t.numel() for t in weights.values())
+    assert params == sum(t.numel() for t in weights.values())
+    assert size == (fine_tune / 'model.safetensors').stat().st_size
+    assert raw['model']['attn_backend'] == 'sdpa'
 
 
 def test_a_diffusion_pipe_save_trains_through_iris_tdm(fine_tune):
@@ -182,13 +189,20 @@ def test_a_diffusion_pipe_save_trains_through_iris_tdm(fine_tune):
                                 generator=g)
     result.loss.backward()
     assert torch.isfinite(result.loss)
-    assert all(p.grad is not None and torch.isfinite(p.grad).all() for p in student.parameters() if p.requires_grad
-               and p.grad is not None)
-    assert any(p.grad is not None and p.grad.abs().sum() > 0 for p in student.parameters())
+    grads = [p.grad for p in student.parameters() if p.grad is not None]
+    assert grads and all(torch.isfinite(grad).all() for grad in grads)
+    assert any(grad.abs().sum() > 0 for grad in grads)
     fake_loss = tdm_fake_loss(generated.detach(), state, sigma, 0.5, fn(fake, y, y_mask), cfg,
                               num_train_timesteps=base.flow.num_train_timesteps, generator=g)
     fake_loss.backward()
     assert torch.isfinite(fake_loss)
+
+
+def set_model_config(directory, **values):
+    config = OmegaConf.load(directory / 'config.yaml')
+    for key, value in values.items():
+        config.model[key] = value
+    OmegaConf.save(config, directory / 'config.yaml')
 
 
 def test_teacher_checks_fail_fast(fine_tune, tmp_path):
@@ -198,14 +212,37 @@ def test_teacher_checks_fail_fast(fine_tune, tmp_path):
     with pytest.raises(distill.PreflightError, match='Turbo'):
         distill.check_teacher(str(fine_tune))
     (fine_tune / 'distill.yaml').unlink()
-    config = OmegaConf.load(fine_tune / 'config.yaml')
-    config.model.attn_backend = 'fa3'
-    OmegaConf.save(config, fine_tune / 'config.yaml')
+    set_model_config(fine_tune, attn_backend='fa3')
     with pytest.raises(distill.PreflightError, match='attn_backend'):
         distill.check_teacher(str(fine_tune))
     (fine_tune / 'config.yaml').unlink()
     with pytest.raises(distill.PreflightError, match='config.yaml'):
         distill.check_teacher(str(fine_tune))
+
+
+def test_teacher_config_edge_cases():
+    distill.check_inference_config({'model': None}, 'teacher')
+    distill.check_inference_config({'model': {'attn_backend': 'fa3', 'text_adapter': 'linear'}}, 'teacher')
+    with pytest.raises(distill.PreflightError, match='task'):
+        distill.check_inference_config({'task': {'name': 'depth'}}, 'teacher')
+    with pytest.raises(distill.PreflightError, match='no Iris config'):
+        distill.check_inference_config(None, 'teacher')
+
+
+def test_pth_teachers(fine_tune, tmp_path):
+    raw = OmegaConf.to_container(OmegaConf.load(fine_tune / 'config.yaml'))
+    weights = safetensors.torch.load_file(str(fine_tune / 'model.safetensors'))
+    training = tmp_path / 'training.pth'
+    torch.save({'config': raw, 'state_dict': weights, 'state_dict_ema': weights}, training)
+    _, params, _ = distill.check_teacher(str(training))
+    assert params == sum(t.numel() for t in weights.values())
+    student = tmp_path / 'student.pth'
+    torch.save({'config': raw, 'state_dict_ema': weights, 'distill_format_version': 1}, student)
+    with pytest.raises(distill.PreflightError, match='Turbo student'):
+        distill.check_teacher(str(student))
+    torch.save({'state_dict': weights}, training)
+    with pytest.raises(distill.PreflightError, match='no Iris config'):
+        distill.check_teacher(str(training))
 
 
 def test_training_on_a_turbo_checkpoint_warns(tmp_path, capsys):
@@ -218,9 +255,10 @@ def test_training_on_a_turbo_checkpoint_warns(tmp_path, capsys):
     assert 'Turbo' not in capsys.readouterr().out
 
 
-def test_merging_onto_a_turbo_base_keeps_its_schedule(tmp_path):
+def test_merge_keeps_a_turbo_schedule_and_drops_a_stale_one(tmp_path):
     from tools import iris_merge_adapter
-    write_checkpoint(tmp_path / 'turbo')
+    for name in ('turbo', 'base'):
+        write_checkpoint(tmp_path / name)
     (tmp_path / 'turbo' / 'distill.yaml').write_text('dmd: {sigmas: [1.0, 0.5]}\n')
     pipe = make_pipeline(tmp_path / 'turbo', cache_text_embeddings=True)
     pipe.load_diffusion_model()
@@ -228,16 +266,106 @@ def test_merging_onto_a_turbo_base_keeps_its_schedule(tmp_path):
     adapter = tmp_path / 'adapter'
     adapter.mkdir()
     pipe.save_adapter(adapter, saved_adapter_state(pipe))
-    iris_merge_adapter.main(['--model', str(tmp_path / 'turbo'), '--adapter', str(adapter),
-                             '--output', str(tmp_path / 'merged')])
-    assert (tmp_path / 'merged' / 'distill.yaml').read_text() == 'dmd: {sigmas: [1.0, 0.5]}\n'
+    out = tmp_path / 'merged'
+    iris_merge_adapter.main(['--model', str(tmp_path / 'turbo'), '--adapter', str(adapter), '--output', str(out)])
+    assert (out / 'distill.yaml').read_text() == 'dmd: {sigmas: [1.0, 0.5]}\n'
+    # the same output directory, now merged onto a base without a schedule
+    iris_merge_adapter.main(['--model', str(tmp_path / 'base'), '--adapter', str(adapter), '--output', str(out)])
+    assert not (out / 'distill.yaml').exists()
 
 
-# ---- work dir and checkpoints ---------------------------------------------------------------------
+# ---- prompts file and distillation checkpoints ------------------------------------------------
+
+def test_prompts_file_checks(tmp_path):
+    path = tmp_path / 'prompts.txt'
+    with pytest.raises(distill.PreflightError, match='does not exist'):
+        distill.check_prompts(path)
+    path.write_bytes(b'\n  \n')
+    with pytest.raises(distill.PreflightError, match='no prompts'):
+        distill.check_prompts(path)
+    path.write_bytes(b'caf\xe9\n')
+    with pytest.raises(distill.PreflightError, match='UTF-8'):
+        distill.check_prompts(path)
+    path.write_bytes(b'a prompt\n')
+    from iris3b.distill.trainer import PromptStream
+    assert distill.check_prompts(path) == PromptStream.from_file(path).sha256
+
+
+def write_distill_checkpoint(path, step, prompts_sha='sha', world_size=1):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save({'distill_format_version': 1, 'state_dict': {}, 'state_dict_ema': {}, 'state_dict_fake': {},
+                'generator_updates': step, 'world_size': world_size,
+                'prompt_state': {'sha256': prompts_sha, 'count': 1, 'cursor': 0}}, path)
+    latest = path.parent / 'latest.pth'
+    latest.unlink(missing_ok=True)
+    latest.symlink_to(path.resolve())
+
+
+def stage_config(tmp_path, *overrides):
+    return distill.load_config(IRIS_CONFIGS / 'turbo_stage1_6step.yaml',
+                               ['teacher=t', 'prompts_file=p', f'work_dir={tmp_path / "run"}', *overrides])
+
+
+def test_a_fresh_run_does_not_overwrite_checkpoints(tmp_path):
+    checkpoints = tmp_path / 'run' / 'checkpoints'
+    cfg = stage_config(tmp_path)
+    assert distill.resolve_run(cfg, checkpoints, 'sha', auto_resume=False) == ''
+    write_distill_checkpoint(checkpoints / 'step_00000100.pth', 100)
+    write_distill_checkpoint(checkpoints / 'step_00000200.pth', 200)
+    with pytest.raises(distill.PreflightError, match='start over'):
+        distill.resolve_run(cfg, checkpoints, 'sha', auto_resume=False)
+    assert distill.resolve_run(cfg, checkpoints, 'sha', auto_resume=True) == \
+        str((checkpoints / 'step_00000200.pth').resolve())
+    # latest.pth dangling (the volume mounted elsewhere): the newest step file
+    (checkpoints / 'latest.pth').unlink()
+    (checkpoints / 'latest.pth').symlink_to('/elsewhere/step_00000200.pth')
+    assert distill.resolve_run(cfg, checkpoints, 'sha', auto_resume=True) == str(checkpoints / 'step_00000200.pth')
+    with pytest.raises(distill.PreflightError, match='mounted at another path'):
+        distill.resolve_run(stage_config(tmp_path, f'resume_from={checkpoints / "latest.pth"}'),
+                            checkpoints, 'sha', auto_resume=False)
+
+
+def test_resume_must_match_gpus_prompts_and_be_the_newest(tmp_path, monkeypatch):
+    checkpoints = tmp_path / 'run' / 'checkpoints'
+    write_distill_checkpoint(checkpoints / 'step_00000100.pth', 100)
+    write_distill_checkpoint(checkpoints / 'step_00000200.pth', 200)
+    resume = stage_config(tmp_path, f'resume_from={checkpoints / "step_00000200.pth"}')
+    assert distill.resolve_run(resume, checkpoints, 'sha', auto_resume=False) == str(checkpoints / 'step_00000200.pth')
+    with pytest.raises(distill.PreflightError, match='another prompts file'):
+        distill.resolve_run(resume, checkpoints, 'other', auto_resume=False)
+    monkeypatch.setenv('WORLD_SIZE', '8')
+    with pytest.raises(distill.PreflightError, match='same GPU count'):
+        distill.resolve_run(resume, checkpoints, 'sha', auto_resume=False)
+    monkeypatch.delenv('WORLD_SIZE')
+    older = stage_config(tmp_path, f'resume_from={checkpoints / "step_00000100.pth"}')
+    with pytest.raises(distill.PreflightError, match='step_00000200.pth, newer'):
+        distill.resolve_run(older, checkpoints, 'sha', auto_resume=False)
+
+
+def test_init_from_must_be_a_distillation_checkpoint(tmp_path, fine_tune):
+    good = tmp_path / 'stage1' / 'step_00001600.pth'
+    write_distill_checkpoint(good, 1600)
+    checkpoints = tmp_path / 'run' / 'checkpoints'
+    assert distill.resolve_run(stage_config(tmp_path, f'init_from={good}'), checkpoints, 'sha', False) == ''
+    with pytest.raises(distill.PreflightError, match='is not a file'):
+        distill.resolve_run(stage_config(tmp_path, f'init_from={fine_tune}'), checkpoints, 'sha', False)
+    plain = tmp_path / 'plain.pth'
+    torch.save({'state_dict': {}}, plain)
+    with pytest.raises(distill.PreflightError, match='not written by Iris distillation'):
+        distill.resolve_run(stage_config(tmp_path, f'init_from={plain}'), checkpoints, 'sha', False)
+    # Iris ignores init_from when resuming, so a missing one does not matter then
+    write_distill_checkpoint(checkpoints / 'step_00000100.pth', 100)
+    resume = stage_config(tmp_path, f'init_from={tmp_path / "gone.pth"}', f'resume_from={checkpoints / "latest.pth"}')
+    assert distill.resolve_run(resume, checkpoints, 'sha', False)
+
+
+# ---- storage, memory ------------------------------------------------------------------------------
 
 def test_work_dir_check_passes_and_cleans_up(tmp_path):
     checkpoints = distill.check_work_dir(tmp_path / 'run')
     assert checkpoints == tmp_path / 'run' / 'checkpoints'
+    assert list(checkpoints.iterdir()) == []
+    assert distill.write_speed(checkpoints, size=1 << 20) > 0
     assert list(checkpoints.iterdir()) == []
 
 
@@ -248,6 +376,18 @@ def test_work_dir_without_symlinks_is_refused(tmp_path, monkeypatch):
     with pytest.raises(distill.PreflightError, match='symlink'):
         distill.check_work_dir(tmp_path / 'run')
     assert list((tmp_path / 'run' / 'checkpoints').iterdir()) == []
+
+
+def test_work_dir_that_cannot_rename_over_a_file_is_refused(tmp_path, monkeypatch):
+    original = Path.replace
+
+    def no_overwrite(self, target):
+        if Path(target).exists():
+            raise OSError(17, 'File exists')
+        return original(self, target)
+    monkeypatch.setattr(Path, 'replace', no_overwrite)
+    with pytest.raises(distill.PreflightError, match='rename over an existing entry'):
+        distill.check_work_dir(tmp_path / 'run')
 
 
 def make_checkpoints(directory, steps, latest):
@@ -267,7 +407,7 @@ def test_pruning_keeps_the_newest_and_the_latest_target(tmp_path):
     assert distill.prune_checkpoints(directory, keep_last=0) == []
 
 
-def test_stale_temporaries_are_removed(tmp_path):
+def test_stale_temporaries_and_broken_null_cache_are_removed(tmp_path):
     directory = tmp_path / 'checkpoints'
     make_checkpoints(directory, [100], latest=100)
     (directory / 'step_00000200.pth.tmp').write_bytes(b'partial')
@@ -275,35 +415,86 @@ def test_stale_temporaries_are_removed(tmp_path):
     removed = distill.remove_stale_temporaries(directory)
     assert sorted(p.name for p in removed) == ['latest.pth.tmp', 'step_00000200.pth.tmp']
     assert sorted(p.name for p in directory.iterdir()) == ['latest.pth', 'step_00000100.pth']
+    cache = tmp_path / 'null'
+    cache.mkdir()
+    torch.save({'embeddings': torch.zeros(1, 2), 'mask': torch.ones(1, 2)}, cache / 'null_embed_good.pth')
+    (cache / 'null_embed_torn.pth').write_bytes(b'PK\x03\x04 cut off')
+    assert [p.name for p in distill.remove_broken_null_cache(cache)] == ['null_embed_torn.pth']
+    assert [p.name for p in cache.iterdir()] == ['null_embed_good.pth']
 
 
-def test_pruning_hooks_into_iris_checkpoint_saves(tmp_path, monkeypatch):
-    from iris3b.train import ckpt
-    monkeypatch.setattr(ckpt, 'save_checkpoint', ckpt.save_checkpoint)
-    distill.install_pruning(keep_last=2)
-    directory = tmp_path / 'checkpoints'
+def fake_distillation_state(directory):
+    """A DistillationState holding a tiny model, enough for its real save()."""
+    import iris3b.distill.trainer as trainer
+    from iris3b.distill.config import DistillConfig
+    state = object.__new__(trainer.DistillationState)
+    state.cfg = DistillConfig(teacher='t', prompts_file='p', fake_updates=1, batch_size=1)
+    state.rank, state.world_size, state.sharded = 0, 1, False
+    state.generator_updates = state.fake_updates = 0
+    state.prompts = trainer.PromptStream(('a',), 'sha', 0)
     model = torch.nn.Linear(2, 2)
+    state.student = state.fake = model
+    state.ema = trainer.EMA(model, 0.9)
+    state.optimizer = state.fake_optimizer = torch.optim.AdamW(model.parameters())
+    state.device, state.generator = torch.device('cpu'), torch.Generator()
+    state.base_config, state.teacher_identity = {}, {}
+    return state
+
+
+def test_pruning_hooks_into_iris_distillation_saves(tmp_path, monkeypatch):
+    import iris3b.distill.trainer as trainer
+    from iris3b.train import ckpt
+    # The hook relies on DistillationState.save importing save_checkpoint at each call.
+    assert not hasattr(trainer, 'save_checkpoint')
+    monkeypatch.setattr(ckpt, 'save_checkpoint', ckpt.save_checkpoint)
+    monkeypatch.setattr(trainer, '_capture_rng', lambda device, generator: {})
+    distill.install_pruning(keep_last=2)
+    state = fake_distillation_state(tmp_path)
+    directory = tmp_path / 'checkpoints'
     for step in (100, 200, 300):
-        # how DistillationState.save calls it
-        from iris3b.train.ckpt import save_checkpoint
-        save_checkpoint(directory / f'step_{step:08d}.pth', model.state_dict(), epoch=0, step=step)
+        state.generator_updates = state.fake_updates = step
+        state.prompts.cursor = 2 * step
+        state.save(directory / f'step_{step:08d}.pth')
     assert sorted(p.name for p in directory.iterdir()) == ['latest.pth', 'step_00000200.pth', 'step_00000300.pth']
-    assert (directory / 'latest.pth').resolve() == (directory / 'step_00000300.pth').resolve()
-    assert torch.load(directory / 'latest.pth', weights_only=False)['step'] == 300
+    assert torch.load(directory / 'latest.pth', weights_only=False)['generator_updates'] == 300
+
+    # a failed delete is reported, and the save that just succeeded stands
+    original = Path.unlink
+
+    def refuse(self, missing_ok=False):
+        if self.name.startswith('step_'):
+            raise PermissionError(13, 'Permission denied', str(self))
+        return original(self, missing_ok=missing_ok)
+    monkeypatch.setattr(Path, 'unlink', refuse)
+    state.generator_updates = state.fake_updates = 400
+    state.prompts.cursor = 800
+    state.save(directory / 'step_00000400.pth')
+    assert (directory / 'latest.pth').resolve() == (directory / 'step_00000400.pth').resolve()
 
 
 @pytest.mark.parametrize('max_steps, save_every, keep_last, expected', [
     (1600, 100, 2, 3), (1600, 100, 0, 16), (500, 100, 0, 5), (450, 100, 0, 5), (100, 100, 5, 1),
 ])
-def test_checkpoints_on_disk(max_steps, save_every, keep_last, expected):
-    cfg = distill.load_config(IRIS_CONFIGS / 'turbo_stage1_6step.yaml',
-                              ['teacher=t', 'prompts_file=p', f'max_steps={max_steps}', f'save_every={save_every}'])
+def test_checkpoints_on_disk(max_steps, save_every, keep_last, expected, tmp_path):
+    cfg = stage_config(tmp_path, f'max_steps={max_steps}', f'save_every={save_every}')
     assert distill.checkpoints_on_disk(cfg, keep_last) == expected
+
+
+def test_memory_warnings(tmp_path, capsys, monkeypatch):
+    monkeypatch.setenv('LOCAL_WORLD_SIZE', '4')
+    fsdp2 = stage_config(tmp_path, 'strategy=fsdp2')
+    distill.check_host_memory(fsdp2, checkpoint_size=84e9, teacher_bytes=12e9, limit=80e9)
+    out = capsys.readouterr().out
+    assert 'gathers each checkpoint' in out and 'loads the teacher' not in out
+    distill.check_host_memory(fsdp2, checkpoint_size=84e9, teacher_bytes=12e9, limit=512e9)
+    assert capsys.readouterr().out == ''
+    distill.check_host_memory(stage_config(tmp_path), checkpoint_size=84e9, teacher_bytes=12e9, limit=40e9)
+    assert 'loads the teacher' in capsys.readouterr().out
 
 
 # ---- launcher -------------------------------------------------------------------------------------
 
-def test_launcher_turns_cudnn_off_and_runs_iris_trainer(fine_tune, tmp_path, monkeypatch):
+def run_launcher(monkeypatch, argv):
     import iris3b.distill.trainer as trainer
     from iris3b.train import ckpt
     monkeypatch.setattr(ckpt, 'save_checkpoint', ckpt.save_checkpoint)
@@ -314,38 +505,59 @@ def test_launcher_turns_cudnn_off_and_runs_iris_trainer(fine_tune, tmp_path, mon
             self.cfg = cfg
 
         def run(self):
-            ran.append((self.cfg, torch.backends.cuda.cudnn_sdp_enabled()))
+            ran.append((self.cfg, torch.backends.cuda.cudnn_sdp_enabled(), ckpt.save_checkpoint))
 
     monkeypatch.setattr(trainer, 'DistillationTrainer', FakeTrainer)
-    prompts = tmp_path / 'prompts.txt'
-    prompts.write_text('a prompt\n', encoding='utf-8')
     before = torch.backends.cuda.cudnn_sdp_enabled()
     try:
-        distill.main(['--config', str(IRIS_CONFIGS / 'turbo_stage1_6step.yaml'), f'teacher={fine_tune}',
-                      f'prompts_file={prompts}', f'work_dir={tmp_path / "run"}', 'strategy=fsdp2'])
+        distill.main(argv)
     finally:
         torch.backends.cuda.enable_cudnn_sdp(before)
-    (cfg, cudnn), = ran
+    return ran
+
+
+def test_launcher_turns_cudnn_off_and_runs_iris_trainer(fine_tune, tmp_path, monkeypatch):
+    from iris3b.train import ckpt
+    original = ckpt.save_checkpoint
+    prompts = tmp_path / 'prompts.txt'
+    prompts.write_text('a prompt\n', encoding='utf-8')
+    # overrides may come after the launcher's own options
+    (cfg, cudnn, save), = run_launcher(monkeypatch, [
+        '--config', str(IRIS_CONFIGS / 'turbo_stage1_6step.yaml'), f'teacher={fine_tune}', '--keep-last', '3',
+        f'prompts_file={prompts}', f'work_dir={tmp_path / "run"}', 'strategy=fsdp2'])
     assert cudnn is False
-    assert (cfg.teacher, cfg.strategy, cfg.max_steps) == (str(fine_tune), 'fsdp2', 1600)
+    assert save is not original
+    assert (cfg.teacher, cfg.prompts_file, cfg.strategy, cfg.resume_from) == (str(fine_tune), str(prompts), 'fsdp2', '')
     assert (tmp_path / 'run' / 'checkpoints').is_dir()
 
 
+def test_launcher_auto_resumes(fine_tune, tmp_path, monkeypatch):
+    prompts = tmp_path / 'prompts.txt'
+    prompts.write_text('a prompt\n', encoding='utf-8')
+    from iris3b.distill.trainer import PromptStream
+    checkpoints = tmp_path / 'run' / 'checkpoints'
+    write_distill_checkpoint(checkpoints / 'step_00000100.pth', 100, PromptStream.from_file(prompts).sha256)
+    argv = ['--config', str(IRIS_CONFIGS / 'turbo_stage1_6step.yaml'), f'teacher={fine_tune}',
+            f'prompts_file={prompts}', f'work_dir={tmp_path / "run"}', '--skip-write-test']
+    with pytest.raises(SystemExit, match='start over'):
+        run_launcher(monkeypatch, argv)
+    (cfg, _, _), = run_launcher(monkeypatch, [*argv, '--auto-resume'])
+    assert cfg.resume_from == str((checkpoints / 'step_00000100.pth').resolve())
+
+
 def test_launcher_stops_before_training_on_a_bad_setup(fine_tune, tmp_path, monkeypatch):
-    import iris3b.distill.trainer as trainer
-    monkeypatch.setattr(trainer, 'DistillationTrainer', lambda cfg: pytest.fail('trainer must not start'))
     config = str(IRIS_CONFIGS / 'turbo_stage1_6step.yaml')
     with pytest.raises(SystemExit, match='prompts_file'):
-        distill.main(['--config', config, f'teacher={fine_tune}', f'prompts_file={tmp_path / "none.txt"}',
-                      f'work_dir={tmp_path / "run"}', '--allow-cudnn-attention'])
+        run_launcher(monkeypatch, ['--config', config, f'teacher={fine_tune}', f'prompts_file={tmp_path / "none.txt"}',
+                                   f'work_dir={tmp_path / "run"}'])
     prompts = tmp_path / 'prompts.txt'
     prompts.write_text('a prompt\n', encoding='utf-8')
     with pytest.raises(SystemExit, match='init_from'):
-        distill.main(['--config', str(IRIS_CONFIGS / 'turbo_stage2_4step.yaml'), f'teacher={fine_tune}',
-                      f'prompts_file={prompts}', f'work_dir={tmp_path / "run"}', '--allow-cudnn-attention'])
+        run_launcher(monkeypatch, ['--config', str(IRIS_CONFIGS / 'turbo_stage2_4step.yaml'), f'teacher={fine_tune}',
+                                   f'prompts_file={prompts}', f'work_dir={tmp_path / "run"}'])
 
 
-def test_upstream_configs_load():
+def test_upstream_configs_load(tmp_path):
     for name in ('turbo_stage1_6step.yaml', 'turbo_stage2_4step.yaml'):
         cfg = distill.load_config(IRIS_CONFIGS / name, ['teacher=t', 'prompts_file=p'])
         assert cfg.betas == [0.0, 0.999]

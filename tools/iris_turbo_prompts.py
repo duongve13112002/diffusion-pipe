@@ -15,11 +15,14 @@ multiline_captions, skip_empty_caption and require_non_latin_caption resolve exa
 training.
 
 Because the file is line based, a caption that spans several lines is joined with spaces;
-otherwise each of its lines would become a separate, truncated prompt. Empty captions, and
-captions that are only their caption_prefix, are dropped (Iris skips blank lines anyway). Each directory's num_repeats weights its captions,
-as it weighted them in training (--ignore-num-repeats turns that off). The result is shuffled
-with a fixed seed: the trainer reads the file in order, and dataset order would hand each
-batch prompts from a single directory.
+otherwise each of its lines would become a separate, truncated prompt. Empty captions,
+captions that are only their caption_prefix and captions that cannot be written as UTF-8 (a
+lone surrogate escape in a captions.json) are dropped and counted. Each directory's num_repeats
+weights its captions (--ignore-num-repeats turns that off). Only num_repeats: training also
+repeats a caption once per cache_shuffle_num variant and per resolution, and
+caption_sampling = 'random_per_epoch' draws one caption per image, none of which this mirrors.
+The result is shuffled with a fixed seed: the trainer reads the file in order, and dataset
+order would hand each batch prompts from a single directory.
 
 --extra-prompts adds the lines of plain text files (one prompt per line) as they are, for
 example general prompts that keep the student close to the base model's range.
@@ -34,6 +37,7 @@ import copy
 import os
 import random
 import sys
+import uuid
 from pathlib import Path
 
 import toml
@@ -96,12 +100,17 @@ def read_extra_prompts(path):
 
 def build_prompts(captions, dedupe=False, shuffle=True, seed=0):
     """(prompts, report): flattened, non-empty, optionally deduplicated, then shuffled."""
-    report = {'joined': 0, 'empty': 0, 'duplicates': 0}
+    report = {'joined': 0, 'empty': 0, 'duplicates': 0, 'unencodable': 0}
     prompts = []
     for caption in captions:
         line = flatten(caption)
         if not line:
             report['empty'] += 1
+            continue
+        try:
+            line.encode('utf-8')
+        except UnicodeEncodeError:
+            report['unencodable'] += 1
             continue
         if line != caption.strip():
             report['joined'] += 1
@@ -119,7 +128,8 @@ def write_atomic(path, prompts):
     """Write to a temporary file in the same directory, fsync, then rename over `path`."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(f'.{path.name}.tmp-{os.getpid()}')
+    # uuid, not the PID: in a container that is often 1 for every pod writing to the volume
+    tmp = path.with_name(f'.{path.name}.tmp-{uuid.uuid4().hex}')
     try:
         with open(tmp, 'w', encoding='utf-8', newline='\n') as f:
             for prompt in prompts:
@@ -173,6 +183,8 @@ def main(argv=None):
         print(f"  {report['joined']} multi-line captions joined into one line")
     if report['empty']:
         print(f"  {report['empty']} empty captions dropped")
+    if report['unencodable']:
+        print(f"  {report['unencodable']} captions with invalid characters (lone surrogates) dropped")
     if report['duplicates']:
         print(f"  {report['duplicates']} duplicates dropped (--dedupe)")
     for name, (steps, batch, fake_updates) in RECIPES.items():
