@@ -158,3 +158,60 @@ def sample_t(t, batch_size, quantile=None):
     else:
         i = torch.randint(0, len(t), size=(batch_size,))
     return t[i]
+
+
+def _cgroup_cpu_quota(root=Path('/sys/fs/cgroup')):
+    """CPUs granted by a cgroup CPU quota (a Kubernetes CPU limit), or None without one."""
+    try:
+        quota, period = (root / 'cpu.max').read_text().split()[:2]  # cgroup v2
+        return None if quota == 'max' else int(quota) / int(period)
+    except (OSError, ValueError):
+        pass
+    try:
+        quota = int((root / 'cpu' / 'cpu.cfs_quota_us').read_text())  # cgroup v1
+        period = int((root / 'cpu' / 'cpu.cfs_period_us').read_text())
+        return quota / period if quota > 0 and period > 0 else None
+    except (OSError, ValueError):
+        return None
+
+
+def usable_cpu_count(cgroup_root=Path('/sys/fs/cgroup')):
+    """CPUs this process can actually run on. os.cpu_count() reports every core of the host, even
+    in a container whose CPU limit or cpuset grants a fraction of them."""
+    try:
+        count = len(os.sched_getaffinity(0))
+    except (AttributeError, OSError):
+        count = os.cpu_count() or 1
+    quota = _cgroup_cpu_quota(cgroup_root)
+    if quota is not None:
+        count = min(count, max(1, int(quota)))
+    return count
+
+
+def limit_cpu_threads(local_world_size, cgroup_root=Path('/sys/fs/cgroup')):
+    """Give each of the GPU processes on this machine its share of the CPUs.
+
+    torch otherwise starts a thread per host core in every process, and the deepspeed launcher
+    (unlike torchrun) does not set OMP_NUM_THREADS: 8 GPU processes on a 224-thread host run
+    1800 threads over the CPUs the pod may use, and the CPU work of startup (loading and casting
+    checkpoints, decoding) spends its time in the scheduler instead. An OMP_NUM_THREADS set by
+    the user is left alone. Returns the thread count set, or None."""
+    if os.environ.get('OMP_NUM_THREADS'):
+        return None
+    threads = max(1, usable_cpu_count(cgroup_root) // max(1, local_world_size))
+    torch.set_num_threads(threads)
+    # Inherited by the processes started later (dataset map workers, dataloader workers).
+    os.environ['OMP_NUM_THREADS'] = str(threads)
+    return threads
+
+
+def ensure_writable_dir(path, setting):
+    """Create `path` now, so a run whose output directory cannot be written stops before the
+    dataset and model load instead of after."""
+    try:
+        os.makedirs(path, exist_ok=True)
+    except OSError as e:
+        raise SystemExit(f'{setting} = {str(path)!r} cannot be created ({e.strerror}: {e.filename}). '
+                         f'Point {setting} at a directory this user can write, e.g. on the PVC.') from None
+    if not os.access(path, os.W_OK | os.X_OK):
+        raise SystemExit(f'{setting} = {str(path)!r} exists but this user cannot write to it.')

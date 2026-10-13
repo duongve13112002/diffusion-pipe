@@ -309,6 +309,12 @@ if __name__ == '__main__':
         config = json.loads(json.dumps(toml.load(f)))
 
     set_config_defaults(config)
+    # Fail now rather than after the dataset and model have loaded.
+    common.ensure_writable_dir(config['output_dir'], 'output_dir')
+    local_world_size = int(os.environ.get('LOCAL_WORLD_SIZE') or os.environ.get('LOCAL_SIZE')
+                           or max(1, torch.cuda.device_count()))
+    if (cpu_threads := common.limit_cpu_threads(local_world_size)) is not None and args.local_rank in (0, -1):
+        print(f'CPU threads per GPU process: {cpu_threads} (set OMP_NUM_THREADS to override)')
     common.AUTOCAST_DTYPE = config['model']['dtype']
     dataset_util.UNCOND_FRACTION = config.get('uncond_fraction', 0.0)
     if map_num_proc := config.get('map_num_proc', None):
