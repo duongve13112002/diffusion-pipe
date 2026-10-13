@@ -881,6 +881,11 @@ do not put `--force` in an initContainer, since every pod start would publish a 
 storage. The tool publishes by renaming a directory: mountpoint-s3 cannot rename at all, and
 gcsfuse renames directories only on hierarchical-namespace buckets or with `--rename-dir-limit`.
 
+A NaN loss: `python tools/iris_nan_check.py --config <training config>` runs the run's own model,
+dtype, text encoder and a few dataset images on one GPU and stops at the first non-finite value:
+in the checkpoint, the text embeddings, a named layer of the forward pass, a gradient, or the
+weights after one of `--steps N` optimizer steps (full learning rate, the config's optimizer).
+
 Saving:
 - Full fine-tune writes Iris's own layout: `model.safetensors` (IrisDiT keys) + `config.yaml`,
   readable by `iris3b.sampling.load_for_inference` and Iris's `scripts/sample.py`, and usable as
