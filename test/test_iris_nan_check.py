@@ -73,3 +73,12 @@ def test_forward_only_stops_after_the_loss(tmp_path, tiny_qwen):  # noqa: F811
     code, out = run(setup(tmp_path, tiny_qwen), '--forward-only')
     assert code == 0, out
     assert 'forward pass and the loss are finite at batch size 2' in out and '[4/4]' not in out
+
+
+def test_activation_checkpointing_gives_the_same_loss_and_gradients(tmp_path, tiny_qwen):  # noqa: F811
+    config = setup(tmp_path, tiny_qwen)
+    plain = run(config, '--steps', '2')
+    checkpointed = run(config, '--steps', '2', '--activation-checkpointing')
+    assert plain[0] == checkpointed[0] == 0, checkpointed[1]
+    pick = lambda out: [line for line in out.splitlines() if 'loss' in line or 'gradient norm' in line]  # noqa: E731
+    assert pick(plain[1]) == pick(checkpointed[1]) and pick(plain[1])

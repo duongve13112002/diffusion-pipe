@@ -111,6 +111,9 @@ def main(argv=None):
     parser.add_argument('--config', required=True, help='The training config (.toml).')
     parser.add_argument('--batch-size', type=int, default=4)
     parser.add_argument('--steps', type=int, default=5, help='Optimizer steps for stage 4 (0 skips it).')
+    parser.add_argument('--activation-checkpointing', action='store_true',
+                        help='Checkpoint every layer after the text encoder, as activation_checkpointing = true '
+                             "does in training: needed for the backward pass at the run's micro batch size.")
     parser.add_argument('--forward-only', action='store_true',
                         help="Forward pass only, without autograd: what the run's micro_batch_size_per_gpu "
                              'fits in memory without activation checkpointing. Skips backward and stage 4.')
@@ -201,10 +204,17 @@ def main(argv=None):
     for layer in layers:
         layer.train()
 
+    def run_layer(i, layer, out):
+        if args.activation_checkpointing and i > 0 and torch.is_grad_enabled():
+            # Training's checkpoint_func for activation_checkpointing = true; the text encoder
+            # layer is never checkpointed there either.
+            return torch.utils.checkpoint.checkpoint(layer, out, use_reentrant=False)
+        return layer(out)
+
     def forward():
         out = features
         for i, layer in enumerate(layers):
-            out = layer(out)
+            out = run_layer(i, layer, out)
             outputs = out if isinstance(out, tuple) else (out,)
             peak = max((max_abs(t) for t in outputs if torch.is_tensor(t)), default=0.0)
             say(f'      {i:3d} {type(layer).__name__:<18} max |out| {peak:.4g}')
@@ -236,6 +246,13 @@ def main(argv=None):
     loss.backward()
     params = [(n, p) for layer in layers for n, p in layer.named_parameters() if p.requires_grad]
     bad = [f'{getattr(p, "original_name", n)}' for n, p in params if p.grad is not None and not torch.isfinite(p.grad).all()]
+    if bad:
+        # Backward runs from the last layer to the first: the highest layer with a non-finite
+        # gradient is where it started.
+        bad_layers = [i for i, layer in enumerate(layers)
+                      if any(p.grad is not None and not torch.isfinite(p.grad).all() for p in layer.parameters())]
+        say(f'      non-finite gradients in layers {bad_layers} (backward starts at the highest: '
+            f'{bad_layers[-1]} {type(layers[bad_layers[-1]]).__name__})')
     norm = math.sqrt(sum(float(p.grad.float().pow(2).sum()) for _, p in params if p.grad is not None))
     say(f'      gradient norm {norm:.4g} over {len(params)} tensors')
     if bad:
@@ -269,8 +286,8 @@ def main(argv=None):
         if step > 1:
             optimizer.zero_grad(set_to_none=True)
             out = features
-            for layer in layers:
-                out = layer(out)
+            for i, layer in enumerate(layers):
+                out = run_layer(i, layer, out)
             loss = loss_fn(out, (target, mask))
             loss.backward()
         grads = [p.grad for p in unique.values() if p.grad is not None]
