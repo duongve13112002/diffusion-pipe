@@ -823,6 +823,7 @@ All `[model]` options:
 | `on_caption_overflow` | checkpoint `text_encoder.on_caption_overflow` (`warn`) | A caption longer than `max_text_length`: `warn` (truncate, say so once), `silent` (truncate) or `error`. |
 | `text_encoder_attn_implementation` | checkpoint config | `attn_implementation` for the Qwen3-VL decoder. |
 | `attn_backend` | checkpoint config (`sdpa`) | Iris attention backend for training: `sdpa`, `torch_flash`, `torch_cudnn`, `fa3`, `fa4`. Not written to the exported `config.yaml`. |
+| `allow_cudnn_attention` | `false` | With `attn_backend = 'sdpa'`, let PyTorch use its cuDNN attention kernel. Off by default: on H200 (torch 2.12, cuDNN 9.20) its backward gives NaN gradients for some real samples where flash and math are finite. `attn_backend = 'torch_cudnn'` still forces it. |
 | `timestep_sample_method` | checkpoint `flow.timestep_sampler` (`logit_normal`) | `logit_normal` or `uniform`. |
 | `logit_mean`, `logit_std` | checkpoint `flow` config | Logit-normal parameters. |
 | `min_t`, `max_t` | `0`, `1` | Bounds on the shifted noise level σ' the model is trained at, the same meaning as for Wan: the sampler is truncated to that range, keeping its shape. With `shift_law` they apply after each batch's shift. |

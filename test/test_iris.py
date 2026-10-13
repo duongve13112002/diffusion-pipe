@@ -1356,3 +1356,19 @@ def test_ema_save_is_a_loadable_iris_checkpoint(ckpt, tmp_path, monkeypatch):
     for name, p in averaged.transformer.named_parameters():
         torch.testing.assert_close(p, ema.shadow[name])
         torch.testing.assert_close(dict(raw.transformer.named_parameters())[name], trained[name])
+
+
+@pytest.mark.parametrize('model_config, enabled', [
+    ({}, False),
+    ({'allow_cudnn_attention': True}, True),
+    ({'attn_backend': 'torch_cudnn'}, True),
+])
+def test_cudnn_attention_is_off_unless_asked_for(ckpt, model_config, enabled):
+    path, _ = ckpt
+    before = torch.backends.cuda.cudnn_sdp_enabled()
+    try:
+        torch.backends.cuda.enable_cudnn_sdp(True)
+        make_pipeline(path, cache_text_embeddings=True, **model_config)
+        assert torch.backends.cuda.cudnn_sdp_enabled() is enabled
+    finally:
+        torch.backends.cuda.enable_cudnn_sdp(before)

@@ -403,6 +403,13 @@ class IrisPipeline(BasePipeline):
         self._checkpoint_attn_backend = model_cfg.attn_backend
         if attn_backend := self.model_config.get('attn_backend', None):
             model_cfg.attn_backend = attn_backend
+        if (model_cfg.attn_backend == 'sdpa' and not self.model_config.get('allow_cudnn_attention', False)
+                and hasattr(torch.backends.cuda, 'enable_cudnn_sdp')):
+            # PyTorch picks cuDNN for this attention on Hopper, and its backward returns NaN for
+            # some real Iris activations (torch 2.12 / cuDNN 9.20, H200: a few samples per batch
+            # of 64 poison blocks.9's q gradient) where flash and math are finite on the same
+            # inputs. Off, PyTorch falls back to flash, then efficient, then math.
+            torch.backends.cuda.enable_cudnn_sdp(False)
         self.patch_size = model_cfg.patch_size
         self.pixels_round_to_multiple = self.patch_size
         te_cfg = self.iris_config.text_encoder
