@@ -11,9 +11,15 @@ metadata:
   name: iris-turbo
 spec:
   backoffLimit: 6               # restarts after a crash, OOM or eviction; each one resumes
+  # Start a replacement pod only once the old one has fully stopped, so two pods never write the
+  # same checkpoints (Kubernetes 1.29+; remove the line on older clusters).
+  podReplacementPolicy: Failed
   template:
     spec:
       restartPolicy: OnFailure
+      # run_turbo.sh passes SIGTERM to the trainer; leave time for a save in progress to fail
+      # cleanly rather than SIGKILL mid-write (the next start removes its scratch file either way).
+      terminationGracePeriodSeconds: 120
       # nodeSelector:
       #   nvidia.com/gpu.product: NVIDIA-H200
       containers:
@@ -45,7 +51,8 @@ spec:
               memory: 400Gi
               cpu: "32"
           volumeMounts:
-            # Same mount path in every pod: latest.pth is an absolute symlink.
+            # Same mount path in every pod: latest.pth is an absolute symlink. The volume must
+            # also hold (or another mount must provide) the teacher and DATASET's image folders.
             - name: data
               mountPath: /pvc
             - name: dshm

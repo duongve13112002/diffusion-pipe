@@ -43,7 +43,9 @@ tools/iris_merge_adapter.py, or an Iris training .pth. Around the trainer it add
 Export the result with Iris's script, which adds the distill.yaml that tells
 scripts/sample.py to sample with the few-step schedule:
 
-    python submodules/iris-3b/scripts/export_distilled.py <work_dir>/checkpoints/latest.pth <out> --dtype bf16
+    python submodules/iris-3b/scripts/export_distilled.py <work_dir>/checkpoints/step_<N>.pth <out> --dtype bf16
+
+(the step file itself: latest.pth is an absolute symlink and dangles under another mount path).
 """
 
 import argparse

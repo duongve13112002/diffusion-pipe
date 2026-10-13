@@ -28,8 +28,12 @@ images. diffusion-pipe adds the pieces around it:
     (`ema_decay = 0.9999`); turn them on for a run you mean to distill.
   - **LoRA / LoKr:** merge it first,
     `python -m tools.iris_merge_adapter --model speridlabs/iris-3b --adapter <save dir> --output <dir>`
-    (with EMA, pass the adapter's `ema/` directory as `--adapter`).
-  - **The base Iris-3B** works too, if you only want Iris's own recipe with your prompts.
+    (with EMA, pass the adapter's `ema/` directory as `--adapter`). If training changed `shift`,
+    `shift_law` or `max_text_length`, pass `--shift`, `--shift-law` and `--max-text-length` too:
+    they change what the teacher computes.
+  - **The base Iris-3B** works too, if you only want Iris's own recipe with your prompts. Download
+    it first (`hf download speridlabs/iris-3b --local-dir iris-3b --exclude "depth/*" "upscaler/*" "turbo/*"`):
+    the teacher must be a local directory, not a repo id.
   - **Not** a Turbo export or a distillation checkpoint. The launcher refuses those. Fine-tuning
     `iris-3b/turbo` itself with diffusion-pipe works but erodes its few-step sampling, and
     diffusion-pipe warns when it loads one: fine-tune the base model and distill the result.
@@ -37,9 +41,10 @@ images. diffusion-pipe adds the pieces around it:
   `ddp` it needs about 160 GB per GPU at batch 8, more than an H200 has.
 - **Host memory.** About 100 GB free for rank 0 when it saves (see [Memory](#memory)), so a
   pod limit of 400 GiB for 8 GPUs is comfortable.
-- **Disk.** About 84 GB per checkpoint. With the default `--keep-last 2`, plan for about
-  260 GB during stage 1 and about as much again during stage 2. The text encoder
-  (`Qwen/Qwen3-VL-4B-Instruct`) adds about 9 GB.
+- **Disk.** About 84 GB per checkpoint. With the default `--keep-last 2`, a stage holds at most
+  three while it saves: about 250 GB during stage 1, and at the end of stage 2 about 420 GB
+  (stage 1's last two and stage 2's three). The text encoder (`Qwen/Qwen3-VL-4B-Instruct`), the
+  export and the prompts add about 25 GB.
 - **Time.** Stage 1 is 1,600 student updates at a global batch of 64, stage 2 500 at 16. Each
   update runs the student over its few-step trajectory and the teacher and fake network
   on the result, and the fake network takes its own update: count on several times
@@ -65,18 +70,23 @@ python submodules/iris-3b/scripts/sample.py --checkpoint /pvc/turbo/export \
     --prompt "a red fox sleeping in fresh snow, golden hour"
 ```
 
-`--steps`, `--cfg-scale`, `--shift` and `--negative-prompt` do not apply to a Turbo model. The
-prompt, `--height`, `--width` and `--seed` do. It was distilled at about one megapixel, so stay
+The schedule is part of the model: `sample.py` refuses `--steps`, `--order`, `--cfg-scale`,
+`--shift` and `--negative-prompt` for it. The prompt, `--height`, `--width` and `--seed` apply. It was distilled at about one megapixel, so stay
 near the 7 training sizes (1024×1024, 752×1344, 896×1344, 896×1200 and their transposes).
 
-`run_turbo.sh` runs these steps, and skips each one whose output already exists:
+`run_turbo.sh` runs these steps. Once `$OUT/export` exists it does nothing; before that it skips
+each step whose output already exists:
 
 1. Builds `$OUT/prompts.txt` from `DATASET` (see [Prompts](#prompts)).
-2. Downloads the teacher's text encoder into `HF_HOME` (default `$OUT/hf`) once, so the eight
-   ranks do not all fetch it at the same moment.
+2. Downloads the teacher's text encoder into `HF_HOME` (default `$OUT/hf`), so the eight ranks
+   do not all fetch it at the same moment. If that fails it only warns. The encoder is the one
+   in the teacher's `config.yaml` (`text_encoder.pretrained`); diffusion-pipe's
+   `text_encoder_path` is not saved there. To use a local copy, set `pretrained` in the teacher's
+   `config.yaml` to its directory before stage 1 (a resume refuses a changed teacher config).
 3. Stage 1 into `$OUT/stage1`, then stage 2 into `$OUT/stage2` from stage 1's final checkpoint.
    Both use `--auto-resume`, so a stage that already finished returns at once and an interrupted
-   one continues from its newest readable checkpoint.
+   one continues from its newest readable checkpoint. Once stage 2 has a checkpoint, stage 1 is
+   not run again, even if its checkpoints were deleted.
 4. Exports stage 2's final EMA into `$OUT/export`, through a scratch directory, so a pod killed
    mid-export never leaves a half-written export behind.
 
@@ -89,12 +99,14 @@ Its settings are environment variables:
 | `EXTRA_PROMPTS` | | Text files with one prompt per line, mixed in as they are. |
 | `OUT` | `/pvc/turbo` | Everything the run writes. |
 | `NGPU` | all visible GPUs | GPUs on this node. |
-| `BATCH1`, `BATCH2` | `64/NGPU`, `16/NGPU` | Per-GPU batch of each stage. The script stops if the recipe's global batch does not split over `NGPU`. |
-| `KEEP_LAST` | `2` | Checkpoints kept per stage. Never 1 on a network volume (see [Restarts](#restarts-and-crashes)). |
+| `BATCH1`, `BATCH2` | `64/NGPU`, `16/NGPU` | Per-GPU batch of each stage; they override `batch_size` in the YAMLs. The script stops if the recipe's global batch does not split over `NGPU`. |
+| `KEEP_LAST` | `2` | Checkpoints kept per stage, `0` for all. `1` is refused (see [Restarts](#restarts-and-crashes)). |
 | `HF_HOME` | `$OUT/hf` | Hugging Face cache, on the volume. Set `HF_TOKEN` too if your cache needs it. |
 | `EXPORT_DTYPE` | `bf16` | As Iris's release. `fp32` keeps the full EMA. |
 
-To start over, delete `$OUT/stage1`, `$OUT/stage2` and `$OUT/export`. To change the prompts,
+The script runs from the repository root wherever it is called from, and relative paths in these
+variables are taken from there. It passes SIGTERM on to the trainer and stops, so an evicted pod
+does not keep training. To start over, delete `$OUT/stage1`, `$OUT/stage2` and `$OUT/export`. To change the prompts,
 delete `$OUT/prompts.txt` as well: a stage that resumes checks that the file has not changed.
 
 ### On Kubernetes
@@ -119,7 +131,12 @@ It sets up what the run needs from the pod:
 - **Memory** 400 GiB. A limit too low for rank 0's save gets the pod OOM-killed at step 100, which
   looks like a random rank dying.
 - **`restartPolicy: OnFailure`** and `backoffLimit: 6`. Each restart resumes where the last
-  checkpoint left off, so at most 100 student updates are lost.
+  checkpoint left off, so at most 100 student updates are lost. A configuration error also
+  restarts six times before the Job fails; check the first pod's log.
+- **`podReplacementPolicy: Failed`** (Kubernetes 1.29+), so a replacement pod starts only after
+  the old one has stopped, and two pods never write the same checkpoints.
+- **The teacher and the dataset** must be reachable from the pod as well: on the same volume, or
+  another mount.
 
 ## The configs
 
@@ -163,11 +180,13 @@ mind when you do:
 - **`save_every`.** Each save writes about 84 GB and every rank waits for it. 100 loses at most
   100 updates on a crash.
 - **Resuming** needs the same GPU count, the same prompts file content and the same teacher
-  weights (Iris hashes them; the paths may move). Of the config, only paths (`teacher`,
+  weights and `config.yaml` (Iris hashes them; the paths may move). Of the config, only paths (`teacher`,
   `prompts_file`, `work_dir`, `init_from`, `init_weights`), `strategy`, `max_steps`,
   `save_every`, `log_every`, the two learning rates and `max_grad_norm` may change; anything else,
   `batch_size` included, is refused. To continue a finished stage for longer, resume it with a
   higher `max_steps`.
+- **Paths in overrides** are parsed as YAML values. A path with ` #` is cut there, and one with
+  `: ` or starting with `*`, `&` or `@` fails. Plain spaces are fine.
 
 ## Prompts
 
@@ -277,7 +296,8 @@ The losses of a distribution-matching run do not fall like a fine-tuning loss. T
 the fake network chase each other, so watch for spikes and NaN rather than a downward trend. To
 judge quality, sample a checkpoint along the way. `scripts/sample.py` takes a training `.pth`
 directly, but treats it as an ordinary model; export it first to sample with the few-step
-schedule:
+schedule. Use the newest `step_*.pth` (with `--keep-last 2` older ones are deleted as training
+goes) and a GPU the training is not using:
 
 ```bash
 python submodules/iris-3b/scripts/export_distilled.py /pvc/turbo/stage1/checkpoints/step_00000800.pth \
@@ -296,7 +316,9 @@ does when a pod restarts with the same command. With `--auto-resume`:
   lags one save behind if a pod dies at the wrong moment.
 - A checkpoint left incomplete by a node crash is renamed to `*.torn` and skipped. Iris writes
   checkpoints without fsync, so after a node crash the newest one can be incomplete. This is why
-  `--keep-last` should stay at 2 or more on a network volume.
+  `--keep-last` should stay at 2 or more on a network volume. The check catches a truncated or
+  unreadable file, not one of full length whose data was lost; if a run goes wrong right after
+  a node crash, resume from the previous checkpoint by hand.
 - A stage that already reached `max_steps` exits at once with status 0.
 
 So the same command is right for the first start and every restart. Without `--auto-resume`,
@@ -313,7 +335,7 @@ pass `resume_from=<work_dir>/checkpoints/step_XXXXXXXX.pth` yourself.
   with each process's own baseline that is around 100 GB on rank 0.
 - **Disk.** Iris keeps every checkpoint: 16 saves, about 1.3 TB, for stage 1. `--keep-last 2`
   keeps two plus the one being written. Stage 2 needs stage 1's final checkpoint, which is always
-  kept; once stage 2 has started, stage 1's older checkpoint can go.
+  kept. Once stage 2 has written its first checkpoint, stage 1's checkpoints can go.
 
 ## What Turbo trades away
 

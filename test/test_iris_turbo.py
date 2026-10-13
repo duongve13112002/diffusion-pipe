@@ -663,6 +663,10 @@ exec {sys.executable} "$@"
 ''')
     (bin_dir / 'torchrun').write_text(f'''#!/usr/bin/env bash
 echo "torchrun $*" >> {log}
+if [ -n "${{HANG_TORCHRUN:-}}" ]; then
+    trap 'echo "torchrun got TERM" >> {log}; exit 143' TERM
+    touch "$HANG_TORCHRUN"; while :; do sleep 0.1; done
+fi
 for a in "$@"; do case $a in work_dir=*) wd=${{a#work_dir=}};; esac; done
 mkdir -p "$wd/checkpoints"
 case $wd in *stage1) last=00001600;; *) last=00000500;; esac
@@ -676,12 +680,15 @@ exit ${{FAIL_TORCHRUN:-0}}
     (teacher / 'config.yaml').write_text(f'text_encoder:\n  name: qwen3_vl\n  pretrained: {teacher}\n')
     out = tmp_path / 'out'
 
-    def run(**env):
+    def run(background=False, **env):
         log.write_text('')
         full = {**os.environ, 'PATH': f'{bin_dir}{os.pathsep}{os.environ["PATH"]}', 'TEACHER': str(teacher),
                 'DATASET': str(dataset), 'OUT': str(out), **env}
-        result = subprocess.run(['bash', str(EXAMPLES / 'run_turbo.sh')], cwd=ROOT, env=full,
-                                capture_output=True, text=True)
+        command = ['bash', str(EXAMPLES / 'run_turbo.sh')]
+        if background:
+            return subprocess.Popen(command, cwd=tmp_path, env=full, stdout=subprocess.PIPE,
+                                    stderr=subprocess.PIPE, text=True), log
+        result = subprocess.run(command, cwd=tmp_path, env=full, capture_output=True, text=True)
         return result, log.read_text().splitlines()
     return run, out
 
@@ -699,12 +706,51 @@ def test_run_turbo_script(run_script):
     assert f'{out}/stage2/checkpoints/step_00000500.pth {out}/export.partial --dtype bf16' in export
     assert (out / 'export' / 'model.safetensors').is_file() and not (out / 'export.partial').exists()
 
-    # a restart: the prompts and the export are kept, both stages are relaunched to auto-resume
+    # a restart after the export: nothing runs again, even with the checkpoints gone
+    for checkpoint in out.glob('stage*/checkpoints/*.pth'):
+        checkpoint.unlink()
+    result, calls = run(DATASET='')
+    assert result.returncode == 0 and calls == [] and 'already' in result.stdout
+
+
+def test_run_turbo_script_restarts_in_stage_2(run_script):
+    run, out = run_script
+    assert run()[0].returncode == 0
     prompts_before = (out / 'prompts.txt').read_bytes()
+    import shutil
+    shutil.rmtree(out / 'export')
+    # stage 1's checkpoints deleted once stage 2 has its own: stage 1 is not retrained
+    shutil.rmtree(out / 'stage1')
     result, calls = run(DATASET='')
     assert result.returncode == 0, result.stderr
-    assert [call.split()[0] for call in calls] == ['torchrun', 'torchrun']
+    stage2, export = calls
+    assert 'stage2_4step.yaml' in stage2 and f'init_from={out}/stage1/checkpoints/step_00001600.pth' in stage2
+    assert export.startswith('export')
     assert (out / 'prompts.txt').read_bytes() == prompts_before
+
+    # neither stage has checkpoints but stage 1's run is over: refused, not restarted from scratch
+    shutil.rmtree(out / 'export')
+    shutil.rmtree(out / 'stage2')
+    (out / 'stage1' / 'checkpoints').mkdir(parents=True)
+    result, calls = run(FAIL_TORCHRUN='1')
+    assert result.returncode != 0
+
+
+def test_run_turbo_script_forwards_sigterm(run_script, tmp_path):
+    import signal
+    import time
+    run, out = run_script
+    started = tmp_path / 'started'
+    process, log = run(background=True, HANG_TORCHRUN=str(started))
+    deadline = time.time() + 60
+    while not started.exists():
+        assert process.poll() is None and time.time() < deadline, process.communicate()
+        time.sleep(0.1)
+    process.send_signal(signal.SIGTERM)
+    stdout, stderr = process.communicate(timeout=30)
+    assert process.returncode == 143 and 'stopped by a signal' in stderr
+    calls = log.read_text().splitlines()
+    assert calls[-1] == 'torchrun got TERM' and len(calls) == 2  # stage 2 never started
 
 
 def test_run_turbo_script_failures(run_script):
@@ -714,6 +760,7 @@ def test_run_turbo_script_failures(run_script):
     assert not (out / 'export').exists() and (out / 'export.partial').exists()
     result, calls = run()  # the half-written export is redone, not taken as finished
     assert result.returncode == 0 and calls[-1].startswith('export')
+    assert not any('stage1_6step' in call for call in calls)
     assert (out / 'export' / 'model.safetensors').is_file() and not (out / 'export.partial').exists()
 
     result, calls = run(FAIL_TORCHRUN='1', OUT=str(out.parent / 'other'))
@@ -721,8 +768,10 @@ def test_run_turbo_script_failures(run_script):
 
     result, calls = run(NGPU='3')
     assert result.returncode != 0 and 'BATCH1' in result.stderr and calls == []
-    result, calls = run(NGPU='4')
+    result, calls = run(NGPU='4', OUT=str(out.parent / 'four'))
     assert result.returncode == 0 and 'batch_size=16' in calls[0] and 'batch_size=4' in calls[1]
 
     result, calls = run(OUT=str(out.parent / 'empty'), DATASET='')
     assert result.returncode != 0 and 'DATASET' in result.stderr
+    result, calls = run(OUT=str(out.parent / 'keep1'), KEEP_LAST='1')
+    assert result.returncode != 0 and 'KEEP_LAST' in result.stderr and calls == []
