@@ -149,6 +149,24 @@ def write_config(path, config_file, cfg, shift=None, shift_law=None, max_text_le
     OmegaConf.save(OmegaConf.create(config), str(path))
 
 
+def same_teacher(model, recorded_path, recorded_sha256):
+    """Whether --model is the teacher a Turbo LoRA recorded: by weights when it is a local
+    directory (a path can move, or hold another model), else by name."""
+    weights = Path(model) / 'model.safetensors'
+    if recorded_sha256 and weights.is_file():
+        import hashlib
+        digest = hashlib.sha256()
+        with open(weights, 'rb') as f:
+            while block := f.read(64 << 20):
+                digest.update(block)
+        return digest.hexdigest() == recorded_sha256
+    if not recorded_path:
+        return True
+    if Path(model).exists() and Path(recorded_path).exists():
+        return Path(model).resolve() == Path(recorded_path).resolve()
+    return str(model).rstrip('/') == str(recorded_path).rstrip('/')
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('--model', default='speridlabs/iris-3b', help='Base checkpoint directory or HF repo id.')
@@ -176,13 +194,14 @@ def main(argv=None):
     if adapter_distill.is_file():
         # A Turbo LoRA (tools/iris_turbo_lora.py): the merged model samples with its few-step schedule.
         from omegaconf import OmegaConf
-        recorded = OmegaConf.load(str(adapter_distill)).get('lora_teacher')
+        distill_info = OmegaConf.load(str(adapter_distill))
         shutil.copyfile(adapter_distill, out / 'distill.yaml')
         print(f'Copied {adapter_distill}: a Turbo LoRA, so the merged model samples with its few-step schedule '
               'and no CFG.')
-        if recorded and str(recorded) != str(args.model):
-            print(f'NOTE: this adapter was distilled from {recorded}; --model is {args.model}. A Turbo LoRA only '
-                  'works on the model it was distilled from.')
+        if not same_teacher(args.model, distill_info.get('lora_teacher'),
+                            distill_info.get('lora_teacher_weights_sha256')):
+            print(f'NOTE: this adapter was distilled from {distill_info.get("lora_teacher")}, which is not '
+                  f'--model {args.model}. A Turbo LoRA only works on the model it was distilled from.')
         return
     distill = resolve_file(args.model, 'distill.yaml', required=False) if Path(args.model).exists() else None
     if distill is None:

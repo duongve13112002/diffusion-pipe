@@ -309,6 +309,15 @@ if __name__ == '__main__':
         # Inline TOML tables are not pickleable, which messes up the multiprocessing dataset stuff. This is a workaround.
         config = json.loads(json.dumps(toml.load(f)))
 
+    if 'turbo' in config:
+        # Iris-3B Turbo: few-step distillation with its own trainers, not this training loop.
+        from utils import iris_turbo
+        try:
+            iris_turbo.run(config)
+        except iris_turbo.TurboConfigError as error:
+            raise SystemExit(f'[iris_turbo] {error}')
+        raise SystemExit(0)
+
     set_config_defaults(config)
     # Fail now rather than after the dataset and model have loaded.
     common.ensure_writable_dir(config['output_dir'], 'output_dir')

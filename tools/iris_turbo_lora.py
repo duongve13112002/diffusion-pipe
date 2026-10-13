@@ -1,8 +1,14 @@
 """Iris-3B Turbo as a LoRA: few-step distillation of an Iris model on one GPU or several.
 
-    torchrun --standalone --nproc_per_node=1 tools/iris_turbo_lora.py --config examples/iris/turbo/lora.toml
-    torchrun --standalone --nproc_per_node=8 tools/iris_turbo_lora.py --config examples/iris/turbo/lora.toml
-    python tools/iris_turbo_lora.py --config examples/iris/turbo/lora.toml     # one GPU, no torchrun
+Usually started by train.py from a diffusion-pipe config with [turbo] and [adapter] tables
+(utils/iris_turbo.py translates it):
+
+    deepspeed --num_gpus=8 train.py --deepspeed --config examples/iris/turbo/iris_3b_turbo_lora.toml
+
+This tool takes the same config, plus --set overrides:
+
+    torchrun --standalone --nproc_per_node=8 tools/iris_turbo_lora.py --config examples/iris/turbo/iris_3b_turbo_lora.toml
+    python tools/iris_turbo_lora.py --config my_turbo_lora.toml --set max_steps=3000   # one GPU
 
 The objective is Iris's own TDM distillation (iris3b.distill.objective and sampler, the code
 behind the released Iris-3B Turbo), but the student and the fake score network are two LoRA
@@ -13,8 +19,8 @@ adapters on ONE frozen copy of the teacher, instead of two more full copies of t
     'fake' adapter    -> the fake score network, trained online on the student's samples
     'ema' adapter     -> the student's exponential moving average, used for previews and saves
 
-So a run needs the base weights once (bf16 by default, 6 GB), the text encoder and the small
-adapters with their optimizer states: an estimated 24-28 GB of GPU memory, or 16-20 GB with
+So a run needs the base weights once (bf16 by default, ~7 GB), the text encoder and the small
+adapters with their optimizer states: an estimated 25-29 GB of GPU memory, or 17-21 GB with
 text_encoder = 'offload' (docs/iris_turbo.md). With several GPUs every
 rank holds the whole model and the adapters' gradients are averaged across ranks after each
 update, which multiplies the batch (data parallel). Teacher and fake share the same frozen base,
@@ -31,8 +37,8 @@ Output, in output_dir:
                               the newest readable one; a finished run exits at once.
     samples/step_XXXXXXXX/    previews of sample_prompts with the EMA student, if any are set.
 
-Every setting is in the TOML config (see examples/iris/turbo/lora.toml); --set key=value
-overrides one, e.g. --set output_dir=/pvc/turbo_lora --set max_steps=3000.
+docs/iris_turbo.md lists every setting. --set key=value overrides one; a dotted key reaches a
+table, e.g. --set turbo.cfg_scale=4.0 --set adapter.rank=32.
 """
 
 import argparse
@@ -190,8 +196,7 @@ def parse_value(text):
         return text
 
 
-def load_config(path, overrides=()):
-    raw = toml.load(str(path))
+def apply_overrides(raw, overrides):
     for item in overrides:
         key, sep, value = item.partition('=')
         if not sep:
@@ -201,6 +206,12 @@ def load_config(path, overrides=()):
         for parent in parents:
             target = target.setdefault(parent, {})
         target[leaf] = parse_value(value.strip())
+    return raw
+
+
+def config_from_dict(raw):
+    """A validated LoraDistillConfig from this tool's flat layout (adapter settings under `adapter`)."""
+    raw = dict(raw)
     adapter = raw.pop('adapter', {}) or {}
     known = {f.name for f in fields(LoraDistillConfig)}
     unknown = sorted(set(raw) - known)
@@ -211,6 +222,11 @@ def load_config(path, overrides=()):
     cfg = LoraDistillConfig(**raw, adapter=AdapterConfig(**adapter))
     cfg.validate()
     return cfg
+
+
+def load_config(path, overrides=()):
+    """This tool's flat TOML layout (the diffusion-pipe layout goes through utils/iris_turbo.py)."""
+    return config_from_dict(apply_overrides(toml.load(str(path)), overrides))
 
 
 # ---- distributed helpers ------------------------------------------------------------------------
@@ -338,13 +354,22 @@ def target_paths(model, targets):
 
 
 def inject(model, paths):
-    layers = {}
+    layers, replaced = {}, {}
     for path in paths:
         parent_name, _, child = path.rpartition('.')
         parent = model.get_submodule(parent_name) if parent_name else model
-        layer = LoRALinear(getattr(parent, child))
+        old = getattr(parent, child)
+        layer = LoRALinear(old)
         setattr(parent, child, layer)
         layers[path] = layer
+        replaced[id(old)] = layer
+    # Iris's shared adaLN cores (modulation_cores) are called by every block through a reference
+    # hidden in a tuple (iris3b.nn.modulation), not through the ModuleDict: point those at the
+    # LoRA layer too, or its adapters never see a forward pass.
+    for module in model.modules():
+        core = getattr(module, '_core', None)
+        if isinstance(core, tuple) and core and id(core[0]) in replaced:
+            module._core = (replaced[id(core[0])],)
     return layers
 
 
@@ -361,7 +386,8 @@ def adapter_state(layers, name, dtype=None):
     for path, layer in layers.items():
         for part in ('lora_A', 'lora_B'):
             tensor = getattr(layer, part)[name].weight.detach()
-            state[f'{path}.{part}.weight'] = tensor.to(dtype) if dtype else tensor.clone()
+            # host copies: a save must not need GPU memory when the card is fullest
+            state[f'{path}.{part}.weight'] = tensor.to('cpu', dtype=dtype or tensor.dtype, copy=True)
     return state
 
 
@@ -391,7 +417,7 @@ def resolve_teacher(teacher):
         return path
     if re.fullmatch(r'[\w.-]+/[\w.-]+', teacher):
         from huggingface_hub import hf_hub_download
-        if rank() == 0:
+        if int(os.environ.get('LOCAL_RANK', '0')) == 0:  # once per node: nodes may not share a cache
             for name in ('config.yaml', 'model.safetensors'):
                 hf_hub_download(teacher, name)
         barrier()
@@ -407,7 +433,29 @@ def file_digest(path, chunk=64 << 20):
     return digest.hexdigest()
 
 
-def load_teacher(teacher, device, base_dtype):
+def cached_digest(path, cache_file):
+    """file_digest, remembered by (path, size, mtime): a restart need not read 6-12 GB again."""
+    stat = os.stat(path)
+    key = {'path': str(Path(path).resolve()), 'size': stat.st_size, 'mtime_ns': stat.st_mtime_ns}
+    if cache_file is not None:
+        try:
+            cached = json.loads(Path(cache_file).read_text(encoding='utf-8'))
+            if cached.get('key') == key:
+                return cached['sha256']
+        except (OSError, ValueError):
+            pass
+    digest = file_digest(path)
+    if cache_file is not None:
+        try:
+            tmp = Path(cache_file).with_name(f'.{Path(cache_file).name}.tmp-{uuid.uuid4().hex}')
+            tmp.write_text(json.dumps({'key': key, 'sha256': digest}), encoding='utf-8')
+            os.replace(tmp, cache_file)
+        except OSError:
+            pass
+    return digest
+
+
+def load_teacher(teacher, device, base_dtype, digest_cache=None):
     """(IrisDiT on device with the teacher's weights, inference config, raw config, identity)."""
     from omegaconf import OmegaConf
     from iris3b.config import INFERENCE_SECTIONS, inference_config
@@ -435,7 +483,7 @@ def load_teacher(teacher, device, base_dtype):
         with safe_open(str(teacher / 'model.safetensors'), framework='pt', device='cpu') as f:
             for key in f.keys():
                 state[key] = f.get_tensor(key).to(device=device, dtype=dtype_for(key))
-        identity = file_digest(teacher / 'model.safetensors') if rank() == 0 else None
+        identity = cached_digest(teacher / 'model.safetensors', digest_cache) if rank() == 0 else None
     else:
         from iris3b.distill.trainer import tensor_content_hash
         from iris3b.sampling import load_for_inference
@@ -473,18 +521,29 @@ def read_checkpoint(path):
 
 
 def newest_checkpoint(directory):
-    """(step, path, payload) of the newest checkpoint that loads; unreadable ones become *.torn."""
+    """(step, path, payload) of the newest checkpoint that loads; corrupt ones become *.torn.
+
+    An I/O error (a network volume hiccup) is raised, not taken for corruption. If checkpoints were
+    set aside, now or by an earlier start, and none loads, this refuses to start the run over.
+    """
     for step, path in reversed(checkpoint_files(directory)):
         try:
             payload = read_checkpoint(path)
             if payload.get('format_version') != FORMAT_VERSION or 'student' not in payload:
                 raise ValueError('not a checkpoint of this tool')
             return step, path, payload
+        except OSError:
+            raise
         except Exception as error:
             torn = path.with_name(path.name + '.torn')
             log(f'WARNING: {path} is unreadable ({type(error).__name__}: {error}), probably cut off by a crash; '
                 f'renamed to {torn.name}, resuming from the one before')
             os.replace(path, torn)
+    torn = sorted(Path(directory).glob('*.torn'))
+    if torn:
+        raise ConfigError(f'no readable checkpoint in {directory}, and {len(torn)} set aside as unreadable '
+                          f'({torn[-1].name}). Starting over would lose the run: delete the *.torn files to '
+                          'start from step 0, or use a new output_dir.')
     return None
 
 
@@ -572,20 +631,30 @@ class LoraDistiller:
         self.step = 0
         self.fake_steps = 0
         null = text_encoder.null('')
-        self.null = (null.embeddings.to(device=device, dtype=torch.bfloat16), null.mask.to(device))
+        self.null = (null.embeddings.to(device), null.mask.to(device))
         self.output = Path(cfg.output_dir)
         self.sample_conditioning = None
 
+    # -- global RNG (adapter dropout) --
+    def global_rng(self):
+        return {'cpu': torch.get_rng_state(),
+                'cuda': torch.cuda.get_rng_state(self.device) if self.device.type == 'cuda' else None}
+
+    def set_global_rng(self, state):
+        torch.set_rng_state(state['cpu'])
+        if state.get('cuda') is not None and self.device.type == 'cuda':
+            torch.cuda.set_rng_state(state['cuda'], self.device)
+
     # -- text --
     def encode(self, prompts):
-        """Prompt encodings kept in bf16 (the encoder's own dtype) until a micro-batch uses them."""
+        """Prompt encodings, in the encoder's own dtype until a micro-batch uses them."""
         if self.cfg.text_encoder == 'offload':
             self.text_encoder.to(self.device)
         try:
             out = []
             for start in range(0, len(prompts), 16):
                 encoding = self.text_encoder.encode(prompts[start:start + 16])
-                out.append((encoding.embeddings.to(self.device, torch.bfloat16), encoding.mask.to(self.device)))
+                out.append((encoding.embeddings.to(self.device), encoding.mask.to(self.device)))
         finally:
             if self.cfg.text_encoder == 'offload':
                 self.text_encoder.to('cpu')
@@ -605,7 +674,8 @@ class LoraDistiller:
         embeddings, mask = conditioning['uncond' if uncond else 'cond']
 
         def call(x, t_model):
-            self.model.train(train)
+            # as Iris: the no-grad steps of a rollout run in eval mode, without checkpointing or dropout
+            self.model.train(train and torch.is_grad_enabled())
             with adapter(name), torch.autocast(device_type=self.autocast_device, dtype=torch.bfloat16):
                 output = self.model(x, t_model, embeddings, y_mask=mask).x
             return output.float()
@@ -646,7 +716,12 @@ class LoraDistiller:
 
     def apply(self, params, optimizer):
         """Average gradients over ranks, clip, step. Returns the gradient norm."""
-        grads = [p.grad if p.grad is not None else torch.zeros_like(p) for p in params]
+        missing = sum(p.grad is None for p in params)
+        if missing:
+            # the same on every rank: the graph does not depend on the data
+            raise RuntimeError(f'{missing} adapter parameters got no gradient: some target_modules are not '
+                               'used by the forward pass')
+        grads = [p.grad for p in params]
         if self.world > 1:
             flat = torch.cat([g.reshape(-1) for g in grads])
             torch.distributed.all_reduce(flat)
@@ -746,6 +821,15 @@ class LoraDistiller:
             return
         if self.sample_conditioning is None:
             self.sample_conditioning = self.encode(list(cfg.sample_prompts))
+        error = None
+        try:
+            self._preview(step)
+        except Exception as exc:
+            error = exc
+        all_ok(error)
+
+    def _preview(self, step):
+        cfg = self.cfg
         embeddings, mask = self.sample_conditioning
         name = 'ema' if self.ema is not None else 'student'
         height, width = cfg.sample_size
@@ -771,7 +855,6 @@ class LoraDistiller:
         if self.rank == 0:
             (out_dir / 'prompts.txt').write_text('\n'.join(f'{i:03d}: {p}' for i, p in enumerate(cfg.sample_prompts))
                                                  + '\n', encoding='utf-8')
-        barrier()
 
     # -- saving --
     def export_adapter(self, step):
@@ -789,7 +872,7 @@ class LoraDistiller:
         try:
             name = 'ema' if self.ema is not None else 'student'
             state = adapter_state(self.layers, name, DTYPES[cfg.save_dtype])
-            state = {'diffusion_model.' + k: v.contiguous().cpu() for k, v in state.items()}
+            state = {'diffusion_model.' + k: v.contiguous() for k, v in state.items()}
             safetensors.torch.save_file(state, str(tmp / 'adapter_model.safetensors'), metadata={'format': 'pt'})
             peft.LoraConfig(r=cfg.adapter.rank, lora_alpha=cfg.adapter.alpha, lora_dropout=0.0, bias='none',
                             target_modules=sorted(self.layers)).save_pretrained(str(tmp))
@@ -803,11 +886,16 @@ class LoraDistiller:
             for path in tmp.iterdir():
                 with open(path, 'rb') as f:
                     os.fsync(f.fileno())
+            old = None
             if final.is_dir():
-                # left by an attempt that crashed before its checkpoint; this run's state replaces it
-                shutil.rmtree(final)
+                # left by an attempt that crashed before its checkpoint; this run's state replaces it.
+                # Moved aside first (a scratch name, removed at startup), so step_N is never partial.
+                old = final.with_name(f'.{final.name}.tmp-{uuid.uuid4().hex}')
+                os.replace(final, old)
             os.replace(tmp, final)
             fsync_dir(final.parent)
+            if old is not None:
+                shutil.rmtree(old, ignore_errors=True)
         finally:
             if tmp.exists():
                 shutil.rmtree(tmp, ignore_errors=True)
@@ -816,16 +904,18 @@ class LoraDistiller:
         """The exported adapter first, then the training checkpoint: a checkpoint never exists
         without its adapter, so a restart never has to re-export one."""
         step = self.step
-        self.export_adapter(step)
         generators = [None] * self.world
+        rngs = [None] * self.world
         state = self.generator.get_state()
         if self.world > 1:
             torch.distributed.all_gather_object(generators, state.cpu())
+            torch.distributed.all_gather_object(rngs, self.global_rng())
         else:
-            generators = [state.cpu()]
+            generators, rngs = [state.cpu()], [self.global_rng()]
         error = None
         if self.rank == 0:
             try:
+                self.export_adapter(step)
                 payload = {
                     'format_version': FORMAT_VERSION,
                     'step': step, 'fake_steps': self.fake_steps,
@@ -835,7 +925,7 @@ class LoraDistiller:
                     'fake': adapter_state(self.layers, 'fake'),
                     'ema': adapter_state(self.layers, 'ema') if self.ema is not None else None,
                     'optimizer': self.optimizer.state_dict(), 'fake_optimizer': self.fake_optimizer.state_dict(),
-                    'generators': generators,
+                    'generators': generators, 'rng': rngs,
                 }
                 checkpoints = self.output / 'checkpoints'
                 save_atomic(payload, checkpoints / f'step_{step:08d}.pt')
@@ -859,11 +949,16 @@ class LoraDistiller:
             for group in optimizer.param_groups:
                 group['lr'] = lr
         self.generator.set_state(payload['generators'][self.rank].to(self.generator.get_state().device))
+        if payload.get('rng'):
+            self.set_global_rng(payload['rng'][self.rank])
         self.prompts.cursor = payload['prompt_state']['cursor']
         self.step, self.fake_steps = payload['step'], payload['fake_steps']
 
     def warm_start(self, payload):
         """init_from: the student from another run's EMA (or raw student), the fake network as it was."""
+        if payload.get('teacher_identity') != self.identity:
+            log('WARNING: init_from was distilled from a different teacher (weights or config) than this '
+                "run's; its adapters start from that model's corrections")
         student = payload['ema'] if payload.get('ema') is not None else payload['student']
         load_adapter_state(self.layers, 'student', student)
         load_adapter_state(self.layers, 'fake', payload['fake'])
@@ -913,10 +1008,20 @@ def build_text_encoder(base, cfg, device):
             encoder = TEXT_ENCODERS.build(te_cfg.name, te_cfg, placement)
             if cfg.text_encoder == 'offload':
                 encoder.to(device)
+            try:
                 encoder.null('')
+            except Exception as error:
+                if rank() != 0:
+                    raise
+                # Iris writes this cache with a plain torch.save: a pod killed mid-write leaves a
+                # file that fails every restart. It is only a cache, so compute it again.
+                log(f'the empty-prompt cache in {te_cfg.null_embed_dir} is unreadable ({type(error).__name__}: '
+                    f'{error}); computing it again')
+                import shutil
+                shutil.rmtree(te_cfg.null_embed_dir, ignore_errors=True)
+                encoder.null('')
+            if cfg.text_encoder == 'offload':
                 encoder.to('cpu')
-            else:
-                encoder.null('')
         barrier()
     return encoder
 
@@ -952,8 +1057,17 @@ def build(cfg, device):
             if found:
                 # before the teacher loads, so a wrong restart fails in seconds
                 check_resume(found[2], cfg, world_size(), PromptStream.from_file(cfg.prompts_file).sha256)
+            adapters = output / 'adapters'
+            if found is None and adapters.is_dir() and any(adapters.glob('step_*')):
+                # an earlier run's adapters, past where this one starts: keep them out of its way
+                aside = output / f'adapters.before-{time.strftime("%Y%m%d-%H%M%S")}'
+                os.replace(adapters, aside)
+                log(f'no checkpoint to resume from, so this run starts at step 0; the adapters already in '
+                    f'{adapters} were moved to {aside.name}')
             if found is None and cfg.init_from:
-                read_checkpoint(cfg.init_from)['student']  # readable, and one of ours
+                payload = read_checkpoint(cfg.init_from)
+                if payload.get('format_version') != FORMAT_VERSION or 'student' not in payload:
+                    raise ConfigError(f'init_from {cfg.init_from} is not a checkpoint of this tool')
         except Exception as exc:
             error = exc
     all_ok(error)
@@ -964,7 +1078,8 @@ def build(cfg, device):
         return None
 
     teacher = resolve_teacher(cfg.teacher)
-    model, base, raw, identity = load_teacher(teacher, device, DTYPES[cfg.base_dtype])
+    model, base, raw, identity = load_teacher(teacher, device, DTYPES[cfg.base_dtype],
+                                              digest_cache=output / 'cache' / 'teacher_sha256.json')
     for h, w in cfg.resolutions + [cfg.sample_size]:
         if h % base.model.patch_size or w % base.model.patch_size:
             raise ConfigError(f'every resolution must be divisible by the patch size {base.model.patch_size}, '
@@ -993,6 +1108,7 @@ def build(cfg, device):
                 torch.distributed.broadcast(param.data, src=0)
     for param in adapter_params(layers, 'student') + adapter_params(layers, 'fake'):
         param.requires_grad_(True)
+    torch.manual_seed(cfg.seed * 1000003 + rank())  # each rank its own dropout masks from here on
     count = sum(p.numel() for p in adapter_params(layers, 'student'))
     log(f'teacher {cfg.teacher}: {len(layers)} linear layers adapted, {count / 1e6:.1f}M parameters per adapter')
 
@@ -1016,15 +1132,26 @@ def build(cfg, device):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument('--config', required=True, help='TOML config (examples/iris/turbo/lora.toml).')
+    parser.add_argument('--config', required=True,
+                        help='TOML config: a diffusion-pipe style one (examples/iris/turbo/iris_3b_turbo_lora.toml) '
+                             'or this tool\'s flat layout.')
     parser.add_argument('--set', action='append', default=[], metavar='KEY=VALUE',
                         help='Override a config key, e.g. --set max_steps=3000 or --set adapter.rank=32.')
     parser.add_argument('--allow-cudnn-attention', action='store_true',
                         help="Keep PyTorch's cuDNN attention kernel (its backward returned NaN on "
                              'H200 / torch 2.12 / cuDNN 9.20).')
     args = parser.parse_args(argv)
-    cfg = load_config(args.config, args.set)
-    if not args.allow_cudnn_attention and hasattr(torch.backends.cuda, 'enable_cudnn_sdp'):
+    raw = apply_overrides(toml.load(args.config), args.set)
+    if 'model' in raw:
+        # the diffusion-pipe layout, as train.py runs it
+        from utils import iris_turbo
+        return iris_turbo.run(raw, allow_cudnn_attention=args.allow_cudnn_attention)
+    return run(config_from_dict(raw), args.allow_cudnn_attention)
+
+
+def run(cfg, allow_cudnn_attention=False):
+    """Train (or resume) the run `cfg` describes. Returns the trainer, None for a finished run."""
+    if not allow_cudnn_attention and hasattr(torch.backends.cuda, 'enable_cudnn_sdp'):
         torch.backends.cuda.enable_cudnn_sdp(False)
     device = setup_device(cfg)
     random.seed(cfg.seed + rank())
@@ -1045,9 +1172,9 @@ def main(argv=None):
         if torch.distributed.is_initialized():
             torch.distributed.destroy_process_group()
 
-
 if __name__ == '__main__':
+    from utils.iris_turbo import TurboConfigError
     try:
         main()
-    except ConfigError as error:
+    except (ConfigError, TurboConfigError) as error:
         raise SystemExit(f'[iris_turbo_lora] {error}')

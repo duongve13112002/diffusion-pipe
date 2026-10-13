@@ -258,6 +258,56 @@ def test_torn_checkpoint_is_set_aside(run, tmp_path, capsys):
     assert 'unreadable' in capsys.readouterr().out
 
 
+def test_an_io_error_is_not_corruption_and_a_run_of_torn_checkpoints_is_not_restarted(run, tmp_path, monkeypatch):
+    config, train = run
+    cfg = config()
+    train('--config', cfg, '--set', 'max_steps=2')
+    checkpoints = tmp_path / 'out' / 'checkpoints'
+    real = lora.read_checkpoint
+
+    def flaky(path):
+        raise OSError(5, 'Input/output error')
+    monkeypatch.setattr(lora, 'read_checkpoint', flaky)
+    with pytest.raises(OSError, match='Input/output'):
+        lora.newest_checkpoint(checkpoints)
+    assert sorted(p.name for p in checkpoints.iterdir()) == ['step_00000002.pt']
+    monkeypatch.setattr(lora, 'read_checkpoint', real)
+    only = checkpoints / 'step_00000002.pt'
+    only.write_bytes(only.read_bytes()[:1000])
+    for _ in range(2):  # the restart after the one that set it aside refuses too
+        with pytest.raises(lora.ConfigError, match='delete the \\*.torn files'):
+            train('--config', cfg, '--set', 'max_steps=3')
+
+
+def test_every_adapter_layer_trains(tmp_path, monkeypatch):
+    """Iris's shared adaLN cores are called through a hidden reference, not the ModuleDict."""
+    write_teacher(tmp_path / 'teacher')
+    (tmp_path / 'prompts.txt').write_text('a\nb\nc\nd\n', encoding='utf-8')
+    monkeypatch.setattr(lora, 'build_text_encoder', stand_in)
+    cfg_path = tmp_path / 'cfg.toml'
+    cfg_path.write_text(CONFIG.format(teacher=tmp_path / 'teacher', prompts=tmp_path / 'prompts.txt',
+                                      output=tmp_path / 'out'), encoding='utf-8')
+    trainer = lora.build(lora.load_config(cfg_path), torch.device('cpu'))
+    assert any(path.startswith('modulation_cores.') for path in trainer.layers)
+    trainer.cycle()
+    for path, layer in trainer.layers.items():
+        for name in ('student', 'fake'):
+            assert layer.lora_B[name].weight.abs().sum() > 0, f'{path} ({name}) did not train'
+
+
+def test_a_fresh_start_moves_an_earlier_runs_adapters_aside(run, tmp_path, capsys):
+    config, train = run
+    cfg = config()
+    stale = tmp_path / 'out' / 'adapters' / 'step_00000500'
+    stale.mkdir(parents=True)
+    (stale / 'adapter_model.safetensors').write_bytes(b'old')
+    train('--config', cfg, '--set', 'max_steps=2')
+    assert sorted(p.name for p in (tmp_path / 'out' / 'adapters').iterdir()) == ['step_00000002']
+    aside, = (tmp_path / 'out').glob('adapters.before-*')
+    assert (aside / 'step_00000500' / 'adapter_model.safetensors').read_bytes() == b'old'
+    assert 'moved to adapters.before-' in capsys.readouterr().out
+
+
 def test_offload_and_bf16_base_and_accumulation(run, tmp_path):
     config, train = run
     trainer = train('--config', config(), '--set', 'text_encoder="offload"', '--set', 'base_dtype="bfloat16"',
@@ -295,21 +345,18 @@ def test_config_errors(run, tmp_path):
     assert lora.load_config(cfg, ['output_dir=/x/y']).output_dir == '/x/y'
 
 
-def test_example_config_is_the_defaults():
-    from dataclasses import asdict
-    example = asdict(lora.load_config(ROOT / 'examples' / 'iris' / 'turbo' / 'lora.toml'))
-    defaults = asdict(lora.LoraDistillConfig())
-    assert {k for k in example if example[k] != defaults[k]} == {'teacher', 'prompts_file', 'output_dir',
-                                                                 'sample_prompts'}
-
-
-def test_exported_adapter_merges_into_the_student(run, tmp_path):
+def test_exported_adapter_merges_into_the_student(run, tmp_path, capsys):
     config, train = run
     trainer = train('--config', config(), '--set', 'save_dtype="float32"')
     adapters = tmp_path / 'out' / 'adapters' / 'step_00000003'
     from tools import iris_merge_adapter
     iris_merge_adapter.main(['--model', str(tmp_path / 'teacher'), '--adapter', str(adapters),
                              '--output', str(tmp_path / 'merged')])
+    assert 'NOTE' not in capsys.readouterr().out
+    write_teacher(tmp_path / 'other', seed=1)  # the same path name check would miss a different model
+    iris_merge_adapter.main(['--model', str(tmp_path / 'other'), '--adapter', str(adapters),
+                             '--output', str(tmp_path / 'merged_other')])
+    assert 'NOTE: this adapter was distilled from' in capsys.readouterr().out
     assert (tmp_path / 'merged' / 'distill.yaml').read_text() == (adapters / 'distill.yaml').read_text()
     from iris3b.config import inference_config
     from iris3b.models.dit import IrisDiT

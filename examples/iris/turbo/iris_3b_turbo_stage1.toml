@@ -1,0 +1,59 @@
+# Iris-3B Turbo from your own Iris model, the whole model (full Turbo), stage 1: a 6-step student.
+# Same layout as the other diffusion-pipe configs; the [turbo] table makes train.py run Iris's own
+# distillation trainer (iris3b.distill, which produced Iris-3B Turbo) instead of its training loop.
+# No [adapter] table: the whole model is distilled. Iris's recipe (turbo_stage1_6step.yaml), for
+# 8 x H200 (about 140 GB per GPU with fsdp2):
+#
+#   deepspeed --num_gpus=8 train.py --deepspeed --config examples/iris/turbo/iris_3b_turbo_stage1.toml
+#   deepspeed --num_gpus=8 train.py --deepspeed --config examples/iris/turbo/iris_3b_turbo_stage2.toml
+#   python submodules/iris-3b/scripts/export_distilled.py \
+#       /data/turbo/stage2/checkpoints/step_00000500.pth /data/turbo/export --dtype bf16
+#
+# Run the same command again after any interruption: it continues from the newest checkpoint and
+# a finished stage exits at once. Guide: docs/iris_turbo.md.
+output_dir = '/data/turbo/stage1'
+# Turbo reads no images, only text: the captions of this dataset are written once to
+# output_dir/prompts.txt. Stage 2 should read the same prompts: point its [turbo] prompts_file here.
+dataset = 'examples/iris/iris_3b_dataset.toml'
+
+# Global batch = micro_batch_size_per_gpu x GPUs. The recipe's is 64: 8 per GPU on 8 GPUs (16 on
+# 4, 32 on 2). Iris's trainer has no gradient accumulation: every update reads a fresh batch.
+micro_batch_size_per_gpu = 8
+gradient_clipping = 1.0
+max_steps = 1600         # student updates; each one and its fake update read 2 x 64 prompts
+# ~84 GB per checkpoint, the newest [turbo] keep_last kept. Each save has to finish inside
+# [turbo] nccl_timeout_minutes (rank 0 writes while the others wait).
+save_every_n_steps = 100
+steps_per_print = 10
+activation_checkpointing = true
+
+[model]
+type = 'iris'
+# Your fine-tune: a diffusion-pipe full fine-tune save dir (its ema/ with EMA on), a LoRA merged
+# with tools/iris_merge_adapter.py, or speridlabs/iris-3b itself.
+transformer_path = '/data/diffusion_pipe_training_runs/iris_full/my-run/epoch6/ema'
+
+[optimizer]
+type = 'adamw'
+lr = 1e-6
+fake_lr = 5e-6
+betas = [0.0, 0.999]
+weight_decay = 0.0
+
+[turbo]
+# ddp needs ~160 GB per GPU at batch 8, more than an H200 has. fsdp2 shards student, fake network,
+# EMA and optimizer states over the GPUs and keeps the global batch. Its saves gather the whole
+# checkpoint (~84 GB) into rank 0's CPU memory: give the machine well over 100 GB.
+strategy = 'fsdp2'
+seed = 62
+sigmas = [1.0, 0.926, 0.833, 0.714, 0.556, 0.333]
+cfg_scale = 3.5          # guidance distilled into the student; the base model's usual CFG
+sigma_min = 0.01
+height = 1024
+width = 1024
+# about one megapixel; every global batch draws one bucket
+resolutions = [[1024, 1024], [752, 1344], [896, 1344], [896, 1200], [1200, 896], [1344, 896], [1344, 752]]
+fake_updates = 1
+ema_decay = 0.999
+keep_last = 2            # checkpoints kept; 0 keeps all (16 saves, ~1.3 TB)
+nccl_timeout_minutes = 120

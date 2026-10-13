@@ -1,0 +1,85 @@
+# Iris-3B Turbo as a LoRA: distill your Iris model into a 4-step adapter, on one GPU or several.
+# Same layout as the other diffusion-pipe configs; the [turbo] table makes train.py run the
+# Turbo distillation instead of its training loop, and [adapter] makes it a LoRA.
+#
+#   deepspeed --num_gpus=1 train.py --deepspeed --config examples/iris/turbo/iris_3b_turbo_lora.toml
+#   deepspeed --num_gpus=8 train.py --deepspeed --config examples/iris/turbo/iris_3b_turbo_lora.toml
+#
+# Run the same command again after any interruption: it continues from the newest checkpoint in
+# output_dir, and a finished run exits at once. Guide: docs/iris_turbo.md ("Turbo as a LoRA").
+output_dir = '/data/diffusion_pipe_training_runs/iris_3b_turbo_lora'
+# The prompts: Turbo reads no images, only text. The captions of this dataset (the one your model
+# was trained on) are written once to output_dir/prompts.txt, without tag shuffling or dropout.
+# Or give a ready file with [turbo] prompts_file (tools/iris_turbo_prompts.py writes one).
+dataset = 'examples/iris/iris_3b_dataset.toml'
+
+# Global batch = micro_batch_size_per_gpu x gradient_accumulation_steps x GPUs. 1 on one GPU
+# works (a single GPU community run used 1); more GPUs give a less noisy update at the same rate.
+micro_batch_size_per_gpu = 1
+gradient_accumulation_steps = 1
+gradient_clipping = 1.0
+# Turbo counts student updates, not epochs.
+max_steps = 2000
+# An adapter in output_dir/adapters/step_N and a training checkpoint (~3 GB at rank 64).
+save_every_n_steps = 100
+steps_per_print = 10
+activation_checkpointing = true
+save_dtype = 'bfloat16'
+
+[model]
+type = 'iris'
+# The model to distill (the teacher): a full fine-tune save dir (its ema/ with EMA), a LoRA merged
+# with tools/iris_merge_adapter.py, a local `hf download speridlabs/iris-3b`, or the repo id.
+# The resulting adapter only works on this exact model.
+transformer_path = '/data/diffusion_pipe_training_runs/iris_full/my-run/epoch6/ema'
+# The frozen base the adapters sit on (~7 GB: the embedders and pixel head stay float32);
+# 'float32' makes it ~12 GB.
+dtype = 'bfloat16'
+
+[adapter]
+type = 'lora'
+rank = 64
+alpha = 64
+# The fake score network is a second adapter on the same base.
+fake_rank = 64
+fake_alpha = 64
+# Every linear layer but the text adapter. Entries are IrisDiT class names or top-level modules.
+#target_modules = ['s_embedder', 't_embedder', 'modulation_cores', 'MMDiTBlock', 'SingleStreamBlock',
+#                  'pixel_embedder', 'PiTBlock', 'final_layer']
+
+[optimizer]
+type = 'adamw'
+# Starting points, not tuned at scale. Iris's full-model recipe uses a fake rate 5x the student's;
+# a community DMD2 LoRA collapsed to texture at 5e-5 and was stable at 2.5e-5. If previews lose
+# contrast or turn to texture, go back to an earlier adapter and lower lr.
+lr = 2e-5
+fake_lr = 1e-4
+betas = [0.0, 0.999]
+weight_decay = 0.0
+
+[turbo]
+# The student's schedule: the noise levels its 4 steps start at (Iris's released Turbo schedule).
+sigmas = [1.0, 0.938, 0.833, 0.625]
+cfg_scale = 3.5          # the teacher's guidance, baked into the student; use the CFG your model samples best at
+# About one megapixel, one bucket drawn per micro-batch. Below ~1 MP Iris shows 16 px block
+# artifacts that a student would learn.
+resolutions = [[1024, 1024], [752, 1344], [896, 1344], [896, 1200], [1200, 896], [1344, 896], [1344, 752]]
+fake_updates = 2         # fake-network updates per student update
+ema_decay = 0.99         # the exported adapter is this EMA of the student
+keep_last = 2            # training checkpoints kept; every exported adapter is kept
+# 'gpu' keeps the text encoder (Qwen3-VL-4B, ~8 GB) on the GPU. 'offload' keeps it in CPU memory
+# and moves it over once per update: ~8 GB less GPU memory, a second or two slower per update.
+text_encoder = 'gpu'
+# General prompts added to the dataset's captions keep the student close to the base model's range:
+#extra_prompts = ['/data/prompts/general.txt']
+
+# Previews with the EMA student, every sample_every updates, in output_dir/samples/step_N. Watch
+# these: a distillation's losses do not show quality.
+sample_every = 100
+sample_size = [1024, 1024]
+sample_prompts = [
+    'a red fox sleeping in fresh snow, golden hour',
+    'a bowl of ramen on a wooden table, steam rising, close-up photograph',
+    'a lighthouse on a cliff at night under the milky way',
+    'portrait of an old fisherman with a grey beard, overcast light',
+]

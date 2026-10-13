@@ -913,10 +913,11 @@ model you trained here can be distilled the same way: a prompts file built from 
 captions (`tools/iris_turbo_prompts.py`), a launcher with checks, safe restarts and checkpoint
 pruning (`tools/iris_turbo_distill.py`), stage configs for 8 GPUs, a one-command script and a
 Kubernetes Job (`examples/iris/turbo/`). For a single GPU, `tools/iris_turbo_lora.py` distills
-into a LoRA instead. See [Iris-3B Turbo](iris_turbo.md) for the full guide:
+into a LoRA instead. Both take a normal diffusion-pipe config with a `[turbo]` table, started
+with `train.py` (`[adapter]` makes it a LoRA). See [Iris-3B Turbo](iris_turbo.md) for the full guide:
 ```
-TEACHER=/pvc/runs/iris_full/<run>/epoch6/ema DATASET=/pvc/configs/dataset.toml OUT=/pvc/turbo \
-    bash examples/iris/turbo/run_turbo.sh
+deepspeed --num_gpus=1 train.py --deepspeed --config examples/iris/turbo/iris_3b_turbo_lora.toml
+deepspeed --num_gpus=8 train.py --deepspeed --config examples/iris/turbo/iris_3b_turbo_stage1.toml
 ```
 Distill a fine-tune of the base model rather than fine-tuning `iris-3b/turbo` itself: training
 erodes Turbo's few-step sampling, and diffusion-pipe warns when it loads a Turbo checkpoint.

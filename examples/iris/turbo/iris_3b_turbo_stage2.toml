@@ -1,0 +1,49 @@
+# Iris-3B Turbo, the whole model (full Turbo), stage 2 (the released schedule): a 4-step student
+# warm-started from stage 1. Iris's recipe (turbo_stage2_4step.yaml); run after stage 1:
+#
+#   deepspeed --num_gpus=8 train.py --deepspeed --config examples/iris/turbo/iris_3b_turbo_stage2.toml
+#   python submodules/iris-3b/scripts/export_distilled.py \
+#       /data/turbo/stage2/checkpoints/step_00000500.pth /data/turbo/export --dtype bf16
+#
+# The teacher stays the same model as in stage 1. init_from is stage 1's final checkpoint: the
+# student starts from its EMA (init_weights = 'ema') and the fake network from stage 1's, with
+# fresh optimizers, counters and prompt order. It is ignored when the run resumes.
+output_dir = '/data/turbo/stage2'
+
+# The recipe's global batch is 16 (8 per GPU on 2 GPUs). On 8 GPUs that is 2 per GPU; keep
+# micro_batch_size_per_gpu x GPUs = 16, since the learning rates below were set for it.
+micro_batch_size_per_gpu = 2
+gradient_clipping = 1.0
+max_steps = 500
+save_every_n_steps = 100
+steps_per_print = 10
+activation_checkpointing = true
+
+[model]
+type = 'iris'
+transformer_path = '/data/diffusion_pipe_training_runs/iris_full/my-run/epoch6/ema'
+
+[optimizer]
+type = 'adamw'
+lr = 2.5e-7
+fake_lr = 2.5e-6
+betas = [0.0, 0.999]
+weight_decay = 0.0
+
+[turbo]
+# stage 1's prompts, so both stages distill the same distribution
+prompts_file = '/data/turbo/stage1/prompts.txt'
+init_from = '/data/turbo/stage1/checkpoints/step_00001600.pth'
+init_weights = 'ema'
+strategy = 'fsdp2'
+seed = 76
+sigmas = [1.0, 0.938, 0.833, 0.625]
+cfg_scale = 3.5
+sigma_min = 0.01
+height = 1024
+width = 1024
+resolutions = [[1024, 1024], [752, 1344], [896, 1344], [896, 1200], [1200, 896], [1344, 896], [1344, 752]]
+fake_updates = 1
+ema_decay = 0.9995       # the released Turbo is this EMA after 500 student updates
+keep_last = 2
+nccl_timeout_minutes = 120
