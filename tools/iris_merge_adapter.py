@@ -172,6 +172,12 @@ def main(argv=None):
     safetensors.torch.save_file(state_dict, str(out / 'model.safetensors'), metadata={'format': 'pt'})
     write_config(out / 'config.yaml', config_file, cfg, args.shift, args.shift_law, args.max_text_length)
     print(f'Wrote {len(state_dict)} tensors to {out / "model.safetensors"}')
+    distill = resolve_file(args.model, 'distill.yaml', required=False) if Path(args.model).exists() else None
+    if distill is not None:
+        # A Turbo base: keep its few-step schedule, which is how Iris's sample.py knows to use it.
+        shutil.copyfile(distill, out / 'distill.yaml')
+        print(f'Copied {distill.name}: the base is Iris-3B Turbo, so the merged model samples with its '
+              'few-step schedule and no CFG.')
 
 
 if __name__ == '__main__':

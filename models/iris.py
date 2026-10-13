@@ -398,6 +398,15 @@ class IrisPipeline(BasePipeline):
 
         self.transformer_path = self.model_config.get('transformer_path', DEFAULT_REPO_ID)
         self.iris_config, self.iris_raw_config = load_iris_config(self.transformer_path)
+        local = Path(self.transformer_path)
+        local = local if local.is_dir() else local.parent
+        if Path(self.transformer_path).exists() and (local / 'distill.yaml').is_file() and is_main_process():
+            # Iris-3B Turbo (iris-3b/turbo): a 4-step model with CFG distilled in. Training it with
+            # the flow-matching loss pulls it back toward a many-step model, and the save has no
+            # distill.yaml, so Iris samples it with the normal schedule.
+            print(f'WARNING: {self.transformer_path} is a Turbo (distilled) checkpoint. Fine-tuning erodes its '
+                  'few-step sampling; train on the base Iris-3B and distill the result instead '
+                  '(tools/iris_turbo_distill.py).')
         model_cfg = self.iris_config.model
         # What save_model writes back: a training-time attention backend (fa3, say) must not
         # end up in the exported config, where it would bind inference to that GPU.

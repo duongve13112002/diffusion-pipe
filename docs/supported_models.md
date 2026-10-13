@@ -905,3 +905,83 @@ Saving:
 
 fp8 `transformer_dtype` is untested and not listed as supported.
 
+
+### Iris-3B Turbo: distilling your fine-tune
+[Iris-3B Turbo](https://github.com/speridlabs/iris-3b#iris-3b-turbo) samples in 4 steps with no
+CFG. Iris made it with TDM distillation, and its trainer ships in the submodule. That trainer is
+not a diffusion-pipe model type: it uses three copies of the network (a frozen teacher, the
+student and an online "fake" score network) and reads only prompts, no images. To make a Turbo
+version of your own model, first train it here as usual, then distill the result:
+
+1. **Teacher.** Use a full fine-tune save directory (with `ema_decay` set, use its `ema/`
+   directory, as Iris's release does). For a LoRA, merge it first with
+   `tools.iris_merge_adapter`. Both are Iris's exported layout, which is what the trainer loads.
+   Fine-tuning `iris-3b/turbo` itself with diffusion-pipe works but erodes its few-step
+   sampling, and diffusion-pipe warns when it loads one. When `tools.iris_merge_adapter` merges
+   onto a Turbo base, it copies that base's `distill.yaml`.
+2. **Prompts.** Build them from the captions you trained on:
+   ```
+   python tools/iris_turbo_prompts.py --dataset dataset.toml --output /pvc/turbo/prompts.txt
+   ```
+   Each prompt is the caption as training encoded it (`caption_prefix` added,
+   `prefix_tag_caption` marker stripped). There is no tag shuffle, tag dropout or caption
+   dropout: Turbo learns guidance from the teacher's CFG 3.5. A multi-line caption becomes one
+   line. Empty and prefix-only captions are dropped. `num_repeats` weights each directory, and
+   the result is shuffled with a fixed seed, because the trainer reads the file in order.
+   - `--extra-prompts general.txt` mixes in other prompts, one per line, such as general
+     prompts that keep the base model's range.
+   - Each student update and each fake-network update draws a fresh global batch, so Iris's
+     stage 1 reads 204,800 prompts and stage 2 reads 16,000. The file is cycled; the tool
+     prints how many passes that makes over it.
+3. **Distill**, stage 1 and then stage 2, with Iris's configs. `tools/iris_turbo_distill.py`
+   takes the same arguments as Iris's `scripts/distill.py`:
+   ```
+   torchrun --nproc_per_node=8 tools/iris_turbo_distill.py \
+       --config submodules/iris-3b/configs/iris3b/turbo_stage1_6step.yaml \
+       teacher=/pvc/out/iris_full/<run>/epoch6 prompts_file=/pvc/turbo/prompts.txt \
+       work_dir=/pvc/turbo/stage1 strategy=fsdp2
+   torchrun --nproc_per_node=2 tools/iris_turbo_distill.py \
+       --config submodules/iris-3b/configs/iris3b/turbo_stage2_4step.yaml \
+       teacher=/pvc/out/iris_full/<run>/epoch6 prompts_file=/pvc/turbo/prompts.txt \
+       work_dir=/pvc/turbo/stage2 init_from=/pvc/turbo/stage1/checkpoints/step_00001600.pth strategy=fsdp2
+   python submodules/iris-3b/scripts/export_distilled.py /pvc/turbo/stage2/checkpoints/latest.pth \
+       /pvc/turbo/my-iris-turbo --dtype bf16
+   ```
+   - Keep the same `teacher` for both stages.
+   - The export writes `distill.yaml` beside the weights, and Iris's `scripts/sample.py` uses it
+     to sample with the 4-step schedule.
+   - After an interruption, add `resume_from=<work_dir>/checkpoints/latest.pth`, with the same
+     config and GPU count.
+
+   Around Iris's trainer, the launcher adds:
+   - **cuDNN attention off.** PyTorch's cuDNN attention kernel is turned off, as in
+     diffusion-pipe's Iris training: its backward returned NaN on H200 / torch 2.12 / cuDNN 9.20.
+     `--allow-cudnn-attention` keeps it on.
+   - **Checks before any weights load.**
+     - The teacher is a text-to-image export, not a Turbo one.
+     - Its `config.yaml` has `model.attn_backend: sdpa`. Iris applies a forced kernel to the
+       masked text adapter too, and it fails there.
+     - `prompts_file`, `init_from` and `resume_from` exist.
+     - `work_dir` accepts a file, a symlink and a rename over it. Iris points `latest.pth` at the
+       newest checkpoint with a symlink, which object-storage FUSE mounts and SMB/Azure Files
+       volumes refuse. Without this check, the run would only fail at its first save.
+   - **Disk space** (rank 0 prints the estimate). A checkpoint is about 84 GB: the FP32 student,
+     EMA, fake network and both AdamW states. Iris keeps every one, which is 16 saves (about
+     1.3 TB) for stage 1. `--keep-last N` (default 2) deletes older `step_*.pth` after each save,
+     never the one `latest.pth` points to; `0` keeps them all. Stage 2 needs stage 1's final
+     checkpoint, which is always kept. Scratch files left by a save that was cut off are removed
+     at start.
+   - **Memory.** Iris needs about 160 GB per GPU for `strategy=ddp` at `batch_size` 8, which is
+     more than an H200 (141 GB). The launcher warns about this. Use `strategy=fsdp2`, which
+     shards the student, the fake network and the optimizer states and keeps the global batch
+     of the recipe, instead of lowering `batch_size`.
+
+   On a pod with a persistent volume (PVC):
+   - Put `work_dir`, `prompts_file` and `HF_HOME` on the volume, so that Qwen3-VL (about 9 GB)
+     downloads once and a rescheduled pod resumes from `latest.pth`.
+   - Run torchrun from a directory on the volume as well: Iris caches the empty-prompt embedding
+     in `output/pretrained_models` relative to the working directory.
+
+Iris's README sets out what Turbo trades away. It is slightly better on prompt following, but
+weaker on long rendered text and less varied across seeds. The released recipe ran stage 1 for
+1,600 student updates on ~1M prompts and stage 2 for 500.
