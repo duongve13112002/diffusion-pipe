@@ -68,24 +68,26 @@ def _swiglu(x):
     return F.silu(gate) * up
 
 
-def make_block_forward(block, deltas):
+def make_block_forward(block, deltas_list):
     """A forward for a ComfyUI FLUX.3 Block (comfy/ldm/flux3/model.py) that adds each linear's
-    LoRA change on the reference rows only. deltas: {linear name: RowDelta}; on a fused-qkv
-    model the q/k/v changes are stacked onto qkv."""
+    LoRA change on the reference rows only. deltas_list: one {linear name: RowDelta} per loaded
+    LoRA; on a fused-qkv model the q/k/v changes are stacked onto qkv."""
+
+    def delta_weight(delta, x):
+        if isinstance(delta, list):
+            return torch.cat([d.weight(x.device) if d is not None else
+                              torch.zeros(block.qkv.weight.shape[0] // 3, x.shape[-1], device=x.device)
+                              for d in delta])
+        return delta.weight(x.device)
 
     def linear(name, module, x, rows):
         out = module(x)
-        delta = deltas.get(name)
-        if delta is None or rows is None:
+        if rows is None:
             return out
         start, end = rows
-        if isinstance(delta, list):
-            weight = torch.cat([d.weight(x.device) if d is not None else
-                                torch.zeros(block.qkv.weight.shape[0] // 3, x.shape[-1], device=x.device)
-                                for d in delta])
-        else:
-            weight = delta.weight(x.device)
-        out[:, start:end] += F.linear(x[:, start:end], weight.to(x.dtype))
+        for deltas in deltas_list:
+            if name in deltas:
+                out[:, start:end] += F.linear(x[:, start:end], delta_weight(deltas[name], x).to(x.dtype))
         return out
 
     def forward(x, spans, pe, transformer_options={}):
@@ -115,6 +117,7 @@ def make_block_forward(block, deltas):
             x[:, start:end].addcmul_(out[:, start:end], mod.gate)
         return x
 
+    forward.flux3_reference_deltas = deltas_list
     return forward
 
 
@@ -140,7 +143,11 @@ def apply_reference_lora(model, sd, strength):
                 continue
             module = getattr(block, name)
             deltas[name] = RowDelta(key, tensors, module.weight.shape[0], module.weight.shape[1], strength)
-        model.add_object_patch(f'diffusion_model.single_blocks.{index}.forward', make_block_forward(block, deltas))
+        # A reference LoRA already loaded on this model (another node upstream) keeps its
+        # weights: the new forward applies both.
+        key = f'diffusion_model.single_blocks.{index}.forward'
+        previous = getattr(model.object_patches.get(key, None), 'flux3_reference_deltas', [])
+        model.add_object_patch(key, make_block_forward(block, previous + [deltas]))
     logging.info(f'FLUX.3 reference LoRA: {len(ordinary)} ordinary tensors, reference-row weights on '
                  f'{len(rows)} shared blocks')
     return model

@@ -1392,6 +1392,16 @@ class DirectoryDataset:
                 **({'extra_control_paths': [str(p) for p in self.extra_control_paths]}
                    if self.extra_control_paths else {})}
 
+    def _check_cached_control_columns(self, metadata, path):
+        """Trusted metadata (--trust_cache with reuse_metadata_cache = false) is never compared with
+        the configuration, so a control_path list that changed since it was cached would
+        silently train with the old number of reference images."""
+        cached = sorted(c for c in metadata.column_names if c == 'control_file' or c.startswith('control_file_'))
+        if cached != sorted(self.control_columns()):
+            raise RuntimeError(
+                f'{path} was cached for control columns {cached}, but control_path now gives '
+                f'{self.control_columns()}. Run with --regenerate_cache (or without --trust_cache).')
+
     def control_columns(self):
         """Metadata columns holding this directory's control files, in reference order."""
         if self.control_path is None:
@@ -1684,6 +1694,7 @@ class DirectoryDataset:
             grouped_cache_dir = self.cache_dir / f'metadata/grouped_metadata_{bucket_suffix(grouping_key)}{self.caption_cache_suffix}'
             print(f'Loading grouped metadata with grouping key {grouping_key}')
             metadata = datasets.load_from_disk(str(grouped_cache_dir))
+            self._check_cached_control_columns(metadata, grouped_cache_dir)
             if self.use_size_buckets:
                 assert len(grouping_key) == 3
                 self.size_bucket_datasets.append(
@@ -1749,11 +1760,7 @@ class DirectoryDataset:
         metadata_cache_file_1 = self.cache_dir / 'metadata/metadata_intermediate'
         metadata_cache_file_2 = self.cache_dir / f'metadata/metadata{self.caption_cache_suffix}.arrow'
 
-        enumerate_files = regenerate_cache or not metadata_cache_file_1.exists() or not trust_cache
-        if not enumerate_files and self.extra_control_paths:
-            cached_columns = datasets.load_from_disk(str(metadata_cache_file_1)).column_names
-            enumerate_files = not set(self.control_columns()) <= set(cached_columns)
-        if enumerate_files:
+        if regenerate_cache or not metadata_cache_file_1.exists() or not trust_cache:
             print('Intermediate metadata is not cached. Enumerating all files.')
             files = list(self.path.glob('*'))
             # deterministic order
@@ -1853,6 +1860,7 @@ class DirectoryDataset:
 
         print('Loading intermediate metadata dataset.')
         metadata_dataset = datasets.load_from_disk(str(metadata_cache_file_1))
+        self._check_cached_control_columns(metadata_dataset, metadata_cache_file_1)
 
         metadata_map_fn = self._metadata_map_fn()
         print('Caching ungrouped metadata.')
@@ -2192,11 +2200,14 @@ class Dataset:
         global_batch_size = {size: bs * gradient_accumulation_steps * self.data_parallel_world_size for size, bs in per_device_batch_size.items()}
         global_batch_size_image = {size: bs * gradient_accumulation_steps * self.data_parallel_world_size for size, bs in per_device_batch_size_image.items()}
 
-        # group same size_bucket together
+        # Group same size_bucket together. A batch is collated from the keys of its first
+        # example, so directories with different control images (none, one, several) must
+        # never share a batch: they are kept in separate buckets.
         datasets_by_size_bucket = defaultdict(list)
         for directory_dataset in self.directory_datasets:
+            controls = tuple(directory_dataset.control_columns())
             for size_bucket_dataset in directory_dataset.get_size_bucket_datasets():
-                datasets_by_size_bucket[size_bucket_dataset.size_bucket].append(size_bucket_dataset)
+                datasets_by_size_bucket[(size_bucket_dataset.size_bucket, controls)].append(size_bucket_dataset)
         self.buckets = []
         for datasets in datasets_by_size_bucket.values():
             self.buckets.append(ConcatenatedBatchedDataset(datasets))
@@ -2281,6 +2292,13 @@ class Dataset:
         # Popped before the loop below, which would otherwise collate it into the batch and
         # hand it to prepare_inputs as though the model had asked for it.
         weights = [example.pop(SAMPLE_WEIGHT_KEY, 1.0) for example in examples]
+        keys = set(examples[0])
+        for example in examples[1:]:
+            if set(example) != keys:
+                # Collating from the first example's keys would silently drop (or fail on)
+                # the others', e.g. the control latents of an edit sample.
+                raise RuntimeError(f'Cannot batch examples with different features: {sorted(keys)} and '
+                                   f'{sorted(example)}')
         ret = {}
         for key in examples[0]:
             if key == 'mask':

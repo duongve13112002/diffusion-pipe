@@ -584,11 +584,11 @@ Notes:
   caption; set it to `true` to cache them and free the text encoder. The DiT attends to every text token,
   so captions of different lengths in one batch are padded and the padding is masked: each sample sees
   exactly what it would see alone (and what ComfyUI gives it).
-- Editing: give a `[[directory]]` a `control_path` (see the [edit dataset example](../examples/flux_kontext_dataset.toml)).
+- Editing: give a `[[directory]]` a `control_path` (see the [dataset example](../examples/flux3/flux3_dataset.toml)).
   FLUX.3 takes up to 10 reference images: `control_path` can be a list of directories, each holding an image
   with the same name as every target. The list order is the reference order; in ComfyUI chain the
-  `ReferenceLatent` nodes in the same order. Text-to-image and edit directories can be trained together
-  (a batch never mixes directories).
+  `ReferenceLatent` nodes in the same order. Text-to-image and edit directories can be trained together:
+  directories with a different number of references never share a batch.
 - `edit_isolation` trains editing without changing text-to-image:
   - `'none'` (default): adapters on every block; trains both.
   - `'image_cond'`: trains only the modules that exist for the reference images (their input projection,
@@ -608,6 +608,10 @@ Notes:
 - Inference: ComfyUI samples Klein with shift 6.93 (mu = 1.93586); Base is meant for 50 steps with CFG 3.5.
   A fixed `shift` around 3 is a reasonable start for training, or `flux_shift = true` (by resolution).
 - `guidance` is not used (Klein Base has no guidance embedding) and other values are refused.
+- PyTorch's cuDNN attention is turned off (its backward has returned NaN on H200 with cuDNN 9.20);
+  `allow_cudnn_attention = true` keeps it.
+- With `diffusion_model_dtype`, the embeddings, the time embedding, the modulations and the final layer
+  stay in high precision.
 
 LoRAs are saved in ComfyUI format.
 

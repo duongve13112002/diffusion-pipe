@@ -1,5 +1,6 @@
-# Text-to-image and editing in one dataset. A batch never mixes directories, so every batch is
-# all text-to-image or all edit samples with the same number of references.
+# Text-to-image and editing in one dataset. Directories with a different number of references
+# never share a batch: every batch is all text-to-image, or all edits with the same number of
+# references.
 
 resolutions = [1024]
 enable_ar_bucket = true

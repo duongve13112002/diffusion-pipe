@@ -280,6 +280,15 @@ def test_batched_mixed_text_lengths_equal_per_sample(tmp_path, ref_shapes):
                                                             [r[i:i + 1] for r in refs]))
 
 
+def test_diffusion_model_dtype_keeps_embeddings_and_modulations_in_high_precision(tmp_path):
+    pipe = attach(make_pipeline(tmp_path, cache_text_embeddings=True), make_model())
+    pipe.dequantize(pipe.diffusion_model, torch.float16)
+    for name, p in pipe.diffusion_model.named_parameters():
+        high = p.ndim == 1 or name.startswith(('emb_in.', 'txt_in.', 'time_in.', 'final_layer.',
+                                               'early_stream_modulations.', 'single_stream_modulations.'))
+        assert p.dtype == (torch.float32 if high else torch.float16), name
+
+
 def test_fused_qkv_checkpoint_is_split(tmp_path):
     fused = make_model(fused_qkv=True)
     pipe = attach(make_pipeline(tmp_path, cache_text_embeddings=True), make_model(fused_qkv=True))
@@ -302,6 +311,30 @@ def test_backward_reaches_every_parameter(tmp_path):
     out.square().mean().backward()
     missing = [n for n, p in pipe.diffusion_model.named_parameters() if p.grad is None or not p.grad.abs().sum() > 0]
     assert missing == []
+
+
+@pytest.mark.parametrize('adapter', [None, lora()], ids=['full', 'lora'])
+@pytest.mark.parametrize('ref_shapes', [(), ((2, 2), (1, 3))])
+def test_every_stage_boundary_gets_its_gradients(tmp_path, adapter, ref_shapes):
+    """Under pipeline parallelism DeepSpeed asserts that every floating point tensor a stage
+    received has a gradient after its backward. Split the layers at every possible point and
+    check that, as _exec_send_grads would."""
+    pipe = attach(make_pipeline(tmp_path, adapter=adapter, cache_text_embeddings=True), make_model())
+    if adapter is not None:
+        pipe.configure_adapter(adapter)
+    layers = pipe.to_layers()
+    inputs = features(latents(2), torch.tensor([0.3, 0.7]), text_embeds([80, 160]), ref_latents(2, ref_shapes))
+    with torch.no_grad():
+        expected = run_layers(layers, inputs)
+    for k in range(1, len(layers)):
+        with torch.no_grad():
+            sent = run_layers(layers[:k], inputs)
+        received = tuple(t.detach().clone().requires_grad_(t.is_floating_point()) for t in sent)
+        out = run_layers(layers[k:], received)
+        torch.testing.assert_close(out, expected)
+        out.square().mean().backward()
+        missing = [i for i, t in enumerate(received) if t.is_floating_point() and t.grad is None]
+        assert missing == [], f'split before layer {k} ({type(layers[k]).__name__}): inputs {missing} get no gradient'
 
 
 # ---- text encoder --------------------------------------------------------------------------------
@@ -334,6 +367,25 @@ def test_text_features_match_comfyui_conditioning(tmp_path):
         torch.testing.assert_close(z[i:i + 1, :lengths[i]], expected)
     # set_clip_options / reset_clip_options pair up around the encode.
     assert te.cond_stage_model.options[-1] is None
+
+
+def test_tokenizing_does_not_load_the_text_encoder(tmp_path):
+    pipe = make_pipeline(tmp_path)
+
+    def refuse():
+        raise AssertionError('the text encoder was loaded to tokenize')
+    pipe.text_encoders[0].load_model_if_needed = refuse
+    ids, lengths = pipe.tokenize(['a cat'])
+    expected = [t for t, _ in pipe.text_encoders[0].tokenize('a cat')['qwen3vl_4b'][0]]
+    assert ids[0].tolist() == expected and lengths.tolist() == [80]
+
+
+@pytest.mark.parametrize('allow', [False, True])
+def test_cudnn_attention_is_off_unless_allowed(tmp_path, monkeypatch, allow):
+    calls = []
+    monkeypatch.setattr(torch.backends.cuda, 'enable_cudnn_sdp', lambda enabled: calls.append(enabled))
+    make_pipeline(tmp_path, allow_cudnn_attention=allow)
+    assert calls == ([] if allow else [False])
 
 
 def test_cached_text_embeddings_are_trimmed(tmp_path):
@@ -375,6 +427,16 @@ def test_prepare_inputs_collects_references_in_order(tmp_path):
     assert len(got) == 3 and all(torch.equal(a, b) for a, b in zip(got, refs))
     torch.testing.assert_close(target, (noisy - (1 - t.view(-1, 1, 1, 1)) * batch['latents']) / t.view(-1, 1, 1, 1)
                                - batch['latents'], rtol=1e-4, atol=1e-4)
+
+
+@pytest.mark.parametrize('indices', [list(range(11)), [0, 2]], ids=['eleven', 'gap'])
+def test_prepare_inputs_refuses_references_it_would_drop(tmp_path, indices):
+    pipe = make_pipeline(tmp_path, cache_text_embeddings=True)
+    refs = ref_latents(1, [(1, 1)] * len(indices))
+    batch = {'latents': latents(1), 'mask': None, 'text_embeds': text_embeds([80]),
+             **{flux3.control_latents_key(i): r for i, r in zip(indices, refs)}}
+    with pytest.raises(ValueError, match='reference images in order'):
+        pipe.prepare_inputs(batch)
 
 
 def test_vae_fn_keys(tmp_path):
@@ -427,6 +489,40 @@ def test_adapter_targets(tmp_path, mode, prefixes):
         assert 'emb_in.image_cond' in targets and 'early_stream_modulations.image_cond.lin' in targets
         assert not any(name.startswith(('single_blocks.', 'emb_in.image', 'txt_in')) and 'image_cond' not in name
                        for name in targets)
+
+
+def test_text_to_image_datasets_leave_the_reference_blocks_out(tmp_path):
+    """Without any reference image the reference blocks never run: an adapter there would never
+    train. One being continued with init_from_existing keeps them."""
+    def targets(**adapter_kwargs):
+        pipe = attach(make_pipeline(tmp_path, adapter=lora(**adapter_kwargs), cache_text_embeddings=True),
+                      make_model())
+        pipe.model_specific_dataset_config_validation({'directory': [{'path': 'a'}]})
+        return pipe, pipe.get_target_modules(pipe.diffusion_model)
+
+    def is_ref(name):
+        return name.startswith('content_mode_blocks.image_cond.')
+
+    pipe, plain = targets()
+    assert plain and not any(is_ref(n) for n in plain)
+    pipe.model_specific_dataset_config_validation({'directory': [{'path': 'b', 'control_path': 'c'}]})
+    assert any(is_ref(n) for n in pipe.get_target_modules(pipe.diffusion_model))
+
+    # An adapter trained with references, continued on text-to-image data.
+    mixed = attach(make_pipeline(tmp_path, adapter=lora(), cache_text_embeddings=True), make_model())
+    mixed.model_specific_dataset_config_validation({'directory': [{'path': 'b', 'control_path': 'c'}]})
+    mixed.configure_adapter(lora())
+    randomize_adapter(mixed)
+    save_dir = tmp_path / 'mixed'
+    save_dir.mkdir()
+    sd = saved_adapter_state(mixed)
+    mixed.save_adapter(save_dir, sd)
+    pipe, resumed = targets(init_from_existing=str(save_dir))
+    assert any(is_ref(n) for n in resumed)
+    pipe.configure_adapter(lora(init_from_existing=str(save_dir)))
+    pipe.load_adapter_weights(save_dir)
+    for k, v in saved_adapter_state(pipe).items():
+        assert torch.equal(v, sd[k]), k
 
 
 @pytest.mark.parametrize('adapter', [lora(), lokr()], ids=['lora', 'lokr'])
@@ -527,6 +623,7 @@ def test_reference_tokens_adapter_round_trip(tmp_path, adapter):
     sd = saved_adapter_state(pipe)
     pipe.save_adapter(save_dir, sd)
     path = save_dir / 'adapter_model.safetensors'
+    assert sorted(p.name for p in save_dir.iterdir()) == ['adapter_config.json', 'adapter_model.safetensors']
     saved = safetensors.torch.load_file(str(path))
     with safetensors.safe_open(str(path), 'pt') as f:
         assert f.metadata()[flux3.ADAPTER_METADATA_KEY] == 'reference_tokens'
@@ -550,10 +647,14 @@ def test_reference_tokens_adapter_round_trip(tmp_path, adapter):
             plain.load_adapter_weights(save_dir)
 
 
-def test_merging_a_reference_tokens_adapter_is_refused(tmp_path):
-    path = tmp_path / 'ref.safetensors'
-    safetensors.torch.save_file({flux3.REFERENCE_ROWS_PREFIX + 'single_blocks.0.q_proj.lora_A.weight': torch.zeros(1)},
-                                str(path))
+@pytest.mark.parametrize('suffix', ['.safetensors', '.pt'])
+def test_merging_a_reference_tokens_adapter_is_refused(tmp_path, suffix):
+    path = tmp_path / f'ref{suffix}'
+    sd = {flux3.REFERENCE_ROWS_PREFIX + 'single_blocks.0.q_proj.lora_A.weight': torch.zeros(1)}
+    if suffix == '.pt':
+        torch.save(sd, str(path))
+    else:
+        safetensors.torch.save_file(sd, str(path))
     pipe = make_pipeline(tmp_path, merge_adapters=[str(path)])
     with pytest.raises(ValueError, match='reference_tokens'):
         pipe.load_diffusion_model()
@@ -598,6 +699,38 @@ def test_comfyui_node_matches_training_forward(tmp_path, adapter, fused_qkv, in_
     tol = {} if in_training else {'rtol': 1e-4, 'atol': 1e-4}
     torch.testing.assert_close(got_edit, want_edit, **tol)
     torch.testing.assert_close(got_t2i, plain_t2i, **tol)
+
+
+def test_comfyui_node_stacks_two_reference_loras(tmp_path):
+    """A reference LoRA loaded after another keeps the first one's shared-block changes: a LoRA
+    and its negation (lora_B * -1) cancel out."""
+    base = make_model()
+    ckpt = write_checkpoint(tmp_path / 'flux3.safetensors', base)
+    pipe = attach(make_pipeline(tmp_path, adapter=lora(), cache_text_embeddings=True,
+                                edit_isolation='reference_tokens'), make_model())
+    pipe.configure_adapter(lora())
+    randomize_adapter(pipe)
+    save_dir = tmp_path / 'adapter'
+    save_dir.mkdir()
+    pipe.save_adapter(save_dir, saved_adapter_state(pipe))
+    sd = safetensors.torch.load_file(str(save_dir / 'adapter_model.safetensors'))
+    negated = {k: -v if 'lora_B' in k else v for k, v in sd.items()}
+    assert any(k.startswith(flux3.REFERENCE_ROWS_PREFIX) for k in sd)
+    x, t, embeds, refs = latents(1), torch.tensor([0.6]), text_embeds([80]), ref_latents(1, [(2, 2)])
+
+    def run(*loras):
+        patcher = comfy.sd.load_diffusion_model(str(ckpt), model_options={'dtype': torch.float32})
+        for lora_sd in loras:
+            patcher = node.apply_reference_lora(patcher, lora_sd, 1.0)
+        patcher.patch_model()
+        try:
+            return comfy_forward(patcher.model.diffusion_model, x, t, embeds[0][None], refs)
+        finally:
+            patcher.unpatch_model()
+
+    plain = run()
+    assert not torch.allclose(run(sd), plain, atol=1e-4)
+    torch.testing.assert_close(run(sd, negated), plain, rtol=1e-4, atol=1e-4)
 
 
 def test_node_splits_keys():
@@ -821,6 +954,68 @@ def test_dataset_to_layers_end_to_end(tmp_path, local_workers, n_refs, cache_tex
         assert out.shape == (2, 128, 2, 3)
         loss = pipe.get_loss_fn()(out, (label[0], torch.tensor([])))
         assert torch.isfinite(loss)
+
+
+def test_directories_with_different_references_never_share_a_batch(tmp_path, local_workers):
+    """Text-to-image, one-reference and two-reference directories in the same size bucket: a
+    batch is collated from its first example's keys, so mixing them would drop references."""
+    images = {n: make_image_dir(tmp_path / n, seed=s) for n, s in (('t2i', 0), ('one', 1), ('two', 2))}
+    controls = [make_image_dir(tmp_path / f'control{i}', seed=10 + i, captions=False) for i in range(2)]
+    pipe = attach(make_pipeline(tmp_path, cache_text_embeddings=True), make_model())
+    bucket = {'num_repeats': 1, 'size_buckets': [[48, 32, 1]]}
+    dataset_config = {'resolutions': [40], 'enable_ar_bucket': False, 'directory': [
+        {'path': str(images['t2i']), **bucket},
+        {'path': str(images['one']), 'control_path': str(controls[0]), **bucket},
+        {'path': str(images['two']), 'control_path': [str(c) for c in controls], **bucket},
+    ]}
+    ds = dataset_util.Dataset(dataset_config, pipe)
+    run_caching(pipe, ds, dataset_config)
+    ds.post_init(0, 1, {None: 4}, 1, {None: 4})
+    assert len(ds) == 3
+    seen = {}
+    for k in range(len(ds)):
+        batch = ds[k]
+        directories = {Path(spec[1]).parent.name for spec in batch['image_spec']}
+        assert len(directories) == 1, directories
+        refs = sum(key.startswith('control_latents') for key in batch)
+        seen[directories.pop()] = refs
+        assert len(pipe.prepare_inputs(batch)[0]) == 4 + refs
+    assert seen == {'t2i': 0, 'one': 1, 'two': 2}
+
+
+@pytest.mark.parametrize('reuse_metadata_cache', [True, False])
+def test_adding_a_control_directory_to_a_cached_dataset(tmp_path, local_workers, reuse_metadata_cache):
+    """A second control directory added after caching: the snapshot cache (default) starts
+    over; trusted metadata cached without it is refused rather than silently used."""
+    images = make_image_dir(tmp_path / 'images')
+    controls = [make_image_dir(tmp_path / f'control{i}', seed=10 + i, captions=False) for i in range(2)]
+    pipe = attach(make_pipeline(tmp_path, cache_text_embeddings=True), make_model())
+
+    def config(control_path):
+        return {'resolutions': [40], 'enable_ar_bucket': False, 'reuse_metadata_cache': reuse_metadata_cache,
+                'directory': [{'path': str(images), 'num_repeats': 1, 'size_buckets': [[48, 32, 1]],
+                               'control_path': control_path}]}
+
+    first = config(str(controls[0]))
+    run_caching(pipe, dataset_util.Dataset(first, pipe), first)
+    second = config([str(c) for c in controls])
+    ds = dataset_util.Dataset(second, pipe)
+    if reuse_metadata_cache:
+        run_caching(pipe, ds, second)
+        ds.post_init(0, 1, {None: 2}, 1, {None: 2})
+        assert all('control_latents_2' in ds[k] for k in range(len(ds)))
+    else:
+        with pytest.raises(RuntimeError, match='regenerate_cache'):
+            ds.cache_metadata(trust_cache=True)
+
+
+def test_collate_refuses_examples_with_different_features(tmp_path):
+    pipe = make_pipeline(tmp_path)
+    ds = dataset_util.Dataset.__new__(dataset_util.Dataset)
+    examples = [{'latents': torch.zeros(1), 'mask': None}, {'latents': torch.zeros(1), 'mask': None,
+                                                            'control_latents': torch.zeros(1)}]
+    with pytest.raises(RuntimeError, match='different features'):
+        ds._collate(examples)
 
 
 def test_single_control_geometry_unchanged(tmp_path):

@@ -245,6 +245,7 @@ class CommonPipeline:
     framerate = None
     pixels_round_to_multiple = 16
     keep_in_high_precision = []
+    match_high_precision_by_path = False
     spatial_compression = 8
     channels = 16
     is_video_vae = False
@@ -711,7 +712,7 @@ class ComfyPipeline(CommonPipeline):
 
             self.text_encoders.append(ModelWrapper(load_fn))
 
-    def dequantize(self, model, diffusion_model_dtype):
+    def dequantize(self, model, diffusion_model_dtype, prefix=''):
         operations = comfy.ops.disable_weight_init
         for mod_name, module in model.named_children():
             is_quantized = False
@@ -721,7 +722,10 @@ class ComfyPipeline(CommonPipeline):
                     p = getattr(module, p_name)
                     is_quantized = True
 
-                name = f'{mod_name}.{p_name}'
+                # keep_in_high_precision is matched against the module's own name, so a keyword
+                # naming a parent (time_in for time_in.in_layer) misses its children. A model
+                # whose keywords name parents sets match_high_precision_by_path.
+                name = f'{prefix}{mod_name}.{p_name}' if self.match_high_precision_by_path else f'{mod_name}.{p_name}'
                 if any(keyword in name for keyword in self.keep_in_high_precision) or p.ndim == 1:
                     continue
                 p.data = p.data.to(diffusion_model_dtype)
@@ -736,7 +740,7 @@ class ComfyPipeline(CommonPipeline):
                     new_linear.bias = module.bias
                 model._modules[mod_name] = new_linear
 
-            self.dequantize(module, diffusion_model_dtype)
+            self.dequantize(module, diffusion_model_dtype, prefix=f'{prefix}{mod_name}.')
 
     def patch_quantized_modules(self, model):
         # For every class that acts like a Linear but isn't a nn.Linear (e.g. quant linear), force it to be a nn.Linear

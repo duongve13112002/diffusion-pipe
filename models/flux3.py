@@ -30,6 +30,7 @@ ComfyUI. Two things ComfyUI does not need are added:
 
 import os
 import sys
+import uuid
 sys.path.insert(0, os.path.join(os.path.abspath(os.path.dirname(__file__)), '../submodules/ComfyUI'))
 
 from pathlib import Path
@@ -45,6 +46,7 @@ from utils.offloading import ModelOffloader
 import comfy.latent_formats
 import comfy.model_management
 import comfy.sd
+import comfy.text_encoders.flux
 import comfy.utils
 from comfy.ldm.flux.layers import timestep_embedding
 from comfy.ldm.flux.math import _apply_rope1
@@ -73,7 +75,7 @@ ADAPTER_METADATA_KEY = 'flux3_edit_isolation'
 MODEL_KEYS = {
     'type', 'diffusion_model', 'vae', 'text_encoders', 'dtype', 'diffusion_model_dtype',
     'merge_adapters', 'cache_text_embeddings', 'timestep_sample_method', 'sigmoid_scale',
-    'shift', 'flux_shift', 'edit_isolation',
+    'shift', 'flux_shift', 'edit_isolation', 'allow_cudnn_attention',
     # train.py writes guidance = 1.0 into every config; FLUX.3 has no guidance embedding.
     'guidance',
 }
@@ -138,6 +140,7 @@ class Flux3Pipeline(ComfyPipeline):
     checkpointable_layers = ['EarlyLayer', 'SingleLayer']
     adapter_target_modules = ['Block']
     keep_in_high_precision = ['emb_in', 'txt_in', 'time_in', 'final_layer', 'stream_modulations']
+    match_high_precision_by_path = True
     spatial_compression = 16
     channels = 128
     max_control_images = MAX_REFERENCES
@@ -190,6 +193,11 @@ class Flux3Pipeline(ComfyPipeline):
 
         super().__init__(config)
         self.cache_text_embeddings = self.model_config['cache_text_embeddings']
+        if not model_config.get('allow_cudnn_attention', False) and hasattr(torch.backends.cuda, 'enable_cudnn_sdp'):
+            # As for Iris: PyTorch picks cuDNN attention on Hopper, and its backward returned NaN
+            # for real activations (torch 2.12 / cuDNN 9.20, H200) where flash and math were
+            # finite. Off, PyTorch falls back to flash, then efficient, then math.
+            torch.backends.cuda.enable_cudnn_sdp(False)
         self.latent_format = comfy.latent_formats.Flux2()
 
         paths = te_config.get('paths', te_config.get('path', None))
@@ -206,8 +214,13 @@ class Flux3Pipeline(ComfyPipeline):
             return comfy.sd.load_text_encoder_state_dicts([sd], clip_type=comfy.sd.CLIPType.FLUX3, disable_dynamic=True)
 
         self.text_encoders = [ModelWrapper(load_text_encoder)]
+        # The tokenizer alone, so that ranks which only tokenize (every rank runs prepare_inputs,
+        # the text is encoded on the first pipeline stage) do not load the 4B text encoder.
+        self._tokenizer = None
 
         self._train_blocks = None
+        # Whether any dataset (training or eval) has reference images; None until validated.
+        self.datasets_have_references = None
         self.offloader_early = ModelOffloader('dummy', [], 0, 0, True, torch.device('cuda'), False, debug=False)
         self.offloader_single = ModelOffloader('dummy', [], 0, 0, True, torch.device('cuda'), False, debug=False)
 
@@ -215,7 +228,7 @@ class Flux3Pipeline(ComfyPipeline):
 
     def load_diffusion_model(self):
         for adapter_path in self.model_config.get('merge_adapters', []):
-            sd = safetensors.torch.load_file(adapter_path) if str(adapter_path).endswith('.safetensors') else {}
+            sd = comfy.utils.load_torch_file(str(adapter_path), safe_load=True)
             if any(k.startswith(REFERENCE_ROWS_PREFIX) for k in sd):
                 raise ValueError(f'{adapter_path} was trained with edit_isolation = reference_tokens: it applies '
                                  'only to reference-token rows, which merging into the weights cannot express.')
@@ -276,8 +289,23 @@ class Flux3Pipeline(ComfyPipeline):
                 if is_image_cond_name(name + '.') or (name.startswith('single_blocks.') and name not in untrainable):
                     targets.add(name)
             elif name.startswith(('content_mode_blocks.', 'txt_mode_blocks.', 'single_blocks.')):
-                targets.add(name)
+                # Without any reference image the reference blocks never run, so an adapter on
+                # them would never train. One loaded with init_from_existing keeps them, so that
+                # its trained weights load and are saved again.
+                if not (name.startswith('content_mode_blocks.image_cond.') and self.datasets_have_references is False
+                        and not self.init_adapter_has_reference_blocks()):
+                    targets.add(name)
         return sorted(targets)
+
+    def init_adapter_has_reference_blocks(self):
+        path = self.config.get('adapter', {}).get('init_from_existing', None)
+        if path is None:
+            return False
+        for f in Path(path).glob('*.safetensors'):
+            with safetensors.safe_open(str(f), 'pt') as handle:
+                if any(k.startswith('diffusion_model.content_mode_blocks.image_cond.') for k in handle.keys()):
+                    return True
+        return False
 
     def adapter_rows_restricted(self):
         return self.edit_isolation == 'reference_tokens'
@@ -291,7 +319,7 @@ class Flux3Pipeline(ComfyPipeline):
             else:
                 out['diffusion_model.' + k] = v
         metadata = {'format': 'pt', ADAPTER_METADATA_KEY: self.edit_isolation}
-        safetensors.torch.save_file(out, save_dir / 'adapter_model.safetensors', metadata=metadata)
+        write_atomic(Path(save_dir) / 'adapter_model.safetensors', safetensors.torch.save(out, metadata=metadata))
 
     def load_adapter_weights(self, adapter_path):
         for f in Path(adapter_path).glob('*.safetensors'):
@@ -313,6 +341,7 @@ class Flux3Pipeline(ComfyPipeline):
     def model_specific_dataset_config_validation(self, dataset_config):
         for directory in dataset_config.get('directory', []):
             paths = control_paths_of(directory)
+            self.datasets_have_references = bool(self.datasets_have_references) or bool(paths)
             if len(paths) > MAX_REFERENCES:
                 raise ValueError(f'{directory.get("path")}: FLUX.3 takes at most {MAX_REFERENCES} reference images, '
                                  f'control_path lists {len(paths)}')
@@ -342,11 +371,11 @@ class Flux3Pipeline(ComfyPipeline):
         """Token ids of each caption as ComfyUI prompts FLUX.3 (chat template, right padded to a
         multiple of 80), padded further to the longest in the batch. Returns (ids, lengths):
         lengths are each caption's own padded length, the text the DiT sees for it."""
-        te = self.text_encoders[0]
-        te.load_model_if_needed()
+        if self._tokenizer is None:
+            self._tokenizer = comfy.text_encoders.flux.Flux3Tokenizer()
         rows = []
         for caption in captions:
-            tokens = te.tokenize(caption)[TEXT_CLIP_NAME]
+            tokens = self._tokenizer.tokenize_with_weights(caption)[TEXT_CLIP_NAME]
             if len(tokens) != 1:
                 raise RuntimeError(f'Expected one token sequence per caption, got {len(tokens)}')
             rows.append([int(t[0]) for t in tokens[0]])
@@ -420,11 +449,11 @@ class Flux3Pipeline(ComfyPipeline):
         target = noise - latents
 
         references = []
-        for i in range(MAX_REFERENCES):
-            key = control_latents_key(i)
-            if key not in inputs:
-                break
+        while (key := control_latents_key(len(references))) in inputs:
             references.append(inputs[key].float())
+        if len(references) > MAX_REFERENCES or len(references) != sum(k.startswith('control_latents') for k in inputs):
+            raise ValueError(f'FLUX.3 takes 1 to {MAX_REFERENCES} reference images in order; the batch has '
+                             f'{sorted(k for k in inputs if k.startswith("control_latents"))}')
 
         return (noisy_latents, t, text, text_lengths, *references), (target, mask)
 
@@ -453,14 +482,14 @@ class Flux3Pipeline(ComfyPipeline):
         text_encoder = None if self.cache_text_embeddings else self
         layers = [TextEncoderLayer(text_encoder, self.dtype), InitialLayer(dm, self.dtype)]
         early = self.early_offload_order()
-        for mode in ('image', 'txt'):
+        for mode in ('image', 'txt', 'image_cond'):
             for i, block in enumerate(blocks[mode]):
-                layers.append(EarlyLayer(mode, block, self.offloader_early, early.index(block)))
-        for block in blocks['image_cond']:
-            layers.append(EarlyLayer('image_cond', block, None, None))
+                # The reference blocks always stay on the GPU (see enable_block_swap).
+                offloader, idx = (self.offloader_early, early.index(block)) if mode != 'image_cond' else (None, None)
+                layers.append(EarlyLayer(mode, block, offloader, idx, last=i == len(blocks[mode]) - 1))
         layers.append(ConcatLayer())
         for i, block in enumerate(blocks['single']):
-            layers.append(SingleLayer(block, self.offloader_single, i))
+            layers.append(SingleLayer(block, self.offloader_single, i, last=i == len(blocks['single']) - 1))
         layers.append(FinalLayer(dm))
         return layers
 
@@ -508,6 +537,30 @@ class Flux3Pipeline(ComfyPipeline):
                 offloader.disable_block_swap()
             offloader.set_forward_only(True)
             offloader.prepare_block_devices_before_forward()
+
+
+def write_atomic(path, data):
+    """Temp name (not *.safetensors, which the adapter loader globs), fsync, rename, fsync the
+    directory: a crash or a network volume hiccup never leaves a torn file under the real name."""
+    tmp = path.with_name(f'.{path.name}.tmp-{uuid.uuid4().hex}')
+    try:
+        with open(tmp, 'wb') as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+        try:
+            fd = os.open(str(path.parent), os.O_RDONLY)
+        except OSError:
+            return
+        try:
+            os.fsync(fd)
+        except OSError:
+            pass
+        finally:
+            os.close(fd)
+    finally:
+        tmp.unlink(missing_ok=True)
 
 
 def control_latents_key(i):
@@ -610,40 +663,61 @@ class Flux3Block(nn.Module):
 
 # ---- pipeline layers -----------------------------------------------------------------------
 #
-# After InitialLayer the activations are one flat tuple:
-#   dims [H, W, R, L], text_lengths, pe, vec_img, img, txt,
-#   early_img (shift, scale, gate), early_txt (3), single_img (3), single_txt (3),
-#   and only when there are references: refs, early_ref (3), single_ref (3).
+# After InitialLayer the activations are one flat tuple, whose layout dims records:
+#   dims [H, W, R, L, has early_image, has early_txt, has early_image_cond], text_lengths, pe,
+#   vec_img, img, txt, single_image (shift, scale, gate), single_txt (3),
+#   early_image (3) and early_txt (3) while a block of that stream is still to run,
+#   and with references (R > 0): refs, single_image_cond (3), early_image_cond (3) while needed.
 # After ConcatLayer:
-#   dims, text_lengths, pe, vec_img, x, single_img (3), single_txt (3) [, single_ref (3)]
+#   dims, text_lengths, pe, vec_img, x, single_image (3), single_txt (3) [, single_image_cond (3)]
+# After the last SingleLayer:
+#   dims, vec_img, x
+#
+# Each layer drops what no later layer reads. Under pipeline parallelism every floating point
+# tensor a stage receives must come back with a gradient (DeepSpeed asserts it), so a tensor
+# carried past its last use would fail the backward of a stage boundary placed there.
 
-N_EARLY_FIXED = 18
+EARLY_MODES = ('image', 'txt', 'image_cond')
 N_JOINT_FIXED = 11
 
 
 def unpack_early(inputs):
-    dims, text_lengths, pe, vec_img, img, txt = inputs[:6]
-    mods = inputs[6:18]
+    dims = inputs[0]
+    H, W, R, L, *present = dims.tolist()
     state = {
-        'dims': dims, 'text_lengths': text_lengths, 'pe': pe, 'vec_img': vec_img, 'img': img, 'txt': txt,
-        'early_image': ModulationOut(*mods[0:3]), 'early_txt': ModulationOut(*mods[3:6]),
-        'single_image': ModulationOut(*mods[6:9]), 'single_txt': ModulationOut(*mods[9:12]),
-        'refs': None,
+        'dims': dims, 'text_lengths': inputs[1], 'pe': inputs[2], 'vec_img': inputs[3], 'img': inputs[4],
+        'txt': inputs[5], 'single_image': ModulationOut(*inputs[6:9]), 'single_txt': ModulationOut(*inputs[9:12]),
+        'refs': None, 'early_image': None, 'early_txt': None, 'early_image_cond': None,
     }
-    if len(inputs) > N_EARLY_FIXED:
-        state['refs'] = inputs[18]
-        state['early_image_cond'] = ModulationOut(*inputs[19:22])
-        state['single_image_cond'] = ModulationOut(*inputs[22:25])
+    i = 12
+    for mode, flag in zip(('image', 'txt'), present[:2]):
+        if flag:
+            state['early_' + mode] = ModulationOut(*inputs[i:i + 3])
+            i += 3
+    if R:
+        state['refs'] = inputs[i]
+        state['single_image_cond'] = ModulationOut(*inputs[i + 1:i + 4])
+        i += 4
+        if present[2]:
+            state['early_image_cond'] = ModulationOut(*inputs[i:i + 3])
+            i += 3
+    assert i == len(inputs), (i, len(inputs))
     return state
 
 
 def pack_early(state):
-    out = [state['dims'], state['text_lengths'], state['pe'], state['vec_img'], state['img'], state['txt'],
-           *modulation_tensors(state['early_image']), *modulation_tensors(state['early_txt']),
+    H, W, R, L = state['dims'][:4].tolist()
+    present = [int(state['early_' + mode] is not None) for mode in EARLY_MODES]
+    dims = torch.tensor([H, W, R, L, *present], dtype=torch.int64, device=state['dims'].device)
+    out = [dims, state['text_lengths'], state['pe'], state['vec_img'], state['img'], state['txt'],
            *modulation_tensors(state['single_image']), *modulation_tensors(state['single_txt'])]
+    for mode in ('image', 'txt'):
+        if state['early_' + mode] is not None:
+            out += modulation_tensors(state['early_' + mode])
     if state['refs'] is not None:
-        out += [state['refs'], *modulation_tensors(state['early_image_cond']),
-                *modulation_tensors(state['single_image_cond'])]
+        out += [state['refs'], *modulation_tensors(state['single_image_cond'])]
+        if state['early_image_cond'] is not None:
+            out += modulation_tensors(state['early_image_cond'])
     return make_contiguous(*out)
 
 
@@ -711,6 +785,7 @@ class InitialLayer(nn.Module):
         pe.requires_grad_(True)  # work around pipeline parallelism issue
 
         R = 0 if ref_tokens is None else ref_tokens.shape[1]
+        # The early-modulation flags are filled in by pack_early.
         dims = torch.tensor([H, W, R, txt.shape[1]], dtype=torch.int64, device=device)
         state = {
             'dims': dims, 'text_lengths': text_lengths.to(device), 'pe': pe, 'vec_img': vec_img,
@@ -720,6 +795,7 @@ class InitialLayer(nn.Module):
             'single_image': self.single_stream_modulations['image'](vec_img)[0],
             'single_txt': self.single_stream_modulations['txt'](vec_zero)[0],
             'refs': ref_tokens,
+            'early_image_cond': None,
         }
         if ref_tokens is not None:
             state['early_image_cond'] = self.early_stream_modulations['image_cond'](vec_zero)[0]
@@ -728,19 +804,21 @@ class InitialLayer(nn.Module):
 
 
 class EarlyLayer(nn.Module):
-    """One of the five per-stream blocks of the image, the text or the references."""
+    """One of the five per-stream blocks of the image, the text or the references. The last
+    one of its stream drops the stream's early modulation."""
 
-    def __init__(self, mode, block, offloader, block_idx):
+    def __init__(self, mode, block, offloader, block_idx, last=False):
         super().__init__()
         self.mode = mode
         self.block = block
         self.offloader = offloader
         self.block_idx = block_idx
+        self.last = last
 
     @torch.autocast('cuda', dtype=AUTOCAST_DTYPE)
     def forward(self, inputs):
         state = unpack_early(inputs)
-        H, W, R, L = state['dims'].tolist()
+        H, W, R, L = state['dims'][:4].tolist()
         HW = H * W
         pe = state['pe']
         key_mask = None
@@ -754,12 +832,14 @@ class EarlyLayer(nn.Module):
                 return inputs
             key, pe = 'refs', pe[:, HW:HW + R]
         tokens = state[key]
-        mod = state['early_' + ('image' if self.mode == 'image' else self.mode)]
+        mod = state['early_' + self.mode]
         if self.offloader is not None:
             self.offloader.wait_for_block(self.block_idx)
         state[key] = self.block(tokens, [(0, tokens.shape[1], mod)], pe, key_mask)
         if self.offloader is not None:
             self.offloader.submit_move_blocks_forward(self.block_idx)
+        if self.last:
+            state['early_' + self.mode] = None
         return pack_early(state)
 
 
@@ -767,6 +847,7 @@ class ConcatLayer(nn.Module):
     @torch.autocast('cuda', dtype=AUTOCAST_DTYPE)
     def forward(self, inputs):
         state = unpack_early(inputs)
+        assert all(state['early_' + mode] is None for mode in EARLY_MODES)
         parts = [state['img']] + ([state['refs']] if state['refs'] is not None else []) + [state['txt']]
         out = [state['dims'], state['text_lengths'], state['pe'], state['vec_img'], torch.cat(parts, dim=1),
                *modulation_tensors(state['single_image']), *modulation_tensors(state['single_txt'])]
@@ -777,7 +858,7 @@ class ConcatLayer(nn.Module):
 
 def joint_spans(inputs):
     dims, text_lengths, pe, vec_img, x = inputs[:5]
-    H, W, R, L = dims.tolist()
+    H, W, R, L = dims[:4].tolist()
     HW = H * W
     spans = [(0, HW, ModulationOut(*inputs[5:8]))]
     if len(inputs) > N_JOINT_FIXED:
@@ -787,13 +868,15 @@ def joint_spans(inputs):
 
 
 class SingleLayer(nn.Module):
-    """One of the 28 shared blocks over [image, references, text]."""
+    """One of the 28 shared blocks over [image, references, text]. The last one passes on only
+    what FinalLayer reads."""
 
-    def __init__(self, block, offloader, block_idx):
+    def __init__(self, block, offloader, block_idx, last=False):
         super().__init__()
         self.block = block
         self.offloader = offloader
         self.block_idx = block_idx
+        self.last = last
 
     @torch.autocast('cuda', dtype=AUTOCAST_DTYPE)
     def forward(self, inputs):
@@ -801,6 +884,8 @@ class SingleLayer(nn.Module):
         self.offloader.wait_for_block(self.block_idx)
         x = self.block(inputs[4], spans, inputs[2], key_mask, adapter_rows=ref_rows)
         self.offloader.submit_move_blocks_forward(self.block_idx)
+        if self.last:
+            return make_contiguous(inputs[0], inputs[3], x)
         return make_contiguous(*inputs[:4], x, *inputs[5:])
 
 
@@ -811,7 +896,7 @@ class FinalLayer(nn.Module):
 
     @torch.autocast('cuda', dtype=AUTOCAST_DTYPE)
     def forward(self, inputs):
-        dims, _, _, vec_img, x = inputs[:5]
+        dims, vec_img, x = inputs
         H, W = dims[0].item(), dims[1].item()
         out = self.final_layer['image'](x[:, :H * W], vec_img)
         return out.transpose(1, 2).reshape(x.shape[0], -1, H, W)
