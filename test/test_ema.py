@@ -365,6 +365,31 @@ def test_a_checkpoint_counts_once_latest_names_it(tmp_path, no_barrier, monkeypa
     assert torch.load(run / 'global_step13' / 'layer_00-model_states.pt')['w'][0] == 13
 
 
+def test_files_of_a_killed_write_are_removed_at_the_start(tmp_path, no_barrier):
+    run = tmp_path / 'run'
+    (run / 'global_step3').mkdir(parents=True)
+    leftovers = [run / '.latest.tmp-11-22', run / 'global_step3' / '.layer_00-model_states.pt.tmp-11-22']
+    kept = [run / 'latest', run / 'global_step3' / 'layer_00-model_states.pt']
+    for path in leftovers + kept:
+        path.write_bytes(b'x')
+    module = nn.Linear(2, 2)
+    named(module)
+    _saver(tmp_path, _Model(), module)
+    assert [p.exists() for p in leftovers + kept] == [False, False, True, True]
+
+
+def test_a_decoupled_checkpoint_engine_is_refused(tmp_path, no_barrier):
+    """Its files are written after save_checkpoint returns: `latest` would name a checkpoint
+    whose files are not there yet."""
+    module = nn.Linear(2, 2)
+    named(module)
+    saver = _saver(tmp_path, _Model(), module)
+    saver.model_engine.checkpoint_engine.is_decoupled = lambda: True
+    with pytest.raises(ValueError, match='decoupled'):
+        saver.save_checkpoint(5, 40)
+    assert not list((tmp_path / 'run').glob('*global_step*')) and not (tmp_path / 'run' / 'latest').exists()
+
+
 def test_saver_without_ema_is_unchanged(tmp_path, no_barrier):
     module = nn.Linear(2, 2)
     named(module)

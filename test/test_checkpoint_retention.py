@@ -80,12 +80,22 @@ class TestTrainCheckpointRetention:
         assert left == ['epoch2', 'epochX', 'epochs_notes', 'samples'], left
 
     def test_the_one_latest_names_is_never_removed(self, tmp_path):
-        # A save of global_step4 failed part way: `latest` still names global_step2, the
-        # checkpoint a resume loads, and it stays even though two newer ones exist.
+        # Saves of global_step3 and 4 failed part way: `latest` still names global_step2, the
+        # checkpoint a resume loads. It stays, and so does global_step1: the two newer ones are
+        # unfinished, so these are the two complete checkpoints.
         self._populate(tmp_path, global_steps=(1, 2, 3, 4))
         (tmp_path / 'latest').write_text('global_step2')
         prune_old_checkpoints(tmp_path, 'global_step', 2)
-        assert sorted(p.name for p in tmp_path.iterdir() if p.is_dir()) == ['global_step2', 'global_step3', 'global_step4']
+        assert sorted(p.name for p in tmp_path.iterdir() if p.is_dir()) == [
+            'global_step1', 'global_step2', 'global_step3', 'global_step4']
+
+    def test_an_unfinished_checkpoint_is_not_counted(self, tmp_path):
+        # A crash while saving global_step300; the resumed run saved global_step250. Counting the
+        # unfinished 300 as one of the two kept would leave 250 the only complete checkpoint.
+        self._populate(tmp_path, global_steps=(100, 200, 250, 300))
+        (tmp_path / 'latest').write_text('global_step250')
+        prune_old_checkpoints(tmp_path, 'global_step', 2)
+        assert sorted(p.name for p in tmp_path.iterdir() if p.is_dir()) == ['global_step200', 'global_step250', 'global_step300']
 
     def test_an_unreadable_latest_removes_nothing(self, tmp_path):
         self._populate(tmp_path, global_steps=(1, 2, 3, 4))
