@@ -542,21 +542,35 @@ def test_text_to_image_datasets_leave_the_reference_blocks_out(tmp_path):
         assert torch.equal(v, sd[k]), k
 
 
+@pytest.mark.parametrize('saved_as', ['adapter', 'checkpoint'])
 @pytest.mark.parametrize('saved_with_references', [True, False, None], ids=['with', 'without', 'no-save'])
 @pytest.mark.parametrize('data_has_references', [True, False])
 def test_a_resumed_run_keeps_the_reference_blocks_it_started_with(tmp_path, saved_with_references,
-                                                                   data_has_references):
+                                                                   data_has_references, saved_as):
     """The checkpoint's optimizer state holds exactly the adapters the run started with, so a
-    resumed run follows its saved adapters even when the data now says otherwise."""
+    resumed run follows them even when the data now says otherwise: read from a saved adapter,
+    or from the DeepSpeed checkpoint when the run has not saved one yet."""
     run_dir = tmp_path / 'run'
     run_dir.mkdir()
+    # Never read: an unfinished save, torn.
+    (run_dir / '.step9.partial').mkdir()
+    (run_dir / '.step9.partial' / 'adapter_model.safetensors').write_bytes(b'torn')
     if saved_with_references is not None:
         first = attach(make_pipeline(tmp_path, adapter=lora(), cache_text_embeddings=True), make_model())
         directory = {'path': 'a', 'control_path': 'c'} if saved_with_references else {'path': 'a'}
         first.model_specific_dataset_config_validation({'directory': [directory]})
         first.configure_adapter(lora())
-        (run_dir / 'step5').mkdir()
-        first.save_adapter(run_dir / 'step5', saved_adapter_state(first))
+        if saved_as == 'adapter':
+            (run_dir / 'step5').mkdir()
+            first.save_adapter(run_dir / 'step5', saved_adapter_state(first))
+        else:
+            # What DeepSpeed writes with exclude_frozen_parameters: each layer's trainable tensors.
+            (run_dir / 'latest').write_text('global_step5')
+            (run_dir / 'global_step5').mkdir()
+            for i, layer in enumerate(first.to_layers()):
+                trainable = {n for n, p in layer.named_parameters() if p.requires_grad}
+                torch.save({k: v for k, v in layer.state_dict().items() if k in trainable},
+                           run_dir / 'global_step5' / f'layer_{i:02d}-model_states.pt')
 
     pipe = attach(make_pipeline(tmp_path, adapter=lora(), cache_text_embeddings=True), make_model())
     pipe.resume_run_dir = run_dir
@@ -1093,6 +1107,16 @@ def test_one_image_directory_with_two_control_configurations_in_a_run(tmp_path, 
     else:
         with pytest.raises(ValueError, match='reuse_metadata_cache = true'):
             manager.register(dataset(str(controls[1])))
+
+    # Two [[directory]] entries of one dataset.
+    config = {'resolutions': [40], 'enable_ar_bucket': False, 'reuse_metadata_cache': reuse_metadata_cache,
+              'directory': [{'path': str(images), 'num_repeats': 1, 'control_path': str(c)} for c in controls]}
+    manager.datasets = []
+    if reuse_metadata_cache:
+        manager.register(dataset_util.Dataset(config, pipe))
+    else:
+        with pytest.raises(ValueError, match='reuse_metadata_cache = true'):
+            manager.register(dataset_util.Dataset(config, pipe))
 
 
 def test_collate_refuses_examples_with_different_features(tmp_path):

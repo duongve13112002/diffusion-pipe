@@ -46,6 +46,15 @@ def remove_unpublished_saves(save_root):
     save_root = Path(save_root)
     if not save_root.is_dir():
         return
+    # publish_dir moves an existing save aside before renaming the new one in: a crash between
+    # the two renames leaves only the old one, which goes back into place.
+    for pattern in ('.*.old-*', f'*/.{EMA_SUBDIR}.old-*'):
+        for old in sorted(save_root.glob(pattern), reverse=True):
+            final = old.with_name(old.name[1:].split('.old-')[0])
+            if old.is_dir() and not final.exists():
+                logger.info(f'Restoring {final} from {old}')
+                os.replace(old, final)
+                fsync_dir(final.parent)
     for pattern in ('.*.partial', f'*/.{EMA_SUBDIR}.partial', '.*.old-*', f'*/.{EMA_SUBDIR}.old-*'):
         for path in save_root.glob(pattern):
             if path.is_dir():
@@ -242,6 +251,18 @@ class Saver:
     def save_checkpoint(self, step, examples):
         # DeepSpeed's own default tag, spelled out so the EMA file lands beside it.
         tag = f'global_step{self.model_engine.global_steps}'
+        if self.ema is not None:
+            # Before DeepSpeed's files: DeepSpeed writes `latest` before it returns, so the
+            # average has to be complete by then or a crash leaves `latest` naming a checkpoint
+            # without it. The average lives on data-parallel rank 0 of each stage; each writes
+            # its own.
+            error = None
+            if self.model_engine.grid.get_data_parallel_rank() == 0:
+                try:
+                    save_ema_checkpoint(self.ema, self.save_root, tag, self.model_engine.grid.get_pipe_parallel_rank())
+                except Exception as e:
+                    error = e
+            all_ok(error)
         self.model_engine.save_checkpoint(
             self.save_root,
             tag=tag,
@@ -253,11 +274,6 @@ class Saver:
             save_latest=True,
             exclude_frozen_parameters=True
         )
-        if self.ema is not None:
-            # The average lives on data-parallel rank 0 of each stage; each writes its own.
-            if self.model_engine.grid.get_data_parallel_rank() == 0:
-                save_ema_checkpoint(self.ema, self.save_root, tag, self.model_engine.grid.get_pipe_parallel_rank())
-            dist.barrier()
 
     def process_epoch(self, epoch, step, examples):
         checkpointed, saved = False, False

@@ -1099,11 +1099,12 @@ if __name__ == '__main__':
         step += 1
         examples += global_batch_size
 
-    # Save final training state checkpoint and model, unless we just saved them.
-    if not checkpointed:
-        saver.save_checkpoint(step, examples)
+    # Save final model and training state checkpoint, unless we just saved them. The model
+    # first, as in the saver: resuming from the checkpoint never skips a save.
     if not saved:
         saver.save_model(final_model_name)
+    if not checkpointed:
+        saver.save_checkpoint(step, examples)
 
     if is_main_process():
         print('TRAINING COMPLETE!')

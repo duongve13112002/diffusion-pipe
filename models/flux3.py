@@ -304,7 +304,16 @@ class Flux3Pipeline(ComfyPipeline):
         """
         wanted = self.datasets_have_references is not False
         if self.resume_run_dir is not None:
-            saved = saved_adapter_has_reference_blocks(self.resume_run_dir)
+            # TextEncoderLayer and InitialLayer, then the image and text early blocks (to_layers).
+            dm = self.diffusion_model
+            first_reference_layer = 2 + len(dm.content_mode_blocks['image']) + len(dm.txt_mode_blocks)
+            # Decided on rank 0 for all: ranks that read the files differently (one hits a
+            # volume error) must not build different adapters.
+            saved = [saved_adapter_has_reference_blocks(self.resume_run_dir, first_reference_layer)
+                     if is_main_process() else None]
+            if torch.distributed.is_available() and torch.distributed.is_initialized():
+                torch.distributed.broadcast_object_list(saved, src=0)
+            saved = saved[0]
             if saved is not None:
                 if saved != wanted and is_main_process():
                     logger.warning(
@@ -674,15 +683,28 @@ def adapter_has_reference_blocks(files):
     return False
 
 
-def saved_adapter_has_reference_blocks(run_dir):
-    """What the adapters saved in run_dir (<run>/epochN/, <run>/stepN/) say about the reference
-    blocks, or None when the run saved none yet. A file that cannot be read now (a network volume
-    hiccup) is skipped, not taken as an answer: every save of a run has the same targets."""
-    for f in sorted(Path(run_dir).glob('*/adapter_model.safetensors')):
+def saved_adapter_has_reference_blocks(run_dir, first_reference_layer):
+    """Whether the run in run_dir trained adapters on the reference blocks, or None when it
+    cannot tell. Every save of a run has the same targets, so any one published adapter
+    (<run>/epochN/, <run>/stepN/; not an unfinished .partial) answers. A run that has only
+    written DeepSpeed checkpoints so far answers through the layer file of its first reference
+    block, which holds that layer's trainable parameters: its adapters, or nothing. A file that
+    cannot be read now (a network volume hiccup) is skipped, never taken as an answer."""
+    run_dir = Path(run_dir)
+    for f in sorted(run_dir.glob('*/adapter_model.safetensors')):
+        if f.parent.name.startswith('.'):
+            continue
         try:
             return adapter_has_reference_blocks([f])
-        except OSError as e:
+        except Exception as e:
             logger.warning(f'Could not read {f} ({e}); trying another saved adapter')
+    try:
+        tag = (run_dir / 'latest').read_text().strip()
+        files = sorted((run_dir / tag).glob(f'layer_{first_reference_layer:02d}-*model_states.pt'))
+        if files:
+            return len(torch.load(files[0], map_location='cpu', weights_only=True, mmap=True)) > 0
+    except Exception as e:
+        logger.warning(f'Could not read the checkpoint in {run_dir} ({e})')
     return None
 
 

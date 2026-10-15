@@ -2525,10 +2525,10 @@ class DatasetManager:
 
     def _check_shared_legacy_caches(self, dataset):
         """With reuse_metadata_cache = false a directory's caches live at one path,
-        <path>/cache/<model>, whatever its control or mask files. Two datasets of one run (the
-        training dataset and an eval dataset, say) that list the same images with different ones
-        would overwrite each other's metadata and latents, one of them while the other has them
-        memory-mapped. reuse_metadata_cache = true keeps a cache per configuration."""
+        <path>/cache/<model>, whatever its control or mask files. Two [[directory]] entries of one
+        run (in the training and an eval dataset, or in one dataset) that list the same images with
+        different ones would overwrite each other's metadata and latents, one of them while the
+        other has them memory-mapped. reuse_metadata_cache = true keeps a cache per configuration."""
         def files_config(ds):
             return {'control_path': [str(p) for p in ([ds.control_path] if ds.control_path else []) + ds.extra_control_paths],
                     'mask_path': str(ds.mask_path), 'default_mask_file': str(ds.default_mask_file),
@@ -2537,16 +2537,18 @@ class DatasetManager:
         def legacy(ds):
             return [d for d in getattr(ds, 'directory_datasets', []) if not getattr(d, 'reuse_metadata_cache', True)]
 
+        earlier = [d for registered in self.datasets for d in legacy(registered)]
         for new in legacy(dataset):
-            for registered in self.datasets:
-                for old in legacy(registered):
-                    if (os.path.realpath(old.cache_dir) == os.path.realpath(new.cache_dir)
-                            and files_config(old) != files_config(new)):
-                        raise ValueError(
-                            f'{new.path} is listed twice with reuse_metadata_cache = false and different files '
-                            f'({files_config(old)} and {files_config(new)}): both would use the cache in '
-                            f'{new.cache_dir} and overwrite each other. Set reuse_metadata_cache = true '
-                            '(the default), which keeps a cache per configuration.')
+            # Earlier [[directory]] entries of the same dataset count too.
+            for old in earlier:
+                if (os.path.realpath(old.cache_dir) == os.path.realpath(new.cache_dir)
+                        and files_config(old) != files_config(new)):
+                    raise ValueError(
+                        f'{new.path} is listed twice with reuse_metadata_cache = false and different files '
+                        f'({files_config(old)} and {files_config(new)}): both would use the cache in '
+                        f'{new.cache_dir} and overwrite each other. Set reuse_metadata_cache = true '
+                        '(the default), which keeps a cache per configuration.')
+            earlier.append(new)
 
     # Some notes for myself:
     # Use the third-party multiprocess library because HF Datasets uses it for the map() calls.

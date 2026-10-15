@@ -233,14 +233,25 @@ def fsync_dir(path):
 
 
 def write_atomic(path, data):
-    """Write bytes under a temporary name (not matching *.safetensors, which adapter loaders
+    """Write bytes under a temporary name (not matching *.safetensors or *.pt, which loaders
     glob), fsync, rename, fsync the directory: a crash or a network volume hiccup never leaves a
     torn file under the real name."""
+    def write(f):
+        f.write(data)
+    _write_atomic(path, write)
+
+
+def torch_save_atomic(obj, path):
+    """torch.save, with write_atomic's guarantees."""
+    _write_atomic(path, lambda f: torch.save(obj, f))
+
+
+def _write_atomic(path, write):
     path = Path(path)
     tmp = path.with_name(f'.{path.name}.tmp-{os.getpid()}-{time.monotonic_ns()}')
     try:
         with open(tmp, 'wb') as f:
-            f.write(data)
+            write(f)
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp, path)

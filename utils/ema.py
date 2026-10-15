@@ -42,6 +42,8 @@ from pathlib import Path
 
 import torch
 
+from utils.common import torch_save_atomic
+
 DEVICES = ('cpu', 'gpu')
 DTYPES = {'float32': torch.float32, 'bfloat16': torch.bfloat16}
 EMA_SUBDIR = 'ema'
@@ -367,7 +369,9 @@ def checkpoint_file(save_root, tag, stage_id):
 
 
 def save_ema_checkpoint(ema, save_root, tag, stage_id):
-    torch.save(ema.state_dict(), checkpoint_file(save_root, tag, stage_id))
+    path = checkpoint_file(save_root, tag, stage_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    torch_save_atomic(ema.state_dict(), path)
 
 
 def load_ema_checkpoint(ema, save_root, tag):
