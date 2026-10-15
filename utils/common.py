@@ -241,9 +241,9 @@ def write_atomic(path, data):
     _write_atomic(path, write)
 
 
-def torch_save_atomic(obj, path):
+def torch_save_atomic(obj, path, **kwargs):
     """torch.save, with write_atomic's guarantees."""
-    _write_atomic(path, lambda f: torch.save(obj, f))
+    _write_atomic(path, lambda f: torch.save(obj, f, **kwargs))
 
 
 def _write_atomic(path, write):

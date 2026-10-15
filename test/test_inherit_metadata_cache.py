@@ -4,6 +4,7 @@ would not."""
 
 import json
 import sys
+import time
 from pathlib import Path
 
 import datasets
@@ -298,12 +299,15 @@ def test_missing_dataset_file_is_a_clear_error(tmp_path, capsys):
     assert 'no such file; pass the dataset .toml' in capsys.readouterr().err
 
 
-def test_reports_progress_while_it_works(tmp_path, capsys):
+def test_reports_progress_while_it_works(tmp_path, capsys, monkeypatch):
     # On network storage a run takes minutes; every stage says what it is doing as it starts.
     data = tmp_path / 'data'
     make_source(data)
     cache_donor(data, SIZE_BUCKETS)
     file = write_toml(tmp_path, data, SIZE_BUCKETS)
+    # The times count from main(), not from the import: in a long test session (or any caller
+    # that imported the module earlier) the first line read [01:...] or later.
+    monkeypatch.setattr(tool, '_START', time.monotonic() - 3600)
     assert tool.main(['--dataset', str(file)]) == 0
     err = capsys.readouterr().err
     for stage in ('importing torch', 'directory 1/1', 'looking for the', 'loading the donor snapshot',

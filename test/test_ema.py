@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 import torch
+from deepspeed.runtime.checkpoint_engine.torch_checkpoint_engine import TorchCheckpointEngine
 from torch import nn
 
 from utils import ema as ema_util
@@ -227,17 +228,25 @@ class _Grid:
 
 
 class _Engine:
+    """DeepSpeed's save_checkpoint as far as the saver sees it: the files go through
+    checkpoint_engine, then the ranks meet at a barrier."""
     grid = _Grid()
     global_steps = 12
 
-    def __init__(self):
+    def __init__(self, barrier=lambda: None):
         self.saved = []
+        self.checkpoint_engine = TorchCheckpointEngine()
+        self.barrier = barrier
 
-    def save_checkpoint(self, save_dir, tag=None, **kwargs):
-        Path(save_dir, tag).mkdir(parents=True, exist_ok=True)
+    def save_checkpoint(self, save_dir, tag=None, save_latest=True, **kwargs):
+        assert not save_latest      # `latest` is the saver's, written once every rank is done
+        # What was on disk when DeepSpeed started writing.
+        self.files_before = sorted(p.name for p in Path(save_dir, tag).iterdir()) if Path(save_dir, tag).exists() else []
+        self.checkpoint_engine.makedirs(Path(save_dir, tag), exist_ok=True)
+        self.checkpoint_engine.save({'w': torch.full((2,), float(self.global_steps))},
+                                    str(Path(save_dir, tag, 'layer_00-model_states.pt')))
+        self.barrier()
         self.saved.append(tag)
-        # What was on disk when DeepSpeed started writing (and, at its end, `latest`).
-        self.files_before = sorted(p.name for p in Path(save_dir, tag).iterdir())
 
 
 class _Model:
@@ -293,8 +302,6 @@ def test_saver_writes_the_average_beside_the_weights(tmp_path, no_barrier, is_ad
     saver.save_checkpoint(5, 40)
     assert engine.saved == ['global_step12']
     assert ema_util.checkpoint_file(tmp_path / 'run', 'global_step12', 0).exists()
-    # Written before DeepSpeed's files: DeepSpeed writes `latest` before it returns, and a
-    # crash after that must not leave `latest` naming a checkpoint without its average.
     assert engine.files_before == [ema_util.checkpoint_file(tmp_path / 'run', 'global_step12', 0).name]
 
 
@@ -313,6 +320,49 @@ def test_a_failed_average_write_stops_the_checkpoint(tmp_path, no_barrier, monke
     with pytest.raises(OSError, match='No space'):
         saver.save_checkpoint(5, 40)
     assert engine.saved == []
+    assert not (tmp_path / 'run' / 'latest').exists()
+
+
+def test_a_checkpoint_counts_once_latest_names_it(tmp_path, no_barrier, monkeypatch):
+    """A resume loads the tag `latest` names. It is written last, once every file is in place,
+    so a save that fails part way resumes from the previous checkpoint; the next save of that
+    tag starts from an empty directory."""
+    module = nn.Linear(2, 2)
+    named(module)
+    saver = _saver(tmp_path, _Model(), module)
+    engine = saver.model_engine
+    run = tmp_path / 'run'
+    saver.save_checkpoint(5, 40)
+    assert (run / 'latest').read_text() == 'global_step12'
+    assert torch.load(run / 'global_step12' / 'layer_00-model_states.pt')['w'][0] == 12
+
+    engine.global_steps = 13
+
+    def broken(*args, **kwargs):
+        raise RuntimeError('DeepSpeed failed')
+    engine.save_checkpoint = broken
+    with pytest.raises(RuntimeError, match='DeepSpeed failed'):
+        saver.save_checkpoint(6, 48)
+    del engine.save_checkpoint
+    assert isinstance(engine.checkpoint_engine, TorchCheckpointEngine)     # put back
+    assert (run / 'latest').read_text() == 'global_step12'
+
+    real = saver_util.torch_save_atomic
+
+    def torn(obj, path, **kwargs):
+        Path(path).write_bytes(b'torn')     # what a plain torch.save leaves when the volume goes
+        raise OSError('volume went away')
+    monkeypatch.setattr(saver_util, 'torch_save_atomic', torn)
+    with pytest.raises(OSError, match='volume went away'):
+        saver.save_checkpoint(6, 48)
+    assert (run / 'latest').read_text() == 'global_step12'
+    monkeypatch.setattr(saver_util, 'torch_save_atomic', real)
+
+    (run / 'global_step13' / 'layer_05-model_states.pt').write_bytes(b'stale')
+    saver.save_checkpoint(6, 48)
+    assert (run / 'latest').read_text() == 'global_step13'
+    assert sorted(p.name for p in (run / 'global_step13').iterdir()) == ['layer_00-model_states.pt']
+    assert torch.load(run / 'global_step13' / 'layer_00-model_states.pt')['w'][0] == 13
 
 
 def test_saver_without_ema_is_unchanged(tmp_path, no_barrier):
@@ -326,7 +376,7 @@ def test_saver_without_ema_is_unchanged(tmp_path, no_barrier):
                              types.SimpleNamespace(state_dict=lambda: {}), engine, module)
     saver.save_model('step3')
     saver.save_checkpoint(3, 24)
-    assert sorted(p.name for p in (tmp_path / 'run').iterdir()) == ['global_step12', 'step3']
+    assert sorted(p.name for p in (tmp_path / 'run').iterdir()) == ['global_step12', 'latest', 'step3']
     assert sorted(p.name for p in (tmp_path / 'run' / 'step3').iterdir()) == ['model.pt', 'train.toml']
     assert not list((tmp_path / 'run').rglob('ema*'))
 
@@ -588,6 +638,49 @@ def _failing_save_worker(rank, world_size, init_file, save_root, results):
             results[rank] = f'{type(e).__name__}: {e}'
     finally:
         torch_dist.destroy_process_group()
+
+
+def _failing_checkpoint_worker(rank, world_size, init_file, save_root, results):
+    import datetime
+    import torch.distributed as torch_dist
+    torch_dist.init_process_group('gloo', init_method=f'file://{init_file}', rank=rank, world_size=world_size,
+                                  timeout=datetime.timedelta(seconds=60))
+    saver_util.is_main_process = lambda: rank == 0     # DeepSpeed's comm is not set up here
+    if rank == 1:
+        def full_volume(obj, path, **kwargs):
+            raise OSError(28, 'No space left on device')
+        saver_util.torch_save_atomic = full_volume
+    try:
+        module = nn.Linear(2, 2)
+        named(module)
+        config_file = Path(save_root) / 'train.toml'
+        if rank == 0:
+            config_file.write_text('')
+        torch_dist.barrier()
+        engine = _Engine(barrier=torch_dist.barrier)
+        engine.grid = types.SimpleNamespace(get_data_parallel_rank=lambda: rank, get_pipe_parallel_rank=lambda: 0)
+        saver = saver_util.Saver(types.SimpleNamespace(config=str(config_file)), {}, False, Path(save_root) / 'run',
+                                 _Model(), types.SimpleNamespace(state_dict=lambda: {}), engine, module)
+        try:
+            saver.save_checkpoint(1, 8)
+            results[rank] = 'returned'
+        except Exception as e:
+            results[rank] = f'{type(e).__name__}: {e}'
+    finally:
+        torch_dist.destroy_process_group()
+
+
+def test_a_checkpoint_write_failing_on_one_rank_stops_every_rank(tmp_path):
+    """DeepSpeed meets at barriers after the writes: a rank raising out of its write would leave
+    the others there until the process group times out."""
+    import torch.multiprocessing as mp
+    with mp.Manager() as manager:
+        results = manager.dict()
+        mp.spawn(_failing_checkpoint_worker, args=(2, str(tmp_path / 'init'), str(tmp_path), results), nprocs=2,
+                 join=True)
+        results = dict(results)
+    assert all('rank 1: OSError' in results[r] and 'No space' in results[r] for r in (0, 1)), results
+    assert not (tmp_path / 'run' / 'latest').exists()
 
 
 def test_a_save_failing_on_rank_0_stops_every_rank(tmp_path):

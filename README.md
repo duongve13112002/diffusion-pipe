@@ -14,6 +14,9 @@ Models supported: SDXL, Flux, LTX-Video, HunyuanVideo (t2v), Cosmos, Lumina Imag
 - Optional OPLoRA (orthogonal projection LoRA) to reduce catastrophic forgetting when training LoRAs
 
 ## Recent changes
+- 2026-10-15
+  - `diffusion_model_dtype` now keeps every weight under the model's high-precision modules (e.g. `time_in`, `final_layer`, Krea2's `txtfusion`, MiniMax H3's `token_refiner`) in the base dtype, as intended; before, only weights directly in those modules were kept. This uses a little more VRAM (up to ~5% of the weights for Krea2).
+  - Saved models, adapters and training checkpoints are written under a temporary name and renamed into place, so an interrupted save never leaves a torn one; a checkpoint's `latest` is written only once all its files are in place, so `--resume_from_checkpoint` always loads a complete one. A failed save now stops every rank instead of leaving them waiting. `keep_last_n_checkpoints` must be at least 2, and never removes the checkpoint `latest` names.
 - 2026-09-28
   - Support Qwen-Image-2.1 (T2I training only).
 - 2026-08-08

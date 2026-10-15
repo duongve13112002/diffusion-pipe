@@ -6,9 +6,10 @@ import sys
 
 import torch
 from deepspeed import comm as dist
+from deepspeed.runtime.checkpoint_engine.torch_checkpoint_engine import TorchCheckpointEngine
 from deepspeed.utils.logging import logger
 
-from utils.common import all_ok, fsync_dir, is_main_process
+from utils.common import all_ok, fsync_dir, is_main_process, torch_save_atomic, write_atomic
 from utils.ema import EMA_SUBDIR, save_ema_checkpoint
 
 
@@ -26,8 +27,12 @@ def publish_dir(staging, final):
     staging, final = Path(staging), Path(final)
     for root, _, files in os.walk(staging):
         for file in files:
-            with open(Path(root) / file, 'rb') as f:
-                os.fsync(f.fileno())
+            # Windows fsyncs (FlushFileBuffers) only a handle open for writing.
+            fd = os.open(Path(root) / file, os.O_RDWR if os.name == 'nt' else os.O_RDONLY)
+            try:
+                os.fsync(fd)
+            finally:
+                os.close(fd)
         fsync_dir(root)
     old = None
     if final.exists():
@@ -62,6 +67,47 @@ def remove_unpublished_saves(save_root):
                 shutil.rmtree(path, ignore_errors=True)
 
 
+def read_latest(save_root):
+    """The tag `latest` names (the checkpoint a resume loads), or None when there is none yet."""
+    try:
+        return (Path(save_root) / 'latest').read_text().strip()
+    except FileNotFoundError:
+        return None
+
+
+class _CheckpointWrites:
+    """DeepSpeed's checkpoint engine for one save_checkpoint call. Each file is written under a
+    temporary name and renamed into place, and a failed write is kept instead of raised:
+    DeepSpeed has barriers after the writes, and a rank that raised before them would leave the
+    others waiting there until the process group times out. Saver.save_checkpoint raises it on
+    every rank once DeepSpeed returns."""
+
+    def __init__(self, engine):
+        self.engine = engine
+        self.error = None
+
+    def __getattr__(self, name):
+        return getattr(self.engine, name)
+
+    def _guard(self, write, *args, **kwargs):
+        if self.error is not None:
+            return
+        try:
+            write(*args, **kwargs)
+        except Exception as e:
+            self.error = e
+
+    def makedirs(self, path, exist_ok=False):
+        self._guard(self.engine.makedirs, path, exist_ok=exist_ok)
+
+    def save(self, state_dict, path):
+        if isinstance(self.engine, TorchCheckpointEngine):
+            self._guard(torch_save_atomic, state_dict, path,
+                        _use_new_zipfile_serialization=self.engine.zipfile_serialization)
+        else:
+            self._guard(self.engine.save, state_dict, path)
+
+
 def prune_old_checkpoints(save_root, prefix, keep, dry_run=False):
     """Keep the `keep` highest-numbered `<prefix><N>` directories under save_root, delete the rest.
 
@@ -72,9 +118,9 @@ def prune_old_checkpoints(save_root, prefix, keep, dry_run=False):
     Ordered by the number in the name, not by mtime: a resumed run rewrites older directories'
     timestamps, and the number is what actually says which checkpoint is later.
 
-    The newest is never deleted. That matters most for global_step*, where DeepSpeed's `latest`
-    file names the tag it will resume from -- deleting that one turns a prunable cache into an
-    unrecoverable run.
+    The newest is never deleted, nor the one `latest` names: that is the tag a resume loads, and
+    deleting it turns a prunable cache into an unrecoverable run. A newer global_step* than
+    `latest` is one whose save did not finish.
 
     Returns the paths removed (or that would be, under dry_run).
     """
@@ -92,8 +138,14 @@ def prune_old_checkpoints(save_root, prefix, keep, dry_run=False):
         if suffix.isdigit():
             numbered.append((int(suffix), path))
 
+    try:
+        latest = read_latest(save_root)
+    except OSError as e:
+        # Not knowing which one a resume loads, delete none of them.
+        logger.warning(f'keep_last_n_checkpoints: could not read {save_root / "latest"} ({e}); not pruning')
+        return []
     numbered.sort(key=lambda pair: pair[0])
-    doomed = [path for _, path in numbered[:-keep]] if len(numbered) > keep else []
+    doomed = [path for _, path in numbered[:-keep] if path.name != latest] if len(numbered) > keep else []
     if not dry_run:
         for path in doomed:
             logger.info(f'keep_last_n_checkpoints: removing {path.name}')
@@ -251,11 +303,22 @@ class Saver:
     def save_checkpoint(self, step, examples):
         # DeepSpeed's own default tag, spelled out so the EMA file lands beside it.
         tag = f'global_step{self.model_engine.global_steps}'
+        save_root = Path(self.save_root)
+
+        # A directory of this tag that `latest` does not name is what a save cut short left;
+        # DeepSpeed would write into it and keep its stale files.
+        error = None
+        if is_main_process():
+            try:
+                if (save_root / tag).exists() and read_latest(save_root) != tag:
+                    logger.info(f'Removing unfinished checkpoint {save_root / tag}')
+                    shutil.rmtree(save_root / tag)
+            except Exception as e:
+                error = e
+        all_ok(error)
+
         if self.ema is not None:
-            # Before DeepSpeed's files: DeepSpeed writes `latest` before it returns, so the
-            # average has to be complete by then or a crash leaves `latest` naming a checkpoint
-            # without it. The average lives on data-parallel rank 0 of each stage; each writes
-            # its own.
+            # The average lives on data-parallel rank 0 of each stage; each writes its own.
             error = None
             if self.model_engine.grid.get_data_parallel_rank() == 0:
                 try:
@@ -263,17 +326,34 @@ class Saver:
                 except Exception as e:
                     error = e
             all_ok(error)
-        self.model_engine.save_checkpoint(
-            self.save_root,
-            tag=tag,
-            client_state={
-                'step': step,
-                'examples': examples,
-                'custom_loader': self.train_dataloader.state_dict(),
-            },
-            save_latest=True,
-            exclude_frozen_parameters=True
-        )
+
+        writes = _CheckpointWrites(self.model_engine.checkpoint_engine)
+        self.model_engine.checkpoint_engine = writes
+        try:
+            self.model_engine.save_checkpoint(
+                self.save_root,
+                tag=tag,
+                client_state={
+                    'step': step,
+                    'examples': examples,
+                    'custom_loader': self.train_dataloader.state_dict(),
+                },
+                save_latest=False,
+                exclude_frozen_parameters=True
+            )
+        finally:
+            self.model_engine.checkpoint_engine = writes.engine
+        all_ok(writes.error)
+
+        # Last, once every rank's files are in place: a resume loads the tag `latest` names, so
+        # a save that fails or is cut short before this resumes from the previous checkpoint.
+        error = None
+        if is_main_process():
+            try:
+                write_atomic(save_root / 'latest', tag.encode())
+            except Exception as e:
+                error = e
+        all_ok(error)
 
     def process_epoch(self, epoch, step, examples):
         checkpointed, saved = False, False
