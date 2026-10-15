@@ -511,6 +511,9 @@ def apply_plan(plan, donor):
 
 
 def main(argv=None):
+    # The times count from this run: called from Python, the module may have been imported long before.
+    global _START
+    _START = time.monotonic()
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('--dataset', required=True, help='The dataset.toml both models train on.')
     parser.add_argument('--from', dest='donor', default='anima',

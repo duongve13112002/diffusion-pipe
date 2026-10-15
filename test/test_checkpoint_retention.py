@@ -79,6 +79,20 @@ class TestTrainCheckpointRetention:
         left = sorted(p.name for p in tmp_path.iterdir())
         assert left == ['epoch2', 'epochX', 'epochs_notes', 'samples'], left
 
+    def test_the_one_latest_names_is_never_removed(self, tmp_path):
+        # A save of global_step4 failed part way: `latest` still names global_step2, the
+        # checkpoint a resume loads, and it stays even though two newer ones exist.
+        self._populate(tmp_path, global_steps=(1, 2, 3, 4))
+        (tmp_path / 'latest').write_text('global_step2')
+        prune_old_checkpoints(tmp_path, 'global_step', 2)
+        assert sorted(p.name for p in tmp_path.iterdir() if p.is_dir()) == ['global_step2', 'global_step3', 'global_step4']
+
+    def test_an_unreadable_latest_removes_nothing(self, tmp_path):
+        self._populate(tmp_path, global_steps=(1, 2, 3, 4))
+        (tmp_path / 'latest').mkdir()       # reading it raises an OSError
+        assert prune_old_checkpoints(tmp_path, 'global_step', 2) == []
+        assert len(list(tmp_path.glob('global_step*'))) == 4
+
     def test_a_file_is_not_mistaken_for_a_checkpoint(self, tmp_path):
         self._populate(tmp_path, epochs=(1, 2))
         (tmp_path / 'epoch99').write_text('a file, not a checkpoint directory', encoding='utf-8')
