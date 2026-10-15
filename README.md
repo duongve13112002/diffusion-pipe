@@ -1,7 +1,7 @@
 # diffusion-pipe
 A pipeline parallel training script for diffusion models.
 
-Models supported: SDXL, Flux, LTX-Video, HunyuanVideo (t2v), Cosmos, Lumina Image 2.0, Wan2.1 (t2v and i2v), Chroma, HiDream, Stable Diffusion 3, Cosmos-Predict2, OmniGen2, Flux Kontext, Wan2.2, Qwen-Image, Qwen-Image-Edit, HunyuanImage-2.1, AuraFlow, Z-Image, HunyuanVideo-1.5, Flux 2 (Dev and Klein), Anima, Ernie-Image, LTX 2.3, Ideogram4, Krea 2, MiniMax H3, Qwen-Image-2.1.
+Models supported: SDXL, Flux, LTX-Video, HunyuanVideo (t2v), Cosmos, Lumina Image 2.0, Wan2.1 (t2v and i2v), Chroma, HiDream, Stable Diffusion 3, Cosmos-Predict2, OmniGen2, Flux Kontext, Wan2.2, Qwen-Image, Qwen-Image-Edit, HunyuanImage-2.1, AuraFlow, Z-Image, HunyuanVideo-1.5, Flux 2 (Dev and Klein), FLUX.3 Klein (text-to-image and multi-reference editing), Anima, Ernie-Image, LTX 2.3, Ideogram4, Krea 2, MiniMax H3, Qwen-Image-2.1.
 
 ## Features
 - Pipeline parallelism, for training models larger than can fit on a single GPU
@@ -14,6 +14,9 @@ Models supported: SDXL, Flux, LTX-Video, HunyuanVideo (t2v), Cosmos, Lumina Imag
 - Optional OPLoRA (orthogonal projection LoRA) to reduce catastrophic forgetting when training LoRAs
 
 ## Recent changes
+- 2026-10-15
+  - Support FLUX.3 Klein Base: LoRA, LoKr, OPLoRA and full fine-tune, text-to-image and editing with up to 10 reference images (`control_path` can now be a list of directories). `edit_isolation` trains editing without changing text-to-image. See [docs/supported_models.md](./docs/supported_models.md#flux3-klein).
+  - ComfyUI updated; update `comfy-kitchen` and `comfy-aimdo` too (`pip install -r requirements.txt -U`).
 - 2026-09-28
   - Support Qwen-Image-2.1 (T2I training only).
 - 2026-08-08

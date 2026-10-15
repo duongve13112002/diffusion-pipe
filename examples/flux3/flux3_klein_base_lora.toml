@@ -1,0 +1,75 @@
+# FLUX.3 Klein Base LoRA: text-to-image and editing (up to 10 reference images) in one run.
+# Start with: deepspeed train.py --deepspeed --config examples/flux3/flux3_klein_base_lora.toml
+
+output_dir = '/data/training_runs/flux3_klein_lora'
+dataset = 'examples/flux3/flux3_dataset.toml'
+
+epochs = 100
+micro_batch_size_per_gpu = 1
+pipeline_stages = 1
+gradient_accumulation_steps = 4
+gradient_clipping = 1.0
+warmup_steps = 50
+
+eval_every_n_epochs = 1
+eval_before_first_step = true
+eval_micro_batch_size_per_gpu = 1
+eval_gradient_accumulation_steps = 1
+
+save_every_n_epochs = 5
+checkpoint_every_n_minutes = 120
+activation_checkpointing = true
+partition_method = 'parameters'
+save_dtype = 'bfloat16'
+caching_batch_size = 1
+steps_per_print = 1
+# The 28 shared blocks are swapped first (up to 26), then the image/text blocks (up to 8).
+# The reference-image blocks always stay on the GPU.
+#blocks_to_swap = 12
+#ema_decay = 0.999
+
+[model]
+type = 'flux3'
+# black-forest-labs/flux-3-image-klein-base. Train Base, not the distilled Klein (refused): a
+# LoRA trained on Base also loads on Klein.
+diffusion_model = '/models/flux-3-image-klein-base/model.safetensors'
+vae = '/models/flux-3-image-klein-base/ae.safetensors'
+# The text_encoder/ directory of the same repository (its shards are read together), or
+# ComfyUI's single file qwen3vl_4b_bf16.safetensors.
+text_encoders = [
+    {path = '/models/flux-3-image-klein-base/text_encoder', type = 'flux3'},
+]
+dtype = 'bfloat16'
+#diffusion_model_dtype = 'float8'
+# Text features are 20480 values per token, so they are computed on the fly by default and the
+# text encoder (~8 GB) stays loaded. true caches them to disk and frees it.
+#cache_text_embeddings = true
+timestep_sample_method = 'logit_normal'
+# Klein samples with a shift of 6.93 (mu = 1.93586). A fixed shift, or flux_shift (by resolution).
+shift = 3
+#flux_shift = true
+# 'none' trains text-to-image and editing together. 'image_cond' or 'reference_tokens' train the
+# edit branch only and leave text-to-image exactly as it was; see flux3_klein_base_edit_only.toml.
+edit_isolation = 'none'
+
+[adapter]
+type = 'lora'
+rank = 32
+dtype = 'bfloat16'
+# OPLoRA (protects the base weights' top singular directions):
+#oplora = true
+#oplora_rank = 16
+
+# LoKr instead:
+#[adapter]
+#type = 'lokr'
+#rank = 16
+#decompose_factor = -1
+#dtype = 'bfloat16'
+
+[optimizer]
+type = 'adamw_optimi'
+lr = 1e-4
+betas = [0.9, 0.99]
+weight_decay = 0.01
+eps = 1e-8

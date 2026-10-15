@@ -85,6 +85,26 @@ def dedup_and_sort(values):
     return np.array(values)
 
 
+def control_file_column(i):
+    """Metadata column of the (i+1)-th control image: control_file, control_file_2, ..."""
+    return 'control_file' if i == 0 else f'control_file_{i + 1}'
+
+
+def validate_control_paths(model, dataset_config):
+    """A list of control directories needs a model that takes that many reference images."""
+    limit = getattr(model, 'max_control_images', 1)
+    for directory in dataset_config.get('directory', []):
+        paths = directory.get('control_path', None)
+        if paths is None or isinstance(paths, (str, Path)):
+            continue
+        if len(paths) == 0:
+            raise ValueError(f'{directory.get("path")}: control_path is an empty list')
+        if len(paths) > limit:
+            raise ValueError(
+                f'{directory.get("path")}: control_path lists {len(paths)} directories, but '
+                f'{type(model).__name__} takes at most {limit} control image(s) per sample.')
+
+
 def seed_from_hash(item):
     return int(hashlib.md5(str.encode(str(item))).hexdigest(), 16) % int(1e9)
 
@@ -1214,7 +1234,17 @@ class DirectoryDataset:
         self.shuffle_delimiter = directory_config.get('cache_shuffle_delimiter', dataset_config.get('cache_shuffle_delimiter', ", "))
         self.path = Path(self.directory_config['path'])
         self.mask_path = Path(self.directory_config['mask_path']) if 'mask_path' in self.directory_config else None
-        self.control_path = Path(self.directory_config['control_path']) if 'control_path' in self.directory_config else None
+        # control_path is one directory, or a list of them for models that take several
+        # reference images (max_control_images). The first stays in the control_file column
+        # every edit model reads; the others go in control_file_2, control_file_3, ...
+        control_paths = self.directory_config.get('control_path', None)
+        if control_paths is None:
+            control_paths = []
+        elif isinstance(control_paths, (str, Path)):
+            control_paths = [control_paths]
+        control_paths = [Path(p) for p in control_paths]
+        self.control_path = control_paths[0] if control_paths else None
+        self.extra_control_paths = control_paths[1:]
         # For testing. Default if a mask is missing.
         self.default_mask_file = Path(self.directory_config['default_mask_file']) if 'default_mask_file' in self.directory_config else None
         self.cache_dir = self.path / 'cache' / self.model_name
@@ -1283,8 +1313,9 @@ class DirectoryDataset:
             raise RuntimeError(f'Invalid path: {self.path}')
         if self.mask_path is not None and (not self.mask_path.exists() or not self.mask_path.is_dir()):
             raise RuntimeError(f'Invalid mask_path: {self.mask_path}')
-        if self.control_path is not None and (not self.control_path.exists() or not self.control_path.is_dir()):
-            raise RuntimeError(f'Invalid control_path: {self.control_path}')
+        for control_path in ([self.control_path] if self.control_path is not None else []) + self.extra_control_paths:
+            if not control_path.exists() or not control_path.is_dir():
+                raise RuntimeError(f'Invalid control_path: {control_path}')
         if self.default_mask_file is not None and (not self.default_mask_file.exists() or not self.default_mask_file.is_file()):
             raise RuntimeError(f'Invalid default_mask_file: {self.default_mask_file}')
 
@@ -1355,7 +1386,17 @@ class DirectoryDataset:
                 'round_to_multiple': self.round_to_multiple if round_to_multiple is _OWN else round_to_multiple,
                 'framerate': self.framerate if framerate is _OWN else framerate,
                 'mask_path': str(self.mask_path), 'control_path': str(self.control_path),
-                'default_mask_file': str(self.default_mask_file), 'shuffle': self.shuffle_metadata}
+                'default_mask_file': str(self.default_mask_file), 'shuffle': self.shuffle_metadata,
+                # Only present with several control directories, so a single-control dataset
+                # keeps the geometry (and the snapshot) it always had.
+                **({'extra_control_paths': [str(p) for p in self.extra_control_paths]}
+                   if self.extra_control_paths else {})}
+
+    def control_columns(self):
+        """Metadata columns holding this directory's control files, in reference order."""
+        if self.control_path is None:
+            return []
+        return ['control_file'] + [control_file_column(i) for i in range(1, len(self.extra_control_paths) + 1)]
 
     def legacy_tensor_sources(self, bucket, cache_name):
         """Describe old tensor inputs without modifying their metadata or shard files."""
@@ -1447,7 +1488,7 @@ class DirectoryDataset:
                     old['size_bucket'] in self.size_buckets.tolist() if self.use_size_buckets
                     else old['ar_bucket'] is not None and old['ar_bucket'][0] in self.ars
                     and old['ar_bucket'][1] in self.frame_buckets)
-                if compatible and all(old.get(k) == row.get(k) for k in ('mask_file', 'control_file')):
+                if compatible and all(old.get(k) == row.get(k) for k in ('mask_file', *self.control_columns())):
                     result = old
                     result['caption'] = captions or ['']
                 else:
@@ -1708,7 +1749,11 @@ class DirectoryDataset:
         metadata_cache_file_1 = self.cache_dir / 'metadata/metadata_intermediate'
         metadata_cache_file_2 = self.cache_dir / f'metadata/metadata{self.caption_cache_suffix}.arrow'
 
-        if regenerate_cache or not metadata_cache_file_1.exists() or not trust_cache:
+        enumerate_files = regenerate_cache or not metadata_cache_file_1.exists() or not trust_cache
+        if not enumerate_files and self.extra_control_paths:
+            cached_columns = datasets.load_from_disk(str(metadata_cache_file_1)).column_names
+            enumerate_files = not set(self.control_columns()) <= set(cached_columns)
+        if enumerate_files:
             print('Intermediate metadata is not cached. Enumerating all files.')
             files = list(self.path.glob('*'))
             # deterministic order
@@ -1717,6 +1762,8 @@ class DirectoryDataset:
             # Mask can have any extension, it just needs to have the same stem as the image.
             mask_file_stems = {path.stem: path for path in self.mask_path.glob('*') if path.is_file()} if self.mask_path is not None else {}
             control_file_stems = {path.stem: path for path in self.control_path.glob('*') if path.is_file()} if self.control_path is not None else {}
+            extra_control_stems = [{path.stem: path for path in control_path.glob('*') if path.is_file()}
+                                   for control_path in self.extra_control_paths]
 
             def process_file(file):
                 if file.suffix != '.tar':
@@ -1731,6 +1778,7 @@ class DirectoryDataset:
             caption_files = []
             mask_files = []
             control_files = []
+            extra_control_files = [[] for _ in self.extra_control_paths]
             for file in tqdm(files):
                 if not file.is_file() or file.suffix in NON_MEDIA_SUFFIXES:
                     continue
@@ -1755,11 +1803,17 @@ class DirectoryDataset:
                         if image_file.stem not in control_file_stems:
                             raise RuntimeError(f'No control file exists for image {image_file}')
                         control_files.append(str(control_file_stems[image_file.stem]))
+                        for control_path, stems, column in zip(self.extra_control_paths, extra_control_stems, extra_control_files):
+                            if image_file.stem not in stems:
+                                raise RuntimeError(f'No control file in {control_path} exists for image {image_file}')
+                            column.append(str(stems[image_file.stem]))
             assert len(image_specs) > 0, f'Directory {self.path} had no images/videos!'
 
             d = {'image_spec': image_specs, 'caption_file': caption_files, 'mask_file': mask_files}
             if self.control_path:
                 d['control_file'] = control_files
+                for i, column in enumerate(extra_control_files, start=1):
+                    d[control_file_column(i)] = column
             metadata_dataset = datasets.Dataset.from_dict(d)
 
             if captions_json.exists():
@@ -1845,8 +1899,8 @@ class DirectoryDataset:
 
         def fn(example):
             empty_return = {'image_spec': [], 'mask_file': [], 'caption': [], 'ar_bucket': [], 'size_bucket': [], 'is_video': []}
-            if self.control_path:
-                empty_return['control_file'] = []
+            for column in self.control_columns():
+                empty_return[column] = []
             # batch size always 1
             caption_file = example['caption_file'][0]
             image_spec = example['image_spec'][0]
@@ -1958,8 +2012,8 @@ class DirectoryDataset:
                 'size_bucket': [size_bucket],
                 'is_video': [is_video],
             }
-            if self.control_path:
-                ret['control_file'] = [example['control_file'][0]]
+            for column in self.control_columns():
+                ret[column] = [example[column][0]]
             return ret
 
         return fn
@@ -2099,6 +2153,7 @@ class Dataset:
         self.batch_fill = resolve_batch_fill_config(
             dataset_config, batch_fill_defaults, batch_fill_overrides)
         if not skip_dataset_validation:
+            validate_control_paths(self.model, self.dataset_config)
             self.model.model_specific_dataset_config_validation(self.dataset_config)
 
         on_the_fly_media = None
@@ -2328,6 +2383,8 @@ def _cache_fn(datasets, queue, preprocess_media_file_fn, num_text_encoders, rege
 
     def latents_map_fn(example, rank):
         is_edit_dataset = ('control_file' in example)
+        control_columns = ['control_file'] + sorted(
+            (k for k in example if k.startswith('control_file_')), key=lambda k: int(k.rsplit('_', 1)[1]))
         first_size_bucket = example['size_bucket'][0]
         tensors_and_masks = []
         image_specs = []
@@ -2342,11 +2399,13 @@ def _cache_fn(datasets, queue, preprocess_media_file_fn, num_text_encoders, rege
             image_specs.extend([image_spec] * len(items))
             captions.extend([caption] * len(items))
             if is_edit_dataset:
-                control_file = example['control_file'][i]
-                control_items = preprocess_media_file_fn((None, control_file), None, size_bucket)
-                assert len(control_items) == 1
+                controls = []
+                for column in control_columns:
+                    control_items = preprocess_media_file_fn((None, example[column][i]), None, size_bucket)
+                    assert len(control_items) == 1
+                    controls.append(control_items[0])
                 assert len(items) == 1
-                control_tensors_and_masks.append(control_items[0])
+                control_tensors_and_masks.append(controls)
             else:
                 control_tensors_and_masks.append(None)
 
@@ -2358,7 +2417,14 @@ def _cache_fn(datasets, queue, preprocess_media_file_fn, num_text_encoders, rege
         results = defaultdict(list)
         for i in range(0, len(tensors_and_masks), caching_batch_size):
             tensor = torch.stack([t[0] for t in tensors_and_masks[i:i+caching_batch_size]])
-            c_tensor = torch.stack([t[0] for t in control_tensors_and_masks[i:i+caching_batch_size]]) if is_edit_dataset else None
+            c_tensor = None
+            if is_edit_dataset:
+                chunk = control_tensors_and_masks[i:i+caching_batch_size]
+                c_tensor = [torch.stack([controls[j][0] for controls in chunk]) for j in range(len(control_columns))]
+                # One control image is passed as a tensor, as every edit model expects; several
+                # (max_control_images > 1) as a list in control_path order.
+                if len(c_tensor) == 1:
+                    c_tensor = c_tensor[0]
             audio_list = [t[1] for t in tensors_and_masks[i:i+caching_batch_size]]  # needs to be list because any example's audio could be None
             if rank not in pipes:
                 pipes[rank] = mp.Pipe(duplex=False)

@@ -1,0 +1,18 @@
+# For edit_isolation = 'image_cond' or 'reference_tokens': every directory needs control images
+# (a text-to-image sample would train nothing, so it is refused).
+
+resolutions = [1024]
+enable_ar_bucket = true
+min_ar = 0.5
+max_ar = 2.0
+num_ar_buckets = 9
+
+[[directory]]
+path = '/data/flux3/edit/target'
+control_path = '/data/flux3/edit/control'
+num_repeats = 1
+
+[[directory]]
+path = '/data/flux3/compose/target'
+control_path = ['/data/flux3/compose/subject', '/data/flux3/compose/background']
+num_repeats = 1

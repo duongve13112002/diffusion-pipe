@@ -181,7 +181,8 @@ def check_snapshot(plan, snapshot, sample, header_sample, seed=0, check_all=Fals
     if missing:
         plan.note(f'donor snapshot lacks columns {sorted(missing)}; it was written by a different version.')
         return False
-    if ('control_file' in snapshot.column_names) != (target.control_path is not None):
+    donor_controls = sorted(c for c in snapshot.column_names if c.startswith('control_file'))
+    if donor_controls != sorted(target.control_columns()):
         plan.note('donor snapshot and this dataset disagree about control_path.')
         return False
     plan.rows = len(snapshot)

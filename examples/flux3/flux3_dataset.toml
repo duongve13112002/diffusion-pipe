@@ -1,0 +1,28 @@
+# Text-to-image and editing in one dataset. A batch never mixes directories, so every batch is
+# all text-to-image or all edit samples with the same number of references.
+
+resolutions = [1024]
+enable_ar_bucket = true
+min_ar = 0.5
+max_ar = 2.0
+num_ar_buckets = 9
+
+[[directory]]
+# Plain text-to-image: images and .txt captions.
+path = '/data/flux3/t2i'
+num_repeats = 1
+
+[[directory]]
+# Single-reference edits: the target images (what the model learns to produce) with captions,
+# and a control image of the same name in control_path.
+path = '/data/flux3/edit/target'
+control_path = '/data/flux3/edit/control'
+num_repeats = 1
+
+[[directory]]
+# Multi-reference: a list of up to 10 control directories, each holding an image of the same
+# name as every target. The order is the reference order: control_path[0] is reference 1,
+# control_path[1] reference 2, ... In ComfyUI, chain the ReferenceLatent nodes in this order.
+path = '/data/flux3/compose/target'
+control_path = ['/data/flux3/compose/subject', '/data/flux3/compose/background']
+num_repeats = 1

@@ -28,6 +28,7 @@ See [source snapshots and cache profiles](caption-processing.md#source-snapshots
 |Z-Image         |✅    |✅              |✅                |
 |HunyuanVideo-1.5|✅    |✅              |✅                |
 |Flux 2          |✅    |✅              |✅                |
+|FLUX.3 Klein    |✅    |✅              |✅                |
 |Anima           |✅    |✅              |✅                |
 |Anima Refiner   |✅    |✅              |✅                |
 |LTX 2.3         |✅    |❌              |✅                |
@@ -544,6 +545,69 @@ Notes:
 - Without block swapping, Dev needs at least 48GB VRAM for LoRA training and probably a lot of system RAM also.
 - The Flux2 VAE has more channels, so a timestep shift value above 1 is useful. I don't know the best value but 3 seems to work well.
 - Make sure you're using the right text encoder. Each version uses a different TE. If you use the wrong one, the caching will still run but you will get shape mismatch errors when it tries to train.
+
+LoRAs are saved in ComfyUI format.
+
+## FLUX.3 Klein
+```
+[model]
+type = 'flux3'
+diffusion_model = '/models/flux-3-image-klein-base/model.safetensors'
+vae = '/models/flux-3-image-klein-base/ae.safetensors'
+text_encoders = [
+    {path = '/models/flux-3-image-klein-base/text_encoder', type = 'flux3'}
+]
+dtype = 'bfloat16'
+#diffusion_model_dtype = 'float8'
+#cache_text_embeddings = true
+timestep_sample_method = 'logit_normal'
+shift = 3
+# 'none' (default), 'image_cond' or 'reference_tokens', see below.
+#edit_isolation = 'none'
+```
+
+Full examples: [LoRA, text-to-image and editing](../examples/flux3/flux3_klein_base_lora.toml),
+[editing only](../examples/flux3/flux3_klein_base_edit_only.toml), and their
+[dataset](../examples/flux3/flux3_dataset.toml) and [edit dataset](../examples/flux3/flux3_edit_dataset.toml).
+
+Notes:
+- **Train Klein Base** ([black-forest-labs/flux-3-image-klein-base](https://huggingface.co/black-forest-labs/flux-3-image-klein-base)).
+  The distilled Klein (a flow map) is refused; a LoRA trained on Base loads on it. The BFL files load
+  directly: `model.safetensors`, `ae.safetensors` (the FLUX.2 VAE) and the `text_encoder/` directory,
+  whose shards are read together. ComfyUI's `qwen3vl_4b_bf16.safetensors` works as the text encoder too.
+  Checkpoints with a fused `qkv` are split into `q_proj`/`k_proj`/`v_proj` at load, so LoRA keys always
+  name those (ComfyUI maps them onto either layout).
+- LoRA, LoKr, OPLoRA and full fine-tuning; EMA, block swap, pipeline parallelism, eval, `diffusion_model_dtype`
+  and batch fill work as for other models.
+- Text: the text encoder is Qwen3-VL-4B, tapped at 8 layers (20480 values per token). Embeddings are computed
+  on the fly by default (`cache_text_embeddings = false`), since caching them takes ~6.5 MB per 160-token
+  caption; set it to `true` to cache them and free the text encoder. The DiT attends to every text token,
+  so captions of different lengths in one batch are padded and the padding is masked: each sample sees
+  exactly what it would see alone (and what ComfyUI gives it).
+- Editing: give a `[[directory]]` a `control_path` (see the [edit dataset example](../examples/flux_kontext_dataset.toml)).
+  FLUX.3 takes up to 10 reference images: `control_path` can be a list of directories, each holding an image
+  with the same name as every target. The list order is the reference order; in ComfyUI chain the
+  `ReferenceLatent` nodes in the same order. Text-to-image and edit directories can be trained together
+  (a batch never mixes directories).
+- `edit_isolation` trains editing without changing text-to-image:
+  - `'none'` (default): adapters on every block; trains both.
+  - `'image_cond'`: trains only the modules that exist for the reference images (their input projection,
+    their 5 blocks and their modulations). A prompt without references never reaches them, so text-to-image
+    is bit-identical. An ordinary LoRA; also a full fine-tune of just those modules (without `[adapter]`).
+    Needs `pipeline_stages = 1`.
+  - `'reference_tokens'`: also puts the adapter on the 28 shared blocks, applied only to the rows of the
+    reference tokens; image and text rows go through the base weights. Stronger than `'image_cond'`,
+    text-to-image still bit-identical. Adapters only. These shared-block weights are saved under
+    `flux3_ref_rows.` instead of `diffusion_model.`, so ComfyUI's ordinary LoRA loader skips them. Load the
+    LoRA with the **Load FLUX.3 Reference LoRA** node: copy or symlink
+    [tools/comfyui_flux3_reference_lora](../tools/comfyui_flux3_reference_lora) into `ComfyUI/custom_nodes/`.
+    It cannot be merged (`merge_adapters` refuses it).
+  
+  Both isolated modes need a `control_path` in every directory, and an adapter keeps the mode it was trained
+  with (resuming or `init_from_existing` with another mode is refused).
+- Inference: ComfyUI samples Klein with shift 6.93 (mu = 1.93586); Base is meant for 50 steps with CFG 3.5.
+  A fixed `shift` around 3 is a reasonable start for training, or `flux_shift = true` (by resolution).
+- `guidance` is not used (Klein Base has no guidance embedding) and other values are refused.
 
 LoRAs are saved in ComfyUI format.
 

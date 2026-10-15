@@ -1,0 +1,59 @@
+# FLUX.3 Klein Base: train editing only, text-to-image stays bit-identical.
+# Start with: deepspeed train.py --deepspeed --config examples/flux3/flux3_klein_base_edit_only.toml
+#
+# edit_isolation = 'reference_tokens' puts the LoRA on the reference-image modules and on the 28
+# shared blocks, where it applies only to the rows of the reference tokens. Without a reference
+# image there are no such rows, so a prompt alone renders exactly as with the base model. In
+# ComfyUI load it with the "Load FLUX.3 Reference LoRA" node (tools/comfyui_flux3_reference_lora);
+# the ordinary LoRA loader would skip the shared-block weights.
+#
+# edit_isolation = 'image_cond' trains only the reference-image modules (their input projection,
+# their five blocks, their modulations). Weaker, but an ordinary LoRA, and it also works for a
+# full fine-tune (remove [adapter]). Every dataset directory needs a control_path in both modes.
+
+output_dir = '/data/training_runs/flux3_klein_edit'
+dataset = 'examples/flux3/flux3_edit_dataset.toml'
+
+epochs = 100
+micro_batch_size_per_gpu = 1
+pipeline_stages = 1
+gradient_accumulation_steps = 4
+gradient_clipping = 1.0
+warmup_steps = 50
+
+eval_every_n_epochs = 1
+eval_before_first_step = true
+eval_micro_batch_size_per_gpu = 1
+eval_gradient_accumulation_steps = 1
+
+save_every_n_epochs = 5
+checkpoint_every_n_minutes = 120
+activation_checkpointing = true
+partition_method = 'parameters'
+save_dtype = 'bfloat16'
+caching_batch_size = 1
+steps_per_print = 1
+
+[model]
+type = 'flux3'
+diffusion_model = '/models/flux-3-image-klein-base/model.safetensors'
+vae = '/models/flux-3-image-klein-base/ae.safetensors'
+text_encoders = [
+    {path = '/models/flux-3-image-klein-base/text_encoder', type = 'flux3'},
+]
+dtype = 'bfloat16'
+timestep_sample_method = 'logit_normal'
+shift = 3
+edit_isolation = 'reference_tokens'
+
+[adapter]
+type = 'lora'
+rank = 32
+dtype = 'bfloat16'
+
+[optimizer]
+type = 'adamw_optimi'
+lr = 1e-4
+betas = [0.9, 0.99]
+weight_decay = 0.01
+eps = 1e-8

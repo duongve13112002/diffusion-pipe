@@ -253,6 +253,9 @@ class CommonPipeline:
     # pretrained weights to protect. Empty for every model that trains adapters purely on
     # pretrained layers.
     oplora_exclude_names = ()
+    # Control (reference) images per sample a model takes. A dataset directory may list up to
+    # this many control_path directories; edit models take one.
+    max_control_images = 1
 
     # Config keys naming the checkpoint this model's VAE is loaded from. They differ per model
     # -- vae_path, diffusers_path, ckpt_path, checkpoint_path -- and there is no rule that
