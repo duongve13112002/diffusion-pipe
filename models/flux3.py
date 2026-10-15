@@ -28,6 +28,7 @@ ComfyUI. Two things ComfyUI does not need are added:
                           this way.
 """
 
+import functools
 import os
 import sys
 import uuid
@@ -297,6 +298,7 @@ class Flux3Pipeline(ComfyPipeline):
                     targets.add(name)
         return sorted(targets)
 
+    @functools.cache
     def init_adapter_has_reference_blocks(self):
         path = self.config.get('adapter', {}).get('init_from_existing', None)
         if path is None:
