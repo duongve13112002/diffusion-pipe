@@ -8,13 +8,49 @@ import torch
 from deepspeed import comm as dist
 from deepspeed.utils.logging import logger
 
-from utils.common import is_main_process
+from utils.common import all_ok, fsync_dir, is_main_process
 from utils.ema import EMA_SUBDIR, save_ema_checkpoint
 
 
 def convert_state_dict_dtype(state_dict, dtype):
     for key, v in state_dict.items():
         state_dict[key] = v.to(device='cpu', dtype=dtype)
+
+
+def publish_dir(staging, final):
+    """Make the fully written directory `staging` appear as `final`: fsync its files, then rename.
+
+    A directory already at `final` (the same name saved again, e.g. a manual save on a step that
+    was just saved) is moved aside first and removed only once the new one is in place.
+    """
+    staging, final = Path(staging), Path(final)
+    for root, _, files in os.walk(staging):
+        for file in files:
+            with open(Path(root) / file, 'rb') as f:
+                os.fsync(f.fileno())
+        fsync_dir(root)
+    old = None
+    if final.exists():
+        old = final.with_name(f'.{final.name}.old-{os.getpid()}-{time.monotonic_ns()}')
+        os.replace(final, old)
+    os.replace(staging, final)
+    fsync_dir(final.parent)
+    if old is not None:
+        shutil.rmtree(old, ignore_errors=True)
+
+
+def remove_unpublished_saves(save_root):
+    """Remove what interrupted saves left behind (see publish_dir): staging directories that were
+    never renamed into place, and replaced directories that were not yet removed. Called before
+    any save of this run starts, so none of them is in use."""
+    save_root = Path(save_root)
+    if not save_root.is_dir():
+        return
+    for pattern in ('.*.partial', f'*/.{EMA_SUBDIR}.partial', '.*.old-*', f'*/.{EMA_SUBDIR}.old-*'):
+        for path in save_root.glob(pattern):
+            if path.is_dir():
+                logger.info(f'Removing unfinished save {path}')
+                shutil.rmtree(path, ignore_errors=True)
 
 
 def prune_old_checkpoints(save_root, prefix, keep, dry_run=False):
@@ -115,67 +151,85 @@ class Saver:
         self.train_dataloader = train_dataloader
         self.model_engine = model_engine
         self.pipeline_model = pipeline_model
+        if is_main_process():
+            remove_unpublished_saves(self.save_root)
 
-    def save_adapter(self, name, ema=False):
+    def _save(self, name, ema, collect, write):
+        """Gather the weights on data-parallel rank 0 of each stage, then write them from stage 0.
+
+        The directory is built under a temporary name beside the real one and renamed into place
+        once every file in it is on disk, so a crash or a network volume hiccup leaves either
+        the previous save or none, never a torn one. Each step's failure is shared with every
+        rank (all_ok) before the next collective, so a failed save stops the run instead of
+        leaving the other ranks to wait out the process group timeout.
+        """
         dp_id = self.model_engine.grid.get_data_parallel_rank()
         stage_id = self.model_engine.grid.get_pipe_parallel_rank()
         save_dir = self.save_root / name
         if ema:
             save_dir = save_dir / EMA_SUBDIR
-        tmp_dir = save_dir / 'tmp'
-        if dp_id == 0 and stage_id == 0:
-            os.makedirs(tmp_dir, exist_ok=False)
-        dist.barrier()
+        staging = save_dir.parent / f'.{save_dir.name}.partial'
+        tmp_dir = staging / 'tmp'
+        writer = dp_id == 0 and stage_id == 0
+
+        error = None
+        if writer:
+            try:
+                # Left by a save that was interrupted: never published, so nothing to keep.
+                if staging.exists():
+                    shutil.rmtree(staging)
+                os.makedirs(tmp_dir)
+            except Exception as e:
+                error = e
+        all_ok(error)
+
+        error = None
         if dp_id == 0:
+            try:
+                partial_state_dict = collect()
+                if 'save_dtype' in self.config:
+                    convert_state_dict_dtype(partial_state_dict, self.config['save_dtype'])
+                torch.save(partial_state_dict, tmp_dir / f'state_dict_{stage_id}.bin')
+            except Exception as e:
+                error = e
+        all_ok(error)
+
+        error = None
+        if writer:
+            try:
+                state_dict = {}
+                for path in tmp_dir.glob('*.bin'):
+                    state_dict.update(torch.load(path, weights_only=True, map_location='cpu'))
+                shutil.rmtree(tmp_dir)
+                write(staging, state_dict)
+                shutil.copy(self.args.config, staging)
+                publish_dir(staging, save_dir)
+            except Exception as e:
+                error = e
+        all_ok(error)
+
+    def save_adapter(self, name, ema=False):
+        def collect():
             partial_state_dict = {}
-            for name, p in self.pipeline_model.named_parameters():
+            for param_name, p in self.pipeline_model.named_parameters():
                 if p.requires_grad:
                     if not hasattr(p, 'original_name'):
-                        logger.warning(f'WARNING: parameter {name} requires_grad but does not have original_name. Not saving it.')
+                        logger.warning(f'WARNING: parameter {param_name} requires_grad but does not have original_name. Not saving it.')
                         continue
                     # TODO: maybe this needs to change if we ever have non-lora adapters?
                     key = p.original_name.replace('.default', '').replace('.modules_to_save', '')
                     partial_state_dict[key] = self.ema.averaged(key, p) if ema else p.detach()
-                    if 'save_dtype' in self.config:
-                        convert_state_dict_dtype(partial_state_dict, self.config['save_dtype'])
-            torch.save(partial_state_dict, tmp_dir / f'state_dict_{stage_id}.bin')
-        dist.barrier()
-        if dp_id == 0 and stage_id == 0:
-            state_dict = {}
-            for path in tmp_dir.glob('*.bin'):
-                state_dict.update(torch.load(path, weights_only=True, map_location='cpu'))
-            self.model.save_adapter(save_dir, state_dict)
-            shutil.copy(self.args.config, save_dir)
-            shutil.rmtree(tmp_dir)
+            return partial_state_dict
+        self._save(name, ema, collect, self.model.save_adapter)
 
     def save_full_model(self, name, ema=False):
-        dp_id = self.model_engine.grid.get_data_parallel_rank()
-        stage_id = self.model_engine.grid.get_pipe_parallel_rank()
-        save_dir = self.save_root / name
-        if ema:
-            save_dir = save_dir / EMA_SUBDIR
-        tmp_dir = save_dir / 'tmp'
-        if dp_id == 0 and stage_id == 0:
-            os.makedirs(tmp_dir, exist_ok=False)
-        dist.barrier()
-        if dp_id == 0:
+        def collect():
             # With BF16_Optimizer, we get pickle errors unless we do p.detach(). I have no idea why.
             if ema:
-                partial_state_dict = {p.original_name: self.ema.averaged(p.original_name, p)
-                                      for p in self.pipeline_model.parameters() if hasattr(p, 'original_name')}
-            else:
-                partial_state_dict = {p.original_name: p.detach() for p in self.pipeline_model.parameters() if hasattr(p, 'original_name')}
-            if 'save_dtype' in self.config:
-                convert_state_dict_dtype(partial_state_dict, self.config['save_dtype'])
-            torch.save(partial_state_dict, tmp_dir / f'state_dict_{stage_id}.bin')
-        dist.barrier()
-        if dp_id == 0 and stage_id == 0:
-            state_dict = {}
-            for path in tmp_dir.glob('*.bin'):
-                state_dict.update(torch.load(path, map_location='cpu', weights_only=True))
-            self.model.save_model(save_dir, state_dict)
-            shutil.copy(self.args.config, save_dir)
-            shutil.rmtree(tmp_dir)
+                return {p.original_name: self.ema.averaged(p.original_name, p)
+                        for p in self.pipeline_model.parameters() if hasattr(p, 'original_name')}
+            return {p.original_name: p.detach() for p in self.pipeline_model.parameters() if hasattr(p, 'original_name')}
+        self._save(name, ema, collect, self.model.save_model)
 
     def save_model(self, name):
         if is_main_process():
@@ -208,12 +262,13 @@ class Saver:
     def process_epoch(self, epoch, step, examples):
         checkpointed, saved = False, False
         if self.train_dataloader.epoch != epoch:
-            if need_to_checkpoint(self.config, epoch):
-                self.save_checkpoint(step, examples)
-                checkpointed = True
+            # The model before the checkpoint: resuming from that checkpoint never skips a save.
             if 'save_every_n_epochs' in self.config and epoch % self.config['save_every_n_epochs'] == 0:
                 self.save_model(f'epoch{epoch}')
                 saved = True
+            if need_to_checkpoint(self.config, epoch):
+                self.save_checkpoint(step, examples)
+                checkpointed = True
             if checkpointed or saved:
                 # After both possible writes for this epoch, so a checkpoint and a model saved
                 # on the same epoch are pruned in one pass.

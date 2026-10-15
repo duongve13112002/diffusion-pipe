@@ -31,7 +31,6 @@ ComfyUI. Two things ComfyUI does not need are added:
 import functools
 import os
 import sys
-import uuid
 sys.path.insert(0, os.path.join(os.path.abspath(os.path.dirname(__file__)), '../submodules/ComfyUI'))
 
 from pathlib import Path
@@ -42,7 +41,7 @@ import torch.nn.functional as F
 import safetensors.torch
 
 from models.base import ComfyPipeline, ModelWrapper, make_contiguous
-from utils.common import AUTOCAST_DTYPE, get_lin_function, time_shift, is_main_process, empty_cuda_cache
+from utils.common import AUTOCAST_DTYPE, get_lin_function, time_shift, is_main_process, empty_cuda_cache, write_atomic
 from utils.offloading import ModelOffloader
 import comfy.latent_formats
 import comfy.model_management
@@ -141,7 +140,6 @@ class Flux3Pipeline(ComfyPipeline):
     checkpointable_layers = ['EarlyLayer', 'SingleLayer']
     adapter_target_modules = ['Block']
     keep_in_high_precision = ['emb_in', 'txt_in', 'time_in', 'final_layer', 'stream_modulations']
-    match_high_precision_by_path = True
     spatial_compression = 16
     channels = 128
     max_control_images = MAX_REFERENCES
@@ -539,30 +537,6 @@ class Flux3Pipeline(ComfyPipeline):
                 offloader.disable_block_swap()
             offloader.set_forward_only(True)
             offloader.prepare_block_devices_before_forward()
-
-
-def write_atomic(path, data):
-    """Temp name (not *.safetensors, which the adapter loader globs), fsync, rename, fsync the
-    directory: a crash or a network volume hiccup never leaves a torn file under the real name."""
-    tmp = path.with_name(f'.{path.name}.tmp-{uuid.uuid4().hex}')
-    try:
-        with open(tmp, 'wb') as f:
-            f.write(data)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp, path)
-        try:
-            fd = os.open(str(path.parent), os.O_RDONLY)
-        except OSError:
-            return
-        try:
-            os.fsync(fd)
-        except OSError:
-            pass
-        finally:
-            os.close(fd)
-    finally:
-        tmp.unlink(missing_ok=True)
 
 
 def control_latents_key(i):

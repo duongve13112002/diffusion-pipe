@@ -1751,10 +1751,11 @@ def main():
             )
     save_full_model_enabled = config['distill'].get('save_full_model', False)
     keep_last_n = config['distill'].get('keep_last_n_checkpoints', None)
-    if keep_last_n is not None and keep_last_n < 1:
+    if keep_last_n is not None and keep_last_n < 2:
+        # 1 would leave nothing to resume from if the newest checkpoint is torn.
         raise RuntimeError(
-            f'[distill] keep_last_n_checkpoints must be >= 1, got {keep_last_n}. Omit it to keep '
-            'every checkpoint.'
+            f'[distill] keep_last_n_checkpoints must be >= 2, got {keep_last_n}: with 1, a torn newest '
+            'checkpoint leaves nothing to resume from. Omit it to keep every checkpoint.'
         )
 
     if save_every_n_epochs is not None:

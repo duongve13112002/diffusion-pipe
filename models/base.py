@@ -245,7 +245,6 @@ class CommonPipeline:
     framerate = None
     pixels_round_to_multiple = 16
     keep_in_high_precision = []
-    match_high_precision_by_path = False
     spatial_compression = 8
     channels = 16
     is_video_vae = False
@@ -722,10 +721,9 @@ class ComfyPipeline(CommonPipeline):
                     p = getattr(module, p_name)
                     is_quantized = True
 
-                # keep_in_high_precision is matched against the module's own name, so a keyword
-                # naming a parent (time_in for time_in.in_layer) misses its children. A model
-                # whose keywords name parents sets match_high_precision_by_path.
-                name = f'{prefix}{mod_name}.{p_name}' if self.match_high_precision_by_path else f'{mod_name}.{p_name}'
+                # Matched against the full path: the keywords name modules such as time_in or
+                # final_layer, whose weights sit in children (time_in.in_layer.weight).
+                name = f'{prefix}{mod_name}.{p_name}'
                 if any(keyword in name for keyword in self.keep_in_high_precision) or p.ndim == 1:
                     continue
                 p.data = p.data.to(diffusion_model_dtype)

@@ -111,10 +111,10 @@ def set_config_defaults(config):
         # treated as unset by prune_all_checkpoint_kinds. The two trainers share the option, so
         # they should agree on what a typo does.
         keep = config['keep_last_n_checkpoints']
-        if not isinstance(keep, int) or isinstance(keep, bool) or keep < 1:
+        if not isinstance(keep, int) or isinstance(keep, bool) or keep < 2:
             raise ValueError(
-                f'keep_last_n_checkpoints must be an integer >= 1, got {keep!r}. Remove the key '
-                'to keep every checkpoint.'
+                f'keep_last_n_checkpoints must be an integer >= 2, got {keep!r}: with 1, a torn newest '
+                'checkpoint leaves nothing to resume from. Remove the key to keep every checkpoint.'
             )
     if 'save_dtype' in config:
         config['save_dtype'] = DTYPE_MAP[config['save_dtype']]
