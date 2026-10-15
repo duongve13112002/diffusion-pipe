@@ -5,11 +5,10 @@ come from the same PyTorch index, chosen for the machine's CUDA version, so the 
 user install them together. Missing one is therefore a normal install slip.
 
 torchaudio is the slip that used to be worst. models/base.py is imported by every model in the
-repo, and it needs torchaudio twice over -- once for its own video-audio resample, and again
-because `import comfy.sd` pulls in comfy.ldm.lightricks.vae.audio_vae, which imports torchaudio
-at module scope. So somebody training images, who will never touch an audio track, still lost
-every model in the repo, and the error named a Lightricks VAE file they had no reason to have
-heard of.
+repo, and it needs torchaudio for its own video-audio resample. (ComfyUI before 29e28e2 also
+imported torchaudio at module scope, through comfy.ldm.lightricks.vae.audio_vae.) So somebody
+training images, who will never touch an audio track, still lost every model in the repo, and
+the error named a file they had no reason to have heard of.
 
 The fix is ordering plus a message: import torchaudio ahead of the comfy imports, guarded. These
 tests pin both, because the value is entirely in the ordering -- a guard placed after the comfy

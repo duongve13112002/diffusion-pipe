@@ -106,8 +106,8 @@ git submodule update
 ```
 Make sure to run `git submodule update` in case any submodule has been updated to a new commit.
 
-The current ComfyUI pin also needs `comfy-aimdo>=0.5.5` for its storage module.
-Update that package inside your project environment if an older installation fails
+The current ComfyUI pin also needs `comfy-aimdo>=0.5.6` and `comfy-kitchen>=0.2.37`.
+Update those packages inside your project environment if an older installation fails
 with `No module named 'comfy_aimdo.storage'`, and run the
 [upstream API audit](docs/note/upstream-api-drift-audit.md) after submodule changes.
 

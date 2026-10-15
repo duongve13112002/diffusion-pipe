@@ -192,9 +192,13 @@ the first time.
   retain the option and its gate projection for VSA checkpoint loading. The guard
   now checks these native and patched signatures; `test/test_minimax_upstream_compat.py`
   constructs a tiny native model and runs CPU backward for both option values.
-- ComfyUI at `3dd559d` imports `comfy_aimdo.storage`; its declared dependency is
-  `comfy-aimdo==0.5.5`. An older installed package can block imports before any
-  signature checks run.
+- ComfyUI at `29e28e2` imports `comfy_aimdo.storage`; its declared dependencies are
+  `comfy-aimdo==0.5.6` and `comfy-kitchen==0.2.37`. An older installed package can block
+  imports before any signature checks run.
+- ComfyUI `29e28e2` made `QwenImage21TransformerBlock`'s gated residual and fp16 clamp
+  in-place, which autograd rejects. `models/qwen_image21.py` restores the out-of-place
+  versions while `in_training` is set; `test/test_qwen_image21_training_compat.py` runs a
+  tiny block's backward on CPU. Signature checks cannot catch this kind of change.
 
 - **`transformer_options` is always omitted** by our ComfyUI block/refiner calls and is optional
   (default `{}`) in every ComfyUI block today. If ComfyUI ever makes it required, **all**

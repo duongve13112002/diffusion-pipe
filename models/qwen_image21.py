@@ -10,7 +10,44 @@ from models.base import ComfyPipeline, make_contiguous
 from utils.common import AUTOCAST_DTYPE, get_lin_function, time_shift
 from utils.offloading import ModelOffloader
 import comfy.latent_formats
+import comfy.model_management
+import comfy.ldm.qwen_image21.model as qwen_image21_model
 from comfy.ldm.qwen_image21.model import block_causal_attention
+
+
+# ComfyUI 29e28e2 made the block's residual update and fp16 clamp in-place, which autograd
+# rejects (a modified leaf view, or a LayerNorm input saved for backward). In training, use
+# the out-of-place versions ComfyUI had before; inference keeps ComfyUI's.
+_comfy_gated_residual = qwen_image21_model._gated_residual
+
+
+def _gated_residual(x, y, gate, prefix_len):
+    if not comfy.model_management.in_training:
+        return _comfy_gated_residual(x, y, gate, prefix_len)
+    g_prefix, g_target = gate
+    out = torch.addcmul(x, y, g_target)
+    if prefix_len:
+        out = torch.cat([torch.addcmul(x[:, :prefix_len], y[:, :prefix_len], g_prefix), out[:, prefix_len:]], dim=1)
+    return out
+
+
+_comfy_block_forward = qwen_image21_model.QwenImage21TransformerBlock.forward
+
+
+def _block_forward(self, x, mod, pe, attn_fn, prefix_len, transformer_options={}):
+    if not comfy.model_management.in_training:
+        return _comfy_block_forward(self, x, mod, pe, attn_fn, prefix_len, transformer_options)
+    scale1, gate1, scale2, gate2, zero = mod
+    norm = qwen_image21_model._modulated_norm
+    x = _gated_residual(x, self.attn(norm(self.img_norm1, x, scale1, prefix_len, zero), pe, attn_fn, prefix_len, transformer_options), gate1, prefix_len)
+    x = _gated_residual(x, self.img_mlp(norm(self.img_norm2, x, scale2, prefix_len, zero)), gate2, prefix_len)
+    if x.dtype == torch.float16:
+        x = x.clip(-65504, 65504)
+    return x
+
+
+qwen_image21_model._gated_residual = _gated_residual
+qwen_image21_model.QwenImage21TransformerBlock.forward = _block_forward
 
 
 def _split_rows(p):

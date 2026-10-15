@@ -20,10 +20,9 @@ sys.path.insert(0, os.path.join(os.path.abspath(os.path.dirname(__file__)), '../
 
 import peft
 import torch
-# torchaudio is required, and not only for the one resample call further down. The vendored
-# ComfyUI imports it at module scope in several places -- comfy.sd pulls in
-# comfy.ldm.lightricks.vae.audio_vae, which does -- so the `import comfy.sd` below needs it
-# too, and there is no configuration in which this module loads without it.
+# torchaudio is required for the video-audio resample call further down. (ComfyUI used to
+# import it at module scope too, through comfy.ldm.lightricks.vae.audio_vae; since 29e28e2 its
+# audio code lives in comfy.audio and no longer does.)
 #
 # It is absent from requirements.txt for the same reason torch and torchvision are: all three
 # have to come from the same PyTorch index, chosen for the machine's CUDA version, so the
