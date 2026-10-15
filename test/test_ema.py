@@ -238,15 +238,17 @@ class _Engine:
 
 
 class _Model:
-    """Records what the saver hands to the model's own save functions."""
-
-    def __init__(self):
-        self.saves = {}
+    """Writes what the saver hands to the model's own save functions, so a test reads it back
+    from where the saver published it."""
 
     def save_model(self, save_dir, state_dict):
-        self.saves[Path(save_dir)] = state_dict
+        torch.save(state_dict, Path(save_dir) / 'model.pt')
 
     save_adapter = save_model
+
+
+def _saved(save_dir):
+    return torch.load(Path(save_dir) / 'model.pt', weights_only=True)
 
 
 @pytest.fixture
@@ -273,7 +275,7 @@ def test_saver_writes_the_average_beside_the_weights(tmp_path, no_barrier, is_ad
     saver = saver_util.Saver(types.SimpleNamespace(config=str(config_file)), {}, is_adapter, tmp_path / 'run', model,
                              types.SimpleNamespace(state_dict=lambda: {}), engine, module, ema=ema)
     saver.save_model('epoch1')
-    raw, averaged = model.saves[tmp_path / 'run' / 'epoch1'], model.saves[tmp_path / 'run' / 'epoch1' / 'ema']
+    raw, averaged = _saved(tmp_path / 'run' / 'epoch1'), _saved(tmp_path / 'run' / 'epoch1' / 'ema')
     assert set(raw) == set(averaged)
     for key, value in averaged.items():
         assert value.dtype == torch.bfloat16
@@ -301,7 +303,8 @@ def test_saver_without_ema_is_unchanged(tmp_path, no_barrier):
                              types.SimpleNamespace(state_dict=lambda: {}), engine, module)
     saver.save_model('step3')
     saver.save_checkpoint(3, 24)
-    assert list(model.saves) == [tmp_path / 'run' / 'step3']
+    assert sorted(p.name for p in (tmp_path / 'run').iterdir()) == ['global_step12', 'step3']
+    assert sorted(p.name for p in (tmp_path / 'run' / 'step3').iterdir()) == ['model.pt', 'train.toml']
     assert not list((tmp_path / 'run').rglob('ema*'))
 
 
@@ -451,3 +454,102 @@ def test_init_path_ends_following_and_survives_a_checkpoint(tmp_path):
     resumed = ParameterEMA(named(model), decay=0.9)
     load_ema_checkpoint(resumed, tmp_path, 'global_step1')
     torch.testing.assert_close(resumed.shadow['0.weight'], torch.full((2, 2), 5.0))
+
+
+def _saver(tmp_path, model, module):
+    config_file = tmp_path / 'train.toml'
+    config_file.write_text('')
+    return saver_util.Saver(types.SimpleNamespace(config=str(config_file)), {}, False, tmp_path / 'run', model,
+                            types.SimpleNamespace(state_dict=lambda: {}), _Engine(), module)
+
+
+def test_a_failed_save_leaves_the_previous_one(tmp_path, no_barrier):
+    """The save directory is built under a temporary name and renamed into place: a save that
+    fails part way leaves the previous save of that name whole, and the next run removes the
+    leftover."""
+    module = nn.Linear(2, 2)
+    named(module)
+    saver = _saver(tmp_path, _Model(), module)
+    saver.save_model('step3')
+    before = _saved(tmp_path / 'run' / 'step3')
+
+    class Failing(_Model):
+        def save_model(self, save_dir, state_dict):
+            (Path(save_dir) / 'model.pt').write_bytes(b'torn')
+            raise OSError('volume went away')
+
+    with torch.no_grad():
+        module.weight.add_(1.0)
+    saver.model = Failing()
+    with pytest.raises(OSError, match='volume went away'):
+        saver.save_model('step3')
+    after = _saved(tmp_path / 'run' / 'step3')
+    assert set(after) == set(before) and all(torch.equal(after[k], before[k]) for k in before)
+    assert (tmp_path / 'run' / '.step3.partial').exists()
+
+    saver = _saver(tmp_path, _Model(), module)
+    assert not (tmp_path / 'run' / '.step3.partial').exists()
+    saver.save_model('step3')
+    assert torch.equal(_saved(tmp_path / 'run' / 'step3')['weight'], module.weight.detach())
+    assert sorted(p.name for p in (tmp_path / 'run').iterdir()) == ['step3']
+
+
+def test_the_model_is_saved_before_the_checkpoint_of_the_same_epoch(tmp_path, no_barrier, monkeypatch):
+    module = nn.Linear(2, 2)
+    named(module)
+    saver = _saver(tmp_path, _Model(), module)
+    saver.config = {'save_every_n_epochs': 1, 'checkpoint_every_n_epochs': 1, 'epochs': 5}
+    order = []
+    monkeypatch.setattr(saver, 'save_model', lambda name: order.append('model'))
+    monkeypatch.setattr(saver, 'save_checkpoint', lambda step, examples: order.append('checkpoint'))
+    saver.train_dataloader = types.SimpleNamespace(epoch=2)
+    saver.process_epoch(1, 10, 80)
+    assert order == ['model', 'checkpoint']
+
+
+def _failing_save_worker(rank, world_size, init_file, save_root, results):
+    import torch.distributed as torch_dist
+    torch_dist.init_process_group('gloo', init_method=f'file://{init_file}', rank=rank, world_size=world_size)
+    saver_util.is_main_process = lambda: rank == 0     # DeepSpeed's comm is not set up here
+    try:
+        module = nn.Linear(2, 2)
+        named(module)
+
+        class Grid:
+            def get_data_parallel_rank(self):
+                return rank
+
+            def get_pipe_parallel_rank(self):
+                return 0
+
+        class Failing(_Model):
+            def save_model(self, save_dir, state_dict):
+                raise OSError('volume went away')
+
+        config_file = Path(save_root) / 'train.toml'
+        if rank == 0:
+            Path(save_root).mkdir(exist_ok=True)
+            config_file.write_text('')
+        torch_dist.barrier()
+        engine = types.SimpleNamespace(grid=Grid(), global_steps=1)
+        saver = saver_util.Saver(types.SimpleNamespace(config=str(config_file)), {}, False, Path(save_root) / 'run',
+                                 Failing(), types.SimpleNamespace(state_dict=lambda: {}), engine, module)
+        try:
+            saver.save_model('step1')
+            results[rank] = 'returned'
+        except Exception as e:
+            results[rank] = f'{type(e).__name__}: {e}'
+    finally:
+        torch_dist.destroy_process_group()
+
+
+def test_a_save_failing_on_rank_0_stops_every_rank(tmp_path):
+    """Without the shared error the other ranks return from the save and wait at the next
+    collective until the process group times out."""
+    import torch.multiprocessing as mp
+    with mp.Manager() as manager:
+        results = manager.dict()
+        mp.spawn(_failing_save_worker, args=(2, str(tmp_path / 'init'), str(tmp_path), results), nprocs=2,
+                 join=True)
+        results = dict(results)
+    assert all('rank 0: OSError: volume went away' in results[r] for r in (0, 1)), results

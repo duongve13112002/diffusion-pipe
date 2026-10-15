@@ -215,3 +215,53 @@ def ensure_writable_dir(path, setting):
                          f'Point {setting} at a directory this user can write, e.g. on the PVC.') from None
     if not os.access(path, os.W_OK | os.X_OK):
         raise SystemExit(f'{setting} = {str(path)!r} exists but this user cannot write to it.')
+
+
+def fsync_dir(path):
+    """Make a rename or a new entry in `path` durable. Some filesystems refuse to open or fsync a
+    directory; the rename itself has still happened, so that is not an error."""
+    try:
+        fd = os.open(str(path), os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
+def write_atomic(path, data):
+    """Write bytes under a temporary name (not matching *.safetensors, which adapter loaders
+    glob), fsync, rename, fsync the directory: a crash or a network volume hiccup never leaves a
+    torn file under the real name."""
+    path = Path(path)
+    tmp = path.with_name(f'.{path.name}.tmp-{os.getpid()}-{time.monotonic_ns()}')
+    try:
+        with open(tmp, 'wb') as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+        fsync_dir(path.parent)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def all_ok(error):
+    """Raise on every rank if any rank failed, before anyone enters another collective. Work done
+    on one rank (saving, exporting) goes between two of these, so a failure there stops every
+    rank instead of leaving the others waiting out the process group timeout."""
+    import torch.distributed as torch_dist
+    if not torch_dist.is_available() or not torch_dist.is_initialized() or torch_dist.get_world_size() == 1:
+        if error is not None:
+            raise error
+        return
+    errors = [None] * torch_dist.get_world_size()
+    torch_dist.all_gather_object(errors, None if error is None else f'{type(error).__name__}: {error}')
+    failed = [f'rank {i}: {e}' for i, e in enumerate(errors) if e is not None]
+    if failed:
+        if error is not None:
+            raise RuntimeError('; '.join(failed)) from error
+        raise RuntimeError('; '.join(failed))

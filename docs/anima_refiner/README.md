@@ -845,7 +845,7 @@ is dropped, the same rounding the image datasets do, so every rank runs the same
 | `lr_scheduler` | `cosine` | shares `utils/lr_schedule.py` with `train.py` |
 | `save_every` | `2000` when neither interval is set | checkpoint interval in steps. Independent of `save_every_n_epochs`; must be >= 1 |
 | `save_every_n_epochs` | — | checkpoint interval in epochs. Independent of `save_every`; must be >= 1 |
-| `keep_last_n_checkpoints` | — | keep this many tagged checkpoints of each kind, deleting older ones. Unset keeps everything |
+| `keep_last_n_checkpoints` | — | keep this many tagged checkpoints of each kind (at least 2), deleting older ones. Unset keeps everything |
 | `log_every` | `50` | progress-bar update interval. Must be >= 1 |
 | `pooled_loss_weight` | `0.1` | weight of the length-normalised mean term |
 | `relational_loss_weight` | `1.0` | weight of the pairwise-structure term that prices mode collapse |
