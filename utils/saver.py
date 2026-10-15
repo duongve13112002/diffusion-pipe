@@ -65,6 +65,13 @@ def remove_unpublished_saves(save_root):
             if path.is_dir():
                 logger.info(f'Removing unfinished save {path}')
                 shutil.rmtree(path, ignore_errors=True)
+    # Files that write_atomic was writing when the process was killed (`latest`, the files of a
+    # training checkpoint).
+    for pattern in ('.*.tmp-*', '*/.*.tmp-*'):
+        for path in save_root.glob(pattern):
+            if path.is_file():
+                logger.info(f'Removing unfinished file {path}')
+                path.unlink(missing_ok=True)
 
 
 def read_latest(save_root):
@@ -119,8 +126,9 @@ def prune_old_checkpoints(save_root, prefix, keep, dry_run=False):
     timestamps, and the number is what actually says which checkpoint is later.
 
     The newest is never deleted, nor the one `latest` names: that is the tag a resume loads, and
-    deleting it turns a prunable cache into an unrecoverable run. A newer global_step* than
-    `latest` is one whose save did not finish.
+    deleting it turns a prunable cache into an unrecoverable run. A global_step* newer than
+    `latest` is one whose save did not finish: it is neither counted nor removed here (its next
+    save replaces it), so `keep` complete checkpoints remain.
 
     Returns the paths removed (or that would be, under dry_run).
     """
@@ -144,6 +152,8 @@ def prune_old_checkpoints(save_root, prefix, keep, dry_run=False):
         # Not knowing which one a resume loads, delete none of them.
         logger.warning(f'keep_last_n_checkpoints: could not read {save_root / "latest"} ({e}); not pruning')
         return []
+    if latest is not None and latest.startswith(prefix) and latest[len(prefix):].isdigit():
+        numbered = [(n, path) for n, path in numbered if n <= int(latest[len(prefix):])]
     numbered.sort(key=lambda pair: pair[0])
     doomed = [path for _, path in numbered[:-keep] if path.name != latest] if len(numbered) > keep else []
     if not dry_run:
@@ -301,6 +311,10 @@ class Saver:
             save(name, ema=True)
 
     def save_checkpoint(self, step, examples):
+        if self.model_engine.checkpoint_engine.is_decoupled():
+            # Its files are written after save_checkpoint returns, so `latest` would come first.
+            raise ValueError('A decoupled DeepSpeed checkpoint engine is not supported: remove the '
+                             '"checkpoint" "writer" "decoupled" setting from the DeepSpeed config.')
         # DeepSpeed's own default tag, spelled out so the EMA file lands beside it.
         tag = f'global_step{self.model_engine.global_steps}'
         save_root = Path(self.save_root)
