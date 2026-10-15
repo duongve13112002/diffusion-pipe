@@ -1,6 +1,7 @@
 """utils/ema.py and its use by utils/saver.py: the average itself, its checkpoint round trip
 (across a different pipeline split), and the ema/ save written beside every normal save."""
 
+import os
 import types
 from pathlib import Path
 
@@ -233,8 +234,10 @@ class _Engine:
         self.saved = []
 
     def save_checkpoint(self, save_dir, tag=None, **kwargs):
-        Path(save_dir, tag).mkdir(parents=True)
+        Path(save_dir, tag).mkdir(parents=True, exist_ok=True)
         self.saved.append(tag)
+        # What was on disk when DeepSpeed started writing (and, at its end, `latest`).
+        self.files_before = sorted(p.name for p in Path(save_dir, tag).iterdir())
 
 
 class _Model:
@@ -290,6 +293,26 @@ def test_saver_writes_the_average_beside_the_weights(tmp_path, no_barrier, is_ad
     saver.save_checkpoint(5, 40)
     assert engine.saved == ['global_step12']
     assert ema_util.checkpoint_file(tmp_path / 'run', 'global_step12', 0).exists()
+    # Written before DeepSpeed's files: DeepSpeed writes `latest` before it returns, and a
+    # crash after that must not leave `latest` naming a checkpoint without its average.
+    assert engine.files_before == [ema_util.checkpoint_file(tmp_path / 'run', 'global_step12', 0).name]
+
+
+def test_a_failed_average_write_stops_the_checkpoint(tmp_path, no_barrier, monkeypatch):
+    module = nn.Linear(2, 2)
+    ema = ParameterEMA(named(module), decay=0.5)
+    config_file = tmp_path / 'train.toml'
+    config_file.write_text('')
+    engine = _Engine()
+    saver = saver_util.Saver(types.SimpleNamespace(config=str(config_file)), {}, False, tmp_path / 'run', _Model(),
+                             types.SimpleNamespace(state_dict=lambda: {}), engine, module, ema=ema)
+
+    def full_volume(obj, path):
+        raise OSError(28, 'No space left on device')
+    monkeypatch.setattr(ema_util, 'torch_save_atomic', full_volume)
+    with pytest.raises(OSError, match='No space'):
+        saver.save_checkpoint(5, 40)
+    assert engine.saved == []
 
 
 def test_saver_without_ema_is_unchanged(tmp_path, no_barrier):
@@ -492,6 +515,30 @@ def test_a_failed_save_leaves_the_previous_one(tmp_path, no_barrier):
     saver.save_model('step3')
     assert torch.equal(_saved(tmp_path / 'run' / 'step3')['weight'], module.weight.detach())
     assert sorted(p.name for p in (tmp_path / 'run').iterdir()) == ['step3']
+
+
+@pytest.mark.parametrize('in_ema', [False, True], ids=['save', 'ema'])
+def test_a_save_moved_aside_but_not_replaced_goes_back(tmp_path, no_barrier, in_ema):
+    """publish_dir moves the old save aside, then renames the new one in: a crash between the
+    two renames leaves only `.name.old-*`, which the next run puts back rather than deletes."""
+    module = nn.Linear(2, 2)
+    named(module)
+    saver = _saver(tmp_path, _Model(), module)
+    saver.save_model('step3')
+    run = tmp_path / 'run'
+    if in_ema:
+        (run / 'step3' / 'ema').mkdir()
+        torch.save({'w': torch.ones(1)}, run / 'step3' / 'ema' / 'model.pt')
+        os.replace(run / 'step3' / 'ema', run / 'step3' / '.ema.old-1234')
+        moved = run / 'step3' / 'ema'
+    else:
+        os.replace(run / 'step3', run / '.step3.old-1234')
+        moved = run / 'step3'
+    (run / '.step4.partial').mkdir()
+
+    _saver(tmp_path, _Model(), module)
+    assert (moved / 'model.pt').exists()
+    assert sorted(p.name for p in run.rglob('.*')) == []
 
 
 def test_the_model_is_saved_before_the_checkpoint_of_the_same_epoch(tmp_path, no_barrier, monkeypatch):
