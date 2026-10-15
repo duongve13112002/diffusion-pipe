@@ -588,9 +588,13 @@ Notes:
   FLUX.3 takes up to 10 reference images: `control_path` can be a list of directories, each holding an image
   with the same name as every target. The list order is the reference order; in ComfyUI chain the
   `ReferenceLatent` nodes in the same order. Text-to-image and edit directories can be trained together:
-  directories with a different number of references never share a batch.
+  directories with a different number of references never share a batch. With
+  `reuse_metadata_cache = false` a run cannot list the same image directory twice with different
+  `control_path`s (training and eval, say): both would use one cache. The default keeps one per configuration.
 - `edit_isolation` trains editing without changing text-to-image:
-  - `'none'` (default): adapters on every block; trains both.
+  - `'none'` (default): adapters on every block; trains both. When no dataset (training or eval) has a
+    `control_path`, the 5 reference blocks get no adapter: they never run, so it would never train. An
+    `init_from_existing` adapter that has them keeps them, and a resumed run keeps what it started with.
   - `'image_cond'`: trains only the modules that exist for the reference images (their input projection,
     their 5 blocks and their modulations). A prompt without references never reaches them, so text-to-image
     is bit-identical. An ordinary LoRA; also a full fine-tune of just those modules (without `[adapter]`).

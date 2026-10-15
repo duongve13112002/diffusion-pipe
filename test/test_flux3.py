@@ -313,8 +313,25 @@ def test_backward_reaches_every_parameter(tmp_path):
     assert missing == []
 
 
-@pytest.mark.parametrize('adapter', [None, lora()], ids=['full', 'lora'])
+@pytest.mark.parametrize('ref_shapes', [[], [(2, 2), (1, 3)]], ids=['t2i', 'edit'])
+def test_layers_do_not_read_their_sizes_back_from_the_device(tmp_path, monkeypatch, ref_shapes):
+    """Reading a CUDA tensor waits for every queued kernel. The sizes are known when the first
+    layer builds them, so no later layer of the stage reads them back."""
+    pipe = attach(make_pipeline(tmp_path, cache_text_embeddings=True), make_model())
+    layers = pipe.to_layers()
+    inputs = features(latents(2), torch.tensor([0.3, 0.7]), text_embeds([80, 160]), ref_latents(2, ref_shapes))
+    with torch.no_grad():
+        start = run_layers(layers[:2], inputs)
+        reads = []
+        for name in ('tolist', 'item'):
+            original = getattr(torch.Tensor, name)
+            monkeypatch.setattr(torch.Tensor, name, lambda t, *a, _o=original, _n=name, **k: (reads.append(_n), _o(t, *a, **k))[1])
+        run_layers(layers[2:], start)
+    assert reads == []
+
+
 @pytest.mark.parametrize('ref_shapes', [(), ((2, 2), (1, 3))])
+@pytest.mark.parametrize('adapter', [None, lora()], ids=['full', 'lora'])
 def test_every_stage_boundary_gets_its_gradients(tmp_path, adapter, ref_shapes):
     """Under pipeline parallelism DeepSpeed asserts that every floating point tensor a stage
     received has a gradient after its backward. Split the layers at every possible point and
@@ -523,6 +540,31 @@ def test_text_to_image_datasets_leave_the_reference_blocks_out(tmp_path):
     pipe.load_adapter_weights(save_dir)
     for k, v in saved_adapter_state(pipe).items():
         assert torch.equal(v, sd[k]), k
+
+
+@pytest.mark.parametrize('saved_with_references', [True, False, None], ids=['with', 'without', 'no-save'])
+@pytest.mark.parametrize('data_has_references', [True, False])
+def test_a_resumed_run_keeps_the_reference_blocks_it_started_with(tmp_path, saved_with_references,
+                                                                   data_has_references):
+    """The checkpoint's optimizer state holds exactly the adapters the run started with, so a
+    resumed run follows its saved adapters even when the data now says otherwise."""
+    run_dir = tmp_path / 'run'
+    run_dir.mkdir()
+    if saved_with_references is not None:
+        first = attach(make_pipeline(tmp_path, adapter=lora(), cache_text_embeddings=True), make_model())
+        directory = {'path': 'a', 'control_path': 'c'} if saved_with_references else {'path': 'a'}
+        first.model_specific_dataset_config_validation({'directory': [directory]})
+        first.configure_adapter(lora())
+        (run_dir / 'step5').mkdir()
+        first.save_adapter(run_dir / 'step5', saved_adapter_state(first))
+
+    pipe = attach(make_pipeline(tmp_path, adapter=lora(), cache_text_embeddings=True), make_model())
+    pipe.resume_run_dir = run_dir
+    directory = {'path': 'b', 'control_path': 'c'} if data_has_references else {'path': 'b'}
+    pipe.model_specific_dataset_config_validation({'directory': [directory]})
+    targets = pipe.get_target_modules(pipe.diffusion_model)
+    expected = data_has_references if saved_with_references is None else saved_with_references
+    assert any(n.startswith('content_mode_blocks.image_cond.') for n in targets) == expected
 
 
 @pytest.mark.parametrize('adapter', [lora(), lokr()], ids=['lora', 'lokr'])
@@ -1007,6 +1049,50 @@ def test_adding_a_control_directory_to_a_cached_dataset(tmp_path, local_workers,
     else:
         with pytest.raises(RuntimeError, match='regenerate_cache'):
             ds.cache_metadata(trust_cache=True)
+
+
+def test_trusted_metadata_with_other_control_directories_is_refused(tmp_path, local_workers):
+    """The same number of control directories, swapped: the column check alone would pass and
+    train with the old reference order."""
+    images = make_image_dir(tmp_path / 'images')
+    controls = [make_image_dir(tmp_path / f'control{i}', seed=10 + i, captions=False) for i in range(2)]
+    pipe = attach(make_pipeline(tmp_path, cache_text_embeddings=True), make_model())
+
+    def config(control_path):
+        return {'resolutions': [40], 'enable_ar_bucket': False, 'reuse_metadata_cache': False,
+                'directory': [{'path': str(images), 'num_repeats': 1, 'size_buckets': [[48, 32, 1]],
+                               'control_path': control_path}]}
+
+    first = config([str(c) for c in controls])
+    run_caching(pipe, dataset_util.Dataset(first, pipe), first)
+    swapped = config([str(c) for c in reversed(controls)])
+    with pytest.raises(RuntimeError, match='control_file from .*control1.*regenerate_cache'):
+        dataset_util.Dataset(swapped, pipe).cache_metadata(trust_cache=True)
+    dataset_util.Dataset(first, pipe).cache_metadata(trust_cache=True)
+
+
+@pytest.mark.parametrize('reuse_metadata_cache', [True, False])
+def test_one_image_directory_with_two_control_configurations_in_a_run(tmp_path, reuse_metadata_cache):
+    """Training and eval on the same images with different references: with one legacy cache
+    per directory they would overwrite each other's caches, so that is refused."""
+    images = make_image_dir(tmp_path / 'images')
+    controls = [make_image_dir(tmp_path / f'control{i}', seed=10 + i, captions=False) for i in range(2)]
+    pipe = make_pipeline(tmp_path, cache_text_embeddings=True)
+
+    def dataset(control_path):
+        config = {'resolutions': [40], 'enable_ar_bucket': False, 'reuse_metadata_cache': reuse_metadata_cache,
+                  'directory': [{'path': str(images), 'num_repeats': 1, 'control_path': control_path}]}
+        return dataset_util.Dataset(config, pipe)
+
+    manager = dataset_util.DatasetManager.__new__(dataset_util.DatasetManager)
+    manager.datasets = []
+    manager.register(dataset(str(controls[0])))
+    manager.register(dataset(str(controls[0])))
+    if reuse_metadata_cache:
+        manager.register(dataset(str(controls[1])))
+    else:
+        with pytest.raises(ValueError, match='reuse_metadata_cache = true'):
+            manager.register(dataset(str(controls[1])))
 
 
 def test_collate_refuses_examples_with_different_features(tmp_path):

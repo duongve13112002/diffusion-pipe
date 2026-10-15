@@ -589,17 +589,8 @@ if __name__ == '__main__':
     if args.test_sample:
         model.prepare_sample_test('a golden retriever running through a grassy field', cfg=1)
 
-    model.load_diffusion_model()
-
-    if adapter_config := config.get('adapter', None):
-        model.configure_adapter(adapter_config)
-        is_adapter = True
-        if init_from_existing := adapter_config.get('init_from_existing', None):
-            model.load_adapter_weights(init_from_existing)
-    else:
-        is_adapter = False
-
-    # Determine run_dir on rank 0 and broadcast it
+    # Determine run_dir on rank 0 and broadcast it. Only named here: it is created once the model
+    # has loaded, so a failed start leaves no empty run for --resume_from_checkpoint to pick.
     run_dir_container = [None]
     if is_main_process():
         if resume_from_checkpoint is True:
@@ -611,6 +602,19 @@ if __name__ == '__main__':
 
     torch.distributed.broadcast_object_list(run_dir_container, src=0, group=dist.get_world_group())
     run_dir = run_dir_container[0]
+    # The adapter has to match the checkpoint it resumes; a model whose targets depend on the
+    # data reads the run's saved adapters from here.
+    model.resume_run_dir = run_dir if resume_from_checkpoint else None
+
+    model.load_diffusion_model()
+
+    if adapter_config := config.get('adapter', None):
+        model.configure_adapter(adapter_config)
+        is_adapter = True
+        if init_from_existing := adapter_config.get('init_from_existing', None):
+            model.load_adapter_weights(init_from_existing)
+    else:
+        is_adapter = False
 
     os.makedirs(run_dir, exist_ok=True)
     if not resume_from_checkpoint and is_main_process():

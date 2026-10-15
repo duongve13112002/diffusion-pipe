@@ -17,6 +17,8 @@ Models supported: SDXL, Flux, LTX-Video, HunyuanVideo (t2v), Cosmos, Lumina Imag
 - 2026-10-15
   - Support FLUX.3 Klein Base: LoRA, LoKr, OPLoRA and full fine-tune, text-to-image and editing with up to 10 reference images (`control_path` can now be a list of directories). `edit_isolation` trains editing without changing text-to-image. See [docs/supported_models.md](./docs/supported_models.md#flux3-klein).
   - ComfyUI updated; update `comfy-kitchen` and `comfy-aimdo` too (`pip install -r requirements.txt -U`).
+  - `diffusion_model_dtype` now keeps every weight under the model's high-precision modules (e.g. `time_in`, `final_layer`, Krea2's `txtfusion`, MiniMax H3's `token_refiner`) in the base dtype, as intended; before, only weights directly in those modules were kept. This uses a little more VRAM (up to ~5% of the weights for Krea2).
+  - Saved models and adapters are written under a temporary name and renamed into place, so an interrupted save never leaves a torn one. A failed save now stops every rank. `keep_last_n_checkpoints` must be at least 2.
 - 2026-09-28
   - Support Qwen-Image-2.1 (T2I training only).
 - 2026-08-08

@@ -1401,6 +1401,17 @@ class DirectoryDataset:
             raise RuntimeError(
                 f'{path} was cached for control columns {cached}, but control_path now gives '
                 f'{self.control_columns()}. Run with --regenerate_cache (or without --trust_cache).')
+        # The same number of control directories, but other ones (or the same in another order):
+        # every file of a column comes from one directory, so the first row tells which.
+        if cached and len(metadata) > 0:
+            first = metadata[0]
+            control_paths = [self.control_path] + self.extra_control_paths
+            for column, control_path in zip(self.control_columns(), control_paths):
+                cached_dir = os.path.dirname(first[column])
+                if os.path.realpath(cached_dir) != os.path.realpath(control_path):
+                    raise RuntimeError(
+                        f'{path} was cached with {column} from {cached_dir}, but control_path now gives '
+                        f'{control_path} for it. Run with --regenerate_cache (or without --trust_cache).')
 
     def control_columns(self):
         """Metadata columns holding this directory's control files, in reference order."""
@@ -2209,8 +2220,11 @@ class Dataset:
             for size_bucket_dataset in directory_dataset.get_size_bucket_datasets():
                 datasets_by_size_bucket[(size_bucket_dataset.size_bucket, controls)].append(size_bucket_dataset)
         self.buckets = []
-        for datasets in datasets_by_size_bucket.values():
-            self.buckets.append(ConcatenatedBatchedDataset(datasets))
+        for (_, controls), datasets in datasets_by_size_bucket.items():
+            bucket = ConcatenatedBatchedDataset(datasets)
+            # Named in the batch fill report, where one size bucket can now appear twice.
+            bucket.num_control_images = len(controls)
+            self.buckets.append(bucket)
 
         for bucket in self.buckets:
             bucket.post_init(global_batch_size, global_batch_size_image, data_parallel_rank,
@@ -2244,14 +2258,15 @@ class Dataset:
         """
         if self.batch_fill['batch_fill_strategy'] != 'fill' or not is_main_process():
             return
-        reports = [b.fill_report for b in self.buckets if b.fill_report is not None]
+        reports = [(b.fill_report, getattr(b, 'num_control_images', 0)) for b in self.buckets if b.fill_report is not None]
         if not reports:
             return
         print(f"batch_fill_strategy = 'fill' (undersized_bucket = "
               f"{self.batch_fill['undersized_bucket']!r}, min_real_fraction = "
               f"{self.batch_fill['min_real_fraction']}):")
-        for r in reports:
-            line = (f"  bucket {r['size_bucket']}: {r['num_samples']} samples, global batch "
+        for r, num_control_images in reports:
+            controls = f' with {num_control_images} control image(s)' if num_control_images else ''
+            line = (f"  bucket {r['size_bucket']}{controls}: {r['num_samples']} samples, global batch "
                     f"{r['global_batch_size']}, {r['batches_before']} -> {r['batches_after']} batches, "
                     f"+{r['num_added']} filled")
             if r['num_masked']:
@@ -2505,7 +2520,33 @@ class DatasetManager:
         self.datasets = []
 
     def register(self, dataset):
+        self._check_shared_legacy_caches(dataset)
         self.datasets.append(dataset)
+
+    def _check_shared_legacy_caches(self, dataset):
+        """With reuse_metadata_cache = false a directory's caches live at one path,
+        <path>/cache/<model>, whatever its control or mask files. Two datasets of one run (the
+        training dataset and an eval dataset, say) that list the same images with different ones
+        would overwrite each other's metadata and latents, one of them while the other has them
+        memory-mapped. reuse_metadata_cache = true keeps a cache per configuration."""
+        def files_config(ds):
+            return {'control_path': [str(p) for p in ([ds.control_path] if ds.control_path else []) + ds.extra_control_paths],
+                    'mask_path': str(ds.mask_path), 'default_mask_file': str(ds.default_mask_file),
+                    'shuffle': ds.shuffle_metadata}
+
+        def legacy(ds):
+            return [d for d in getattr(ds, 'directory_datasets', []) if not getattr(d, 'reuse_metadata_cache', True)]
+
+        for new in legacy(dataset):
+            for registered in self.datasets:
+                for old in legacy(registered):
+                    if (os.path.realpath(old.cache_dir) == os.path.realpath(new.cache_dir)
+                            and files_config(old) != files_config(new)):
+                        raise ValueError(
+                            f'{new.path} is listed twice with reuse_metadata_cache = false and different files '
+                            f'({files_config(old)} and {files_config(new)}): both would use the cache in '
+                            f'{new.cache_dir} and overwrite each other. Set reuse_metadata_cache = true '
+                            '(the default), which keeps a cache per configuration.')
 
     # Some notes for myself:
     # Use the third-party multiprocess library because HF Datasets uses it for the map() calls.

@@ -245,6 +245,8 @@ class CommonPipeline:
     framerate = None
     pixels_round_to_multiple = 16
     keep_in_high_precision = []
+    # Set by train.py when resuming: the run directory whose checkpoint the adapter must match.
+    resume_run_dir = None
     spatial_compression = 8
     channels = 16
     is_video_vae = False

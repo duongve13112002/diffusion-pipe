@@ -28,7 +28,6 @@ ComfyUI. Two things ComfyUI does not need are added:
                           this way.
 """
 
-import functools
 import os
 import sys
 sys.path.insert(0, os.path.join(os.path.abspath(os.path.dirname(__file__)), '../submodules/ComfyUI'))
@@ -39,6 +38,7 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 import safetensors.torch
+from deepspeed.utils.logging import logger
 
 from models.base import ComfyPipeline, ModelWrapper, make_contiguous
 from utils.common import AUTOCAST_DTYPE, get_lin_function, time_shift, is_main_process, empty_cuda_cache, write_atomic
@@ -277,6 +277,7 @@ class Flux3Pipeline(ComfyPipeline):
         # never train, so it is left out.
         last = f'single_blocks.{len(target_model.single_blocks) - 1}.'
         untrainable = {last + linear for linear in ('q_proj', 'attn_out', 'mlp_in', 'mlp_out')}
+        adapt_reference_blocks = self.edit_isolation != 'none' or self.adapt_reference_blocks()
         targets = set()
         for name, module in target_model.named_modules():
             if not isinstance(module, nn.Linear):
@@ -288,24 +289,31 @@ class Flux3Pipeline(ComfyPipeline):
                 if is_image_cond_name(name + '.') or (name.startswith('single_blocks.') and name not in untrainable):
                     targets.add(name)
             elif name.startswith(('content_mode_blocks.', 'txt_mode_blocks.', 'single_blocks.')):
-                # Without any reference image the reference blocks never run, so an adapter on
-                # them would never train. One loaded with init_from_existing keeps them, so that
-                # its trained weights load and are saved again.
-                if not (name.startswith('content_mode_blocks.image_cond.') and self.datasets_have_references is False
-                        and not self.init_adapter_has_reference_blocks()):
-                    targets.add(name)
+                if name.startswith('content_mode_blocks.image_cond.') and not adapt_reference_blocks:
+                    continue
+                targets.add(name)
         return sorted(targets)
 
-    @functools.cache
-    def init_adapter_has_reference_blocks(self):
+    def adapt_reference_blocks(self):
+        """Whether edit_isolation = 'none' puts adapters on the reference blocks.
+
+        Without any reference image in the data they never run, so an adapter there would never
+        train. An adapter continued with init_from_existing keeps them when it has them. A
+        resumed run follows the adapters it saved, whatever the data says now: its checkpoint's
+        optimizer state has exactly those parameters.
+        """
+        wanted = self.datasets_have_references is not False
+        if self.resume_run_dir is not None:
+            saved = saved_adapter_has_reference_blocks(self.resume_run_dir)
+            if saved is not None:
+                if saved != wanted and is_main_process():
+                    logger.warning(
+                        f'{self.resume_run_dir} was started with{"" if saved else "out"} adapters on the reference '
+                        f'blocks; the resumed run keeps {"them" if saved else "it that way"} to match its checkpoint, '
+                        f'although the datasets now {"have no" if saved else "have"} reference images.')
+                return saved
         path = self.config.get('adapter', {}).get('init_from_existing', None)
-        if path is None:
-            return False
-        for f in Path(path).glob('*.safetensors'):
-            with safetensors.safe_open(str(f), 'pt') as handle:
-                if any(k.startswith('diffusion_model.content_mode_blocks.image_cond.') for k in handle.keys()):
-                    return True
-        return False
+        return wanted or (path is not None and adapter_has_reference_blocks(Path(path).glob('*.safetensors')))
 
     def adapter_rows_restricted(self):
         return self.edit_isolation == 'reference_tokens'
@@ -657,9 +665,48 @@ EARLY_MODES = ('image', 'txt', 'image_cond')
 N_JOINT_FIXED = 11
 
 
+def adapter_has_reference_blocks(files):
+    """Whether any of these adapter files has weights on the reference blocks."""
+    for f in files:
+        with safetensors.safe_open(str(f), 'pt') as handle:
+            if any(k.startswith('diffusion_model.content_mode_blocks.image_cond.') for k in handle.keys()):
+                return True
+    return False
+
+
+def saved_adapter_has_reference_blocks(run_dir):
+    """What the adapters saved in run_dir (<run>/epochN/, <run>/stepN/) say about the reference
+    blocks, or None when the run saved none yet. A file that cannot be read now (a network volume
+    hiccup) is skipped, not taken as an answer: every save of a run has the same targets."""
+    for f in sorted(Path(run_dir).glob('*/adapter_model.safetensors')):
+        try:
+            return adapter_has_reference_blocks([f])
+        except OSError as e:
+            logger.warning(f'Could not read {f} ({e}); trying another saved adapter')
+    return None
+
+
+def make_dims(values, device):
+    dims = torch.tensor(values, dtype=torch.int64, device=device)
+    dims.flux3_values = list(values)
+    return dims
+
+
+def dims_values(dims):
+    """The ints in `dims`. Reading a CUDA tensor waits for the GPU to finish everything queued,
+    so every layer would stall the launch of its own kernels: within a pipeline stage the same
+    tensor object is passed from layer to layer, so its values are kept on it and read once per
+    stage (or after a reentrant checkpoint has detached it)."""
+    values = getattr(dims, 'flux3_values', None)
+    if values is None:
+        values = dims.tolist()
+        dims.flux3_values = values
+    return values
+
+
 def unpack_early(inputs):
     dims = inputs[0]
-    H, W, R, L, *present = dims.tolist()
+    H, W, R, L, *present = dims_values(dims)
     state = {
         'dims': dims, 'text_lengths': inputs[1], 'pe': inputs[2], 'vec_img': inputs[3], 'img': inputs[4],
         'txt': inputs[5], 'single_image': ModulationOut(*inputs[6:9]), 'single_txt': ModulationOut(*inputs[9:12]),
@@ -682,9 +729,10 @@ def unpack_early(inputs):
 
 
 def pack_early(state):
-    H, W, R, L = state['dims'][:4].tolist()
+    values = dims_values(state['dims'])
     present = [int(state['early_' + mode] is not None) for mode in EARLY_MODES]
-    dims = torch.tensor([H, W, R, L, *present], dtype=torch.int64, device=state['dims'].device)
+    # Rebuilt only when a stream drops its modulation.
+    dims = state['dims'] if values[4:] == present else make_dims(values[:4] + present, state['dims'].device)
     out = [dims, state['text_lengths'], state['pe'], state['vec_img'], state['img'], state['txt'],
            *modulation_tensors(state['single_image']), *modulation_tensors(state['single_txt'])]
     for mode in ('image', 'txt'):
@@ -762,7 +810,7 @@ class InitialLayer(nn.Module):
 
         R = 0 if ref_tokens is None else ref_tokens.shape[1]
         # The early-modulation flags are filled in by pack_early.
-        dims = torch.tensor([H, W, R, txt.shape[1]], dtype=torch.int64, device=device)
+        dims = make_dims([H, W, R, txt.shape[1]], device)
         state = {
             'dims': dims, 'text_lengths': text_lengths.to(device), 'pe': pe, 'vec_img': vec_img,
             'img': img, 'txt': txt,
@@ -794,7 +842,7 @@ class EarlyLayer(nn.Module):
     @torch.autocast('cuda', dtype=AUTOCAST_DTYPE)
     def forward(self, inputs):
         state = unpack_early(inputs)
-        H, W, R, L = state['dims'][:4].tolist()
+        H, W, R, L = dims_values(state['dims'])[:4]
         HW = H * W
         pe = state['pe']
         key_mask = None
@@ -834,7 +882,7 @@ class ConcatLayer(nn.Module):
 
 def joint_spans(inputs):
     dims, text_lengths, pe, vec_img, x = inputs[:5]
-    H, W, R, L = dims[:4].tolist()
+    H, W, R, L = dims_values(dims)[:4]
     HW = H * W
     spans = [(0, HW, ModulationOut(*inputs[5:8]))]
     if len(inputs) > N_JOINT_FIXED:
@@ -873,6 +921,6 @@ class FinalLayer(nn.Module):
     @torch.autocast('cuda', dtype=AUTOCAST_DTYPE)
     def forward(self, inputs):
         dims, vec_img, x = inputs
-        H, W = dims[0].item(), dims[1].item()
+        H, W = dims_values(dims)[:2]
         out = self.final_layer['image'](x[:, :H * W], vec_img)
         return out.transpose(1, 2).reshape(x.shape[0], -1, H, W)
