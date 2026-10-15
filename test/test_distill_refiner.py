@@ -750,6 +750,20 @@ class TestZeROAccumulationBoundaryForReal:
     Nothing about that is visible to a mock, so this test uses the real engine.
     """
 
+    @pytest.fixture(autouse=True)
+    def _process_group_env(self, monkeypatch):
+        # Scoped to each test. Left in os.environ, RANK/WORLD_SIZE/MASTER_PORT reach the
+        # subprocesses later tests start (test_iris_nan_check), which then try to start a
+        # process group on the port this process holds. The group itself stays: DeepSpeed
+        # caches it, so a destroyed and recreated group breaks the next engine.
+        import socket
+        with socket.socket() as sock:
+            sock.bind(('127.0.0.1', 0))
+            port = sock.getsockname()[1]
+        for key, value in (('MASTER_ADDR', '127.0.0.1'), ('MASTER_PORT', str(port)), ('RANK', '0'),
+                           ('WORLD_SIZE', '1'), ('LOCAL_RANK', '0')):
+            monkeypatch.setenv(key, value)
+
     @staticmethod
     def _init_engine(gas, stage=1):
         import torch.distributed as dist
@@ -763,11 +777,6 @@ class TestZeROAccumulationBoundaryForReal:
             if 'shm' in name.lower():
                 deepspeed.ops.__compatible_ops__[name] = False
 
-        os.environ.setdefault('MASTER_ADDR', '127.0.0.1')
-        os.environ.setdefault('MASTER_PORT', '29577')
-        os.environ.setdefault('RANK', '0')
-        os.environ.setdefault('WORLD_SIZE', '1')
-        os.environ.setdefault('LOCAL_RANK', '0')
         if not dist.is_initialized():
             dist.init_process_group(backend='gloo', rank=0, world_size=1)
 
