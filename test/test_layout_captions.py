@@ -6,7 +6,6 @@ against arithmetic written the same way as the code under test.
 """
 
 import functools
-import importlib.util
 import io
 import json
 import math
@@ -42,14 +41,40 @@ def single_process(monkeypatch):
     monkeypatch.setattr(dataset_module, 'is_main_process', lambda: True)
 
 
-def load_compiler():
-    """MOSS-Image's own prompt compiler (skills/moss-image-prompt-enhancer)."""
-    path = (Path(__file__).resolve().parents[1] / 'submodules' / 'MOSS-Image' / 'skills'
-            / 'moss-image-prompt-enhancer' / 'scripts' / 'compile_prompt.py')
-    spec = importlib.util.spec_from_file_location('moss_compile_prompt', path)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
+class compiler:
+    """MOSS-Image's own prompt compiler, the part these tests check against: centered_box from
+    skills/moss-image-prompt-enhancer/scripts/compile_prompt.py of
+    https://github.com/OpenMOSS/MOSS-Image (commit 1f808b7, Apache-2.0), copied unchanged."""
+
+    @staticmethod
+    def require(condition, message):
+        if not condition:
+            raise ValueError(message)
+
+    @staticmethod
+    def centered_box(box, width, height, location):
+        require = compiler.require
+        require(isinstance(box, list) and len(box) == 4, f"{location} must be [x1,y1,x2,y2]")
+        require(
+            all(type(v) in (int, float) and math.isfinite(v) for v in box),
+            f"{location} must contain four finite numbers",
+        )
+        x1, y1, x2, y2 = box
+        require(x1 < x2 and y1 < y2, f"{location} must have positive width and height")
+        require(
+            0 <= x1 < x2 <= width and 0 <= y1 < y2 <= height,
+            f"{location} exceeds the {width}x{height} canvas",
+        )
+        # Enclose in pixel edges before centering, as in Echidna generation export.
+        result = [
+            math.floor(round(y1, 9)) - height // 2,
+            math.floor(round(x1, 9)) - width // 2,
+            math.ceil(round(y2, 9)) - height // 2,
+            math.ceil(round(x2, 9)) - width // 2,
+        ]
+        require(result[0] < result[2] and result[1] < result[3],
+                f"{location} is too small at export precision")
+        return result
 
 
 def compact(obj):
@@ -292,7 +317,6 @@ class TestMossBoxes:
         """Compile an absolute-pixel draft for the original image with MOSS-Image's own
         compiler, rewrite it, and compare with the compiler run on the same box mapped to the
         bucket: identical, also when a side is odd (the origin is side // 2, not side / 2)."""
-        compiler = load_compiler()
         left, top, cw, ch = fit_crop_box(*src, *dst)
         sx, sy = dst[0] / cw, dst[1] / ch
         rng = random.Random(hash(src) & 0xffff)

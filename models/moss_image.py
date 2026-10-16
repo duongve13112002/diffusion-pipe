@@ -1,9 +1,11 @@
 """MOSS-Image (OpenMOSS-Team/MOSS-Image-Base, -SFT): a 5B single-stream text-to-image DiT.
 
-The transformer is the ComfyUI implementation the MOSS-Image repository ships with its node pack
-(submodules/MOSS-Image/comfyui/moss-image/model.py), imported from the submodule unchanged, so its
-module tree and state-dict names are exactly what ComfyUI and diffusers load. Its forward is cut
-into pipeline layers below. Two things in that forward shape the cut:
+The transformer is ComfyUI's own MOSS-Image model (comfy.ldm.moss_image.model.MOSSImage), so what
+trains here is what ComfyUI runs, and its state-dict names are what ComfyUI and diffusers load. It
+is built with q, k and v as separate projections whatever the checkpoint's layout, so adapters
+always have that layout. Its forward is cut into pipeline layers below; the blocks run their own
+forward, on ComfyUI's differentiable path (models/base.py sets model_management.in_training). Two
+things in that forward shape the cut:
 
   - Every block reads its adaLN parameters from one shared Linear (shared_block_modulation). It
     runs once, in InitialLayer, and its output travels down the pipeline with the hidden states.
@@ -23,7 +25,6 @@ ComfyUI or diffusers layout), or a mix: a component path overrides the same comp
 diffusers_path.
 """
 
-import importlib.util
 import json
 import logging
 import math
@@ -52,14 +53,19 @@ import comfy.model_patcher
 import comfy.ops
 import comfy.sd
 import comfy.sd1_clip
+import comfy.supported_models
 import comfy.supported_models_base
 import comfy.utils
+import comfy.ldm.moss_image.model
+from comfy.ldm.flux.layers import timestep_embedding
+from comfy.ldm.moss_image.model import modulated_rms_norm
 from comfy.text_encoders import qwen35
 
 
-PLUGIN_DIR = Path(__file__).resolve().parent.parent / 'submodules' / 'MOSS-Image' / 'comfyui' / 'moss-image'
-
 NUM_TRAIN_TIMESTEPS = 1000
+# ComfyUI's MOSS-Image fixes these two; every released checkpoint uses them.
+FREQ_DIM = 256
+ROPE_BASE = 10000.0
 MAX_TEXT_TOKENS = 4096
 TEXT_DIM = 4096
 LATENT_CHANNELS = 128
@@ -103,33 +109,6 @@ DTYPE_NAMES = {
     'bfloat16': torch.bfloat16, 'bf16': torch.bfloat16, 'float32': torch.float32, 'fp32': torch.float32,
     'float8_e4m3fn': torch.float8_e4m3fn, 'float8': torch.float8_e4m3fn, 'float8_e5m2': torch.float8_e5m2,
 }
-
-
-def _load_plugin_module(name):
-    """A module of the MOSS-Image ComfyUI node pack, loaded from the submodule by path.
-
-    The pack is a package whose __init__ imports its nodes, and those import comfy.storage,
-    which ComfyUI 3216c62 does not have (the version pinned here, 3dd559d81, does). model.py
-    and text_encoder.py only import comfy itself, so loading them on their own works on both.
-    """
-    key = f'moss_image_plugin_{name}'
-    if key in sys.modules:
-        return sys.modules[key]
-    path = PLUGIN_DIR / f'{name}.py'
-    if not path.is_file():
-        raise RuntimeError(
-            f'{path} does not exist. The MOSS-Image submodule is missing; run '
-            '`git submodule update --init submodules/MOSS-Image`.'
-        )
-    spec = importlib.util.spec_from_file_location(key, path)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[key] = module
-    try:
-        spec.loader.exec_module(module)
-    except BaseException:
-        del sys.modules[key]
-        raise
-    return module
 
 
 def _dtype(value, key):
@@ -225,7 +204,8 @@ def split_fused_qkv(state):
     """state with each block's fused proj.qkv cut into proj.q, proj.k and proj.v.
 
     Comfy-Org/MOSS-Image and ai-toolkit's saves fuse q, k and v into one Linear (rows q, k, v);
-    the node pack's model, which this pipeline trains, keeps them apart. Cutting by rows is exact
+    this pipeline builds ComfyUI's model with them apart, so adapters have one layout whatever
+    the checkpoint's (ComfyUI maps q/k/v adapters onto a fused file too). Cutting by rows is exact
     for plain weights and for quantized ones with a scale per tensor or per row (int8_tensorwise
     with convrot rotates the input dimension, which q, k and v share).
     """
@@ -344,8 +324,8 @@ def merge_adapter(patcher, adapter_path):
     return patcher
 
 
-def transformer_unet_config(state, rope_base=10000.0):
-    """Constructor arguments of MOSSImageTransformer, read from its weights.
+def transformer_unet_config(state, rope_base=ROPE_BASE):
+    """The transformer's diffusers config (MOSSImageTransformer's arguments), read from its weights.
 
     rope_base is the one argument the weights do not determine; it comes from config.json.
     """
@@ -369,6 +349,35 @@ def transformer_unet_config(state, rope_base=10000.0):
     }
 
 
+def comfy_unet_config(unet_config):
+    """ComfyUI's MOSSImage arguments for a transformer of this diffusers config.
+
+    ComfyUI's model has a fixed timestep embedding width and RoPE base, and splits each head's
+    rotary dimensions over four axes; a config outside that is refused rather than run wrongly.
+    """
+    wrong = []
+    if unet_config['freq_dim'] != FREQ_DIM:
+        wrong.append(f'freq_dim = {unet_config["freq_dim"]} (ComfyUI\'s MOSS-Image uses {FREQ_DIM})')
+    if unet_config['rope_base'] != ROPE_BASE:
+        wrong.append(f'rope_base = {unet_config["rope_base"]} (ComfyUI\'s MOSS-Image uses {ROPE_BASE:g})')
+    dim, heads = unet_config['dim'], unet_config['num_heads']
+    if dim % heads or (dim // heads) % 8:
+        wrong.append(f'dim = {dim} with num_heads = {heads} (the head size must be a multiple of 8)')
+    if wrong:
+        raise ValueError('This MOSS-Image transformer cannot run as ComfyUI\'s MOSS-Image: ' + ', '.join(wrong))
+    return {
+        'image_model': 'moss_image',
+        'dim': dim,
+        'ffn_dim': unet_config['ffn_dim'],
+        'num_heads': heads,
+        'num_layers': unet_config['num_layers'],
+        'text_dim': unet_config['text_dim'],
+        'latent_channels': unet_config['latent_channels'],
+        # Always q, k and v apart (split_fused_qkv), so adapters have one layout.
+        'fused_qkv': False,
+    }
+
+
 def read_transformer_config(path):
     """config.json of a diffusers transformer directory ({} when there is none).
 
@@ -380,7 +389,7 @@ def read_transformer_config(path):
     config = json.loads(config_file.read_text())
     if config.get('_class_name') not in (None, 'MOSSImageTransformer'):
         raise ValueError(f'{config_file} describes a {config.get("_class_name")}, not a MOSS-Image transformer')
-    rope_base = config.get('rope_base', 10000.0)
+    rope_base = config.get('rope_base', ROPE_BASE)
     if not isinstance(rope_base, (int, float)) or isinstance(rope_base, bool) or not rope_base > 0:
         raise ValueError(f'{config_file}: rope_base must be a positive number, got {rope_base!r}')
     return config
@@ -394,36 +403,63 @@ def check_declared_config(declared, unet_config, source):
         raise ValueError(f'{source} does not match its weights: ' + ', '.join(wrong))
 
 
-class MossImageModelConfig(comfy.supported_models_base.BASE):
-    """ComfyUI model config for the transformer: what the node pack's MOSSImageConfig declares."""
-    unet_extra_config = {}
-    sampling_settings = {'shift': 1.0, 'multiplier': 1000}
-    latent_format = comfy.latent_formats.Flux2
-    supported_inference_dtypes = [torch.bfloat16, torch.float32]
-    memory_usage_factor = 4.0
+# Keys of a checkpoint the model does not load: the RoPE frequencies (a derived constant ComfyUI
+# recomputes; diffusers keeps it as a buffer) and Comfy-Org's int8 files' attention choice, an
+# int8 attention kernel picked for inference. Training runs ComfyUI's regular attention.
+_NOT_LOADED = re.compile(r'rope\.bands|.*\.comfy_attention\.config')
 
-    def get_model(self, state_dict, prefix='', device=None):
-        transformer = _load_plugin_module('model').MOSSImageTransformer
-        return comfy.model_base.BaseModel(self, comfy.model_base.ModelType.FLOW, device=device, unet_model=transformer)
+# What ComfyUI's checkpoint detection (model_detection) assumes of a MOSS-Image transformer: a
+# file of another shape trains here, but ComfyUI's Load Diffusion Model cannot load what it saves.
+COMFY_DETECTED = {'head size': 128, 'text_dim': 4096, 'latent_channels': 128}
+RELEASED_NUM_LAYERS = 42
+
+
+def model_keys(comfy_config):
+    """The state dict keys ComfyUI's MOSSImage of this config has, built without any memory.
+
+    ComfyUI's mixed-precision operations do not report a quantized layer whose weight is missing
+    (nor its bias), so missing keys are found from these rather than from load_state_dict.
+    """
+    model = comfy.ldm.moss_image.model.MOSSImage(**comfy_config, device='meta', operations=comfy.ops.disable_weight_init)
+    return set(model.state_dict())
+
+
+def warn_about_shape(unet_config, declared, source):
+    detected = {'head size': unet_config['dim'] // unet_config['num_heads'],
+                'text_dim': unet_config['text_dim'], 'latent_channels': unet_config['latent_channels']}
+    odd = [f'{key} = {detected[key]} (ComfyUI expects {value})'
+           for key, value in COMFY_DETECTED.items() if detected[key] != value]
+    if odd:
+        logging.warning(f'{source}: ComfyUI cannot detect a MOSS-Image transformer with '
+                        f'{", ".join(odd)}, so its Load Diffusion Model will not load what this run saves')
+    # A single file has no record of its block count: the count ends at the first block missing.
+    if unet_config['num_layers'] != RELEASED_NUM_LAYERS and 'num_layers' not in declared:
+        logging.warning(f'{source} has {unet_config["num_layers"]} blocks; the released MOSS-Image '
+                        f'transformers have {RELEASED_NUM_LAYERS}. If this file should have more, it is truncated.')
 
 
 def load_transformer_patcher(state, metadata, dtype, load_device=None, offload_device=None, declared=None):
     """ModelPatcher for a MOSS-Image transformer state dict.
 
-    comfy.sd.load_diffusion_model_state_dict cannot detect this model, so this is that function
-    with the detection replaced by MossImageModelConfig. It is also the node pack's own
-    load_model_state without the fast_disk argument, which ComfyUI 3216c62's ModelPatcher does
-    not accept. Comfy quantized checkpoints (fp8 scaled, comfy-kitchen formats) go through
-    ComfyUI's own mixed-precision operations, as they do in ComfyUI.
+    comfy.sd.load_diffusion_model_state_dict, with the checkpoint normalised first: any prefix
+    removed, a fused proj.qkv split, a diffusers config.json honoured. Comfy quantized checkpoints
+    (fp8 scaled, comfy-kitchen formats) go through ComfyUI's own mixed-precision operations, as
+    they do in ComfyUI.
 
     declared is the transformer directory's config.json, if any: checked against the weights,
     and the source of rope_base.
     """
     declared = declared or {}
     state, metadata = transformer_state(state, metadata)
-    unet_config = transformer_unet_config(state, declared.get('rope_base', 10000.0))
+    state = {k: v for k, v in state.items() if not _NOT_LOADED.fullmatch(k)}
+    unet_config = transformer_unet_config(state, declared.get('rope_base', ROPE_BASE))
     check_declared_config(declared, unet_config, 'The transformer config.json')
-    config = MossImageModelConfig(unet_config)
+    comfy_config = comfy_unet_config(unet_config)
+    missing = sorted(model_keys(comfy_config) - state.keys())
+    if missing:
+        raise RuntimeError(f'The MOSS-Image checkpoint is missing {len(missing)} weights, e.g. {missing[:5]}')
+    warn_about_shape(unet_config, declared, 'The MOSS-Image transformer')
+    config = comfy.supported_models.MOSSImage(comfy_config)
     config.quant_config = comfy.utils.detect_layer_quantization(state, '')
     if load_device is None:
         load_device = comfy.model_management.get_torch_device()
@@ -436,29 +472,21 @@ def load_transformer_patcher(state, metadata, dtype, load_device=None, offload_d
     patcher = comfy.model_patcher.ModelPatcher(model, load_device=load_device, offload_device=offload_device)
     if not comfy.model_management.is_device_cpu(offload_device):
         model.to(offload_device)
-    missing, unexpected = model.diffusion_model.load_state_dict(_with_rope_bands(state, model.diffusion_model),
-                                                                strict=False)
-    # Quantized layers keep their scales in extra keys that the comfy ops consume themselves.
-    missing = [k for k in missing if k != 'rope.bands']
+    missing, unexpected = model.diffusion_model.load_state_dict(state, strict=False)
     if missing:
         raise RuntimeError(f'The MOSS-Image checkpoint is missing {len(missing)} weights, e.g. {missing[:5]}')
-    if unexpected and config.quant_config is None:
+    # Quantized layers' scales are consumed by the comfy ops, so anything left over is not the model's
+    # (a block past the first one missing, a stray key), quantized or not.
+    if unexpected:
         raise RuntimeError(f'Unexpected keys in the MOSS-Image checkpoint, e.g. {unexpected[:5]}')
     return patcher
 
 
-def default_rope_bands(diffusion_model):
-    return diffusion_model.rope._default_bands(torch.device('cpu'))
-
-
-def _with_rope_bands(state, diffusion_model):
-    # rope.bands is a derived constant: the ComfyUI model recomputes it on every call and only
-    # keeps the buffer for checkpoint compatibility. A checkpoint without it (an older export)
-    # must still load, and the buffer must not stay torch.empty garbage.
-    if 'rope.bands' not in state:
-        state = dict(state)
-        state['rope.bands'] = default_rope_bands(diffusion_model)
-    return state
+def default_rope_bands(head_dim, base=ROPE_BASE):
+    """The diffusers model's rope.bands buffer: base^(-i / n) for its n = head_dim / 8 bands, in
+    fp32 (ComfyUI's EmbedND computes the same frequencies)."""
+    num_bands = head_dim // 8
+    return 1 / (base ** (torch.arange(num_bands, dtype=torch.float32) / num_bands))
 
 
 # ---- text encoder ----------------------------------------------------------------------------------
@@ -495,7 +523,13 @@ def qwen35_comfy_layout(state):
 
 
 class MossImageTokenizer(comfy.sd1_clip.SD1Tokenizer):
-    """The node pack's MOSSImageTokenizer, recording how long each prompt was before truncation."""
+    """Tokens of MOSS-Image's chat template, at most MAX_TEXT_TOKENS of them, recording how long
+    each prompt was before truncation.
+
+    The same token ids as ComfyUI's MOSSImageTokenizer for any caption that is not itself a chat
+    transcript (ComfyUI passes text starting with <|im_start|> through as it is); ComfyUI does not
+    truncate, the reference pipeline does (max_sequence_length 4096).
+    """
 
     def __init__(self, embedding_directory=None, tokenizer_data={}):
         def tokenizer(*args, **kwargs):
@@ -654,10 +688,13 @@ class NoiseLevelSampler:
 
 class LayerState:
     """What every pipeline layer shares and is not a module: the compute dtype, the layers to skip
-    while sampling, and a few RoPE tables (they depend only on the image grid and text length)."""
+    while sampling, and a few RoPE tables (they depend only on the image grid and text length).
 
-    def __init__(self, rope_module, compute_dtype):
-        self.rope_module = [rope_module]
+    rope is the model's rope method; its fp32 tables stay fp32, as in ComfyUI's forward.
+    """
+
+    def __init__(self, rope, compute_dtype):
+        self.rope_fn = rope
         self.compute_dtype = compute_dtype
         self.skip_layers = frozenset()
         self._rope = OrderedDict()
@@ -666,7 +703,7 @@ class LayerState:
         key = (height, width, text_length, str(device))
         if key not in self._rope:
             with torch.no_grad():
-                table = self.rope_module[0](height, width, text_length, device).to(self.compute_dtype)
+                table = self.rope_fn(height, width, text_length, device)
             self._rope[key] = table
             while len(self._rope) > 8:
                 self._rope.popitem(last=False)
@@ -676,7 +713,7 @@ class LayerState:
 class MossImagePipeline(ComfyPipeline):
     name = 'moss_image'
     checkpointable_layers = ['InitialLayer', 'TransformerLayer']
-    adapter_target_modules = ['_Block']
+    adapter_target_modules = ['Block']
     keep_in_high_precision = KEEP_IN_HIGH_PRECISION
     spatial_compression = 16
     channels = LATENT_CHANNELS
@@ -880,13 +917,14 @@ class MossImagePipeline(ComfyPipeline):
     def save_model(self, save_dir, sd):
         """diffusers transformer layout: config.json + diffusion_pytorch_model.safetensors.
 
-        The same file is a ComfyUI diffusion model (the node pack's MOSSImageUNETLoader reads it)
-        and a transformer_path for this pipeline, and the folder loads with diffusers.
+        The same file is a ComfyUI diffusion model (Load Diffusion Model reads it) and a
+        transformer_path for this pipeline, and the folder loads with diffusers, whose model keeps
+        the RoPE frequencies as a buffer (rope.bands).
         """
         sd = dict(sd)
         if 'rope.bands' not in sd:
-            sd['rope.bands'] = default_rope_bands(self.diffusion_model).to(torch.float32)
-        unet_config = transformer_unet_config(sd, self.diffusion_model.rope.base)
+            sd['rope.bands'] = default_rope_bands(sd['layers.0.q_norm.weight'].shape[0])
+        unet_config = transformer_unet_config(sd)
         config = {'_class_name': 'MOSSImageTransformer', **unet_config}
         safetensors.torch.save_file(sd, Path(save_dir) / 'diffusion_pytorch_model.safetensors', metadata={'format': 'pt'})
         (Path(save_dir) / 'config.json').write_text(json.dumps(config, indent=2) + '\n')
@@ -914,7 +952,8 @@ class MossImagePipeline(ComfyPipeline):
         s = sigma.view(-1, 1, 1, 1)
         noisy = (1 - s) * latents + s * noise
         target = noise - latents
-        return (noisy, sigma * NUM_TRAIN_TIMESTEPS, text, text_mask), (target, mask)
+        # ComfyUI's MOSS-Image takes sigma itself; its timestep embedding scales it by 1000.
+        return (noisy, sigma, text, text_mask), (target, mask)
 
     # ---- pipeline layers -------------------------------------------------------------------------
 
@@ -923,7 +962,7 @@ class MossImagePipeline(ComfyPipeline):
         state = self.layer_state
         layers = [InitialLayer(model, state)]
         for i, block in enumerate(model.layers):
-            layers.append(TransformerLayer(block, i, self.offloader, state))
+            layers.append(TransformerLayer(block, i, self.offloader, state, len(model.layers)))
         layers.append(FinalLayer(model))
         return layers
 
@@ -934,7 +973,7 @@ class MossImagePipeline(ComfyPipeline):
         assert blocks_to_swap <= num_blocks - 2, (
             f'Cannot swap more than {num_blocks - 2} blocks. Requested {blocks_to_swap} blocks to swap.')
         self.offloader = ModelOffloader(
-            '_Block', blocks, num_blocks, blocks_to_swap, True, torch.device('cuda'),
+            'Block', blocks, num_blocks, blocks_to_swap, True, torch.device('cuda'),
             self.config['reentrant_activation_checkpointing'])
         model.layers = None
         model.to('cuda')
@@ -1019,7 +1058,7 @@ class MossImagePipeline(ComfyPipeline):
         for i in tqdm(range(num_steps), desc='Sampling'):
             sigma = sigmas[i]
             sigma_next = sigmas[i + 1] if i + 1 < num_steps else torch.zeros_like(sigma)
-            t = (sigma * NUM_TRAIN_TIMESTEPS).view(1).float()
+            t = sigma.view(1).float()
             active = slg_start <= i / num_steps < slg_stop
             conditional = self._predict(x, t, self.conds)
             prediction = conditional
@@ -1038,27 +1077,6 @@ class MossImagePipeline(ComfyPipeline):
         img = self.vae_decode(x)
         comfy.model_management.unload_all_models()
         return img
-
-
-def block_forward(block, x, rope, modulation, compute_dtype, attention):
-    """_Block.forward with the activations cast to compute_dtype rather than to the weight dtype.
-
-    Identical to the original whenever the weights are stored in the compute dtype; with fp8
-    weights the original would round the activations to fp8 before every projection.
-    """
-    shift_a, scale_a, gate_a, shift_f, scale_f, gate_f = modulation.unbind(1)
-    y = block.norm1(x) * (1 + scale_a[:, None]) + shift_a[:, None]
-    y = y.to(compute_dtype)
-    q = block.q_norm(block.proj['q'](y).unflatten(-1, (block.heads, -1))).flatten(2)
-    k = block.k_norm(block.proj['k'](y).unflatten(-1, (block.heads, -1))).flatten(2)
-    x = x + block.proj['o'](attention(q, k, block.proj['v'](y), rope, block.heads)) * gate_a[:, None]
-    y = block.norm2(x) * (1 + scale_f[:, None]) + shift_f[:, None]
-    hidden, gate = block.proj['ffn_up_gate'](y.to(compute_dtype)).chunk(2, -1)
-    return x + block.proj['ffn_down'](_plugin_situ(hidden, gate)) * gate_f[:, None]
-
-
-def _plugin_situ(hidden, gate):
-    return _load_plugin_module('model')._situ(hidden, gate)
 
 
 def _length_groups(lengths):
@@ -1091,6 +1109,9 @@ def _tie(out, *unused):
 
 
 class InitialLayer(nn.Module):
+    """MOSSImage._forward up to the blocks: the time embedding and both modulations, the image
+    tokens, and the text refined at each sample's own length."""
+
     def __init__(self, model, state):
         super().__init__()
         self.video_embedder = model.video_embedder
@@ -1098,7 +1119,6 @@ class InitialLayer(nn.Module):
         self.time_embedding = model.time_embedding
         self.shared_block_modulation = model.shared_block_modulation
         self.video_head_modulation = model.video_head_modulation
-        self.freq_dim = model.freq_dim
         self.latent_channels = model.latent_channels
         self.state = state
 
@@ -1107,11 +1127,12 @@ class InitialLayer(nn.Module):
         for item in inputs:
             if torch.is_floating_point(item):
                 item.requires_grad_(True)
-        x, timestep, text, text_mask = inputs
+        x, sigma, text, text_mask = inputs
         batch, channels, height, width = x.shape
         if channels != self.latent_channels:
             raise ValueError(f'Expected {self.latent_channels} latent channels, got {channels}')
         device = x.device
+        dtype = self.state.compute_dtype
         text_mask = text_mask.bool()
         lengths = text_mask.sum(1)
         expected = torch.arange(text_mask.shape[1], device=device)[None] < lengths[:, None]
@@ -1121,37 +1142,33 @@ class InitialLayer(nn.Module):
         if min(lengths_list) == 0:
             raise ValueError('Each sample needs at least one valid text token.')
 
-        # As MOSSImageTransformer.forward: the sinusoid in float64, its MLP fed float32.
-        times = timestep.to(device=device, dtype=torch.float32).reshape(-1).expand(batch)
-        half = self.freq_dim // 2
-        freq = 10000 ** (-torch.arange(half, device=device, dtype=torch.float64) / half)
-        phase = times.double()[:, None] * freq
-        embedding = torch.cat((phase.cos(), phase.sin()), -1).float()
-        time = self.time_embedding(embedding.to(self.time_embedding[0].weight.dtype)).float()
-        mod = self.shared_block_modulation(time.to(self.shared_block_modulation.weight.dtype)).view(batch, 6, -1)
-        head = self.video_head_modulation(time.to(self.video_head_modulation.weight.dtype)).view(batch, 2, -1)
+        # ComfyUI hands the model its inputs in the compute dtype (BaseModel._apply_model).
+        sigma = sigma.to(device=device, dtype=torch.float32).reshape(-1).expand(batch)
+        vec = self.time_embedding(timestep_embedding(sigma, FREQ_DIM).to(dtype))
+        mod = self.shared_block_modulation(vec).unflatten(-1, (6, -1))
+        head = self.video_head_modulation(vec).unflatten(-1, (2, -1))
 
         hw = height * width
-        video = x.flatten(2).transpose(1, 2)
-        video = self.video_embedder(video.to(self.video_embedder.weight.dtype).contiguous())
+        video = self.video_embedder(x.to(dtype).flatten(2).transpose(1, 2))
+        text = text.to(dtype)
         pieces = []
         for n, indices in _length_groups(lengths_list).items():
-            rope = self.state.rope(height, width, n, device)
-            context = text[indices, :n]
-            refined = self.text_embedder(context, rope[:, hw:])
-            pieces.append((indices, torch.cat((video[indices], refined.to(video.dtype)), 1)))
+            pe = self.state.rope(height, width, n, device)
+            refined = self.text_embedder(text[indices, :n], pe[:, hw:])
+            pieces.append((indices, torch.cat((video[indices], refined), 1)))
         hidden = _assemble(pieces, batch, hw + max(lengths_list))
         sizes = torch.tensor([height, width], device=device)
         return make_contiguous(hidden, mod, head, lengths, sizes)
 
 
 class TransformerLayer(nn.Module):
-    def __init__(self, block, block_idx, offloader, state):
+    def __init__(self, block, block_idx, offloader, state, num_blocks):
         super().__init__()
         self.block = block
         self.block_idx = block_idx
         self.offloader = offloader
         self.state = state
+        self.transformer_options = {'total_blocks': num_blocks, 'block_type': 'single', 'block_index': block_idx}
 
     def forward(self, inputs):
         hidden, mod, head, lengths, sizes = inputs
@@ -1161,14 +1178,15 @@ class TransformerLayer(nn.Module):
             hw = height * width
             lengths_list = lengths.tolist()
             batch, total = hidden.shape[:2]
-            attention = _load_plugin_module('model')._attention
             groups = _length_groups(lengths_list)
             pieces = []
             for n, indices in groups.items():
-                rope = self.state.rope(height, width, n, hidden.device)
+                pe = self.state.rope(height, width, n, hidden.device)
                 rows = hidden[:, :hw + n] if len(indices) == batch else hidden[indices, :hw + n]
                 rows_mod = mod if len(indices) == batch else mod[indices]
-                pieces.append((indices, block_forward(self.block, rows, rope, rows_mod, self.state.compute_dtype, attention)))
+                # MOSSImage._forward's mod: six (batch, 1, dim) tensors.
+                out = self.block(rows, rows_mod.unsqueeze(2).unbind(1), pe, self.transformer_options)
+                pieces.append((indices, out))
             if len(groups) == 1 and hw + lengths_list[0] == total:
                 hidden = pieces[0][1]
             else:
@@ -1186,8 +1204,8 @@ class FinalLayer(nn.Module):
     def forward(self, inputs):
         hidden, mod, head, lengths, sizes = inputs
         height, width = sizes.tolist()
-        x = self.final_norm_video(hidden[:, :height * width].to(self.final_norm_video.weight.dtype))
-        x = x * (1 + head[:, 1, None]) + head[:, 0, None]
-        x = self.final_linear_video(x.to(self.final_linear_video.weight.dtype))
+        shift, scale = head.unsqueeze(2).unbind(1)
+        x = modulated_rms_norm(hidden[:, :height * width], self.final_norm_video, scale, shift)
+        x = self.final_linear_video(x)
         out = x.transpose(1, 2).reshape(x.shape[0], -1, height, width)
         return _tie(out, mod)

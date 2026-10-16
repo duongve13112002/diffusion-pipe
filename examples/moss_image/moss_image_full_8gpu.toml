@@ -5,8 +5,8 @@
 # killed mid-save leaves the previous ones intact; resume with --resume_from_checkpoint.
 #
 # Saves are diffusers transformer directories (config.json + diffusion_pytorch_model.safetensors):
-# a transformer_path for this trainer, a diffusers MOSSImageTransformer, and a ComfyUI diffusion
-# model for the MOSS-Image node pack (comfyui/moss_image_compat on ComfyUI 3216c62).
+# a transformer_path for this trainer, a diffusers MOSSImageTransformer, and a diffusion model for
+# ComfyUI's Load Diffusion Model node (its diffusion_pytorch_model.safetensors).
 output_dir = '/pvc/runs/moss_image_full'
 dataset = 'examples/moss_image/moss_image_dataset.toml'
 

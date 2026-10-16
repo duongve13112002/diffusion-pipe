@@ -756,8 +756,8 @@ Everything is ComfyUI model format. Only T2I is currently supported. I2I edit tr
 ## MOSS-Image
 [MOSS-Image](https://github.com/OpenMOSS/MOSS-Image) is a 5B single-stream text-to-image DiT
 (42 blocks) with the Qwen3.5-9B language model as text encoder and the FLUX.2 VAE. The
-transformer is the one the MOSS-Image repository ships for ComfyUI, imported unchanged from the
-`submodules/MOSS-Image` submodule (`git submodule update --init submodules/MOSS-Image`).
+transformer is ComfyUI's native MOSS-Image (`comfy.ldm.moss_image`, in the ComfyUI submodule),
+the model ComfyUI itself runs for inference; training uses its differentiable path.
 Both [MOSS-Image-Base](https://huggingface.co/OpenMOSS-Team/MOSS-Image-Base) and
 [MOSS-Image-SFT](https://huggingface.co/OpenMOSS-Team/MOSS-Image-SFT) train the same way.
 ```
@@ -798,7 +798,12 @@ freed. Edit/control datasets are not supported.
   fused weights are split into the q, k and v this pipeline trains; quantized ones only in
   formats with one scale per tensor or per row (fp8, `int8_tensorwise`), other formats are refused.
   The int8 attention those `int8_convrot_attn` files ask for (`comfy_attention.config`) is not
-  used: attention runs in `dtype`.
+  used: attention runs in `dtype`. Transformers ComfyUI's MOSS-Image cannot run (a `freq_dim`
+  other than 256, a `rope_base` other than 10000, a head size not a multiple of 8) are refused,
+  as is a checkpoint with a weight missing or a key that is not the model's, quantized or not.
+  A transformer of another shape than ComfyUI detects (head size 128, `text_dim` 4096, 128
+  latent channels) trains with a warning: ComfyUI's loader cannot load what it saves. So does a
+  single file with other than 42 blocks, which may be truncated.
 - `merge_adapters` also takes ai-toolkit's MOSS-Image LoRAs, which adapt the fused `proj.qkv`
   (ComfyUI, diffusers `transformer.` and kohya `lora_unet_` names): each of q, k and v gets the
   LoRA's A and its third of B, which is exact. Fused LoKr/LoHa/DoRA cannot be split and are
@@ -806,17 +811,22 @@ freed. Edit/control datasets are not supported.
 - `--test_sample` uses the reference pipeline's sampler: 50 Euler steps over its snapped
   shift-5 sigmas, CFG 3 whose negative branch skips block 22, and optional skip-layer guidance.
   Each setting is a `sample_*` key in `[model]` (see the LoRA example).
-- Saves: LoRA/LoKr adapters load in ComfyUI with the standard LoRA loader on top of the
-  MOSS-Image model. A full fine-tune saves a diffusers transformer directory (`config.json` +
-  `diffusion_pytorch_model.safetensors`). That directory is a `transformer_path` here, a diffusers
-  `MOSSImageTransformer`, and a diffusion model for the MOSS-Image ComfyUI nodes.
-- ComfyUI 3216c62 is older than the MOSS-Image node pack. Install
-  [comfyui/moss_image_compat](../comfyui/moss_image_compat/README.md) instead of the pack there.
-  Training itself works with both 3216c62 and the ComfyUI pinned in this repository.
+- Saves (of the released MOSS-Image shape): LoRA/LoKr adapters load in ComfyUI with the standard
+  LoRA loader on top of any MOSS-Image diffusion model, the bf16 files and Comfy-Org's fused and int8 ones alike (ComfyUI
+  maps the q, k and v adapters onto a fused `proj.qkv`). A full fine-tune saves a diffusers
+  transformer directory (`config.json` + `diffusion_pytorch_model.safetensors`). That directory is
+  a `transformer_path` here and a diffusers `MOSSImageTransformer`, and its safetensors file loads
+  in ComfyUI's Load Diffusion Model node.
+- In ComfyUI, sample with the model as it loads, or with `ModelSamplingAuraFlow` to change the
+  shift. Do not use `ModelSamplingSD3`: it hands the model sigma x 1000, while ComfyUI's
+  MOSS-Image takes sigma itself, and the images come out broken.
+- ComfyUI's MOSS-Image text encoder does not cut prompts at 4096 tokens as training does; keep
+  prompts within that length in ComfyUI.
 
 ### Layout (JSON) captions
 A caption file can hold a MOSS-Image layout prompt instead of text: the JSON object its prompt
-compiler (`submodules/MOSS-Image/skills/moss-image-prompt-enhancer/scripts/compile_prompt.py`)
+compiler (`skills/moss-image-prompt-enhancer/scripts/compile_prompt.py` in
+[OpenMOSS/MOSS-Image](https://github.com/OpenMOSS/MOSS-Image))
 writes, with boxes in pixels of the original image (`yxyx`, origin at `(height // 2, width // 2)`).
 The compiler's output is compact JSON, which is the form the model was trained on:
 ```

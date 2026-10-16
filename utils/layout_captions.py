@@ -13,7 +13,7 @@ the text. Caption dropout still applies to them.
 
 Formats (MossImagePipeline.layout_caption_format / Ideogram4Pipeline.layout_caption_format):
 
-  moss_image  The prompt MOSS-Image's compiler produces (skills/moss-image-prompt-enhancer):
+  moss_image  The prompt MOSS-Image's compiler produces (skills/moss-image-prompt-enhancer in OpenMOSS/MOSS-Image):
               {"summary": {"caption": ...}, "items": [{"bbox": [y1, x1, y2, x2], ...}],
                "bbox_coord_space": "abs_centralized", "bbox_format": "yxyx"}
               Boxes are integer pixels of the original image with the origin at its centre.

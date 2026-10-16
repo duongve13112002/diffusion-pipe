@@ -15,7 +15,7 @@ Models supported: SDXL, Flux, LTX-Video, HunyuanVideo (t2v), Cosmos, Lumina Imag
 
 ## Recent changes
 - 2026-10-16
-  - Support MOSS-Image (Base and SFT): LoRA, LoKr, OPLoRA and full fine-tuning, from a diffusers directory or ComfyUI single files (fp8 and comfy-quant included). See [supported models](docs/supported_models.md#moss-image) and `examples/moss_image/`. `comfyui/moss_image_compat` runs the MOSS-Image ComfyUI nodes on ComfyUI 3216c62.
+  - Support MOSS-Image (Base and SFT): LoRA, LoKr, OPLoRA and full fine-tuning, from a diffusers directory or ComfyUI single files (fp8 and comfy-quant included). See [supported models](docs/supported_models.md#moss-image) and `examples/moss_image/`. The transformer is ComfyUI's native MOSS-Image, and saved adapters and fine-tunes load in ComfyUI's own loaders.
   - Layout (JSON) captions for MOSS-Image and Ideogram4: a caption file holding the model's JSON prompt has its boxes rewritten for each bucket's crop, and tag operations skip it. Detection is per caption. The caption cache key of these two models changes, so their caption caches are rebuilt.
 - 2026-10-15
   - `diffusion_model_dtype` now keeps every weight under the model's high-precision modules (e.g. `time_in`, `final_layer`, Krea2's `txtfusion`, MiniMax H3's `token_refiner`) in the base dtype, as intended; before, only weights directly in those modules were kept. This uses a little more VRAM (up to ~5% of the weights for Krea2).
