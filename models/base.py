@@ -709,7 +709,7 @@ class ComfyPipeline(CommonPipeline):
 
             self.text_encoders.append(ModelWrapper(load_fn))
 
-    def dequantize(self, model, diffusion_model_dtype):
+    def dequantize(self, model, diffusion_model_dtype, prefix=''):
         operations = comfy.ops.disable_weight_init
         for mod_name, module in model.named_children():
             is_quantized = False
@@ -736,7 +736,7 @@ class ComfyPipeline(CommonPipeline):
                     new_linear.bias = module.bias
                 model._modules[mod_name] = new_linear
 
-            self.dequantize(module, diffusion_model_dtype)
+            self.dequantize(module, diffusion_model_dtype, prefix=f'{prefix}{mod_name}.')
 
     def patch_quantized_modules(self, model):
         # For every class that acts like a Linear but isn't a nn.Linear (e.g. quant linear), force it to be a nn.Linear
