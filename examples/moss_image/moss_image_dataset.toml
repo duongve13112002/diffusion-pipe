@@ -1,0 +1,24 @@
+# MOSS-Image dataset. The model was trained at about one megapixel over many aspect ratios;
+# bucket sides are rounded to multiples of 16 (the VAE's 16x compression).
+resolutions = [1024]
+enable_ar_bucket = true
+min_ar = 0.5
+max_ar = 2.0
+num_ar_buckets = 9
+
+# Drop some captions so the empty-prompt branch that CFG samples with keeps training.
+caption_dropout_rate = 0.1
+
+[[directory]]
+path = '/data/datasets/my_images'
+num_repeats = 1
+# Captions are .txt files next to the images, one of two kinds, detected per file:
+#   - plain text, which gets every caption option below;
+#   - a layout caption: the whole file is the JSON prompt MOSS-Image's prompt compiler writes
+#     ({"summary": {"caption": ...}, "items": [{"bbox": [y1, x1, y2, x2], ...}],
+#       "bbox_coord_space": "abs_centralized", "bbox_format": "yxyx"}), boxes in pixels of
+#     the original image. Its boxes are rewritten for the crop and size of each bucket, and
+#     caption_prefix goes into summary.caption. Tag shuffling, tag dropout, multiline
+#     splitting and non-Latin line removal skip layout captions; caption dropout still applies.
+#caption_prefix = 'sks, '
+#shuffle_tags = true

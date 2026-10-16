@@ -12,6 +12,8 @@ import random
 import tarfile
 from pathlib import Path
 
+from utils.layout_captions import is_layout_caption
+
 logger = logging.getLogger(__name__)
 
 CAPTIONS_JSON_FILE = 'captions.json'
@@ -127,6 +129,7 @@ def preprocess_caption(
     tag_dropout_rate: float = 0.0,
     rng=random,
     enable_remove_non_latin: bool = False,
+    layout_captions: bool = False,
 ) -> str:
     """Strip markers, optionally filter lines and augment tags, then apply caption_prefix.
 
@@ -134,7 +137,13 @@ def preprocess_caption(
     tag list, and caption_prefix goes on last so it stays pinned to the front the way every
     other model in this repo expects. With filtering enabled, empty bodies stay empty, even
     when caption_prefix is set. Whole-caption dropout is handled at dataset access, never here.
+
+    layout_captions (a model with a layout_caption_format) returns a JSON layout caption
+    untouched: shuffling, dropping or filtering would break its JSON, and its caption_prefix
+    goes inside it when the caption is rewritten for its bucket (utils/layout_captions.py).
     """
+    if layout_captions and is_layout_caption(caption):
+        return caption
     body, is_tag = split_tag_prefix(caption, prefix_tag_caption)
     if enable_remove_non_latin:
         # Inspect lines before tag augmentation. A mixed Latin/non-Latin line is removed in
@@ -161,6 +170,7 @@ def shuffle_captions(
     tag_dropout_rate: float = 0.0,
     seed=None,
     enable_remove_non_latin: bool = False,
+    layout_captions: bool = False,
 ) -> list[str]:
     """Expand captions into the variants that get embedded and cached.
 
@@ -175,11 +185,14 @@ def shuffle_captions(
     embeddings unnecessarily. Image latents now fingerprint the other columns only.
     Nothing is lost by fixing them -- the variants are frozen into the text embedding cache
     anyway, so redrawing them per run never produced fresh augmentation.
+
+    layout_captions: see preprocess_caption. A layout caption still gets `count` variants (all
+    the same text), so the caption numbering is the same as for plain captions.
     """
     rng = random if seed is None else random.Random(seed)
     if (count == 0 and tag_dropout_rate <= 0 and not tag_markers(prefix_tag_caption)
             and not enable_remove_non_latin):
-        return [caption_prefix + c for c in captions]
+        return [c if layout_captions and is_layout_caption(c) else caption_prefix + c for c in captions]
 
     variants = max(count, 1)
     return [
@@ -192,6 +205,7 @@ def shuffle_captions(
             tag_dropout_rate=tag_dropout_rate,
             rng=rng,
             enable_remove_non_latin=enable_remove_non_latin,
+            layout_captions=layout_captions,
         )
         for caption in captions
         for _ in range(variants)
@@ -199,7 +213,7 @@ def shuffle_captions(
 
 
 def read_caption_file(path: Path, multiline_captions: bool = False,
-                      keep_empty_caption: bool = False) -> list[str]:
+                      keep_empty_caption: bool = False, layout_captions: bool = False) -> list[str]:
     """Read a sidecar .txt caption file.
 
     Historically the whole file is one caption, newlines included. `multiline_captions` opts a
@@ -207,14 +221,20 @@ def read_caption_file(path: Path, multiline_captions: bool = False,
     captions.json already allows. It is opt-in because flipping it changes the number of
     training samples for every existing dataset whose .txt files happen to wrap.
     keep_empty_caption preserves an existing blank file as one unconditional sample when
-    filtering is enabled; it never changes the source file.
+    filtering is enabled; it never changes the source file. With layout_captions, a file whose
+    whole text is a JSON layout caption is one caption even with multiline_captions.
     """
     # utf-8-sig, not utf-8: a caption file saved by a Windows editor starts with a BOM,
     # and str.strip() does not remove U+FEFF -- it is not whitespace. The stray codepoint
     # would ride into the tokenizer on the first caption only, so the damage is silent and
     # uneven. utf-8-sig reads a BOM-less file identically.
     text = path.read_text(encoding='utf-8-sig')
-    if not multiline_captions:
+    return split_caption_lines(text, multiline_captions, keep_empty_caption, layout_captions)
+
+
+def split_caption_lines(text, multiline_captions=False, keep_empty_caption=False, layout_captions=False):
+    """A caption file's text as its captions (see read_caption_file)."""
+    if not multiline_captions or (layout_captions and is_layout_caption(text)):
         return [text.strip()]
     captions = [line for line in (l.strip() for l in text.splitlines()) if line]
     return captions or ([''] if keep_empty_caption else [])

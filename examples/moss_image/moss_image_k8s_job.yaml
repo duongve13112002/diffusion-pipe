@@ -1,0 +1,60 @@
+# MOSS-Image full fine-tune as a Kubernetes Job on one 8-GPU node, with everything on a PVC.
+# The command is the usual one (deepspeed train.py --deepspeed --config ...); the wrapper only
+# decides whether this pod resumes. Edit image, claimName and the paths, then:
+#   kubectl apply -f examples/moss_image/moss_image_k8s_job.yaml
+#
+# On a restart (node loss, eviction) the pod resumes the newest run that has a checkpoint. If
+# the newest run never wrote one, nothing can be resumed and a new run starts, saying so. A
+# volume that cannot be read fails the pod instead of starting over.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: moss-image-full
+spec:
+  backoffLimit: 6
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: train
+          image: your-registry/diffusion-pipe:latest
+          workingDir: /pvc/diffusion-pipe
+          resources:
+            limits:
+              nvidia.com/gpu: 8
+          env:
+            - name: CONFIG
+              value: examples/moss_image/moss_image_full_8gpu.toml
+            - name: OUTPUT_DIR  # output_dir of the config
+              value: /pvc/runs/moss_image_full
+            - name: NCCL_DEBUG
+              value: WARN
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -euo pipefail
+              mountpoint -q /pvc || { echo "/pvc is not mounted"; exit 1; }
+              mkdir -p "$OUTPUT_DIR"
+              # find fails on an unreadable volume, and pipefail makes that fail the pod.
+              newest=$(find "$OUTPUT_DIR" -mindepth 1 -maxdepth 1 -type d | sort | tail -n 1)
+              resume=()
+              if [ -n "$newest" ] && [ -f "$newest/latest" ]; then
+                echo "Resuming $newest"
+                resume=(--resume_from_checkpoint "$(basename "$newest")")
+              elif [ -n "$newest" ]; then
+                echo "Newest run $newest has no checkpoint to resume from: starting a new run"
+              fi
+              exec deepspeed --num_gpus=8 train.py --deepspeed --config "$CONFIG" ${resume[@]+"${resume[@]}"}
+          volumeMounts:
+            - name: pvc
+              mountPath: /pvc
+            - name: shm  # DataLoader workers and NCCL need more than the default 64 MB
+              mountPath: /dev/shm
+      volumes:
+        - name: pvc
+          persistentVolumeClaim:
+            claimName: training-pvc
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 64Gi

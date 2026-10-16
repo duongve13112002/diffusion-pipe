@@ -58,10 +58,12 @@ from utils.captions import (
     preprocess_caption,
     read_caption_file,
     shuffle_captions,
+    split_caption_lines,
     split_tag_prefix,
     validate_caption_dropout_rate,
     validate_non_latin_caption_requirement,
 )
+from utils.layout_captions import LAYOUT_REWRITE_VERSION, LayoutCaptionRewriter, is_layout_caption
 
 
 def bucket_suffix(key):
@@ -341,15 +343,33 @@ class TextEmbeddingDataset:
         return self.te_dataset[self.image_spec_to_te_idx[image_spec][caption_number]]
 
 
+def _has_content_digest(cache_path):
+    """Whether a tensor cache recorded the digest of the inputs it encoded (ReadOnlyCache reads
+    the same field). An unreadable volume raises; a manifest that does not parse claims nothing."""
+    manifest = Path(cache_path) / 'cache_manifest.json'
+    if not manifest.exists():
+        return False
+    try:
+        record = json.loads(manifest.read_text(encoding='utf-8'))
+    except ValueError:
+        return False
+    return isinstance(record, dict) and bool(record.get('content_digest'))
+
+
 def _cache_text_embeddings(metadata_dataset, map_fn, i, cache_dir, regenerate_cache,
                            caching_batch_size, text_encoder_key='',
                            keep_on_fingerprint_change=False, identity=None,
-                           profile_sources=None, profile_lookup_dir=None):
+                           profile_sources=None, profile_lookup_dir=None, layout_rewriter=None):
+    """layout_rewriter (a LayoutCaptionRewriter) rewrites each layout caption for its row's
+    media and size bucket before it is encoded; the metadata must then have size_bucket set."""
 
     def flatten_captions(example):
         result = {key: [] for key in example}
         for i, captions in enumerate(example['caption']):
             for caption in captions:
+                if layout_rewriter is not None:
+                    caption = layout_rewriter(caption, example['image_spec'][i], example['size_bucket'][i],
+                                              example['is_video'][i])
                 result['caption'].append(caption)
                 for key, value in example.items():
                     if key == 'caption':
@@ -358,7 +378,10 @@ def _cache_text_embeddings(metadata_dataset, map_fn, i, cache_dir, regenerate_ca
         return result
 
     if profile_sources is not None:
-        flattened_path = cache_dir / f'flattened_captions_{metadata_dataset._fingerprint}'
+        # The flattened text depends on the rewrite, so its files are named after it too.
+        rewrite_tag = ('' if layout_rewriter is None else
+                       '_' + Hasher.hash([layout_rewriter.cache_tag, layout_rewriter.caption_prefix]))
+        flattened_path = cache_dir / f'flattened_captions_{metadata_dataset._fingerprint}{rewrite_tag}'
         if flattened_path.exists():
             flattened_captions = datasets.load_from_disk(str(flattened_path))
         else:
@@ -373,12 +396,20 @@ def _cache_text_embeddings(metadata_dataset, map_fn, i, cache_dir, regenerate_ca
                 if len(source) and isinstance(source[0]['caption'], str):
                     result.append((source, path))
                     continue
-                flattened_source = profile_lookup_dir / f'flattened_{source._fingerprint}'
+                flattened_source = profile_lookup_dir / f'flattened_{source._fingerprint}{rewrite_tag}'
                 if not flattened_source.exists():
                     flattened = source.map(flatten_captions, batched=True, keep_in_memory=True,
                                            remove_columns=source.column_names)
                     flattened.save_to_disk(str(flattened_source))
-                result.append((datasets.load_from_disk(str(flattened_source)), path))
+                flattened = datasets.load_from_disk(str(flattened_source))
+                if layout_rewriter is not None and not _has_content_digest(path) and any(
+                        is_layout_caption(c) for captions in source['caption'] for c in captions):
+                    # This donor's metadata holds the caption files' text, and the code that
+                    # filled it may or may not have rewritten the layout ones before encoding.
+                    # Only its recorded content digest tells which, and it has none.
+                    print(f'[CACHE] {path} has layout captions and no content digest; not reusing it.')
+                    continue
+                result.append((flattened, path))
             return result
         te_dataset = tensor_profile(
             flattened_captions, map_fn,
@@ -427,6 +458,9 @@ CAPTION_CACHE_SETTINGS = {
     'tag_dropout_rate': 0.0,
     'multiline_captions': False,
     'enable_remove_non_latin': False,
+    # Set for a model with a layout_caption_format: its JSON captions skip the tag operations
+    # and keep caption_prefix for the per-bucket rewrite.
+    'layout_captions': '',
 }
 
 
@@ -548,6 +582,9 @@ class SizeBucketDataset:
         self.tag_dropout_rate = directory_config.get('tag_dropout_rate', 0.0)
         self.enable_remove_non_latin = directory_config.get('enable_remove_non_latin', False)
         self.caption_dropout_rate = directory_config.get('caption_dropout_rate', None)
+        # Rewrites JSON layout captions for this bucket (utils/layout_captions.py); None for a
+        # model without a layout_caption_format.
+        self.layout_rewriter = getattr(directory_dataset, 'layout_rewriter', None)
         if self.num_repeats <= 0:
             raise ValueError(f'num_repeats must be >0, was {self.num_repeats}')
 
@@ -686,8 +723,18 @@ class SizeBucketDataset:
                 if getattr(self.directory_dataset, 'reuse_metadata_cache', False) else None),
             profile_lookup_dir=(self.directory_dataset.snapshot_dir / 'tensor_lookups'
                                 if getattr(self.directory_dataset, 'reuse_metadata_cache', False) else None),
+            layout_rewriter=self.layout_rewriter,
         )
         self.text_embedding_datasets.append(te_dataset)
+
+    def _rewrite_layout(self, caption, image_spec):
+        """A layout caption as this bucket trains it, for the paths that tokenize the caption
+        string at __getitem__ time (the cached path rewrites before encoding)."""
+        if self.layout_rewriter is None or not caption:
+            return caption
+        # (w, h, frames), also for an AR bucket's (ar, w, h, frames) naming key.
+        size_bucket = tuple(self.size_bucket)[-3:]
+        return self.layout_rewriter(caption, tuple(image_spec), size_bucket, size_bucket[-1] > 1)
 
     def add_text_embedding_dataset(self, te_dataset):
         self.text_embedding_datasets.append(te_dataset)
@@ -758,6 +805,7 @@ class SizeBucketDataset:
                             shuffle=self.online_shuffle,
                             tag_dropout_rate=self.tag_dropout_rate,
                             enable_remove_non_latin=self.enable_remove_non_latin,
+                            layout_captions=self.layout_rewriter is not None,
                         )
                     else:
                         # Metadata already applied the deterministic parts, but the online
@@ -767,7 +815,9 @@ class SizeBucketDataset:
                             caption_prefix=self.caption_prefix,
                             prefix_tag_caption=self.prefix_tag_caption,
                             enable_remove_non_latin=self.enable_remove_non_latin,
+                            layout_captions=self.layout_rewriter is not None,
                         )
+                    caption = self._rewrite_layout(caption, entry['image_spec'])
                 else:
                     print(f'WARNING: image {key} did not have entry in captions_dict. Using empty caption.')
                     caption = ''
@@ -786,7 +836,11 @@ class SizeBucketDataset:
                         shuffle=self.online_shuffle,
                         tag_dropout_rate=self.tag_dropout_rate,
                         enable_remove_non_latin=self.enable_remove_non_latin,
+                        layout_captions=self.layout_rewriter is not None,
                     )
+                if not self.text_embedding_datasets:
+                    # Tokenized from this string: rewrite a layout caption for this bucket.
+                    caption = self._rewrite_layout(caption, entry['image_spec'])
 
         for ds, uncond_ds in zip(self.text_embedding_datasets, self.uncond_text_embeddings):
             emb_dict = uncond_ds[0] if use_uncond else ds.get_text_embeddings(tuple(entry['image_spec']), caption_number)
@@ -1151,6 +1205,16 @@ class ARBucketDataset:
     def cache_text_embeddings(self, map_fn, i, regenerate_cache=False, caching_batch_size=1,
                               text_encoder_key='', keep_text_embedding_cache=False,
                               identity=None):
+        if (getattr(self.directory_dataset, 'layout_rewriter', None) is not None
+                and any(is_layout_caption(c) for captions in self.metadata_dataset['caption'] for c in captions)):
+            # A layout caption is a different text at each resolution (its boxes follow the
+            # crop), so each size bucket of this aspect ratio caches its own embeddings.
+            for size_bucket_dataset in self.size_buckets:
+                size_bucket_dataset.cache_text_embeddings(
+                    map_fn, i, regenerate_cache=regenerate_cache, caching_batch_size=caching_batch_size,
+                    text_encoder_key=text_encoder_key, keep_text_embedding_cache=keep_text_embedding_cache,
+                    identity=identity)
+            return
         print(f'caching text embeddings: {self.ar_frames}')
         te_dataset = _cache_text_embeddings(
             self.metadata_dataset, map_fn, i, self.cache_dir, regenerate_cache,
@@ -1175,7 +1239,8 @@ _OWN = object()
 class DirectoryDataset:
     def __init__(self, directory_config, dataset_config, model_name, framerate=None,
                  round_to_multiple=32, skip_dataset_validation=False,
-                 caches_text_embeddings=True, vae_identity='', on_the_fly_media=None):
+                 caches_text_embeddings=True, vae_identity='', on_the_fly_media=None,
+                 layout_caption_format=None):
         self._set_defaults(directory_config, dataset_config)
         self.directory_config = directory_config
         # (media_loader, encode_fn) for a model that reads its media at __getitem__ time instead
@@ -1241,7 +1306,13 @@ class DirectoryDataset:
             'tag_dropout_rate': directory_config.get('tag_dropout_rate', dataset_config.get('tag_dropout_rate', 0.0)),
             'multiline_captions': directory_config.get('multiline_captions', dataset_config.get('multiline_captions', False)),
             'enable_remove_non_latin': directory_config['enable_remove_non_latin'],
+            'layout_captions': (f'v{LAYOUT_REWRITE_VERSION}-{layout_caption_format}'
+                                if layout_caption_format else ''),
         })
+        # JSON layout captions (utils/layout_captions.py), for a model that declares a format.
+        self.layout_caption_format = layout_caption_format
+        self.layout_rewriter = (LayoutCaptionRewriter(layout_caption_format, directory_config['caption_prefix'])
+                                if layout_caption_format else None)
         self.grouping_keys_json_file = self.cache_dir / f'metadata/grouping_keys{self.caption_cache_suffix}.json'
         self.skip_empty_caption = directory_config.get('skip_empty_caption', dataset_config.get('skip_empty_caption', True))
         self.multiline_captions = directory_config.get('multiline_captions', dataset_config.get('multiline_captions', False))
@@ -1498,9 +1569,8 @@ class DirectoryDataset:
                 if batch['_caption_missing'][index]:
                     captions = None
                 elif batch['_caption_sidecar'][index] and self.multiline_captions:
-                    captions = [line.strip() for line in captions[0].splitlines() if line.strip()]
-                    if not captions and self.enable_remove_non_latin:
-                        captions = ['']
+                    captions = split_caption_lines(captions[0], True, self.enable_remove_non_latin,
+                                                   self.layout_rewriter is not None)
                 if not captions:
                     if self.skip_empty_caption:
                         continue
@@ -1515,7 +1585,8 @@ class DirectoryDataset:
                         captions, self.shuffle, self.shuffle_delimiter,
                         self.directory_config['caption_prefix'], self.prefix_tag_caption,
                         self.tag_dropout_rate, seed=seed_from_hash((self.path, batch['image_spec'][index])),
-                        enable_remove_non_latin=self.enable_remove_non_latin)
+                        enable_remove_non_latin=self.enable_remove_non_latin,
+                        layout_captions=self.layout_rewriter is not None)
                 for key in result:
                     result[key].append(captions if key == 'caption' else batch[key][index])
             return result
@@ -1668,6 +1739,22 @@ class DirectoryDataset:
                         self,
                     )
                 )
+        if self.layout_rewriter is not None:
+            self._report_layout_captions()
+
+    def _report_layout_captions(self):
+        buckets = self.size_bucket_datasets if self.use_size_buckets else self.ar_bucket_datasets
+        # Counted per image: cache_shuffle_num repeats each caption, which is not the user's count.
+        total = layout = 0
+        for bucket in buckets:
+            for captions in bucket.metadata_dataset['caption']:
+                total += 1
+                layout += any(is_layout_caption(c) for c in captions)
+        if layout and is_main_process():
+            field = {'moss_image': 'summary.caption', 'ideogram4': 'high_level_description'}[self.layout_caption_format]
+            print(f'{self.path}: {layout} of {total} images have {self.layout_caption_format} layout (JSON) captions: '
+                  f'their boxes are rewritten for each bucket, caption_prefix goes into {field}, and tag '
+                  f'shuffling, tag dropout, multiline splitting and non-Latin line removal skip them.')
 
     def _group_metadata_and_save_to_disk(self, regenerate_cache=False, trust_cache=False):
         metadata_dataset = self._get_ungrouped_metadata(regenerate_cache=regenerate_cache, trust_cache=trust_cache)
@@ -1857,7 +1944,8 @@ class DirectoryDataset:
                 captions = example['caption'][0]
             if captions is None and caption_file:
                 captions = read_caption_file(Path(caption_file), self.multiline_captions,
-                                             self.enable_remove_non_latin)
+                                             self.enable_remove_non_latin,
+                                             layout_captions=self.layout_rewriter is not None)
             if not captions:
                 captions = None
             if captions is None:
@@ -1889,6 +1977,7 @@ class DirectoryDataset:
                     # identical on every launch. Image latents fingerprint other columns only.
                     seed=seed_from_hash((self.path, image_spec)),
                     enable_remove_non_latin=self.enable_remove_non_latin,
+                    layout_captions=self.layout_rewriter is not None,
                 )
             if image_spec[0] is None:
                 tar_f = None
@@ -2128,6 +2217,7 @@ class Dataset:
                 # a model that has not declared one, which keeps its caches exactly as before.
                 vae_identity=model.vae_cache_key(),
                 on_the_fly_media=on_the_fly_media,
+                layout_caption_format=getattr(model, 'layout_caption_format', None),
             )
             self.directory_datasets.append(directory_dataset)
 

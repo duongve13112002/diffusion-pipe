@@ -36,6 +36,7 @@ See [source snapshots and cache profiles](caption-processing.md#source-snapshots
 |MiniMax H3      |✅    |✅              |✅                |
 |Qwen-Image-2.1  |✅    |✅              |✅                |
 |Iris-3B         |✅    |✅              |❌                |
+|MOSS-Image      |✅    |✅              |✅                |
 
 
 ## SDXL
@@ -751,6 +752,81 @@ timestep_sample_method = 'logit_normal'
 #merge_adapters = ['/path/to/training_adapter.safetensors']  # merges adapters into weights before training starts
 ```
 Everything is ComfyUI model format. Only T2I is currently supported. I2I edit training would require significant refactors of the dataset processing code (it assumes the text embeddings can be computed from the text prompt alone, which isn't true for this model). Qwen-Image-2.1 is a CFG-distilled model. Training it without a de-distillation adapter breaks the distillation and you will need to use CFG for inference.
+
+## MOSS-Image
+[MOSS-Image](https://github.com/OpenMOSS/MOSS-Image) is a 5B single-stream text-to-image DiT
+(42 blocks) with the Qwen3.5-9B language model as text encoder and the FLUX.2 VAE. The
+transformer is the one the MOSS-Image repository ships for ComfyUI, imported unchanged from the
+`submodules/MOSS-Image` submodule (`git submodule update --init submodules/MOSS-Image`).
+Both [MOSS-Image-Base](https://huggingface.co/OpenMOSS-Team/MOSS-Image-Base) and
+[MOSS-Image-SFT](https://huggingface.co/OpenMOSS-Team/MOSS-Image-SFT) train the same way.
+```
+[model]
+type = 'moss_image'
+# A diffusers directory: transformer/, text_encoder/ + tokenizer/ and vae/ all load from it.
+diffusers_path = '/data/models/MOSS-Image-Base'
+# Override any component with a diffusers component directory or a single .safetensors file
+# (ComfyUI or diffusers layout, including fp8 scaled and comfy-quant checkpoints):
+#transformer_path = '/data/comfyui/models/diffusion_models/moss_image_fp8_scaled.safetensors'
+#text_encoder_path = '/data/comfyui/models/text_encoders/qwen35_9b.safetensors'
+#vae_path = '/data/comfyui/models/vae/flux2-vae.safetensors'
+dtype = 'bfloat16'
+#diffusion_model_dtype = 'float8'   # LoRA/LoKr only
+```
+Example configs: [LoRA on one H200](../examples/moss_image/moss_image_lora.toml),
+[full fine-tune on 8 H200s](../examples/moss_image/moss_image_full_8gpu.toml) (pipeline parallel, optional
+Muon), [dataset](../examples/moss_image/moss_image_dataset.toml), and a
+[Kubernetes Job](../examples/moss_image/moss_image_k8s_job.yaml) for runs on a network volume.
+
+LoRA, LoKr, OPLoRA and full fine-tuning are supported, as are fp8 (`diffusion_model_dtype`) and
+ComfyUI quantized checkpoints (adapters only), block swap (adapters only), pipeline parallelism,
+activation checkpointing, eval, masks, `merge_adapters`, any diffusion-pipe optimizer (including
+`genericoptim` with `muon = true`) and `--test_sample`. Text embeddings are always cached
+(`cache_text_embeddings = false` is refused): the 9B encoder runs once per caption, then is
+freed. Edit/control datasets are not supported.
+
+- Noise levels follow the technical report's final pretraining stage: logit-normal over sigma
+  (`logit_mean = -1.09`, `logit_std = 0.95`) capped at `sigma_cutoff = 0.95`, with
+  `uniform_fraction = 0.01` drawn uniformly, on the 1000-step grid. `timestep_sample_method =
+  'uniform'`, `shift`, `min_t` and `max_t` are also available. Keys that do not apply are refused
+  by name (`flux_shift`, `vae`, `text_encoders`, `diffusion_model`, ...).
+- Captions are encoded with MOSS-Image's chat template and cut at 4096 tokens
+  (`on_caption_overflow = 'warn' | 'silent' | 'error'`).
+- `--test_sample` uses the reference pipeline's sampler: 50 Euler steps over its snapped
+  shift-5 sigmas, CFG 3 whose negative branch skips block 22, and optional skip-layer guidance.
+  Each setting is a `sample_*` key in `[model]` (see the LoRA example).
+- Saves: LoRA/LoKr adapters load in ComfyUI with the standard LoRA loader on top of the
+  MOSS-Image model. A full fine-tune saves a diffusers transformer directory (`config.json` +
+  `diffusion_pytorch_model.safetensors`). That directory is a `transformer_path` here, a diffusers
+  `MOSSImageTransformer`, and a diffusion model for the MOSS-Image ComfyUI nodes.
+- ComfyUI 3216c62 is older than the MOSS-Image node pack. Install
+  [comfyui/moss_image_compat](../comfyui/moss_image_compat/README.md) instead of the pack there.
+  Training itself works with both 3216c62 and the ComfyUI pinned in this repository.
+
+### Layout (JSON) captions
+A caption file can hold a MOSS-Image layout prompt instead of text: the JSON object its prompt
+compiler writes, with boxes in pixels of the original image (origin at the centre, `yxyx`):
+```
+{"summary": {"caption": "A poster for a jazz night"}, "items": [{"label": "title", "caption": "JAZZ NIGHT", "bbox": [-300, -200, -150, 200]}], "bbox_coord_space": "abs_centralized", "bbox_format": "yxyx"}
+```
+Detection is per caption: a file whose whole text parses as a JSON object is a layout caption,
+and anything else is a plain caption with every caption option as usual. For layout captions:
+- the boxes are rewritten for each bucket: following the centre crop and resize the image gets,
+  clipped to the crop, and an item whose box is cropped out entirely is dropped. A box outside
+  the image is an error naming the file. Each bucket caches its own embedding of the rewritten
+  text, so one image at several resolutions gets the right boxes at each.
+- `caption_prefix` goes into `summary.caption`. A caption without one is an error naming the
+  file.
+- tag shuffling, tag dropout, multiline splitting and non-Latin line removal skip them, because
+  they would break the JSON. Caption dropout still applies.
+- the rewritten text keeps the file's own JSON formatting.
+
+A one-line notice per directory reports how many images have layout captions. Ideogram4 uses
+the same mechanism for its JSON prompts (ComfyUI's Build JSON Prompt (Ideogram) schema: boxes are
+`[ymin, xmin, ymax, xmax]` in 0..1000 and `caption_prefix` goes into `high_level_description`),
+and its rewritten captions are always compact JSON
+(`json.dumps(..., separators=(",", ":"), ensure_ascii=False)`). This feature changes the caption
+cache key of both models, so caches made before it are rebuilt.
 
 ## Iris-3B
 [Iris-3B](https://github.com/speridlabs/iris-3b) is a 3B pixel-space diffusion transformer: no VAE,

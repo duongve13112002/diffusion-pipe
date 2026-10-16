@@ -425,6 +425,9 @@ if __name__ == '__main__':
     elif model_type == 'iris':
         from models import iris
         model = iris.IrisPipeline(config)
+    elif model_type == 'moss_image':
+        from models import moss_image
+        model = moss_image.MossImagePipeline(config)
     else:
         raise NotImplementedError(f'Model type {model_type} is not implemented')
 

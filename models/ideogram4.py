@@ -26,6 +26,9 @@ class Ideogram4Pipeline(ComfyPipeline):
     keep_in_high_precision = ['input_proj', 'llm_cond_norm', 'llm_cond_proj', 't_embedding', 'adaln_proj', 'embed_image_indicator', 'final_layer', 'mlp_in']
     spatial_compression = 16
     channels = 128
+    # JSON prompt captions (ComfyUI's BuildJsonPromptIdeogram schema) get their boxes rewritten
+    # per bucket: see utils/layout_captions.py.
+    layout_caption_format = 'ideogram4'
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)

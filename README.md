@@ -1,7 +1,7 @@
 # diffusion-pipe
 A pipeline parallel training script for diffusion models.
 
-Models supported: SDXL, Flux, LTX-Video, HunyuanVideo (t2v), Cosmos, Lumina Image 2.0, Wan2.1 (t2v and i2v), Chroma, HiDream, Stable Diffusion 3, Cosmos-Predict2, OmniGen2, Flux Kontext, Wan2.2, Qwen-Image, Qwen-Image-Edit, HunyuanImage-2.1, AuraFlow, Z-Image, HunyuanVideo-1.5, Flux 2 (Dev and Klein), Anima, Ernie-Image, LTX 2.3, Ideogram4, Krea 2, MiniMax H3, Qwen-Image-2.1.
+Models supported: SDXL, Flux, LTX-Video, HunyuanVideo (t2v), Cosmos, Lumina Image 2.0, Wan2.1 (t2v and i2v), Chroma, HiDream, Stable Diffusion 3, Cosmos-Predict2, OmniGen2, Flux Kontext, Wan2.2, Qwen-Image, Qwen-Image-Edit, HunyuanImage-2.1, AuraFlow, Z-Image, HunyuanVideo-1.5, Flux 2 (Dev and Klein), Anima, Ernie-Image, LTX 2.3, Ideogram4, Krea 2, MiniMax H3, Qwen-Image-2.1, Iris-3B, MOSS-Image.
 
 ## Features
 - Pipeline parallelism, for training models larger than can fit on a single GPU
@@ -14,6 +14,9 @@ Models supported: SDXL, Flux, LTX-Video, HunyuanVideo (t2v), Cosmos, Lumina Imag
 - Optional OPLoRA (orthogonal projection LoRA) to reduce catastrophic forgetting when training LoRAs
 
 ## Recent changes
+- 2026-10-16
+  - Support MOSS-Image (Base and SFT): LoRA, LoKr, OPLoRA and full fine-tuning, from a diffusers directory or ComfyUI single files (fp8 and comfy-quant included). See [supported models](docs/supported_models.md#moss-image) and `examples/moss_image/`. `comfyui/moss_image_compat` runs the MOSS-Image ComfyUI nodes on ComfyUI 3216c62.
+  - Layout (JSON) captions for MOSS-Image and Ideogram4: a caption file holding the model's JSON prompt has its boxes rewritten for each bucket's crop, and tag operations skip it. Detection is per caption. The caption cache key of these two models changes, so their caption caches are rebuilt.
 - 2026-10-15
   - `diffusion_model_dtype` now keeps every weight under the model's high-precision modules (e.g. `time_in`, `final_layer`, Krea2's `txtfusion`, MiniMax H3's `token_refiner`) in the base dtype, as intended; before, only weights directly in those modules were kept. This uses a little more VRAM (up to ~5% of the weights for Krea2).
   - Saved models, adapters and training checkpoints are written under a temporary name and renamed into place, so an interrupted save never leaves a torn one; a checkpoint's `latest` is written only once all its files are in place, so `--resume_from_checkpoint` always loads a complete one. A failed save now stops every rank instead of leaving them waiting. `keep_last_n_checkpoints` must be at least 2, and never removes the checkpoint `latest` names.

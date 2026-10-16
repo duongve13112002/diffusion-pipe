@@ -1,0 +1,89 @@
+# MOSS-Image LoRA on one H200 with AdamW. See docs/supported_models.md#moss-image.
+#   deepspeed --num_gpus=1 train.py --deepspeed --config examples/moss_image/moss_image_lora.toml
+# Preview one image with the model's own sampler (written to example.png) and quit:
+#   deepspeed --num_gpus=1 train.py --deepspeed --config examples/moss_image/moss_image_lora.toml --test_sample
+output_dir = '/data/diffusion_pipe_training_runs/moss_image_lora'
+dataset = 'examples/moss_image/moss_image_dataset.toml'
+
+epochs = 50
+micro_batch_size_per_gpu = 2
+pipeline_stages = 1
+gradient_accumulation_steps = 2
+gradient_clipping = 1.0
+warmup_steps = 100
+
+eval_every_n_epochs = 1
+eval_before_first_step = true
+eval_micro_batch_size_per_gpu = 1
+eval_gradient_accumulation_steps = 1
+
+save_every_n_epochs = 2
+checkpoint_every_n_minutes = 120
+activation_checkpointing = true
+partition_method = 'parameters'
+save_dtype = 'bfloat16'
+caching_batch_size = 4
+steps_per_print = 1
+# On a smaller GPU, swap blocks to the CPU (LoRA/LoKr only; MOSS-Image has 42).
+#blocks_to_swap = 16
+
+[model]
+type = 'moss_image'
+# A MOSS-Image diffusers directory (OpenMOSS-Team/MOSS-Image-Base or MOSS-Image-SFT): its
+# transformer/, text_encoder/ (+ tokenizer/) and vae/ are all loaded from it.
+diffusers_path = '/data/models/MOSS-Image-Base'
+# Any component can come from elsewhere instead: a diffusers component directory, or a single
+# .safetensors file in ComfyUI or diffusers layout (fp8 scaled / comfy-quant files included).
+#transformer_path = '/data/comfyui/models/diffusion_models/moss_image_base_fp8_scaled.safetensors'
+#text_encoder_path = '/data/comfyui/models/text_encoders/qwen35_9b.safetensors'
+#vae_path = '/data/comfyui/models/vae/flux2-vae.safetensors'
+dtype = 'bfloat16'
+# Keep the 42 blocks in fp8 to save memory (LoRA/LoKr only); everything else stays in dtype.
+#diffusion_model_dtype = 'float8'
+# Adapters merged into the weights before training (for example a LoRA trained on Base).
+#merge_adapters = ['/data/loras/moss_style.safetensors']
+
+# Noise levels: the technical report's final pretraining distribution (logit-normal over
+# sigma, mean -1.09, std 0.95, capped at 0.95, plus 1% uniform). All of these are optional.
+timestep_sample_method = 'logit_normal'
+#logit_mean = -1.09
+#logit_std = 0.95
+#sigma_cutoff = 0.95
+#uniform_fraction = 0.01
+#shift = 1.0
+# Captions longer than the text encoder's 4096 tokens are cut: 'warn' (default), 'silent' or 'error'.
+#on_caption_overflow = 'warn'
+
+# --test_sample settings; the defaults are the reference pipeline's.
+#sample_steps = 50
+#sample_cfg = 3.0
+#sample_shift = 5.0
+#sample_negative_prompt = ''
+#sample_uncond_skip_layers = [22]
+#sample_slg_layers = []
+#sample_slg_scale = 0.0
+
+[adapter]
+type = 'lora'
+rank = 32
+dtype = 'bfloat16'
+# OPLoRA (orthogonal-projection LoRA):
+#oplora = true
+#oplora_rank = 16
+
+# LoKr instead of LoRA:
+#[adapter]
+#type = 'lokr'
+#rank = 16
+#decompose_factor = 8
+#dtype = 'bfloat16'
+
+[optimizer]
+type = 'adamw_optimi'
+lr = 1e-4
+betas = [0.9, 0.99]
+weight_decay = 0.01
+eps = 1e-8
+
+[monitoring]
+enable_wandb = false

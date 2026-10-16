@@ -1,0 +1,66 @@
+# MOSS-Image full fine-tune on 8 H200s: 2 pipeline stages x 4 data-parallel replicas.
+#   deepspeed --num_gpus=8 train.py --deepspeed --config examples/moss_image/moss_image_full_8gpu.toml
+# Paths are on a network volume (/pvc), as in examples/moss_image/moss_image_k8s_job.yaml.
+# Checkpoints and saves are written under a temporary name and renamed into place, so a pod
+# killed mid-save leaves the previous ones intact; resume with --resume_from_checkpoint.
+#
+# Saves are diffusers transformer directories (config.json + diffusion_pytorch_model.safetensors):
+# a transformer_path for this trainer, a diffusers MOSSImageTransformer, and a ComfyUI diffusion
+# model for the MOSS-Image node pack (comfyui/moss_image_compat on ComfyUI 3216c62).
+output_dir = '/pvc/runs/moss_image_full'
+dataset = 'examples/moss_image/moss_image_dataset.toml'
+
+epochs = 10
+micro_batch_size_per_gpu = 2
+# MOSS-Image is 42 blocks (~5B parameters). Two stages leave ample room on H200s for bf16
+# weights, gradients and optimizer states; with pipeline_stages = 8 every GPU holds ~1/8.
+pipeline_stages = 2
+gradient_accumulation_steps = 4
+gradient_clipping = 1.0
+warmup_steps = 200
+
+eval_every_n_steps = 500
+eval_before_first_step = true
+eval_micro_batch_size_per_gpu = 1
+eval_gradient_accumulation_steps = 1
+
+save_every_n_steps = 1000
+checkpoint_every_n_minutes = 60
+# Older checkpoints of each kind are deleted as new ones land; at least 2 (a torn newest one
+# must leave something to resume from).
+keep_last_n_checkpoints = 3
+activation_checkpointing = true
+partition_method = 'parameters'
+save_dtype = 'bfloat16'
+caching_batch_size = 4
+steps_per_print = 10
+
+[model]
+type = 'moss_image'
+# Base for broad fine-tunes; SFT (OpenMOSS-Team/MOSS-Image-SFT) to start from the
+# instruction-tuned model.
+diffusers_path = '/pvc/models/MOSS-Image-Base'
+# A previous full fine-tune's save works as the transformer; the rest still comes from diffusers_path.
+#transformer_path = '/pvc/runs/moss_image_full/<run>/step5000'
+dtype = 'bfloat16'
+timestep_sample_method = 'logit_normal'
+
+[optimizer]
+type = 'adamw_optimi'
+lr = 1e-5
+betas = [0.9, 0.99]
+weight_decay = 0.01
+eps = 1e-8
+
+# Muon for the 2D weights (orthogonalised updates scaled to AdamW's RMS, so the same lr range
+# applies); 1D parameters and parameters without weight decay stay on Adam.
+#[optimizer]
+#type = 'genericoptim'
+#lr = 1e-5
+#betas = [0.9, 0.99]
+#weight_decay = 0.01
+#eps = 1e-8
+#muon = true
+
+[monitoring]
+enable_wandb = false
