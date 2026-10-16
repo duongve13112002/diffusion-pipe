@@ -28,3 +28,6 @@
 [submodule "submodules/iris-3b"]
 	path = submodules/iris-3b
 	url = https://github.com/speridlabs/iris-3b
+[submodule "submodules/MOSS-Image"]
+	path = submodules/MOSS-Image
+	url = https://github.com/OpenMOSS/MOSS-Image.git
