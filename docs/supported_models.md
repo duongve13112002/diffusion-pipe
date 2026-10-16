@@ -790,8 +790,16 @@ freed. Edit/control datasets are not supported.
   `uniform_fraction = 0.01` drawn uniformly, on the 1000-step grid. `timestep_sample_method =
   'uniform'`, `shift`, `min_t` and `max_t` are also available. Keys that do not apply are refused
   by name (`flux_shift`, `vae`, `text_encoders`, `diffusion_model`, ...).
-- Captions are encoded with MOSS-Image's chat template and cut at 4096 tokens
-  (`on_caption_overflow = 'warn' | 'silent' | 'error'`).
+- Captions are encoded with MOSS-Image's chat template, which trims the caption, and cut at
+  4096 tokens (`on_caption_overflow = 'warn' | 'silent' | 'error'`).
+- Checkpoints with each block's q, k and v fused into `proj.qkv` load too: the
+  [Comfy-Org/MOSS-Image](https://huggingface.co/Comfy-Org/MOSS-Image) repack (bf16, and its
+  `int8_convrot` files as a quantized base for adapters) and ai-toolkit's full fine-tunes. The
+  fused weights are split into the q, k and v this pipeline trains; quantized ones only in
+  formats with one scale per tensor or per row (fp8, `int8_tensorwise`), other formats are refused.
+- `merge_adapters` also takes ai-toolkit's MOSS-Image LoRAs, which adapt the fused `proj.qkv`:
+  each of q, k and v gets the LoRA's A and its third of B, which is exact. Fused LoKr/LoHa/DoRA
+  cannot be split and are refused, as is an adapter with a key that matches no weight.
 - `--test_sample` uses the reference pipeline's sampler: 50 Euler steps over its snapped
   shift-5 sigmas, CFG 3 whose negative branch skips block 22, and optional skip-layer guidance.
   Each setting is a `sample_*` key in `[model]` (see the LoRA example).

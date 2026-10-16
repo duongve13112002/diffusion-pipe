@@ -25,6 +25,7 @@ diffusers_path.
 
 import importlib.util
 import json
+import logging
 import math
 import os
 import re
@@ -204,13 +205,129 @@ def transformer_state(state, metadata):
     prefix = _transformer_prefix(state)
     state, metadata = comfy.utils.convert_old_quants(dict(state), prefix, metadata=metadata)
     if not prefix:
-        return state, metadata
+        return split_fused_qkv(state), metadata
     stripped = {k[len(prefix):]: v for k, v in state.items() if k.startswith(prefix)}
     for k, v in state.items():
         if (k.endswith('.comfy_quant') and not k.startswith(prefix)
                 and k[:-len('comfy_quant')] + 'weight' in stripped):
             stripped[k] = v
-    return stripped, metadata
+    return split_fused_qkv(stripped), metadata
+
+
+# Quantization formats whose layers can be cut by output rows: row-major weights with one scale
+# per tensor or per row. Block-scaled formats (nvfp4, mxfp8) keep their scales swizzled.
+ROW_SPLITTABLE_QUANT_FORMATS = ('float8_e4m3fn', 'float8_e5m2', 'int8_tensorwise')
+_FUSED_QKV = re.compile(r'layers\.\d+\.proj\.qkv\.weight')
+
+
+def split_fused_qkv(state):
+    """state with each block's fused proj.qkv cut into proj.q, proj.k and proj.v.
+
+    Comfy-Org/MOSS-Image and ai-toolkit's saves fuse q, k and v into one Linear (rows q, k, v);
+    the node pack's model, which this pipeline trains, keeps them apart. Cutting by rows is exact
+    for plain weights and for quantized ones with a scale per tensor or per row (int8_tensorwise
+    with convrot rotates the input dimension, which q, k and v share).
+    """
+    fused = sorted(k[:-len('.weight')] for k in state if _FUSED_QKV.fullmatch(k))
+    if not fused:
+        return state
+    state = dict(state)
+    for base in fused:
+        block = base[:-len('.qkv')]
+        both = [f'{block}.{p}.weight' for p in 'qkv' if f'{block}.{p}.weight' in state]
+        if both:
+            raise ValueError(f'The MOSS-Image checkpoint has both {base}.weight and {both[0]}')
+        if (quant := state.get(base + '.comfy_quant')) is not None:
+            layout = json.loads(bytes(quant.tolist()).decode('utf-8')).get('format')
+            if layout not in ROW_SPLITTABLE_QUANT_FORMATS:
+                raise ValueError(
+                    f'{base} is quantized as {layout!r}, which cannot be split into q, k and v '
+                    f'(only {", ".join(ROW_SPLITTABLE_QUANT_FORMATS)} can). Use an unquantized or '
+                    'one of those checkpoints.')
+        rows = state[base + '.weight'].shape[0]
+        if rows % 3:
+            raise ValueError(f'{base}.weight has {rows} rows, not three equal parts q, k and v')
+        for key in [k for k in state if k.startswith(base + '.')]:
+            value = state.pop(key)
+            suffix = key[len(base):]
+            if suffix == '.comfy_quant' or value.ndim == 0 or value.shape[0] != rows:
+                parts = (value,) * 3  # format description, per-tensor scale
+            else:
+                parts = tuple(part.clone() for part in value.chunk(3, 0))
+            for name, part in zip('qkv', parts):
+                state[f'{block}.{name}{suffix}'] = part
+    return state
+
+
+_FUSED_QKV_ADAPTER = re.compile(r'(.*layers\.\d+\.proj\.)qkv\.(.+)')
+
+
+def split_fused_qkv_adapter(sd, source):
+    """An adapter for the fused proj.qkv (ai-toolkit's MOSS-Image LoRAs) as one for q, k and v.
+
+    The rows of the fused update B @ A are q, k and v, so each gets A, its third of B and the
+    same alpha: exact. A full-weight diff is cut the same way. Other adapter kinds (LoKr, LoHa,
+    DoRA) do not split by rows and are refused.
+    """
+    out = {}
+    for key, value in sd.items():
+        match = _FUSED_QKV_ADAPTER.fullmatch(key)
+        if match is None:
+            if key in out:
+                raise ValueError(f'{source}: {key} is given both for proj.qkv and for itself')
+            out[key] = value
+            continue
+        head, rest = match.groups()
+        if rest in ('lora_A.weight', 'lora_down.weight', 'alpha'):
+            parts = (value,) * 3
+        elif rest in ('lora_B.weight', 'lora_up.weight', 'diff', 'diff_b'):
+            if value.shape[0] % 3:
+                raise ValueError(f'{source}: {key} has {value.shape[0]} rows, not three equal parts')
+            parts = tuple(part.clone() for part in value.chunk(3, 0))
+        else:
+            raise ValueError(
+                f'{source}: {key} adapts the fused proj.qkv in a form that cannot be split into q, k '
+                'and v (only LoRA and full-weight diffs can)')
+        for name, part in zip('qkv', parts):
+            new = f'{head}{name}.{rest}'
+            if new in out or new in sd:
+                raise ValueError(f'{source}: {new} is given both for proj.qkv and for itself')
+            out[new] = part
+    return out
+
+
+class _UnloadedAdapterKeys(logging.Handler):
+    # comfy.lora.load_lora only logs the adapter keys it could not place.
+    def __init__(self):
+        super().__init__(logging.WARNING)
+        self.keys = []
+
+    def emit(self, record):
+        message = record.getMessage()
+        for marker in ('lora key not loaded: ', 'NOT LOADED '):
+            if message.startswith(marker):
+                self.keys.append(message[len(marker):])
+
+
+def merge_adapter(patcher, adapter_path):
+    """patcher with the adapter file at adapter_path added at strength 1; every key must apply."""
+    sd = comfy.utils.load_torch_file(str(adapter_path), safe_load=True)
+    sd = split_fused_qkv_adapter(sd, adapter_path)
+    root = logging.getLogger()
+    catcher = _UnloadedAdapterKeys()
+    level = root.level
+    root.addHandler(catcher)
+    if not root.isEnabledFor(logging.WARNING):
+        root.setLevel(logging.WARNING)
+    try:
+        patcher, _ = comfy.sd.load_lora_for_models(patcher, None, sd, 1.0, 0.0)
+    finally:
+        root.removeHandler(catcher)
+        root.setLevel(level)
+    if catcher.keys:
+        raise ValueError(f'{adapter_path}: {len(catcher.keys)} adapter keys match no MOSS-Image weight, '
+                         f'e.g. {catcher.keys[:3]}')
+    return patcher
 
 
 def transformer_unet_config(state, rope_base=10000.0):
@@ -375,7 +492,8 @@ class MossImageTokenizer(comfy.sd1_clip.SD1Tokenizer):
         self.last_untruncated_length = None
 
     def tokenize_with_weights(self, text, return_word_ids=False, **kwargs):
-        text = f'<|im_start|>user\n{text}<|im_end|>\n<|im_start|>assistant\n<think>\n'
+        # The chat template trims the prompt (render_content(...)|trim, which is str.strip()).
+        text = f'<|im_start|>user\n{text.strip()}<|im_end|>\n<|im_start|>assistant\n<think>\n'
         tokens = super().tokenize_with_weights(text, return_word_ids=return_word_ids, disable_weights=True, **kwargs)
         self.last_untruncated_length = len(tokens['qwen35_9b'][0])
         tokens['qwen35_9b'] = [tokens['qwen35_9b'][0][:MAX_TEXT_TOKENS]]
@@ -644,7 +762,7 @@ class MossImagePipeline(ComfyPipeline):
     # ---- identities ------------------------------------------------------------------------------
 
     def text_encoder_cache_key(self, i):
-        return f'moss_image|{self.text_encoder_path}|qwen35_9b|last|{MAX_TEXT_TOKENS}|trimmed-v1'
+        return f'moss_image|{self.text_encoder_path}|qwen35_9b|last|{MAX_TEXT_TOKENS}|trimmed-v1|prompt-strip-v1'
 
     # ---- models ----------------------------------------------------------------------------------
 
@@ -664,9 +782,7 @@ class MossImagePipeline(ComfyPipeline):
             adapter_path = Path(adapter_path)
             if adapter_path.is_dir():
                 adapter_path = adapter_path / 'adapter_model.safetensors'
-            sd = comfy.utils.load_torch_file(str(adapter_path), safe_load=True)
-            patcher, _ = comfy.sd.load_lora_for_models(patcher, None, sd, 1.0, 0.0)
-            del sd
+            patcher = merge_adapter(patcher, adapter_path)
 
         # Every ComfyUI layer then casts its weight to the compute dtype per call (differentiably;
         # the weights of a diffusion_model_dtype fp8 model stay fp8 in memory).

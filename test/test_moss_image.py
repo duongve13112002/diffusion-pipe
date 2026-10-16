@@ -7,6 +7,7 @@ rather than a tolerance question.
 
 import json
 import math
+import re
 from pathlib import Path
 
 import pytest
@@ -183,7 +184,9 @@ def test_prompt_template_matches_the_chat_template():
     from transformers import AutoTokenizer
     hf = AutoTokenizer.from_pretrained(str(tokenizer_dir), local_files_only=True)
     ours = mi.MossImageTokenizer()
-    for prompt in ['a cat', 'Ảnh một con mèo, "quoted" (weighted:1.5) text', '{"items": [{"bbox": [1, 2, 3, 4]}]}']:
+    # The template trims the prompt (render_content(...)|trim); so must we.
+    for prompt in ['a cat', 'Ảnh một con mèo, "quoted" (weighted:1.5) text', '{"items": [{"bbox": [1, 2, 3, 4]}]}',
+                   '  a cat\n', '\n\ta dog, ', '   ']:
         formatted = hf.apply_chat_template([{'role': 'user', 'content': prompt}], tokenize=False,
                                            add_generation_prompt=True, enable_thinking=True)
         expected = hf(formatted)['input_ids']
@@ -688,6 +691,122 @@ def test_fp8_diffusion_model_dtype_matches_fp8_rounded_weights(tmp_path):
     pipe.pipeline_model(forward_inputs()).square().mean().backward()
     lora = [p for n, p in pipe.diffusion_model.named_parameters() if 'lora_A' in n]
     assert lora and all(p.grad is not None for p in lora)
+
+
+def fused_qkv(state):
+    """The Comfy-Org/MOSS-Image layout (also ai-toolkit's saves): each block's q, k and v fused into proj.qkv."""
+    state = dict(state)
+    for key in [k for k in state if re.fullmatch(r'layers\.\d+\.proj\.q\.weight', k)]:
+        base = key[:-len('.q.weight')]
+        state[base + '.qkv.weight'] = torch.cat([state.pop(f'{base}.{p}.weight') for p in 'qkv'], 0)
+    return state
+
+
+@pytest.mark.parametrize('prefix', ['', 'model.diffusion_model.'])
+def test_fused_qkv_checkpoints_load(prefix, tmp_path):
+    reference = tiny_reference()
+    path = tmp_path / 'moss_image_base_bf16.safetensors'
+    safetensors.torch.save_file({prefix + k: v for k, v in fused_qkv(tiny_state(reference)).items()}, path)
+    pipe = pipeline_from_transformer(path)
+    assert 'layers.0.proj.q.weight' in pipe.diffusion_model.state_dict()
+    inputs = forward_inputs()
+    with torch.no_grad():
+        expected = reference(inputs[0], inputs[1], inputs[2], attention_mask=inputs[3])
+        torch.testing.assert_close(pipe.pipeline_model(inputs), expected, rtol=1e-5, atol=1e-5)
+
+
+def int8_rows(w):
+    scale = w.abs().amax(1, keepdim=True) / 127.0
+    return torch.round(w / scale).clamp(-127, 127).to(torch.int8), scale.float()
+
+
+def quant_metadata(layers):
+    return {'_quantization_metadata': json.dumps({'format_version': '1.0', 'layers': layers})}
+
+
+@pytest.mark.parametrize('convrot', [False, True])
+def test_fused_qkv_int8_checkpoints_load_like_split_ones(convrot, tmp_path):
+    # Comfy-Org/MOSS-Image's int8_convrot files: int8 weights with one scale per row.
+    pytest.importorskip('comfy_kitchen')
+    reference = tiny_reference()
+    conf = {'format': 'int8_tensorwise', **({'convrot': True, 'convrot_groupsize': 16} if convrot else {})}
+    split, fused = tiny_state(reference), fused_qkv(tiny_state(reference))
+    split_layers, fused_layers = {}, {}
+    for i in range(TINY['num_layers']):
+        base = f'layers.{i}.proj'
+        weight, scale = int8_rows(fused[base + '.qkv.weight'])
+        fused[base + '.qkv.weight'], fused[base + '.qkv.weight_scale'] = weight, scale
+        fused_layers[base + '.qkv'] = conf
+        for name, w, s in zip('qkv', weight.chunk(3), scale.chunk(3)):
+            split[f'{base}.{name}.weight'], split[f'{base}.{name}.weight_scale'] = w.clone(), s.clone()
+            split_layers[f'{base}.{name}'] = conf
+    outputs = []
+    for name, state, layers in (('split', split, split_layers), ('fused', fused, fused_layers)):
+        path = tmp_path / f'{name}.safetensors'
+        safetensors.torch.save_file(state, path, metadata=quant_metadata(layers))
+        pipe = pipeline_from_transformer(path, adapter=LORA)
+        assert type(pipe.diffusion_model.get_submodule('layers.1.proj.k').weight).__name__ == 'QuantizedTensor'
+        with torch.no_grad():
+            outputs.append(pipe.pipeline_model(forward_inputs()))
+    torch.testing.assert_close(outputs[1], outputs[0], rtol=0, atol=0)
+    if not convrot:  # the weights were not rotated, so only the plain format matches the reference
+        inputs = forward_inputs()
+        with torch.no_grad():
+            expected = reference(inputs[0], inputs[1], inputs[2], attention_mask=inputs[3])
+        torch.testing.assert_close(outputs[1], expected, rtol=5e-2, atol=5e-2)
+
+
+def test_fused_qkv_in_a_block_scaled_format_is_refused(tmp_path):
+    state = fused_qkv(tiny_state(tiny_reference()))
+    state['layers.0.proj.qkv.comfy_quant'] = torch.tensor(list(json.dumps({'format': 'nvfp4'}).encode()),
+                                                          dtype=torch.uint8)
+    with pytest.raises(ValueError, match="'nvfp4', which cannot be split"):
+        mi.transformer_state(state, {})
+
+
+def fused_lora(reference, names, rank=4, alpha=2.0, seed=3):
+    """An ai-toolkit style LoRA on every block's fused proj.qkv, and the split weights it should give."""
+    torch.manual_seed(seed)
+    dim = TINY['dim']
+    adapter, expected = {}, tiny_state(reference)
+    for i in range(TINY['num_layers']):
+        a, b = 0.1 * torch.randn(rank, dim), 0.1 * torch.randn(3 * dim, rank)
+        key = f'diffusion_model.layers.{i}.proj.qkv'
+        adapter.update({f'{key}.{names[0]}': a, f'{key}.{names[1]}': b, f'{key}.alpha': torch.tensor(alpha)})
+        for name, part in zip('qkv', ((alpha / rank) * (b @ a)).chunk(3)):
+            expected[f'layers.{i}.proj.{name}.weight'] = expected[f'layers.{i}.proj.{name}.weight'] + part
+    # A module both layouts share is adapted as it is.
+    a, b = 0.1 * torch.randn(rank, dim), 0.1 * torch.randn(3 * dim, rank)
+    adapter.update({f'diffusion_model.text_embedder.blocks.0.qkv.{names[0]}': a,
+                    f'diffusion_model.text_embedder.blocks.0.qkv.{names[1]}': b})
+    expected['text_embedder.blocks.0.qkv.weight'] = expected['text_embedder.blocks.0.qkv.weight'] + b @ a
+    return adapter, expected
+
+
+@pytest.mark.parametrize('names', [('lora_A.weight', 'lora_B.weight'), ('lora_down.weight', 'lora_up.weight')])
+def test_merge_adapters_splits_fused_qkv_loras(names, tmp_path):
+    # ai-toolkit trains MOSS-Image LoRAs on the fused proj.qkv.
+    reference = tiny_reference()
+    adapter, expected = fused_lora(reference, names)
+    safetensors.torch.save_file(adapter, tmp_path / 'aitk_lora.safetensors')
+    transformer = write_transformer_dir(tiny_state(reference), tmp_path / 'transformer')
+    merged = pipeline_from_transformer(transformer, {'merge_adapters': [str(tmp_path / 'aitk_lora.safetensors')]})
+    got = merged.diffusion_model.state_dict()
+    for key in [k for k in expected if '.proj.' in k or k.startswith('text_embedder.blocks.0.qkv')]:
+        torch.testing.assert_close(got[key].float(), expected[key].float(), rtol=1e-5, atol=1e-6, msg=key)
+
+
+@pytest.mark.parametrize('adapter,message', [
+    ({'diffusion_model.layers.0.proj.nothing.lora_A.weight': torch.zeros(4, 64),
+      'diffusion_model.layers.0.proj.nothing.lora_B.weight': torch.zeros(64, 4)}, 'match no MOSS-Image weight'),
+    ({'diffusion_model.layers.0.proj.qkv.lokr_w1': torch.zeros(3, 3),
+      'diffusion_model.layers.0.proj.qkv.lokr_w2': torch.zeros(64, 64)}, 'cannot be split'),
+])
+def test_merge_adapters_refuses_what_it_cannot_apply(adapter, message, tmp_path):
+    safetensors.torch.save_file(adapter, tmp_path / 'adapter.safetensors')
+    transformer = write_transformer_dir(tiny_state(tiny_reference()), tmp_path / 'transformer')
+    with pytest.raises(ValueError, match=message):
+        pipeline_from_transformer(transformer, {'merge_adapters': [str(tmp_path / 'adapter.safetensors')]})
 
 
 def quantized_state(reference, layers, prefix='', style='metadata'):
