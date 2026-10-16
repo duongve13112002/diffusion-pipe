@@ -6,6 +6,8 @@ import math
 import os
 import hashlib
 import json
+import shutil
+import socket
 import tarfile
 from inspect import signature
 import sys
@@ -24,7 +26,7 @@ import multiprocess as mp
 from tqdm import tqdm
 from comfy_api.latest import InputImpl
 
-from utils.common import is_main_process, VIDEO_EXTENSIONS, round_to_nearest_multiple
+from utils.common import fsync_dir, is_main_process, VIDEO_EXTENSIONS, round_to_nearest_multiple
 from utils.cache import Cache
 from utils.cache_profiles import (align_legacy_metadata, IndexedTextEmbeddingDataset, RowsByImage,
                                   tensor_profile)
@@ -63,7 +65,7 @@ from utils.captions import (
     validate_caption_dropout_rate,
     validate_non_latin_caption_requirement,
 )
-from utils.layout_captions import LAYOUT_REWRITE_VERSION, LayoutCaptionRewriter, is_layout_caption
+from utils.layout_captions import LAYOUT_METADATA_VERSION, LayoutCaptionRewriter, is_layout_caption
 
 
 def bucket_suffix(key):
@@ -342,6 +344,54 @@ class TextEmbeddingDataset:
     def get_text_embeddings(self, image_spec, caption_number):
         return self.te_dataset[self.image_spec_to_te_idx[image_spec][caption_number]]
 
+    def get_caption(self, image_spec, caption_number):
+        """The text these embeddings were encoded from."""
+        return self.flattened_captions[self.image_spec_to_te_idx[image_spec][caption_number]]['caption']
+
+
+def _save_dataset_atomically(dataset, path, replace=False):
+    """save_to_disk under a temporary name, then renamed into place, so a run killed part-way
+    (or a network volume that drops a write) never leaves a directory that looks complete.
+    Without replace, a copy another process published first is kept."""
+    path = Path(path)
+    tag = f'{socket.gethostname()}-{os.getpid()}'  # ranks of several nodes share a volume
+    temporary = path.with_name(f'.{path.name}.partial-{tag}')
+    if temporary.exists():
+        shutil.rmtree(temporary)
+    dataset.save_to_disk(str(temporary))
+    for file in temporary.iterdir():
+        if file.is_file():
+            with open(file, 'rb') as handle:
+                os.fsync(handle.fileno())
+    fsync_dir(temporary)
+    previous = None
+    if replace and path.exists():
+        # A directory cannot be renamed over a non-empty one. Interrupted here, the path is
+        # missing and the next run builds it again.
+        previous = path.with_name(f'.{path.name}.previous-{tag}')
+        os.rename(path, previous)
+    try:
+        os.rename(temporary, path)
+    except OSError:
+        if not path.exists():
+            raise
+        shutil.rmtree(temporary)  # another process published the same contents first
+    fsync_dir(path.parent)
+    if previous is not None:
+        shutil.rmtree(previous)
+
+
+def _flattened_captions(metadata_dataset, flatten_captions, path, regenerate=False):
+    """The flattened (and rewritten) captions, kept at path. Rewriting reads every layout
+    caption's image header, so it is done once, not on every rank at every launch; regenerate
+    (--regenerate_cache) does it again, for images replaced under the same name."""
+    if path.exists() and not regenerate:
+        return datasets.load_from_disk(str(path))
+    flattened = metadata_dataset.map(flatten_captions, batched=True, keep_in_memory=True,
+                                     remove_columns=metadata_dataset.column_names)
+    _save_dataset_atomically(flattened, path, replace=regenerate)
+    return datasets.load_from_disk(str(path))
+
 
 def _has_content_digest(cache_path):
     """Whether a tensor cache recorded the digest of the inputs it encoded (ReadOnlyCache reads
@@ -381,27 +431,18 @@ def _cache_text_embeddings(metadata_dataset, map_fn, i, cache_dir, regenerate_ca
         # The flattened text depends on the rewrite, so its files are named after it too.
         rewrite_tag = ('' if layout_rewriter is None else
                        '_' + Hasher.hash([layout_rewriter.cache_tag, layout_rewriter.caption_prefix]))
-        flattened_path = cache_dir / f'flattened_captions_{metadata_dataset._fingerprint}{rewrite_tag}'
-        if flattened_path.exists():
-            flattened_captions = datasets.load_from_disk(str(flattened_path))
-        else:
-            flattened_captions = metadata_dataset.map(
-                flatten_captions, batched=True, keep_in_memory=True,
-                remove_columns=metadata_dataset.column_names)
-            flattened_captions.save_to_disk(str(flattened_path))
-            flattened_captions = datasets.load_from_disk(str(flattened_path))
+        flattened_captions = _flattened_captions(
+            metadata_dataset, flatten_captions,
+            cache_dir / f'flattened_captions_{metadata_dataset._fingerprint}{rewrite_tag}',
+            regenerate=regenerate_cache and map_fn is not None)
         def donors():
             result = []
             for source, path in profile_sources():
                 if len(source) and isinstance(source[0]['caption'], str):
                     result.append((source, path))
                     continue
-                flattened_source = profile_lookup_dir / f'flattened_{source._fingerprint}{rewrite_tag}'
-                if not flattened_source.exists():
-                    flattened = source.map(flatten_captions, batched=True, keep_in_memory=True,
-                                           remove_columns=source.column_names)
-                    flattened.save_to_disk(str(flattened_source))
-                flattened = datasets.load_from_disk(str(flattened_source))
+                flattened = _flattened_captions(
+                    source, flatten_captions, profile_lookup_dir / f'flattened_{source._fingerprint}{rewrite_tag}')
                 if layout_rewriter is not None and not _has_content_digest(path) and any(
                         is_layout_caption(c) for captions in source['caption'] for c in captions):
                     # This donor's metadata holds the caption files' text, and the code that
@@ -419,7 +460,14 @@ def _cache_text_embeddings(metadata_dataset, map_fn, i, cache_dir, regenerate_ca
             encoder_key=text_encoder_key, lookup_dir=profile_lookup_dir)
         return IndexedTextEmbeddingDataset(
             te_dataset, flattened_captions, cache_dir / f'caption_index_{metadata_dataset._fingerprint}.sqlite')
-    flattened_captions = metadata_dataset.map(flatten_captions, batched=True, keep_in_memory=True, remove_columns=metadata_dataset.column_names)
+    if layout_rewriter is None:
+        flattened_captions = metadata_dataset.map(flatten_captions, batched=True, keep_in_memory=True, remove_columns=metadata_dataset.column_names)
+    else:
+        rewrite_tag = Hasher.hash([layout_rewriter.cache_tag, layout_rewriter.caption_prefix])
+        flattened_captions = _flattened_captions(
+            metadata_dataset, flatten_captions,
+            cache_dir / f'flattened_captions_{metadata_dataset._fingerprint}_{rewrite_tag}',
+            regenerate=regenerate_cache and map_fn is not None)
     te_dataset = _map_and_cache(
         flattened_captions,
         map_fn,
@@ -821,6 +869,10 @@ class SizeBucketDataset:
                 else:
                     print(f'WARNING: image {key} did not have entry in captions_dict. Using empty caption.')
                     caption = ''
+            elif self.text_embedding_datasets and self.layout_rewriter is not None:
+                # The text the cached embeddings were encoded from: a layout caption rewritten
+                # for this bucket, so a model that reads the caption too sees the same boxes.
+                caption = self.text_embedding_datasets[0].get_caption(tuple(entry['image_spec']), caption_number)
             else:
                 caption = entry_caption
                 if self._augment_at_runtime:
@@ -1306,7 +1358,7 @@ class DirectoryDataset:
             'tag_dropout_rate': directory_config.get('tag_dropout_rate', dataset_config.get('tag_dropout_rate', 0.0)),
             'multiline_captions': directory_config.get('multiline_captions', dataset_config.get('multiline_captions', False)),
             'enable_remove_non_latin': directory_config['enable_remove_non_latin'],
-            'layout_captions': (f'v{LAYOUT_REWRITE_VERSION}-{layout_caption_format}'
+            'layout_captions': (f'v{LAYOUT_METADATA_VERSION}-{layout_caption_format}'
                                 if layout_caption_format else ''),
         })
         # JSON layout captions (utils/layout_captions.py), for a model that declares a format.
@@ -2608,7 +2660,7 @@ class DatasetManager:
             idx = id - 1
             if self.te_fn_requires_control_file[idx]:
                 args.append(control_file)
-            results = self.call_text_encoder_fns[idx](*args)
+            results = _encode_distinct_rows(self.call_text_encoder_fns[idx], args)
         else:
             raise RuntimeError()
         # Need to move to CPU here. If we don't, we get this error:
@@ -2621,6 +2673,34 @@ class DatasetManager:
             else:
                 cpu_results[k] = v.to('cpu')
         pipe.send(cpu_results)
+
+
+def _encode_distinct_rows(encode, columns):
+    """encode(*columns), with each distinct row encoded once and its result copied to the rows
+    that repeat it: the cache_shuffle_num variants of a layout caption are one text, and so are
+    repeated empty captions. A text encoder's result has one entry per row along its first
+    dimension (the cache stores result[key][i] for row i); one that does not is encoded whole."""
+    keys = [repr(row) for row in zip(*columns)]
+    position = {}
+    for key in keys:
+        position.setdefault(key, len(position))
+    if len(position) == len(keys):
+        return encode(*columns)
+    first = {}
+    for row, key in enumerate(keys):
+        first.setdefault(key, row)
+    distinct = list(first.values())
+    results = encode(*[[column[row] for row in distinct] for column in columns])
+    inverse = [position[key] for key in keys]
+    expanded = {}
+    for name, value in results.items():
+        if torch.is_tensor(value) and value.dim() > 0 and value.size(0) == len(distinct):
+            expanded[name] = value[torch.tensor(inverse, device=value.device)]
+        elif isinstance(value, (list, tuple)) and len(value) == len(distinct):
+            expanded[name] = [value[i] for i in inverse]
+        else:
+            return encode(*columns)
+    return expanded
 
 
 def split_batch(batch, pieces):

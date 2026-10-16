@@ -5,8 +5,11 @@ the pixels ImageOps.fit actually produces (models/base.py convert_crop_and_resiz
 against arithmetic written the same way as the code under test.
 """
 
+import functools
+import importlib.util
 import io
 import json
+import math
 import random
 import sys
 import tarfile
@@ -36,6 +39,16 @@ from utils.layout_captions import (  # noqa: E402
 @pytest.fixture(autouse=True)
 def single_process(monkeypatch):
     monkeypatch.setattr(dataset_module, 'is_main_process', lambda: True)
+
+
+def load_compiler():
+    """MOSS-Image's own prompt compiler (skills/moss-image-prompt-enhancer)."""
+    path = (Path(__file__).resolve().parents[1] / 'submodules' / 'MOSS-Image' / 'skills'
+            / 'moss-image-prompt-enhancer' / 'scripts' / 'compile_prompt.py')
+    spec = importlib.util.spec_from_file_location('moss_compile_prompt', path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def compact(obj):
@@ -110,6 +123,70 @@ class TestGeometry:
             tar.add(path, arcname='sub/a.png')
         assert media_size((str(tar_path), 'sub/a.png')) == (37, 21)
 
+    def test_media_size_indexes_each_tar_once(self, tmp_path, monkeypatch):
+        """Members are found through an index built once per archive: opening a TarFile per
+        lookup rescans every header before the member, quadratic over a tar dataset."""
+        import utils.layout_captions as layout_module
+        tar_path = tmp_path / 'many.tar'
+        sizes = {}
+        with tarfile.open(tar_path, 'w') as tar:
+            for i in range(300):
+                image = Image.new('RGB', (8 + i % 7, 8 + i % 5))
+                buffer = io.BytesIO()
+                image.save(buffer, format='PNG')
+                info = tarfile.TarInfo(f'img/{i}.png')
+                info.size = buffer.tell()
+                buffer.seek(0)
+                tar.addfile(info, buffer)
+                sizes[f'img/{i}.png'] = image.size
+        layout_module._media_size.cache_clear()
+        opened = []
+        real = tarfile.TarFile.__init__
+
+        def counting_init(self, *args, **kwargs):
+            opened.append(args[0] if args else kwargs.get('name'))
+            real(self, *args, **kwargs)
+
+        monkeypatch.setattr(tarfile.TarFile, '__init__', counting_init)
+        scans = []
+        real_next = tarfile.TarFile.next
+        monkeypatch.setattr(tarfile.TarFile, 'next', lambda self: scans.append(1) or real_next(self))
+        for _ in range(3):  # cache_shuffle variants and buckets ask again
+            for name, size in sizes.items():
+                assert media_size((str(tar_path), name)) == size
+        assert len(opened) == 1
+        # One pass over the headers (plus the end-of-archive read), not one per member.
+        assert len(scans) <= len(sizes) + 2
+
+    def test_tar_handles_are_not_shared_with_a_forked_process(self, tmp_path):
+        import multiprocessing
+        import utils.layout_captions as layout_module
+        tar_path = tmp_path / 't.tar'
+        with tarfile.open(tar_path, 'w') as tar:
+            for i, size in enumerate([(5, 6), (7, 8)]):
+                buffer = io.BytesIO()
+                Image.new('RGB', size).save(buffer, format='PNG')
+                info = tarfile.TarInfo(f'{i}.png')
+                info.size = buffer.tell()
+                buffer.seek(0)
+                tar.addfile(info, buffer)
+        layout_module._media_size.cache_clear()
+        assert media_size((str(tar_path), '0.png')) == (5, 6)
+        parent_tar = layout_module._open_tars.tars[str(tar_path)][0]
+        context = multiprocessing.get_context('fork')
+        with context.Pool(1) as pool:
+            child = pool.apply(_child_tar_identity, (str(tar_path),))
+        # The child inherited the parent's open archive and opened its own instead.
+        assert child == ((7, 8), True, True)
+        assert layout_module._open_tars.tars[str(tar_path)][0] is parent_tar
+
+
+def _child_tar_identity(tar_path):
+    import utils.layout_captions as layout_module
+    inherited = layout_module._open_tars.tars.get(tar_path)
+    size = media_size((tar_path, '1.png'))
+    return size, inherited is not None, layout_module._open_tars.tars[tar_path] is not inherited
+
 
 class TestMossBoxes:
     def test_box_follows_the_pixels_through_the_crop(self):
@@ -133,9 +210,9 @@ class TestMossBoxes:
         rr = rng.randrange(rl + int(cw * 0.2), int(left + cw) - 3)
         rb = rng.randrange(rt + int(ch * 0.2), int(top + ch) - 3)
         image = image_with_rect(src, rt, rl, rb, rr)
-        cx, cy = src[0] / 2, src[1] / 2
+        # The compiler's origin: width // 2, height // 2.
+        cx, cy = src[0] // 2, src[1] // 2
         bbox = [rt - cy, rl - cx, rb - cy, rr - cx]
-        bbox = [int(v) if float(v).is_integer() else v for v in bbox]
         out = json.loads(rewrite_layout_caption(moss_caption([{'bbox': bbox}]), 'moss_image', src, dst))
         y1, x1, y2, x2 = out['items'][0]['bbox']
         assert all(type(v) is int for v in (y1, x1, y2, x2))
@@ -203,10 +280,42 @@ class TestMossBoxes:
         with pytest.raises(ValueError, match=r'img/a\.png: items\[0\]\.bbox .* outside the 120x80 image'):
             rewrite_layout_caption(caption, 'moss_image', (120, 80), (64, 64), source='img/a.png')
 
-    def test_half_pixel_overhang_of_an_odd_image_is_accepted(self):
-        # The compiler ceils the right edge of a 121-wide image to 61 (the centre is at 60.5).
-        caption = moss_caption([{'bbox': [-40, 0, 40, 61]}])
+    def test_far_edge_of_an_odd_image_is_accepted(self):
+        # The compiler subtracts 121 // 2 = 60 from x, so a 121-wide image runs -60..61.
+        caption = moss_caption([{'bbox': [-40, -60, 40, 61]}])
         rewrite_layout_caption(caption, 'moss_image', (121, 80), (64, 64))
+
+    @pytest.mark.parametrize('src,dst', [((121, 81), (64, 48)), ((97, 203), (112, 224)),
+                                         ((333, 101), (96, 32)), ((64, 64), (64, 64))])
+    def test_odd_images_follow_the_compilers_origin(self, src, dst):
+        """Compile an absolute-pixel draft for the original image with MOSS-Image's own
+        compiler, rewrite it, and compare with the compiler run on the same box mapped to the
+        bucket: identical, also when a side is odd (the origin is side // 2, not side / 2)."""
+        compiler = load_compiler()
+        left, top, cw, ch = fit_crop_box(*src, *dst)
+        sx, sy = dst[0] / cw, dst[1] / ch
+        rng = random.Random(hash(src) & 0xffff)
+        for _ in range(20):
+            x1 = rng.uniform(left + 1, left + cw * 0.5)
+            y1 = rng.uniform(top + 1, top + ch * 0.5)
+            x2 = rng.uniform(x1 + 2, left + cw - 1)
+            y2 = rng.uniform(y1 + 2, top + ch - 1)
+            # A whole-pixel box, as a draft drawn on the image would be.
+            x1, y1, x2, y2 = (math.floor(x1), math.floor(y1), math.ceil(x2), math.ceil(y2))
+            box = compiler.centered_box([x1, y1, x2, y2], src[0], src[1], 'bbox')
+            out = json.loads(rewrite_layout_caption(moss_caption([{'bbox': box}]), 'moss_image', src, dst))
+            mapped = [(x1 - left) * sx, (y1 - top) * sy, (x2 - left) * sx, (y2 - top) * sy]
+            assert out['items'][0]['bbox'] == compiler.centered_box(mapped, dst[0], dst[1], 'bbox')
+
+    def test_zero_size_box_inside_the_crop_is_kept(self):
+        # A zero-height box is a degenerate but valid region; it moves with the crop.
+        caption = moss_caption([{'label': 'line', 'bbox': [0, -40, 0, 40]}])
+        out = json.loads(rewrite_layout_caption(caption, 'moss_image', (120, 80), (64, 64)))
+        assert out['items'][0]['bbox'] == [0, -32, 0, 32]
+        # One that the crop removes is dropped like any other.
+        caption = moss_caption([{'label': 'line', 'bbox': [-10, -55, 10, -55]}])
+        out = json.loads(rewrite_layout_caption(caption, 'moss_image', (120, 80), (64, 64)))
+        assert out['items'] == []
 
     @pytest.mark.parametrize('space,layout', [('abs', 'yxyx'), ('abs_centralized', 'xyxy'), (None, None)])
     def test_other_coordinate_spaces_are_refused(self, space, layout):
@@ -216,8 +325,8 @@ class TestMossBoxes:
         with pytest.raises(ValueError, match='abs_centralized'):
             rewrite_layout_caption(compact(obj), 'moss_image', (64, 64), (64, 64))
 
-    @pytest.mark.parametrize('bbox', [[0, 0, 8], [0, 0, 8, 'x'], [0, 0, 8, True], [0, 0, 0, 8],
-                                      [8, 0, 0, 8], [0, 0, 8, float('nan')], 'box'])
+    @pytest.mark.parametrize('bbox', [[0, 0, 8], [0, 0, 8, 'x'], [0, 0, 8, True], [8, 0, 0, 8],
+                                      [0, 8, 8, 0], [0, 0, 8, float('nan')], 'box'])
     def test_malformed_boxes_are_refused(self, bbox):
         caption = json.dumps({'summary': {'caption': 'x'}, 'items': [{'bbox': bbox}],
                               'bbox_coord_space': 'abs_centralized', 'bbox_format': 'yxyx'})
@@ -242,27 +351,49 @@ class TestIdeogramBoxes:
                            'compositional_deconstruction': {'background': 'white', 'elements': elements},
                            **extra}, indent=2, ensure_ascii=True)
 
-    def test_box_follows_the_pixels_and_output_is_compact(self):
+    def test_box_follows_the_pixels_and_keeps_the_formatting(self):
         # 120x80, rectangle x 70..100, y 20..60: 0..1000 grid is x * 1000/120, y * 1000/80.
         image = image_with_rect((120, 80), 20, 70, 60, 100)
         bbox = [250, round(70 / 120 * 1000), 750, round(100 / 120 * 1000)]
         caption = self.caption([{'type': 'text', 'bbox': bbox, 'text': 'Café'}])
         out = rewrite_layout_caption(caption, 'ideogram4', (120, 80), (64, 64))
         obj = json.loads(out)
-        assert out == compact(obj)
-        assert 'Café' in out  # ensure_ascii=False
+        assert out == json.dumps(obj, indent=2, ensure_ascii=True)
+        # The compact form (json.dumps(..., separators=(",", ":"), ensure_ascii=False)) stays compact.
+        compact_caption = compact(json.loads(caption))
+        out_compact = rewrite_layout_caption(compact_caption, 'ideogram4', (120, 80), (64, 64))
+        assert out_compact == compact(obj) and 'Café' in out_compact
         top, left, bottom, right = dark_extent(fitted(image, (64, 64)))
         ymin, xmin, ymax, xmax = obj['compositional_deconstruction']['elements'][0]['bbox']
         # The input box is itself rounded to the grid (583 for 583.3), so allow one grid step.
         expected = [round(v / 64 * 1000) for v in (top, left, bottom, right)]
         assert all(abs(a - b) <= 1 for a, b in zip([ymin, xmin, ymax, xmax], expected))
 
-    def test_unchanged_caption_is_still_compacted(self):
+    def test_unchanged_caption_is_used_as_written(self):
         caption = self.caption([{'type': 'obj', 'bbox': [0, 0, 1000, 1000]}])
-        out = rewrite_layout_caption(caption, 'ideogram4', (64, 64), (64, 64))
-        assert out == compact(json.loads(caption))
+        assert rewrite_layout_caption(caption + '\n', 'ideogram4', (64, 64), (64, 64)) == caption
         caption = json.dumps({'high_level_description': 'only text'}, indent=2)
-        assert rewrite_layout_caption(caption, 'ideogram4', (64, 64), (64, 64)) == compact(json.loads(caption))
+        assert rewrite_layout_caption(caption, 'ideogram4', (64, 64), (64, 64)) == caption
+
+    @pytest.mark.parametrize('indent', [2, 0])
+    def test_comfyui_dictionary_to_string_output_keeps_its_form(self, indent):
+        """ComfyUI's ConvertDictionaryToString (indent 2 by default; 0 is json.dumps' default
+        one-line form): the rewritten prompt is in the form ComfyUI sends at inference."""
+        obj = json.loads(self.caption([{'type': 'a', 'bbox': [250, 500, 750, 800]}]))
+        caption = json.dumps(obj, ensure_ascii=False, indent=indent or None)
+        out = rewrite_layout_caption(caption, 'ideogram4', (120, 80), (64, 64))
+        expected = json.loads(out)
+        assert expected['compositional_deconstruction']['elements'][0]['bbox'] != [250, 500, 750, 800]
+        assert out == json.dumps(expected, ensure_ascii=False, indent=indent or None)
+
+    def test_zero_size_boxes_from_comfyui_are_accepted(self):
+        # nodes_bounding_boxes._norm_bbox writes ymin == ymax for a zero-height region.
+        caption = self.caption([{'type': 'line', 'bbox': [500, 250, 500, 750]},
+                                {'type': 'gone', 'bbox': [500, 0, 500, 100]}])
+        out = json.loads(rewrite_layout_caption(caption, 'ideogram4', (120, 80), (64, 64)))
+        elements = out['compositional_deconstruction']['elements']
+        assert [e['type'] for e in elements] == ['line']
+        assert elements[0]['bbox'] == [500, 125, 500, 875]
 
     def test_cut_box_is_clipped_and_outside_box_dropped(self):
         # 120x80 to 64x64 keeps x 20..100 of 120, i.e. 167..833 on the 0..1000 grid.
@@ -291,7 +422,14 @@ class TestIdeogramBoxes:
         out = json.loads(rewrite_layout_caption(self.caption([]), 'ideogram4', (64, 64), (64, 64), 'sks, '))
         assert out['high_level_description'] == 'sks, a poster'
         with pytest.raises(ValueError, match=r'c\.png: .*high_level_description'):
-            rewrite_layout_caption('{"style_description": "x"}', 'ideogram4', (64, 64), (64, 64), 'sks, ', 'c.png')
+            rewrite_layout_caption('{"high_level_description": 3}', 'ideogram4', (64, 64), (64, 64), 'sks, ', 'c.png')
+
+    def test_caption_prefix_becomes_a_missing_description(self):
+        # BuildJsonPromptIdeogram leaves high_level_description out when it is empty.
+        caption = compact({'style_description': 'flat', 'compositional_deconstruction': {'elements': []}})
+        out = rewrite_layout_caption(caption, 'ideogram4', (64, 64), (64, 64), 'sks, ')
+        assert out == compact({'high_level_description': 'sks', 'style_description': 'flat',
+                               'compositional_deconstruction': {'elements': []}})
 
 
 class TestRewriter:
@@ -364,6 +502,12 @@ def _stub_text_encoder(example, rank):
     import torch
     return {'embedding': [torch.tensor(list(c.encode('utf-8')) or [0], dtype=torch.uint8)
                           for c in example['caption']]}
+
+
+def _logging_text_encoder(log, example, rank):
+    with open(log, 'a', encoding='utf-8') as handle:
+        handle.write(''.join(c + '\n' for c in example['caption']))
+    return _stub_text_encoder(example, rank)
 
 
 def decode(embedding):
@@ -523,6 +667,136 @@ class TestDataset:
         assert self.encoded(leaf, 'a') == self.expected(caption, (64, 64, 1))
         generated = list((tmp_path / 'imgs' / 'cache').rglob('text_embeddings_0_*/generated_*'))
         assert not generated, 'every caption was in the first run\'s cache, so nothing is encoded again'
+
+    @pytest.mark.parametrize('reuse', [False, True])
+    def test_a_later_launch_reads_no_image_headers(self, tmp_path, monkeypatch, reuse):
+        """Loading the caches (every rank, every launch: DatasetManager.cache's map_fn=None
+        pass) uses the rewritten captions kept on disk instead of rewriting them again, which
+        reads each layout caption's image header."""
+        import utils.layout_captions as layout_module
+        caption = moss_caption([{'bbox': [-20, 10, 20, 40]}])
+        files = {'a': caption, 'b': caption, 'c': 'plain'}
+        overrides = dict(resolutions=[64, 128], cache_shuffle_num=3, reuse_metadata_cache=reuse)
+        first = self.cache(self.make(tmp_path, files, **overrides))
+        expected = {tuple(leaf.size_bucket): self.encoded(leaf, 'a') for leaf in first}
+        calls = []
+        real = layout_module.media_size
+        monkeypatch.setattr(layout_module, 'media_size', lambda spec: calls.append(spec) or real(spec))
+        again = self.make(tmp_path, files, **overrides)
+        again.cache_metadata(trust_cache=True)
+        for bucket in again.size_bucket_datasets if again.use_size_buckets else again.ar_bucket_datasets:
+            bucket.cache_latents(None, trust_cache=True)
+        again.cache_text_embeddings(None, 0)
+        assert calls == []
+        assert {tuple(leaf.size_bucket): self.encoded(leaf, 'a') for leaf in leaves(again)} == expected
+
+    @pytest.mark.parametrize('reuse', [False, True])
+    def test_regenerate_cache_rewrites_for_a_replaced_image(self, tmp_path, monkeypatch, reuse):
+        """The kept rewritten captions are rebuilt by --regenerate_cache: an image replaced
+        under the same name, at another size, gets boxes for its new size. The metadata need
+        not change with it (it records buckets, not sizes), so this is the stale case."""
+        import utils.layout_captions as layout_module
+        caption = moss_caption([{'bbox': [-20, -40, 20, 40]}])
+        (leaf,) = self.cache(self.make(tmp_path, {'a': caption}, size_buckets=[[64, 64, 1]],
+                                       reuse_metadata_cache=reuse))
+        assert self.encoded(leaf, 'a') == self.expected(caption, (64, 64, 1), src=(120, 80))
+        # The replacement, as the header reads it (the pixels and the metadata stay the same).
+        monkeypatch.setattr(layout_module, 'media_size', lambda spec: (120, 100))
+        (leaf,) = self.cache(self.make(tmp_path, {'a': caption}, size_buckets=[[64, 64, 1]],
+                                       reuse_metadata_cache=reuse))
+        assert self.encoded(leaf, 'a') == self.expected(caption, (64, 64, 1), src=(120, 100))
+        assert self.expected(caption, (64, 64, 1), src=(120, 100)) != self.expected(caption, (64, 64, 1))
+        assert not list((tmp_path / 'imgs' / 'cache').rglob('.flattened*'))  # no temporaries left
+
+    def test_identical_variants_are_encoded_once(self):
+        """cache_shuffle_num makes N copies of a layout caption (it is never shuffled); the
+        text encoder sees it once per batch and every copy gets that embedding."""
+        caption = moss_caption([{'bbox': [-20, 10, 20, 40]}])
+        encoded = []
+
+        def counting_encoder(captions, is_video):
+            encoded.extend(captions)
+            return _stub_text_encoder({'caption': captions}, 0)
+
+        manager = dataset_module.DatasetManager.__new__(dataset_module.DatasetManager)
+        manager.call_text_encoder_fns = [counting_encoder]
+        manager.te_fn_requires_control_file = [False]
+        sent = []
+
+        class Pipe:
+            def send(self, value):
+                sent.append(value)
+
+        captions = [caption] * 3 + ['a, b', 'b, a', 'a, b']
+        # Not an nn.Module: a ComfyUI model wrapper that loads itself when first needed.
+        manager.submodels = [None, type('Lazy', (), {'load_model_if_needed': lambda self: None})()]
+        manager._handle_task((1, captions, [False] * 6, None, Pipe()))
+        assert encoded == [caption, 'a, b', 'b, a']
+        assert [decode(e) for e in sent[0]['embedding']] == captions
+
+    def test_distinct_rows_handle_batched_tensors_and_odd_results(self):
+        import torch
+        calls = []
+
+        def batched(captions, is_video):
+            calls.append(list(captions))
+            return {'embeds': torch.stack([torch.full((2,), float(len(c))) for c in captions]),
+                    'mask': [torch.ones(1)] * len(captions)}
+
+        out = dataset_module._encode_distinct_rows(batched, [['aa', 'b', 'aa'], [False, False, False]])
+        assert calls == [['aa', 'b']]
+        assert out['embeds'][:, 0].tolist() == [2.0, 1.0, 2.0] and len(out['mask']) == 3
+        # Rows that differ in another column are different rows.
+        calls.clear()
+        dataset_module._encode_distinct_rows(batched, [['aa', 'aa'], [False, True]])
+        assert calls == [['aa', 'aa']]
+
+        def not_per_row(captions, is_video):
+            calls.append(list(captions))
+            return {'pooled': torch.zeros(5)}
+
+        calls.clear()
+        out = dataset_module._encode_distinct_rows(not_per_row, [['x', 'x', 'y'], [False] * 3])
+        assert calls == [['x', 'y'], ['x', 'x', 'y']] and out['pooled'].shape == (5,)
+
+    @pytest.mark.parametrize('reuse', [False, True])
+    def test_caption_text_matches_the_cached_embedding(self, tmp_path, reuse):
+        """With cached embeddings the batch's caption is the text that was encoded: the layout
+        caption rewritten for this bucket, not the file's text."""
+        caption = moss_caption([{'bbox': [-20, 10, 20, 40]}])
+        ds = self.make(tmp_path, {'a': caption, 'b': 'plain'}, caption_prefix='p, ', reuse_metadata_cache=reuse)
+        (leaf,) = self.cache(ds)
+        seen = {}
+        for i in range(len(leaf)):
+            item = leaf[i]
+            seen[decode(item['embedding'])] = item['caption']
+        assert seen == {self.expected(caption, tuple(leaf.size_bucket)[-3:], 'p, '): self.expected(
+            caption, tuple(leaf.size_bucket)[-3:], 'p, '), 'p, plain': 'p, plain'}
+
+    @pytest.mark.parametrize('reuse', [False, True])
+    def test_plain_captions_keep_the_embeddings_of_a_model_without_layout_captions(self, tmp_path, reuse):
+        """Ideogram 4 declared a layout format after people had cached plain-caption datasets
+        with it; the text cache of a dataset with no JSON caption is unchanged by that."""
+        files = {'a': 'plain one', 'b': 'plain two'}
+        self.cache(self.make(tmp_path, files, layout_format=None, reuse_metadata_cache=reuse))
+        log = tmp_path / 'encoded.txt'
+        ds = self.make(tmp_path, files, layout_format='ideogram4', reuse_metadata_cache=reuse)
+        ds.cache_metadata(regenerate_cache=False)
+        for bucket in ds.ar_bucket_datasets:
+            bucket.cache_latents(_stub_latents, regenerate_cache=False)
+        # The encoder runs in a worker process, so it reports through a file.
+        ds.cache_text_embeddings(functools.partial(_logging_text_encoder, log), 0, regenerate_cache=False)
+        assert not log.exists() or log.read_text(encoding='utf-8') == ''
+        (leaf,) = leaves(ds)
+        assert self.encoded(leaf, 'a') == 'plain one'
+        # The log does see an encode: a caption that is not in the old cache.
+        ds = self.make(tmp_path, {'a': 'plain one', 'b': 'new text'}, layout_format='ideogram4',
+                       reuse_metadata_cache=reuse)
+        ds.cache_metadata(regenerate_cache=reuse)  # a profile snapshot is refreshed only on request
+        for bucket in ds.ar_bucket_datasets:
+            bucket.cache_latents(_stub_latents, regenerate_cache=False)
+        ds.cache_text_embeddings(functools.partial(_logging_text_encoder, log), 0, regenerate_cache=False)
+        assert 'new text' in log.read_text(encoding='utf-8')
 
 
 class TestModelsDeclareTheirFormat:

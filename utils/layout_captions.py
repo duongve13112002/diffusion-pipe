@@ -21,22 +21,33 @@ Formats (MossImagePipeline.layout_caption_format / Ideogram4Pipeline.layout_capt
   ideogram4   Ideogram 4's prompt (ComfyUI's BuildJsonPromptIdeogram):
               {"high_level_description": ..., "compositional_deconstruction":
                {"elements": [{"bbox": [ymin, xmin, ymax, xmax], ...}]}}
-              Boxes are integers in 0..1000 of the image, origin at the top left. The rewritten
-              caption is compact JSON, json.dumps(..., separators=(",", ":"), ensure_ascii=False).
+              Boxes are integers in 0..1000 of the image, origin at the top left. A zero-height
+              or zero-width box (which ComfyUI's bounding box nodes can write) is allowed.
+
+A rewritten caption keeps the caption's own JSON formatting: compact (what MOSS-Image's
+compiler and json.dumps(..., separators=(",", ":"), ensure_ascii=False) write), ComfyUI's
+indent=2, or another usual json.dumps style; anything else comes out compact. A caption that
+needs no change is used exactly as written.
 
 A box cut by the crop is clipped to it; an item whose box lies wholly outside the crop is
 dropped. A box outside the original image is an error naming the file.
 """
 
+import functools
 import json
 import math
+import os
 import tarfile
+from collections import OrderedDict
 from pathlib import Path
 
 LAYOUT_FORMATS = ('moss_image', 'ideogram4')
 
-# Bumped when the rewrite changes, so caches built by an older rewrite are rebuilt.
-LAYOUT_REWRITE_VERSION = 1
+# Bumped when the rewrite changes, so text caches built by an older rewrite are rebuilt.
+LAYOUT_REWRITE_VERSION = 2
+# Bumped when the metadata stage handles layout captions differently (it keeps them whole and
+# out of the tag operations), so metadata cached by an older version is rebuilt.
+LAYOUT_METADATA_VERSION = 1
 
 # Pixel multiple the media preprocessing rounds a bucket to (PreprocessMediaFile's default,
 # which both layout models use).
@@ -83,16 +94,59 @@ def bucket_pixel_size(size_bucket):
             int(round(height / BUCKET_ROUNDING) * BUCKET_ROUNDING))
 
 
-def media_size(image_spec):
-    """(width, height) of a dataset media file, from its header. image_spec is (tar or None, path)."""
+class _OpenTars:
+    """Open tar archives with a name -> member index, a few at a time.
+
+    tarfile finds a member by scanning the headers before it (TarFile.getmember is a linear
+    search, and a fresh TarFile reads every header again), so looking members up one by one
+    is quadratic in the archive size. Each archive here is indexed once. The handles belong to
+    the process that opened them: a forked worker shares the file offset with its parent, so
+    it opens its own.
+    """
+
+    def __init__(self, limit=8):
+        self.limit = limit
+        self.pid = None
+        self.tars = OrderedDict()
+
+    def member(self, tar_path, name):
+        if self.pid != os.getpid():
+            self.tars = OrderedDict()  # inherited handles stay with the parent
+            self.pid = os.getpid()
+        entry = self.tars.get(tar_path)
+        if entry is None:
+            tar = tarfile.TarFile(tar_path)
+            entry = (tar, {info.name: info for info in tar.getmembers()})
+            self.tars[tar_path] = entry
+            while len(self.tars) > self.limit:
+                self.tars.popitem(last=False)[1][0].close()
+        else:
+            self.tars.move_to_end(tar_path)
+        tar, index = entry
+        info = index.get(name)
+        if info is None:
+            raise KeyError(f'{name} is not in {tar_path}')
+        return tar.extractfile(info)
+
+
+_open_tars = _OpenTars()
+
+
+@functools.lru_cache(maxsize=1 << 18)
+def _media_size(tar_path, member):
     from PIL import Image
-    tar_path, member = image_spec
     if tar_path is None:
         with Image.open(member) as image:
             return image.size
-    with tarfile.TarFile(tar_path) as tar:
-        with tar.extractfile(Path(member).as_posix()) as handle, Image.open(handle) as image:
-            return image.size
+    with _open_tars.member(tar_path, Path(member).as_posix()) as handle, Image.open(handle) as image:
+        return image.size
+
+
+def media_size(image_spec):
+    """(width, height) of a dataset media file, from its header. image_spec is (tar or None, path).
+    Remembered per process: every caption variant and bucket of an image asks again."""
+    tar_path, member = image_spec
+    return _media_size(None if tar_path is None else str(tar_path), str(member))
 
 
 def _box(value, location):
@@ -100,9 +154,18 @@ def _box(value, location):
             or not all(type(v) in (int, float) and math.isfinite(v) for v in value)):
         raise ValueError(f'{location} must be four finite numbers, got {value!r}')
     y1, x1, y2, x2 = value
-    if not (y1 < y2 and x1 < x2):
-        raise ValueError(f'{location} must have positive width and height, got {list(value)}')
+    if not (y1 <= y2 and x1 <= x2):
+        raise ValueError(f'{location} must be [y1, x1, y2, x2] with y1 <= y2 and x1 <= x2, got {list(value)}')
     return value
+
+
+def _fit_span(lo, hi, new_lo, new_hi, limit_lo, limit_hi):
+    """The span [new_lo, new_hi] (the rewritten [lo, hi]) clipped to [limit_lo, limit_hi], or
+    None when the crop leaves nothing of it. A zero-size span stays when it is inside."""
+    if hi == lo:
+        return (new_lo, new_hi) if limit_lo <= new_lo <= limit_hi else None
+    new_lo, new_hi = max(new_lo, limit_lo), min(new_hi, limit_hi)
+    return (new_lo, new_hi) if new_lo < new_hi else None
 
 
 class _Geometry:
@@ -123,10 +186,6 @@ class _Geometry:
         return (value - self.top) * self.scale_y
 
 
-def _clip(lo, hi, limit_lo, limit_hi):
-    return max(lo, limit_lo), min(hi, limit_hi)
-
-
 def _moss_boxes(obj, geometry, source):
     """Rewrite MOSS-Image's centred pixel yxyx boxes in place. True if anything changed."""
     items = obj.get('items')
@@ -143,9 +202,10 @@ def _moss_boxes(obj, geometry, source):
             f'{source}: MOSS-Image layout boxes must be bbox_coord_space "abs_centralized" and '
             f'bbox_format "yxyx" (what its prompt compiler writes), got {space!r} and {layout!r}')
     g = geometry
-    # Centre of the original image and of the bucket, in top-left pixel coordinates.
-    src_cx, src_cy = g.src_width / 2, g.src_height / 2
-    dst_cx, dst_cy = g.dst_width / 2, g.dst_height / 2
+    # The origin, in top-left pixel coordinates: the compiler subtracts height // 2 and
+    # width // 2 from pixel coordinates (centered_box in compile_prompt.py).
+    src_cx, src_cy = g.src_width // 2, g.src_height // 2
+    dst_cx, dst_cy = g.dst_width // 2, g.dst_height // 2
     kept, changed = [], False
     for index, item in enumerate(items):
         if not (isinstance(item, dict) and 'bbox' in item):
@@ -153,20 +213,22 @@ def _moss_boxes(obj, geometry, source):
             continue
         location = f'{source}: items[{index}].bbox'
         y1, x1, y2, x2 = _box(item['bbox'], location)
-        # The compiler floors the top/left edge and ceils the bottom/right one, so a box may
-        # reach half a pixel past the centre-relative edge of an odd-sized image.
-        if not (-src_cy - 1 <= y1 and y2 <= src_cy + 1 and -src_cx - 1 <= x1 and x2 <= src_cx + 1):
+        # The compiler's boxes lie within [-(side // 2), side - side // 2]; one pixel of slack
+        # for hand-written ones.
+        if not (-src_cy - 1 <= y1 and y2 <= g.src_height - src_cy + 1
+                and -src_cx - 1 <= x1 and x2 <= g.src_width - src_cx + 1):
             raise ValueError(f'{location} {list(item["bbox"])} lies outside the {g.src_width}x{g.src_height} image')
-        top = math.floor(round(g.y(y1 + src_cy) - dst_cy, 6))
-        left = math.floor(round(g.x(x1 + src_cx) - dst_cx, 6))
-        bottom = math.ceil(round(g.y(y2 + src_cy) - dst_cy, 6))
-        right = math.ceil(round(g.x(x2 + src_cx) - dst_cx, 6))
-        top, bottom = _clip(top, bottom, -(g.dst_height // 2), g.dst_height - g.dst_height // 2)
-        left, right = _clip(left, right, -(g.dst_width // 2), g.dst_width - g.dst_width // 2)
-        if top >= bottom or left >= right:
+        # As the compiler does: top/left edges floored, bottom/right ones ceiled, in pixels.
+        rows = _fit_span(y1, y2, math.floor(round(g.y(y1 + src_cy), 6)) - dst_cy,
+                         math.ceil(round(g.y(y2 + src_cy), 6)) - dst_cy,
+                         -dst_cy, g.dst_height - dst_cy)
+        cols = _fit_span(x1, x2, math.floor(round(g.x(x1 + src_cx), 6)) - dst_cx,
+                         math.ceil(round(g.x(x2 + src_cx), 6)) - dst_cx,
+                         -dst_cx, g.dst_width - dst_cx)
+        if rows is None or cols is None:
             changed = True  # wholly cropped out
             continue
-        box = [top, left, bottom, right]
+        box = [rows[0], cols[0], rows[1], cols[1]]
         if box != list(item['bbox']):
             item = dict(item, bbox=box)
             changed = True
@@ -205,12 +267,12 @@ def _ideogram_boxes(obj, geometry, source):
         def grid_x(v):
             return round(g.x(v / 1000 * g.src_width) / g.dst_width * 1000)
 
-        top, bottom = _clip(grid_y(ymin), grid_y(ymax), 0, 1000)
-        left, right = _clip(grid_x(xmin), grid_x(xmax), 0, 1000)
-        if top >= bottom or left >= right:
-            changed = True
+        rows = _fit_span(ymin, ymax, grid_y(ymin), grid_y(ymax), 0, 1000)
+        cols = _fit_span(xmin, xmax, grid_x(xmin), grid_x(xmax), 0, 1000)
+        if rows is None or cols is None:
+            changed = True  # wholly cropped out
             continue
-        box = [top, left, bottom, right]
+        box = [rows[0], cols[0], rows[1], cols[1]]
         if box != list(element['bbox']):
             element = dict(element, bbox=box)
             changed = True
@@ -234,7 +296,8 @@ def _insert_prefix(obj, path, prefix, source):
 
 def _same_style_dump(obj, original):
     """obj in the JSON formatting the original text uses, when one of the usual styles
-    reproduces it exactly; else compact, the form MOSS-Image's compiler writes."""
+    reproduces it exactly (compact, json.dumps' default, an indent such as ComfyUI's
+    indent=2); else compact, the form MOSS-Image's compiler writes."""
     parsed = json.loads(original)
     styles = [dict(separators=(',', ':')), dict(separators=(', ', ': '))]
     lines = original.splitlines()
@@ -252,10 +315,6 @@ def _same_style_dump(obj, original):
     return json.dumps(obj, ensure_ascii=False, separators=(',', ':'))
 
 
-def _compact(obj):
-    return json.dumps(obj, ensure_ascii=False, separators=(',', ':'))
-
-
 def rewrite_layout_caption(caption, layout_format, src_size, dst_size, caption_prefix='', source='caption'):
     """The layout caption for an image of src_size (w, h) fitted to dst_size (w, h).
 
@@ -270,14 +329,21 @@ def rewrite_layout_caption(caption, layout_format, src_size, dst_size, caption_p
         if caption_prefix:
             _insert_prefix(obj, ('summary', 'caption'), caption_prefix, source)
             changed = True
-        original = caption.strip()
-        return _same_style_dump(obj, original) if changed else original
-    if layout_format == 'ideogram4':
-        _ideogram_boxes(obj, geometry, source)
+    elif layout_format == 'ideogram4':
+        changed = _ideogram_boxes(obj, geometry, source)
         if caption_prefix:
-            _insert_prefix(obj, ('high_level_description',), caption_prefix, source)
-        return _compact(obj)
-    raise ValueError(f'Unknown layout caption format {layout_format!r}; expected one of {LAYOUT_FORMATS}')
+            if 'high_level_description' not in obj:
+                # BuildJsonPromptIdeogram leaves out an empty description; the prefix becomes
+                # it, in the place that node puts the key (first).
+                obj = {'high_level_description': caption_prefix.strip().rstrip(',').strip(), **obj}
+            else:
+                _insert_prefix(obj, ('high_level_description',), caption_prefix, source)
+            changed = True
+    else:
+        raise ValueError(f'Unknown layout caption format {layout_format!r}; expected one of {LAYOUT_FORMATS}')
+    original = caption.strip()
+    return _same_style_dump(obj, original) if changed else original
+
 
 
 class LayoutCaptionRewriter:

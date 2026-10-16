@@ -369,7 +369,7 @@ class IndexedTextEmbeddingDataset:
     def __setstate__(self, state):
         self.__dict__.update(state)
 
-    def get_text_embeddings(self, image_spec, caption_number):
+    def _row(self, image_spec, caption_number):
         if self._hashes is not None:
             key = np.uint64(_image_hash(json.dumps(image_spec)))
             position = int(np.searchsorted(self._hashes, key))
@@ -377,7 +377,7 @@ class IndexedTextEmbeddingDataset:
             if (position == len(self._hashes) or self._hashes[position] != key
                     or not 0 <= number < self._counts[position]):
                 raise KeyError((image_spec, caption_number))
-            return self.te_dataset[int(self._starts[position]) + number]
+            return int(self._starts[position]) + number
         if self.lookup is None or self.pid != os.getpid():
             self.close()
             self.lookup = sqlite3.connect(self.path.resolve().as_uri() + '?mode=ro', uri=True)
@@ -386,7 +386,14 @@ class IndexedTextEmbeddingDataset:
                                     (json.dumps(image_spec), int(caption_number))).fetchone()
         if match is None:
             raise KeyError((image_spec, caption_number))
-        return self.te_dataset[match[0]]
+        return match[0]
+
+    def get_text_embeddings(self, image_spec, caption_number):
+        return self.te_dataset[self._row(image_spec, caption_number)]
+
+    def get_caption(self, image_spec, caption_number):
+        """The text these embeddings were encoded from."""
+        return self.flattened_captions[self._row(image_spec, caption_number)]['caption']
 
     def close(self):
         if self.lookup is not None:

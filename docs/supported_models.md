@@ -805,28 +805,40 @@ freed. Edit/control datasets are not supported.
 
 ### Layout (JSON) captions
 A caption file can hold a MOSS-Image layout prompt instead of text: the JSON object its prompt
-compiler writes, with boxes in pixels of the original image (origin at the centre, `yxyx`):
+compiler (`submodules/MOSS-Image/skills/moss-image-prompt-enhancer/scripts/compile_prompt.py`)
+writes, with boxes in pixels of the original image (`yxyx`, origin at `(height // 2, width // 2)`).
+The compiler's output is compact JSON, which is the form the model was trained on:
 ```
-{"summary": {"caption": "A poster for a jazz night"}, "items": [{"label": "title", "caption": "JAZZ NIGHT", "bbox": [-300, -200, -150, 200]}], "bbox_coord_space": "abs_centralized", "bbox_format": "yxyx"}
+{"summary":{"caption":"A poster for a jazz night"},"items":[{"label":"text","caption":"The title in gold capitals","text":"JAZZ NIGHT","bbox":[-300,-200,-150,200]}],"bbox_coord_space":"abs_centralized","bbox_format":"yxyx"}
 ```
 Detection is per caption: a file whose whole text parses as a JSON object is a layout caption,
 and anything else is a plain caption with every caption option as usual. For layout captions:
 - the boxes are rewritten for each bucket: following the centre crop and resize the image gets,
-  clipped to the crop, and an item whose box is cropped out entirely is dropped. A box outside
-  the image is an error naming the file. Each bucket caches its own embedding of the rewritten
-  text, so one image at several resolutions gets the right boxes at each.
+  with the compiler's rounding (top/left edges floored, bottom/right ones ceiled), clipped to the
+  crop, and an item whose box is cropped out entirely is dropped. A box outside the image is an
+  error naming the file. Each bucket caches its own embedding of the rewritten text, so one
+  image at several resolutions gets the right boxes at each. The rewritten captions are kept
+  with the cache, so later launches read no image headers; `--regenerate_cache` rewrites them
+  again (for an image replaced under the same name).
 - `caption_prefix` goes into `summary.caption`. A caption without one is an error naming the
   file.
 - tag shuffling, tag dropout, multiline splitting and non-Latin line removal skip them, because
   they would break the JSON. Caption dropout still applies.
-- the rewritten text keeps the file's own JSON formatting.
+- the rewritten text keeps the file's own JSON formatting (compact, ComfyUI's `indent=2`, or
+  another `json.dumps` style; anything else comes out compact), and a caption that needs no
+  change is used exactly as written.
+- with `cache_shuffle_num`, the variants of a layout caption are all the same text; it is encoded
+  once and every variant gets that embedding.
 
 A one-line notice per directory reports how many images have layout captions. Ideogram4 uses
 the same mechanism for its JSON prompts (ComfyUI's Build JSON Prompt (Ideogram) schema: boxes are
-`[ymin, xmin, ymax, xmax]` in 0..1000 and `caption_prefix` goes into `high_level_description`),
-and its rewritten captions are always compact JSON
-(`json.dumps(..., separators=(",", ":"), ensure_ascii=False)`). This feature changes the caption
-cache key of both models, so caches made before it are rebuilt.
+`[ymin, xmin, ymax, xmax]` in 0..1000, a zero-height or zero-width box is allowed, and
+`caption_prefix` goes into `high_level_description`, which it becomes when the prompt has none).
+Its captions keep their formatting the same way: a compact caption
+(`json.dumps(..., separators=(",", ":"), ensure_ascii=False)`) stays compact, and one written by
+ComfyUI's Convert Dictionary to String stays in that node's form, which is what ComfyUI sends at
+inference. This feature changes the metadata cache key of both models, so their metadata is
+rebuilt once; the text embeddings of plain captions are reused.
 
 ## Iris-3B
 [Iris-3B](https://github.com/speridlabs/iris-3b) is a 3B pixel-space diffusion transformer: no VAE,
