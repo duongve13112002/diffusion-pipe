@@ -797,9 +797,12 @@ freed. Edit/control datasets are not supported.
   `int8_convrot` files as a quantized base for adapters) and ai-toolkit's full fine-tunes. The
   fused weights are split into the q, k and v this pipeline trains; quantized ones only in
   formats with one scale per tensor or per row (fp8, `int8_tensorwise`), other formats are refused.
-- `merge_adapters` also takes ai-toolkit's MOSS-Image LoRAs, which adapt the fused `proj.qkv`:
-  each of q, k and v gets the LoRA's A and its third of B, which is exact. Fused LoKr/LoHa/DoRA
-  cannot be split and are refused, as is an adapter with a key that matches no weight.
+  The int8 attention those `int8_convrot_attn` files ask for (`comfy_attention.config`) is not
+  used: attention runs in `dtype`.
+- `merge_adapters` also takes ai-toolkit's MOSS-Image LoRAs, which adapt the fused `proj.qkv`
+  (ComfyUI, diffusers `transformer.` and kohya `lora_unet_` names): each of q, k and v gets the
+  LoRA's A and its third of B, which is exact. Fused LoKr/LoHa/DoRA cannot be split and are
+  refused, as is an adapter with a key that matches no weight (the error names the file's keys).
 - `--test_sample` uses the reference pipeline's sampler: 50 Euler steps over its snapped
   shift-5 sigmas, CFG 3 whose negative branch skips block 22, and optional skip-layer guidance.
   Each setting is a `sample_*` key in `[model]` (see the LoRA example).

@@ -45,6 +45,7 @@ from models.base import ComfyPipeline, ModelWrapper, PreprocessMediaFile, make_c
 from utils.common import is_main_process
 from utils.offloading import ModelOffloader
 import comfy.latent_formats
+import comfy.lora
 import comfy.model_base
 import comfy.model_management
 import comfy.model_patcher
@@ -253,13 +254,15 @@ def split_fused_qkv(state):
             if suffix == '.comfy_quant' or value.ndim == 0 or value.shape[0] != rows:
                 parts = (value,) * 3  # format description, per-tensor scale
             else:
-                parts = tuple(part.clone() for part in value.chunk(3, 0))
+                parts = value.chunk(3, 0)  # views: load_state_dict copies them into the model
             for name, part in zip('qkv', parts):
                 state[f'{block}.{name}{suffix}'] = part
     return state
 
 
-_FUSED_QKV_ADAPTER = re.compile(r'(.*layers\.\d+\.proj\.)qkv\.(.+)')
+# The block's fused qkv under PEFT/ComfyUI names (diffusion_model.layers.0.proj.qkv.lora_A.weight)
+# and kohya ones (lora_unet_layers_0_proj_qkv.lora_down.weight).
+_FUSED_QKV_ADAPTER = re.compile(r'(.*layers[._]\d+[._]proj[._])qkv\.(.+)')
 
 
 def split_fused_qkv_adapter(sd, source):
@@ -267,66 +270,77 @@ def split_fused_qkv_adapter(sd, source):
 
     The rows of the fused update B @ A are q, k and v, so each gets A, its third of B and the
     same alpha: exact. A full-weight diff is cut the same way. Other adapter kinds (LoKr, LoHa,
-    DoRA) do not split by rows and are refused.
+    DoRA) do not split by rows and are refused. A diffusers-style 'transformer.' prefix becomes
+    ComfyUI's 'diffusion_model.'.
+
+    Returns the adapter and, for each of its keys, the key of the file it came from.
     """
-    out = {}
+    out, origin = {}, {}
     for key, value in sd.items():
-        match = _FUSED_QKV_ADAPTER.fullmatch(key)
+        name = 'diffusion_model.' + key[len('transformer.'):] if key.startswith('transformer.') else key
+        match = _FUSED_QKV_ADAPTER.fullmatch(name)
         if match is None:
-            if key in out:
-                raise ValueError(f'{source}: {key} is given both for proj.qkv and for itself')
-            out[key] = value
-            continue
-        head, rest = match.groups()
-        if rest in ('lora_A.weight', 'lora_down.weight', 'alpha'):
-            parts = (value,) * 3
-        elif rest in ('lora_B.weight', 'lora_up.weight', 'diff', 'diff_b'):
-            if value.shape[0] % 3:
-                raise ValueError(f'{source}: {key} has {value.shape[0]} rows, not three equal parts')
-            parts = tuple(part.clone() for part in value.chunk(3, 0))
+            pieces = [(name, value)]
         else:
-            raise ValueError(
-                f'{source}: {key} adapts the fused proj.qkv in a form that cannot be split into q, k '
-                'and v (only LoRA and full-weight diffs can)')
-        for name, part in zip('qkv', parts):
-            new = f'{head}{name}.{rest}'
-            if new in out or new in sd:
-                raise ValueError(f'{source}: {new} is given both for proj.qkv and for itself')
-            out[new] = part
-    return out
+            head, rest = match.groups()
+            if rest in ('lora_A.weight', 'lora_down.weight', 'alpha'):
+                parts = (value,) * 3
+            elif rest in ('lora_B.weight', 'lora_up.weight', 'diff', 'diff_b'):
+                if value.shape[0] % 3:
+                    raise ValueError(f'{source}: {key} has {value.shape[0]} rows, not three equal parts')
+                parts = value.chunk(3, 0)
+            else:
+                raise ValueError(
+                    f'{source}: {key} adapts the fused proj.qkv in a form that cannot be split into q, k '
+                    'and v (only LoRA and full-weight diffs can)')
+            pieces = [(f'{head}{p}.{rest}', part) for p, part in zip('qkv', parts)]
+        for new, part in pieces:
+            if new in out:
+                raise ValueError(f'{source}: {key} and {origin[new]} both adapt {new}')
+            out[new], origin[new] = part, key
+    return out, origin
 
 
-class _UnloadedAdapterKeys(logging.Handler):
-    # comfy.lora.load_lora only logs the adapter keys it could not place.
+class _RecordingLogging:
+    """The logging module as comfy.lora and comfy.sd see it while an adapter merges.
+
+    They only log the adapter keys they could not place; recording the calls themselves does not
+    depend on logger levels, filters or logging.disable.
+    """
+
+    MARKERS = ('lora key not loaded: ', 'NOT LOADED ')
+
     def __init__(self):
-        super().__init__(logging.WARNING)
         self.keys = []
 
-    def emit(self, record):
-        message = record.getMessage()
-        for marker in ('lora key not loaded: ', 'NOT LOADED '):
-            if message.startswith(marker):
-                self.keys.append(message[len(marker):])
+    def __getattr__(self, name):
+        return getattr(logging, name)
+
+    def warning(self, msg, *args, **kwargs):
+        text = str(msg) % args if args else str(msg)
+        for marker in self.MARKERS:
+            if text.startswith(marker):
+                self.keys.append(text[len(marker):])
+        logging.warning(msg, *args, **kwargs)
 
 
 def merge_adapter(patcher, adapter_path):
     """patcher with the adapter file at adapter_path added at strength 1; every key must apply."""
     sd = comfy.utils.load_torch_file(str(adapter_path), safe_load=True)
-    sd = split_fused_qkv_adapter(sd, adapter_path)
-    root = logging.getLogger()
-    catcher = _UnloadedAdapterKeys()
-    level = root.level
-    root.addHandler(catcher)
-    if not root.isEnabledFor(logging.WARNING):
-        root.setLevel(logging.WARNING)
+    sd, origin = split_fused_qkv_adapter(sd, adapter_path)
+    recorder = _RecordingLogging()
+    modules = (comfy.lora, comfy.sd)
+    saved = [module.logging for module in modules]
+    for module in modules:
+        module.logging = recorder
     try:
         patcher, _ = comfy.sd.load_lora_for_models(patcher, None, sd, 1.0, 0.0)
     finally:
-        root.removeHandler(catcher)
-        root.setLevel(level)
-    if catcher.keys:
-        raise ValueError(f'{adapter_path}: {len(catcher.keys)} adapter keys match no MOSS-Image weight, '
-                         f'e.g. {catcher.keys[:3]}')
+        for module, value in zip(modules, saved):
+            module.logging = value
+    if recorder.keys:
+        keys = sorted({origin.get(key, key) for key in recorder.keys})
+        raise ValueError(f'{adapter_path}: {len(keys)} adapter keys match no MOSS-Image weight, e.g. {keys[:3]}')
     return patcher
 
 

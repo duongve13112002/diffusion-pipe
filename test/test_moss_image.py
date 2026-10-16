@@ -764,36 +764,142 @@ def test_fused_qkv_in_a_block_scaled_format_is_refused(tmp_path):
         mi.transformer_state(state, {})
 
 
-def fused_lora(reference, names, rank=4, alpha=2.0, seed=3):
-    """An ai-toolkit style LoRA on every block's fused proj.qkv, and the split weights it should give."""
+FUSED_LORA_KEYS = {
+    'comfy': lambda module: 'diffusion_model.' + module,
+    'diffusers': lambda module: 'transformer.' + module,
+    'kohya': lambda module: 'lora_unet_' + module.replace('.', '_'),
+}
+
+
+def fused_lora(reference, names=('lora_A.weight', 'lora_B.weight'), alpha=None, style='comfy', rank=4, seed=3):
+    """A LoRA on every block's fused proj.qkv, and the split weights it should give.
+
+    The defaults are what ai-toolkit saves for MOSS-Image: PEFT names, the comfy prefix, no alpha.
+    """
     torch.manual_seed(seed)
-    dim = TINY['dim']
+    dim, name_of = TINY['dim'], FUSED_LORA_KEYS[style]
+    scale = 1.0 if alpha is None else alpha / rank
     adapter, expected = {}, tiny_state(reference)
     for i in range(TINY['num_layers']):
         a, b = 0.1 * torch.randn(rank, dim), 0.1 * torch.randn(3 * dim, rank)
-        key = f'diffusion_model.layers.{i}.proj.qkv'
-        adapter.update({f'{key}.{names[0]}': a, f'{key}.{names[1]}': b, f'{key}.alpha': torch.tensor(alpha)})
-        for name, part in zip('qkv', ((alpha / rank) * (b @ a)).chunk(3)):
+        key = name_of(f'layers.{i}.proj.qkv')
+        adapter.update({f'{key}.{names[0]}': a, f'{key}.{names[1]}': b})
+        if alpha is not None:
+            adapter[f'{key}.alpha'] = torch.tensor(alpha)
+        for name, part in zip('qkv', (scale * (b @ a)).chunk(3)):
             expected[f'layers.{i}.proj.{name}.weight'] = expected[f'layers.{i}.proj.{name}.weight'] + part
     # A module both layouts share is adapted as it is.
     a, b = 0.1 * torch.randn(rank, dim), 0.1 * torch.randn(3 * dim, rank)
-    adapter.update({f'diffusion_model.text_embedder.blocks.0.qkv.{names[0]}': a,
-                    f'diffusion_model.text_embedder.blocks.0.qkv.{names[1]}': b})
+    key = name_of('text_embedder.blocks.0.qkv')
+    adapter.update({f'{key}.{names[0]}': a, f'{key}.{names[1]}': b})
     expected['text_embedder.blocks.0.qkv.weight'] = expected['text_embedder.blocks.0.qkv.weight'] + b @ a
     return adapter, expected
 
 
-@pytest.mark.parametrize('names', [('lora_A.weight', 'lora_B.weight'), ('lora_down.weight', 'lora_up.weight')])
-def test_merge_adapters_splits_fused_qkv_loras(names, tmp_path):
-    # ai-toolkit trains MOSS-Image LoRAs on the fused proj.qkv.
-    reference = tiny_reference()
-    adapter, expected = fused_lora(reference, names)
-    safetensors.torch.save_file(adapter, tmp_path / 'aitk_lora.safetensors')
-    transformer = write_transformer_dir(tiny_state(reference), tmp_path / 'transformer')
-    merged = pipeline_from_transformer(transformer, {'merge_adapters': [str(tmp_path / 'aitk_lora.safetensors')]})
-    got = merged.diffusion_model.state_dict()
+def merged_pipeline(reference, adapter, tmp_path, transformer=None, train=None):
+    safetensors.torch.save_file(adapter, tmp_path / 'adapter.safetensors')
+    if transformer is None:
+        transformer = write_transformer_dir(tiny_state(reference), tmp_path / 'transformer')
+    return pipeline_from_transformer(transformer, {'merge_adapters': [str(tmp_path / 'adapter.safetensors')]},
+                                     adapter=train)
+
+
+def assert_adapted(pipe, expected):
+    got = pipe.diffusion_model.state_dict()
     for key in [k for k in expected if '.proj.' in k or k.startswith('text_embedder.blocks.0.qkv')]:
         torch.testing.assert_close(got[key].float(), expected[key].float(), rtol=1e-5, atol=1e-6, msg=key)
+
+
+@pytest.mark.parametrize('names,alpha,style', [
+    (('lora_A.weight', 'lora_B.weight'), None, 'comfy'),  # what ai-toolkit saves
+    (('lora_A.weight', 'lora_B.weight'), 2.0, 'comfy'),
+    (('lora_down.weight', 'lora_up.weight'), 2.0, 'comfy'),
+    (('lora_A.weight', 'lora_B.weight'), None, 'diffusers'),
+    (('lora_down.weight', 'lora_up.weight'), 8.0, 'kohya'),
+])
+def test_merge_adapters_splits_fused_qkv_loras(names, alpha, style, tmp_path):
+    # ai-toolkit trains MOSS-Image LoRAs on the fused proj.qkv.
+    reference = tiny_reference()
+    adapter, expected = fused_lora(reference, names, alpha, style)
+    assert_adapted(merged_pipeline(reference, adapter, tmp_path), expected)
+
+
+def test_merge_adapters_splits_a_fused_qkv_diff(tmp_path):
+    reference = tiny_reference()
+    torch.manual_seed(4)
+    diff = 0.01 * torch.randn(3 * TINY['dim'], TINY['dim'])
+    expected = tiny_state(reference)
+    for name, part in zip('qkv', diff.chunk(3)):
+        expected[f'layers.1.proj.{name}.weight'] = expected[f'layers.1.proj.{name}.weight'] + part
+    pipe = merged_pipeline(reference, {'diffusion_model.layers.1.proj.qkv.diff': diff}, tmp_path)
+    assert_adapted(pipe, {k: v for k, v in expected.items() if k.startswith('layers.1.')})
+
+
+def test_merge_adapters_onto_a_fused_fp8_base_matches_a_split_one(tmp_path):
+    pytest.importorskip('comfy_kitchen')
+    reference = tiny_reference()
+    split, fused = tiny_state(reference), fused_qkv(tiny_state(reference))
+    split_layers, fused_layers = {}, {}
+    for i in range(TINY['num_layers']):
+        base = f'layers.{i}.proj'
+        scale = fused[base + '.qkv.weight'].abs().max() / 448.0
+        fused[base + '.qkv.weight'] = (fused[base + '.qkv.weight'] / scale).to(torch.float8_e4m3fn)
+        fused[base + '.qkv.weight_scale'] = scale.float()
+        fused_layers[base + '.qkv'] = {'format': 'float8_e4m3fn'}
+        for name, w in zip('qkv', fused[base + '.qkv.weight'].chunk(3)):
+            split[f'{base}.{name}.weight'], split[f'{base}.{name}.weight_scale'] = w.clone(), scale.float().clone()
+            split_layers[f'{base}.{name}'] = {'format': 'float8_e4m3fn'}
+    adapter, _ = fused_lora(reference)
+    outputs = []
+    for name, state, layers in (('split', split, split_layers), ('fused', fused, fused_layers)):
+        (tmp_path / name).mkdir()
+        path = tmp_path / name / 'moss.safetensors'
+        safetensors.torch.save_file(state, path, metadata=quant_metadata(layers))
+        pipe = merged_pipeline(reference, adapter, tmp_path / name, transformer=path, train=LORA)
+        with torch.no_grad():
+            outputs.append(pipe.pipeline_model(forward_inputs()))
+    torch.testing.assert_close(outputs[1], outputs[0], rtol=0, atol=0)
+
+
+def test_a_checkpoint_with_both_fused_and_split_qkv_is_refused():
+    state = fused_qkv(tiny_state(tiny_reference()))
+    state['layers.2.proj.k.weight'] = torch.zeros(TINY['dim'], TINY['dim'])
+    with pytest.raises(ValueError, match=r'both layers\.2\.proj\.qkv\.weight and layers\.2\.proj\.k\.weight'):
+        mi.transformer_state(state, {})
+
+
+@pytest.mark.parametrize('order', ['fused first', 'split first'])
+def test_an_adapter_with_both_fused_and_split_qkv_is_refused(order, tmp_path):
+    fused = {'diffusion_model.layers.0.proj.qkv.lora_A.weight': torch.zeros(4, 64),
+             'diffusion_model.layers.0.proj.qkv.lora_B.weight': torch.zeros(192, 4)}
+    split = {'diffusion_model.layers.0.proj.v.lora_A.weight': torch.zeros(4, 64)}
+    adapter = {**fused, **split} if order == 'fused first' else {**split, **fused}
+    with pytest.raises(ValueError, match='both adapt diffusion_model.layers.0.proj.v.lora_A.weight'):
+        mi.split_fused_qkv_adapter(adapter, 'adapter.safetensors')
+
+
+def test_unmatched_adapter_keys_are_refused_whatever_logging_does(tmp_path):
+    import logging
+
+    class DropAll(logging.Filter):
+        def filter(self, record):
+            return False
+
+    adapter = {'transformer.layers.0.proj.nothing.lora_A.weight': torch.zeros(4, 64),
+               'transformer.layers.0.proj.nothing.lora_B.weight': torch.zeros(64, 4)}
+    root, drop = logging.getLogger(), DropAll()
+    level = root.level
+    root.setLevel(logging.CRITICAL)
+    root.addFilter(drop)
+    logging.disable(logging.CRITICAL)
+    try:
+        # The file's own key names, not the renamed ones.
+        with pytest.raises(ValueError, match=r"transformer\.layers\.0\.proj\.nothing\.lora_A\.weight"):
+            merged_pipeline(tiny_reference(), adapter, tmp_path)
+    finally:
+        logging.disable(logging.NOTSET)
+        root.removeFilter(drop)
+        root.setLevel(level)
 
 
 @pytest.mark.parametrize('adapter,message', [
