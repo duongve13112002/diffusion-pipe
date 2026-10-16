@@ -828,7 +828,8 @@ and anything else is a plain caption with every caption option as usual. For lay
   another `json.dumps` style; anything else comes out compact), and a caption that needs no
   change is used exactly as written.
 - with `cache_shuffle_num`, the variants of a layout caption are all the same text; it is encoded
-  once and every variant gets that embedding.
+  once and every variant gets that embedding (whatever `caching_batch_size` is: the most recent
+  256 MB of embeddings are remembered while caching).
 
 A one-line notice per directory reports how many images have layout captions. Ideogram4 uses
 the same mechanism for its JSON prompts (ComfyUI's Build JSON Prompt (Ideogram) schema: boxes are

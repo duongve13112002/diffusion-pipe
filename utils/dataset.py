@@ -1,7 +1,7 @@
 from pathlib import Path
 import os.path
 import random
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
 import math
 import os
 import hashlib
@@ -354,7 +354,9 @@ def _save_dataset_atomically(dataset, path, replace=False):
     (or a network volume that drops a write) never leaves a directory that looks complete.
     Without replace, a copy another process published first is kept."""
     path = Path(path)
-    tag = f'{socket.gethostname()}-{os.getpid()}'  # ranks of several nodes share a volume
+    host = socket.gethostname()  # ranks of several nodes share a volume
+    _remove_dead_temporaries(path, host)
+    tag = f'{host}-{os.getpid()}'
     temporary = path.with_name(f'.{path.name}.partial-{tag}')
     if temporary.exists():
         shutil.rmtree(temporary)
@@ -378,18 +380,50 @@ def _save_dataset_atomically(dataset, path, replace=False):
         shutil.rmtree(temporary)  # another process published the same contents first
     fsync_dir(path.parent)
     if previous is not None:
-        shutil.rmtree(previous)
+        # On NFS a file still open somewhere cannot be removed (it is renamed to .nfsXXXX and
+        # the directory stays non-empty). What is left is removed by a later save.
+        shutil.rmtree(previous, ignore_errors=True)
+
+
+def _pid_alive(pid):
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _remove_dead_temporaries(path, host):
+    """Remove what an interrupted _save_dataset_atomically of path on this host left behind:
+    its partial copy, or the previous copy it had moved aside. Only for processes that are
+    gone; another host's are left alone (their pids mean nothing here)."""
+    for leftover in path.parent.glob(f'.{path.name}.*-{host}-*'):
+        kind, _, pid = leftover.name[len(path.name) + 2:].rpartition('-')
+        if kind not in (f'partial-{host}', f'previous-{host}') or not pid.isdigit():
+            continue
+        if int(pid) != os.getpid() and not _pid_alive(int(pid)):
+            shutil.rmtree(leftover, ignore_errors=True)
+
+
+# Flattened-caption paths this process already rebuilt for --regenerate_cache: each text
+# encoder asks for the same one, and the earlier encoder's dataset still has it open.
+_regenerated_paths = set()
 
 
 def _flattened_captions(metadata_dataset, flatten_captions, path, regenerate=False):
     """The flattened (and rewritten) captions, kept at path. Rewriting reads every layout
     caption's image header, so it is done once, not on every rank at every launch; regenerate
     (--regenerate_cache) does it again, for images replaced under the same name."""
+    regenerate = regenerate and str(path) not in _regenerated_paths
     if path.exists() and not regenerate:
         return datasets.load_from_disk(str(path))
     flattened = metadata_dataset.map(flatten_captions, batched=True, keep_in_memory=True,
                                      remove_columns=metadata_dataset.column_names)
     _save_dataset_atomically(flattened, path, replace=regenerate)
+    if regenerate:
+        _regenerated_paths.add(str(path))
     return datasets.load_from_disk(str(path))
 
 
@@ -2561,6 +2595,7 @@ class DatasetManager:
         self.caching_batch_size = caching_batch_size
         self.keep_models_loaded = keep_models_loaded
         self.datasets = []
+        self.recent_text_encodings = _RecentTextEncodings()
 
     def register(self, dataset):
         self.datasets.append(dataset)
@@ -2660,7 +2695,7 @@ class DatasetManager:
             idx = id - 1
             if self.te_fn_requires_control_file[idx]:
                 args.append(control_file)
-            results = _encode_distinct_rows(self.call_text_encoder_fns[idx], args)
+            results = self.recent_text_encodings.encode(idx, self.call_text_encoder_fns[idx], args)
         else:
             raise RuntimeError()
         # Need to move to CPU here. If we don't, we get this error:
@@ -2675,32 +2710,80 @@ class DatasetManager:
         pipe.send(cpu_results)
 
 
-def _encode_distinct_rows(encode, columns):
-    """encode(*columns), with each distinct row encoded once and its result copied to the rows
-    that repeat it: the cache_shuffle_num variants of a layout caption are one text, and so are
-    repeated empty captions. A text encoder's result has one entry per row along its first
-    dimension (the cache stores result[key][i] for row i); one that does not is encoded whole."""
-    keys = [repr(row) for row in zip(*columns)]
-    position = {}
-    for key in keys:
-        position.setdefault(key, len(position))
-    if len(position) == len(keys):
-        return encode(*columns)
-    first = {}
-    for row, key in enumerate(keys):
-        first.setdefault(key, row)
-    distinct = list(first.values())
-    results = encode(*[[column[row] for row in distinct] for column in columns])
-    inverse = [position[key] for key in keys]
-    expanded = {}
-    for name, value in results.items():
-        if torch.is_tensor(value) and value.dim() > 0 and value.size(0) == len(distinct):
-            expanded[name] = value[torch.tensor(inverse, device=value.device)]
-        elif isinstance(value, (list, tuple)) and len(value) == len(distinct):
-            expanded[name] = [value[i] for i in inverse]
-        else:
-            return encode(*columns)
-    return expanded
+class _RecentTextEncodings:
+    """Text-encoder results of recently encoded rows, so a row that repeats one is not encoded
+    again: the cache_shuffle_num variants of a layout caption are one text, and repeated empty
+    captions are too. Those repeats sit in adjacent rows, which caching_batch_size and the
+    worker processes split across batches, but every batch is encoded here, in the one
+    process that serves the GPU queue. Bounded in bytes; the oldest rows go first.
+
+    A text encoder's result has one entry per row along its first dimension (the cache stores
+    result[key][i] for row i). A result that does not is used as it is, and nothing is reused.
+    A column that is None (control_file for a dataset without control images) is passed on
+    as None.
+    """
+
+    def __init__(self, limit_bytes=256 << 20):
+        self.limit_bytes = limit_bytes
+        self.rows = OrderedDict()
+        self.size = 0
+
+    @staticmethod
+    def _per_row(results, count):
+        rows = [{} for _ in range(count)]
+        for name, value in results.items():
+            if torch.is_tensor(value) and value.dim() > 0 and value.size(0) == count:
+                parts = [value[i].to('cpu').clone() for i in range(count)]
+            elif isinstance(value, (list, tuple)) and len(value) == count:
+                parts = [v.to('cpu').clone() if torch.is_tensor(v) else v for v in value]
+            else:
+                return None
+            for row, part in zip(rows, parts):
+                row[name] = part
+        return rows
+
+    @staticmethod
+    def _row_bytes(row):
+        return sum(v.numel() * v.element_size() for v in row.values() if torch.is_tensor(v))
+
+    def _remember(self, key, row):
+        size = self._row_bytes(row)
+        if size > self.limit_bytes:
+            return
+        self.rows[key] = (row, size)
+        self.size += size
+        while self.size > self.limit_bytes:
+            self.size -= self.rows.popitem(last=False)[1][1]
+
+    def encode(self, encoder, encode, columns):
+        count = len(columns[0])
+        keys = [repr((encoder, row)) for row in zip(*(c for c in columns if c is not None))]
+        found, missing = {}, []
+        for i, key in enumerate(keys):
+            if key in found:
+                continue
+            if key in self.rows:
+                self.rows.move_to_end(key)
+                found[key] = self.rows[key][0]
+            else:
+                found[key] = None
+                missing.append(i)
+        if len(missing) == count:
+            results = encode(*columns)
+            rows = self._per_row(results, count)
+            for key, row in zip(keys, rows or []):
+                self._remember(key, row)
+            return results
+        if missing:
+            results = encode(*[None if c is None else [c[i] for i in missing] for c in columns])
+            rows = self._per_row(results, len(missing))
+            if rows is None:
+                return encode(*columns)
+            for i, row in zip(missing, rows):
+                found[keys[i]] = row
+                self._remember(keys[i], row)
+        names = found[keys[0]].keys()
+        return {name: [found[key][name] for key in keys] for name in names}
 
 
 def split_batch(batch, pieces):

@@ -159,13 +159,14 @@ def _box(value, location):
     return value
 
 
-def _fit_span(lo, hi, new_lo, new_hi, limit_lo, limit_hi):
-    """The span [new_lo, new_hi] (the rewritten [lo, hi]) clipped to [limit_lo, limit_hi], or
-    None when the crop leaves nothing of it. A zero-size span stays when it is inside."""
-    if hi == lo:
-        return (new_lo, new_hi) if limit_lo <= new_lo <= limit_hi else None
+def _fit_span(lo, hi, mapped, new_lo, new_hi, limit_lo, limit_hi):
+    """The span [new_lo, new_hi] (the rewritten [lo, hi], rounded) clipped to [limit_lo,
+    limit_hi], or None when the crop leaves nothing of it. A zero-size span stays when its
+    position before rounding (mapped) is inside."""
+    if hi == lo and not limit_lo <= mapped <= limit_hi:
+        return None
     new_lo, new_hi = max(new_lo, limit_lo), min(new_hi, limit_hi)
-    return (new_lo, new_hi) if new_lo < new_hi else None
+    return (new_lo, new_hi) if new_lo < new_hi or hi == lo else None
 
 
 class _Geometry:
@@ -219,10 +220,12 @@ def _moss_boxes(obj, geometry, source):
                 and -src_cx - 1 <= x1 and x2 <= g.src_width - src_cx + 1):
             raise ValueError(f'{location} {list(item["bbox"])} lies outside the {g.src_width}x{g.src_height} image')
         # As the compiler does: top/left edges floored, bottom/right ones ceiled, in pixels.
-        rows = _fit_span(y1, y2, math.floor(round(g.y(y1 + src_cy), 6)) - dst_cy,
+        rows = _fit_span(y1, y2, g.y(y1 + src_cy) - dst_cy,
+                         math.floor(round(g.y(y1 + src_cy), 6)) - dst_cy,
                          math.ceil(round(g.y(y2 + src_cy), 6)) - dst_cy,
                          -dst_cy, g.dst_height - dst_cy)
-        cols = _fit_span(x1, x2, math.floor(round(g.x(x1 + src_cx), 6)) - dst_cx,
+        cols = _fit_span(x1, x2, g.x(x1 + src_cx) - dst_cx,
+                         math.floor(round(g.x(x1 + src_cx), 6)) - dst_cx,
                          math.ceil(round(g.x(x2 + src_cx), 6)) - dst_cx,
                          -dst_cx, g.dst_width - dst_cx)
         if rows is None or cols is None:
@@ -262,13 +265,13 @@ def _ideogram_boxes(obj, geometry, source):
             raise ValueError(f'{location} {list(element["bbox"])} lies outside 0..1000')
 
         def grid_y(v):
-            return round(g.y(v / 1000 * g.src_height) / g.dst_height * 1000)
+            return g.y(v / 1000 * g.src_height) / g.dst_height * 1000
 
         def grid_x(v):
-            return round(g.x(v / 1000 * g.src_width) / g.dst_width * 1000)
+            return g.x(v / 1000 * g.src_width) / g.dst_width * 1000
 
-        rows = _fit_span(ymin, ymax, grid_y(ymin), grid_y(ymax), 0, 1000)
-        cols = _fit_span(xmin, xmax, grid_x(xmin), grid_x(xmax), 0, 1000)
+        rows = _fit_span(ymin, ymax, grid_y(ymin), round(grid_y(ymin)), round(grid_y(ymax)), 0, 1000)
+        cols = _fit_span(xmin, xmax, grid_x(xmin), round(grid_x(xmin)), round(grid_x(xmax)), 0, 1000)
         if rows is None or cols is None:
             changed = True  # wholly cropped out
             continue

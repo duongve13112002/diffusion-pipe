@@ -10,6 +10,7 @@ import importlib.util
 import io
 import json
 import math
+import os
 import random
 import sys
 import tarfile
@@ -312,10 +313,16 @@ class TestMossBoxes:
         caption = moss_caption([{'label': 'line', 'bbox': [0, -40, 0, 40]}])
         out = json.loads(rewrite_layout_caption(caption, 'moss_image', (120, 80), (64, 64)))
         assert out['items'][0]['bbox'] == [0, -32, 0, 32]
-        # One that the crop removes is dropped like any other.
-        caption = moss_caption([{'label': 'line', 'bbox': [-10, -55, 10, -55]}])
+        # One that the crop removes is dropped like any other, on either side: the crop keeps
+        # x 20..100 of 120 (centred -40..40), so x = 41 is outside, as is x = -41.
+        for x in (-55, -41, 41, 55):
+            caption = moss_caption([{'label': 'line', 'bbox': [-10, x, 10, x]}])
+            out = json.loads(rewrite_layout_caption(caption, 'moss_image', (120, 80), (64, 64)))
+            assert out['items'] == [], x
+        # On the crop's edge it stays, inside the bucket.
+        caption = moss_caption([{'label': 'line', 'bbox': [-10, 40, 10, 40]}])
         out = json.loads(rewrite_layout_caption(caption, 'moss_image', (120, 80), (64, 64)))
-        assert out['items'] == []
+        assert out['items'][0]['bbox'] == [-8, 32, 8, 32]
 
     @pytest.mark.parametrize('space,layout', [('abs', 'yxyx'), ('abs_centralized', 'xyxy'), (None, None)])
     def test_other_coordinate_spaces_are_refused(self, space, layout):
@@ -702,15 +709,75 @@ class TestDataset:
         assert self.encoded(leaf, 'a') == self.expected(caption, (64, 64, 1), src=(120, 80))
         # The replacement, as the header reads it (the pixels and the metadata stay the same).
         monkeypatch.setattr(layout_module, 'media_size', lambda spec: (120, 100))
+        monkeypatch.setattr(dataset_module, '_regenerated_paths', set())  # a new launch
         (leaf,) = self.cache(self.make(tmp_path, {'a': caption}, size_buckets=[[64, 64, 1]],
                                        reuse_metadata_cache=reuse))
         assert self.encoded(leaf, 'a') == self.expected(caption, (64, 64, 1), src=(120, 100))
         assert self.expected(caption, (64, 64, 1), src=(120, 100)) != self.expected(caption, (64, 64, 1))
         assert not list((tmp_path / 'imgs' / 'cache').rglob('.flattened*'))  # no temporaries left
 
-    def test_identical_variants_are_encoded_once(self):
-        """cache_shuffle_num makes N copies of a layout caption (it is never shuffled); the
-        text encoder sees it once per batch and every copy gets that embedding."""
+    def test_regenerating_for_several_text_encoders_rewrites_once(self, tmp_path, monkeypatch):
+        """Each text encoder caches from the same flattened captions; --regenerate_cache
+        rebuilds them for the first only (the first one's dataset still has them open)."""
+        import utils.layout_captions as layout_module
+        caption = moss_caption([{'bbox': [-20, 10, 20, 40]}])
+        ds = self.make(tmp_path, {'a': caption}, size_buckets=[[64, 64, 1]])
+        ds.cache_metadata(regenerate_cache=True)
+        for bucket in ds.size_bucket_datasets:
+            bucket.cache_latents(_stub_latents, regenerate_cache=True)
+        monkeypatch.setattr(dataset_module, '_regenerated_paths', set())
+        calls = []
+        real = layout_module.media_size
+        monkeypatch.setattr(layout_module, 'media_size', lambda spec: calls.append(spec) or real(spec))
+        ds.cache_text_embeddings(_stub_text_encoder, 1, regenerate_cache=True)
+        ds.cache_text_embeddings(_stub_text_encoder, 2, regenerate_cache=True)
+        assert len(calls) == 1
+        (leaf,) = leaves(ds)
+        assert [decode(t.get_text_embeddings(tuple(leaf.metadata_dataset['image_spec'][0]), 0)['embedding'])
+                for t in leaf.text_embedding_datasets] == [self.expected(caption, (64, 64, 1))] * 2
+
+    def test_leftovers_of_dead_processes_are_removed(self, tmp_path):
+        import datasets as hf_datasets
+        import socket
+        host = socket.gethostname()
+        path = tmp_path / 'flattened_captions_x'
+        dead = 2 ** 22 + 12345  # above any pid_max default
+        stale = [tmp_path / f'.{path.name}.partial-{host}-{dead}', tmp_path / f'.{path.name}.previous-{host}-{dead}']
+        kept = [tmp_path / f'.{path.name}.partial-otherhost-{dead}',
+                tmp_path / f'.{path.name}.partial-{host}-{os.getpid()}x', tmp_path / '.unrelated']
+        live = tmp_path / f'.{path.name}.partial-{host}-1'  # pid 1 is alive
+        for d in stale + kept + [live]:
+            d.mkdir()
+        dataset_module._save_dataset_atomically(hf_datasets.Dataset.from_dict({'a': [1]}), path)
+        assert not any(d.exists() for d in stale)
+        assert all(d.exists() for d in kept + [live])
+        assert hf_datasets.load_from_disk(str(path))['a'] == [1]
+
+    @staticmethod
+    def manager(encoder, requires_control_file=False):
+        manager = dataset_module.DatasetManager.__new__(dataset_module.DatasetManager)
+        # Not an nn.Module: a ComfyUI model wrapper that loads itself when first needed.
+        manager.submodels = [None, type('Lazy', (), {'load_model_if_needed': lambda self: None})()]
+        manager.call_text_encoder_fns = [encoder]
+        manager.te_fn_requires_control_file = [requires_control_file]
+        manager.recent_text_encodings = dataset_module._RecentTextEncodings()
+        return manager
+
+    @staticmethod
+    def send(manager, captions, control_file=None):
+        sent = []
+
+        class Pipe:
+            def send(self, value):
+                sent.append(value)
+
+        manager._handle_task((1, captions, [False] * len(captions), control_file, Pipe()))
+        return sent[0]
+
+    def test_identical_variants_are_encoded_once_across_batches(self):
+        """cache_shuffle_num makes N copies of a layout caption (it is never shuffled). They
+        are adjacent rows, which caching_batch_size (1 by default) and the worker processes
+        split into separate batches; each is still encoded once."""
         caption = moss_caption([{'bbox': [-20, 10, 20, 40]}])
         encoded = []
 
@@ -718,23 +785,38 @@ class TestDataset:
             encoded.extend(captions)
             return _stub_text_encoder({'caption': captions}, 0)
 
-        manager = dataset_module.DatasetManager.__new__(dataset_module.DatasetManager)
-        manager.call_text_encoder_fns = [counting_encoder]
-        manager.te_fn_requires_control_file = [False]
-        sent = []
-
-        class Pipe:
-            def send(self, value):
-                sent.append(value)
-
-        captions = [caption] * 3 + ['a, b', 'b, a', 'a, b']
-        # Not an nn.Module: a ComfyUI model wrapper that loads itself when first needed.
-        manager.submodels = [None, type('Lazy', (), {'load_model_if_needed': lambda self: None})()]
-        manager._handle_task((1, captions, [False] * 6, None, Pipe()))
+        manager = self.manager(counting_encoder)
+        # caching_batch_size = 1: one task per row.
+        rows = [caption] * 3 + ['a, b', 'b, a', 'a, b']
+        outputs = [self.send(manager, [row]) for row in rows]
         assert encoded == [caption, 'a, b', 'b, a']
-        assert [decode(e) for e in sent[0]['embedding']] == captions
+        assert [decode(o['embedding'][0]) for o in outputs] == rows
+        # And within one batch.
+        encoded.clear()
+        out = self.send(manager, [caption + ' ', caption + ' ', 'a, b'])
+        assert encoded == [caption + ' ']
+        assert [decode(e) for e in out['embedding']] == [caption + ' ', caption + ' ', 'a, b']
 
-    def test_distinct_rows_handle_batched_tensors_and_odd_results(self):
+    def test_a_dataset_without_control_files_still_encodes(self):
+        """A text encoder that takes control_file (Qwen-Image) gets None for a dataset without
+        control images; repeats are still found by the other columns."""
+        seen = []
+
+        def qwen_like(captions, is_video, control_file):
+            seen.append((list(captions), control_file))
+            return _stub_text_encoder({'caption': captions}, 0)
+
+        manager = self.manager(qwen_like, requires_control_file=True)
+        out = self.send(manager, ['x', 'x', 'y'])
+        assert seen == [(['x', 'y'], None)]
+        assert [decode(e) for e in out['embedding']] == ['x', 'x', 'y']
+        seen.clear()
+        out = self.send(manager, ['x', 'z'], control_file=['c1.png', 'c2.png'])
+        assert seen == [(['x', 'z'], ['c1.png', 'c2.png'])]  # another control image: another row
+        out = self.send(manager, ['x'], control_file=['c1.png'])
+        assert len(seen) == 1 and decode(out['embedding'][0]) == 'x'
+
+    def test_recent_encodings_handle_batched_tensors_bounds_and_odd_results(self):
         import torch
         calls = []
 
@@ -743,21 +825,40 @@ class TestDataset:
             return {'embeds': torch.stack([torch.full((2,), float(len(c))) for c in captions]),
                     'mask': [torch.ones(1)] * len(captions)}
 
-        out = dataset_module._encode_distinct_rows(batched, [['aa', 'b', 'aa'], [False, False, False]])
+        recent = dataset_module._RecentTextEncodings()
+        out = recent.encode(0, batched, [['aa', 'b', 'aa'], [False, False, False]])
         assert calls == [['aa', 'b']]
-        assert out['embeds'][:, 0].tolist() == [2.0, 1.0, 2.0] and len(out['mask']) == 3
-        # Rows that differ in another column are different rows.
+        assert [e[0].item() for e in out['embeds']] == [2.0, 1.0, 2.0] and len(out['mask']) == 3
+        # Rows that differ in another column, or in the encoder, are different rows.
         calls.clear()
-        dataset_module._encode_distinct_rows(batched, [['aa', 'aa'], [False, True]])
-        assert calls == [['aa', 'aa']]
+        recent.encode(0, batched, [['aa', 'aa'], [True, True]])
+        recent.encode(1, batched, [['aa'], [False]])
+        assert calls == [['aa'], ['aa']]
+        # A batch with nothing new is not encoded; one with no repeats is returned as encoded.
+        calls.clear()
+        recent.encode(0, batched, [['b'], [False]])
+        assert calls == []
+        out = recent.encode(0, batched, [['new1', 'new2'], [False, False]])
+        assert torch.is_tensor(out['embeds']) and out['embeds'].shape == (2, 2)
+        # Bounded in bytes: the oldest rows are forgotten.
+        small = dataset_module._RecentTextEncodings(limit_bytes=3 * (2 * 4 + 4))
+        for c in ['p', 'q', 'r', 's']:
+            small.encode(0, batched, [[c], [False]])
+        calls.clear()
+        small.encode(0, batched, [['p'], [False]])
+        small.encode(0, batched, [['s'], [False]])
+        assert calls == [['p']] and small.size <= small.limit_bytes
 
         def not_per_row(captions, is_video):
             calls.append(list(captions))
             return {'pooled': torch.zeros(5)}
 
         calls.clear()
-        out = dataset_module._encode_distinct_rows(not_per_row, [['x', 'x', 'y'], [False] * 3])
+        recent = dataset_module._RecentTextEncodings()
+        out = recent.encode(0, not_per_row, [['x', 'x', 'y'], [False] * 3])
         assert calls == [['x', 'y'], ['x', 'x', 'y']] and out['pooled'].shape == (5,)
+        recent.encode(0, not_per_row, [['x'], [False]])
+        assert calls == [['x', 'y'], ['x', 'x', 'y'], ['x']]  # nothing was remembered from it
 
     @pytest.mark.parametrize('reuse', [False, True])
     def test_caption_text_matches_the_cached_embedding(self, tmp_path, reuse):

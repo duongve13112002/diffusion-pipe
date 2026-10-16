@@ -1,6 +1,7 @@
 """tools/iris_nan_check.py names the stage a NaN comes from. Runs the tool in a subprocess: it
 initialises a process group, which must not leak into the other tests."""
 
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -41,11 +42,19 @@ def setup(tmp_path, qwen, poison=None):
     return config
 
 
+# Set by tests that initialise a process group in the pytest process (test_distill_refiner
+# leaves MASTER_PORT=29577 and a gloo group bound to it). The tool picks its own port only when
+# MASTER_PORT is unset, so a child that inherited them would try to bind the parent's port.
+DISTRIBUTED_ENV = ('MASTER_ADDR', 'MASTER_PORT', 'RANK', 'WORLD_SIZE', 'LOCAL_RANK', 'LOCAL_WORLD_SIZE')
+
+
 def run(config, *flags):
     code = ('import sys, runpy; sys.path.insert(0, %r); import test.conftest; '
             'sys.argv = sys.argv[1:]; runpy.run_path(sys.argv[0], run_name="__main__")') % str(ROOT)
+    env = {k: v for k, v in os.environ.items() if k not in DISTRIBUTED_ENV}
     result = subprocess.run([sys.executable, '-c', code, str(TOOL), '--config', str(config), '--device', 'cpu',
-                             '--batch-size', '2', *flags], cwd=ROOT, capture_output=True, text=True, timeout=600)
+                             '--batch-size', '2', *flags], cwd=ROOT, capture_output=True, text=True, timeout=600,
+                            env=env)
     return result.returncode, result.stdout
 
 
