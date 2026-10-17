@@ -17,6 +17,19 @@ Formats (MossImagePipeline.layout_caption_format / Ideogram4Pipeline.layout_capt
               {"summary": {"caption": ...}, "items": [{"bbox": [y1, x1, y2, x2], ...}],
                "bbox_coord_space": "abs_centralized", "bbox_format": "yxyx"}
               Boxes are integer pixels of the original image with the origin at its centre.
+              The technical report (appendix C.3) trains the model on three box representations
+              of such prompts, so a caption may also be written in the other ones:
+              normalized_1000  boxes in 0..1000 of the image, origin at the top left (what the
+                               report stores, and what Figure 6 shows: no bbox_coord_space or
+                               bbox_format keys; "bbox_coord_space": "normalized_1000" and
+                               "bbox_format": "yxyx" are accepted as well)
+              Boxes under "items" (summary/items schema) and under "elements" (scene/element
+              schema) are rewritten. The caption stays in the space it is written in.
+  moss_image_centered
+              The same captions, but a caption in normalized_1000 is converted to the centred
+              pixel space of its bucket (what the model's USERGUIDE recommends: it generalizes
+              better to resolutions not seen in training), with the bbox_coord_space and
+              bbox_format keys the compiler writes. Captions already centred stay as they are.
               The rewritten caption keeps the caption's own JSON formatting.
   ideogram4   Ideogram 4's prompt (ComfyUI's BuildJsonPromptIdeogram):
               {"high_level_description": ..., "compositional_deconstruction":
@@ -41,10 +54,10 @@ import tarfile
 from collections import OrderedDict
 from pathlib import Path
 
-LAYOUT_FORMATS = ('moss_image', 'ideogram4')
+LAYOUT_FORMATS = ('moss_image', 'moss_image_centered', 'ideogram4')
 
 # Bumped when the rewrite changes, so text caches built by an older rewrite are rebuilt.
-LAYOUT_REWRITE_VERSION = 2
+LAYOUT_REWRITE_VERSION = 3
 # Bumped when the metadata stage handles layout captions differently (it keeps them whole and
 # out of the tag operations), so metadata cached by an older version is rebuilt.
 LAYOUT_METADATA_VERSION = 1
@@ -187,47 +200,36 @@ class _Geometry:
         return (value - self.top) * self.scale_y
 
 
-def _moss_boxes(obj, geometry, source):
-    """Rewrite MOSS-Image's centred pixel yxyx boxes in place. True if anything changed."""
-    items = obj.get('items')
-    if items is None:
-        return False
-    if not isinstance(items, list):
-        raise ValueError(f'{source}: items must be an array')
-    boxed = [item for item in items if isinstance(item, dict) and 'bbox' in item]
-    if not boxed:
-        return False
-    space, layout = obj.get('bbox_coord_space'), obj.get('bbox_format')
-    if (space, layout) != ('abs_centralized', 'yxyx'):
-        raise ValueError(
-            f'{source}: MOSS-Image layout boxes must be bbox_coord_space "abs_centralized" and '
-            f'bbox_format "yxyx" (what its prompt compiler writes), got {space!r} and {layout!r}')
-    g = geometry
+def _centered_span(lo_px, hi_px, to_bucket, bucket_center, bucket_size):
+    """[lo_px, hi_px], in pixels of the original image (top-left origin), as a span of bucket
+    pixels counted from the bucket's centre, or None when the crop leaves nothing of it. As the
+    compiler does: the near edge floored, the far one ceiled, in pixels."""
+    return _fit_span(lo_px, hi_px, to_bucket(lo_px) - bucket_center,
+                     math.floor(round(to_bucket(lo_px), 6)) - bucket_center,
+                     math.ceil(round(to_bucket(hi_px), 6)) - bucket_center,
+                     -bucket_center, bucket_size - bucket_center)
+
+
+def _centered_boxes(entries, g, source, label):
+    """Rewrite centred pixel yxyx boxes. (the entries to keep, whether anything changed)"""
     # The origin, in top-left pixel coordinates: the compiler subtracts height // 2 and
     # width // 2 from pixel coordinates (centered_box in compile_prompt.py).
     src_cx, src_cy = g.src_width // 2, g.src_height // 2
     dst_cx, dst_cy = g.dst_width // 2, g.dst_height // 2
     kept, changed = [], False
-    for index, item in enumerate(items):
+    for index, item in enumerate(entries):
         if not (isinstance(item, dict) and 'bbox' in item):
             kept.append(item)
             continue
-        location = f'{source}: items[{index}].bbox'
+        location = f'{source}: {label}[{index}].bbox'
         y1, x1, y2, x2 = _box(item['bbox'], location)
         # The compiler's boxes lie within [-(side // 2), side - side // 2]; one pixel of slack
         # for hand-written ones.
         if not (-src_cy - 1 <= y1 and y2 <= g.src_height - src_cy + 1
                 and -src_cx - 1 <= x1 and x2 <= g.src_width - src_cx + 1):
             raise ValueError(f'{location} {list(item["bbox"])} lies outside the {g.src_width}x{g.src_height} image')
-        # As the compiler does: top/left edges floored, bottom/right ones ceiled, in pixels.
-        rows = _fit_span(y1, y2, g.y(y1 + src_cy) - dst_cy,
-                         math.floor(round(g.y(y1 + src_cy), 6)) - dst_cy,
-                         math.ceil(round(g.y(y2 + src_cy), 6)) - dst_cy,
-                         -dst_cy, g.dst_height - dst_cy)
-        cols = _fit_span(x1, x2, g.x(x1 + src_cx) - dst_cx,
-                         math.floor(round(g.x(x1 + src_cx), 6)) - dst_cx,
-                         math.ceil(round(g.x(x2 + src_cx), 6)) - dst_cx,
-                         -dst_cx, g.dst_width - dst_cx)
+        rows = _centered_span(y1 + src_cy, y2 + src_cy, g.y, dst_cy, g.dst_height)
+        cols = _centered_span(x1 + src_cx, x2 + src_cx, g.x, dst_cx, g.dst_width)
         if rows is None or cols is None:
             changed = True  # wholly cropped out
             continue
@@ -236,8 +238,93 @@ def _moss_boxes(obj, geometry, source):
             item = dict(item, bbox=box)
             changed = True
         kept.append(item)
-    if changed:
-        obj['items'] = kept
+    return kept, changed
+
+
+def _normalized_boxes(entries, g, source, label, to_centered=False):
+    """Rewrite [ymin, xmin, ymax, xmax] boxes in 0..1000 of the image (origin top left) for the
+    bucket, or with to_centered as centred pixel boxes of the bucket. (the entries to keep,
+    whether anything changed)"""
+    kept, changed = [], False
+    for index, entry in enumerate(entries):
+        if not (isinstance(entry, dict) and 'bbox' in entry):
+            kept.append(entry)
+            continue
+        location = f'{source}: {label}[{index}].bbox'
+        ymin, xmin, ymax, xmax = _box(entry['bbox'], location)
+        if not all(0 <= v <= 1000 for v in (ymin, xmin, ymax, xmax)):
+            raise ValueError(f'{location} {list(entry["bbox"])} lies outside 0..1000')
+        if to_centered:
+            rows = _centered_span(ymin / 1000 * g.src_height, ymax / 1000 * g.src_height, g.y,
+                                  g.dst_height // 2, g.dst_height)
+            cols = _centered_span(xmin / 1000 * g.src_width, xmax / 1000 * g.src_width, g.x,
+                                  g.dst_width // 2, g.dst_width)
+        else:
+            def grid_y(v):
+                return g.y(v / 1000 * g.src_height) / g.dst_height * 1000
+
+            def grid_x(v):
+                return g.x(v / 1000 * g.src_width) / g.dst_width * 1000
+
+            rows = _fit_span(ymin, ymax, grid_y(ymin), round(grid_y(ymin)), round(grid_y(ymax)), 0, 1000)
+            cols = _fit_span(xmin, xmax, grid_x(xmin), round(grid_x(xmin)), round(grid_x(xmax)), 0, 1000)
+        if rows is None or cols is None:
+            changed = True  # wholly cropped out
+            continue
+        box = [rows[0], cols[0], rows[1], cols[1]]
+        if box != list(entry['bbox']):
+            entry = dict(entry, bbox=box)
+            changed = True
+        kept.append(entry)
+    return kept, changed
+
+
+# The lists of a MOSS-Image prompt that hold boxes: the summary/items schema and the
+# scene/element schema of the technical report (appendix C.3).
+MOSS_BOX_LISTS = ('items', 'elements')
+
+
+def _moss_space(obj, source):
+    """'centered' or 'normalized': the space the boxes of a MOSS-Image prompt are written in."""
+    space, layout = obj.get('bbox_coord_space'), obj.get('bbox_format')
+    if (space, layout) == ('abs_centralized', 'yxyx'):
+        return 'centered'
+    # The report's own prompts carry no markers (Figure 6) or, for half of them, an explicit one.
+    if space in (None, 'normalized_1000') and layout in (None, 'yxyx'):
+        return 'normalized'
+    raise ValueError(
+        f'{source}: MOSS-Image layout boxes must be bbox_coord_space "abs_centralized" with bbox_format '
+        f'"yxyx" (what its prompt compiler writes), or normalized to 0..1000 as [y1, x1, y2, x2] '
+        f'(bbox_coord_space "normalized_1000" or no marker at all), got {space!r} and {layout!r}')
+
+
+def _moss_boxes(obj, geometry, source, to_centered=False):
+    """Rewrite the boxes of a MOSS-Image prompt in place. True if anything changed."""
+    lists = {}
+    for name in MOSS_BOX_LISTS:
+        entries = obj.get(name)
+        if entries is None:
+            continue
+        if not isinstance(entries, list):
+            raise ValueError(f'{source}: {name} must be an array')
+        if any(isinstance(entry, dict) and 'bbox' in entry for entry in entries):
+            lists[name] = entries
+    if not lists:
+        return False
+    space = _moss_space(obj, source)
+    changed = False
+    for name, entries in lists.items():
+        if space == 'centered':
+            kept, list_changed = _centered_boxes(entries, geometry, source, name)
+        else:
+            kept, list_changed = _normalized_boxes(entries, geometry, source, name, to_centered)
+        if list_changed:
+            obj[name] = kept
+            changed = True
+    if to_centered and space == 'normalized':
+        obj['bbox_coord_space'] = 'abs_centralized'
+        obj['bbox_format'] = 'yxyx'
+        changed = True
     return changed
 
 
@@ -253,33 +340,7 @@ def _ideogram_boxes(obj, geometry, source):
         return False
     if not isinstance(elements, list):
         raise ValueError(f'{source}: compositional_deconstruction.elements must be an array')
-    g = geometry
-    kept, changed = [], False
-    for index, element in enumerate(elements):
-        if not (isinstance(element, dict) and 'bbox' in element):
-            kept.append(element)
-            continue
-        location = f'{source}: compositional_deconstruction.elements[{index}].bbox'
-        ymin, xmin, ymax, xmax = _box(element['bbox'], location)
-        if not all(0 <= v <= 1000 for v in (ymin, xmin, ymax, xmax)):
-            raise ValueError(f'{location} {list(element["bbox"])} lies outside 0..1000')
-
-        def grid_y(v):
-            return g.y(v / 1000 * g.src_height) / g.dst_height * 1000
-
-        def grid_x(v):
-            return g.x(v / 1000 * g.src_width) / g.dst_width * 1000
-
-        rows = _fit_span(ymin, ymax, grid_y(ymin), round(grid_y(ymin)), round(grid_y(ymax)), 0, 1000)
-        cols = _fit_span(xmin, xmax, grid_x(xmin), round(grid_x(xmin)), round(grid_x(xmax)), 0, 1000)
-        if rows is None or cols is None:
-            changed = True  # wholly cropped out
-            continue
-        box = [rows[0], cols[0], rows[1], cols[1]]
-        if box != list(element['bbox']):
-            element = dict(element, bbox=box)
-            changed = True
-        kept.append(element)
+    kept, changed = _normalized_boxes(elements, geometry, source, 'compositional_deconstruction.elements')
     if changed:
         obj['compositional_deconstruction'] = dict(composition, elements=kept)
     return changed
@@ -327,10 +388,13 @@ def rewrite_layout_caption(caption, layout_format, src_size, dst_size, caption_p
     if obj is None:
         return caption
     geometry = _Geometry(src_size, dst_size)
-    if layout_format == 'moss_image':
-        changed = _moss_boxes(obj, geometry, source)
+    if layout_format in ('moss_image', 'moss_image_centered'):
+        changed = _moss_boxes(obj, geometry, source, to_centered=layout_format == 'moss_image_centered')
         if caption_prefix:
-            _insert_prefix(obj, ('summary', 'caption'), caption_prefix, source)
+            # The scene/element schema has no summary: its description is gen_brief.
+            path = ('gen_brief',) if 'summary' not in obj and isinstance(obj.get('gen_brief'), str) \
+                else ('summary', 'caption')
+            _insert_prefix(obj, path, caption_prefix, source)
             changed = True
     elif layout_format == 'ideogram4':
         changed = _ideogram_boxes(obj, geometry, source)

@@ -348,13 +348,17 @@ class TestMossBoxes:
         out = json.loads(rewrite_layout_caption(caption, 'moss_image', (120, 80), (64, 64)))
         assert out['items'][0]['bbox'] == [-8, 32, 8, 32]
 
-    @pytest.mark.parametrize('space,layout', [('abs', 'yxyx'), ('abs_centralized', 'xyxy'), (None, None)])
+    @pytest.mark.parametrize('space,layout', [('abs', 'yxyx'), ('abs_centralized', 'xyxy'),
+                                              ('abs_centralized', None), ('normalized_1000', 'xyxy'),
+                                              ('normalized', 'yxyx')])
     def test_other_coordinate_spaces_are_refused(self, space, layout):
-        obj = {'summary': {'caption': 'x'}, 'items': [{'bbox': [0, 0, 8, 8]}]}
-        if space:
-            obj.update(bbox_coord_space=space, bbox_format=layout)
-        with pytest.raises(ValueError, match='abs_centralized'):
-            rewrite_layout_caption(compact(obj), 'moss_image', (64, 64), (64, 64))
+        obj = {'summary': {'caption': 'x'}, 'items': [{'bbox': [0, 0, 8, 8]}],
+               'bbox_coord_space': space}
+        if layout:
+            obj['bbox_format'] = layout
+        for fmt in ('moss_image', 'moss_image_centered'):
+            with pytest.raises(ValueError, match='abs_centralized.*normalized'):
+                rewrite_layout_caption(compact(obj), fmt, (64, 64), (64, 64))
 
     @pytest.mark.parametrize('bbox', [[0, 0, 8], [0, 0, 8, 'x'], [0, 0, 8, True], [8, 0, 0, 8],
                                       [0, 8, 8, 0], [0, 0, 8, float('nan')], 'box'])
@@ -374,6 +378,134 @@ class TestMossBoxes:
     def test_caption_prefix_without_a_summary_caption_names_the_file(self, obj):
         with pytest.raises(ValueError, match=r'a\.png: caption_prefix is set.*summary\.caption'):
             rewrite_layout_caption(compact(obj), 'moss_image', (64, 64), (64, 64), 'sks, ', source='a.png')
+
+
+def norm_caption(items=None, markers=None, **extra):
+    """A MOSS-Image prompt with boxes normalized to 0..1000 [y1, x1, y2, x2], as in the report's
+    Figure 6 (no marker keys), or with the given marker keys."""
+    obj = {'summary': {'caption': 'a poster'}, 'items': items if items is not None else [], **extra,
+           **(markers or {})}
+    return compact(obj)
+
+
+NORM_MARKERS = {'bbox_coord_space': 'normalized_1000', 'bbox_format': 'yxyx'}
+
+
+class TestMossNormalizedBoxes:
+    """The report stores boxes normalized to 0..1000 and trains on them next to the centred pixel
+    form, so a caption may be written in either."""
+
+    def test_box_follows_the_pixels_through_the_crop(self):
+        # 200x100 image, rectangle x 100..150, y 20..60 -> normalized x 500..750, y 200..600.
+        image = image_with_rect((200, 100), 20, 100, 60, 150)
+        caption = norm_caption([{'label': 'text', 'bbox': [200, 500, 600, 750]}])
+        for dst in ((64, 64), (96, 48), (48, 96)):
+            out = json.loads(rewrite_layout_caption(caption, 'moss_image', (200, 100), dst))
+            y1, x1, y2, x2 = out['items'][0]['bbox']
+            assert all(0 <= v <= 1000 for v in (y1, x1, y2, x2))
+            top, left, bottom, right = dark_extent(fitted(image, dst))
+            # 1/1000 of a side is under a pixel here; resampling blurs an edge about a pixel.
+            for value, pixels, side in ((y1, top, dst[1]), (y2, bottom, dst[1]),
+                                        (x1, left, dst[0]), (x2, right, dst[0])):
+                assert abs(value / 1000 * side - pixels) <= 1.5, (dst, value, pixels)
+            assert 'bbox_coord_space' not in out, 'a caption without markers stays without them'
+
+    def test_the_caption_stays_normalized_and_keeps_its_markers(self):
+        for markers in (None, NORM_MARKERS):
+            caption = norm_caption([{'bbox': [200, 500, 600, 750]}], markers)
+            out = json.loads(rewrite_layout_caption(caption, 'moss_image', (200, 100), (64, 64)))
+            assert {k: v for k, v in out.items() if k.startswith('bbox_')} == (markers or {})
+        # Same size: nothing to rewrite, the text comes back exactly.
+        caption = norm_caption([{'bbox': [200, 500, 600, 750]}, {'bbox': [0, 0, 1000, 1000]}], NORM_MARKERS)
+        assert rewrite_layout_caption(caption, 'moss_image', (64, 64), (64, 64)) == caption
+
+    def test_box_cut_by_the_crop_is_clipped_and_one_outside_is_dropped(self):
+        # 120x80 to 64x64 keeps x 20..100 of 120, i.e. 166.67..833.33 of 1000.
+        caption = norm_caption([
+            {'label': 'cut', 'bbox': [400, 0, 600, 250]},
+            {'label': 'gone', 'bbox': [400, 0, 600, 100]},
+            {'label': 'no box'},
+        ])
+        out = json.loads(rewrite_layout_caption(caption, 'moss_image', (120, 80), (64, 64)))
+        assert [item['label'] for item in out['items']] == ['cut', 'no box']
+        assert out['items'][0]['bbox'] == [400, 0, 600, 125]
+
+    def test_box_outside_zero_to_1000_names_the_file(self):
+        for bbox in ([0, 0, 500, 1001], [-1, 0, 500, 500]):
+            with pytest.raises(ValueError, match=r'img/a\.png: items\[0\]\.bbox .* outside 0\.\.1000'):
+                rewrite_layout_caption(norm_caption([{'bbox': bbox}]), 'moss_image', (64, 64), (64, 64),
+                                       source='img/a.png')
+
+    def test_a_centred_caption_without_markers_fails_on_its_negative_coordinates(self):
+        with pytest.raises(ValueError, match=r'outside 0\.\.1000'):
+            rewrite_layout_caption(norm_caption([{'bbox': [-20, 10, 20, 40]}]), 'moss_image', (64, 64), (64, 64))
+
+    @pytest.mark.parametrize('markers', [None, NORM_MARKERS])
+    @pytest.mark.parametrize('seed', range(12))
+    def test_conversion_to_centred_equals_the_centred_route(self, seed, markers):
+        """A whole-pixel box written normalized and converted equals the same box written as the
+        compiler writes it (centred pixels) and rewritten: the two routes meet at the bucket."""
+        rng = random.Random(seed)
+        src = (rng.randrange(60, 300), rng.randrange(60, 300))
+        dst = bucket_pixel_size((rng.randrange(32, 200), rng.randrange(32, 200), 1))
+        x1, y1 = rng.randrange(0, src[0] - 10), rng.randrange(0, src[1] - 10)
+        x2, y2 = rng.randrange(x1 + 3, src[0] + 1), rng.randrange(y1 + 3, src[1] + 1)
+        normalized = [y1 / src[1] * 1000, x1 / src[0] * 1000, y2 / src[1] * 1000, x2 / src[0] * 1000]
+        centred = compiler.centered_box([x1, y1, x2, y2], src[0], src[1], 'bbox')
+        got = json.loads(rewrite_layout_caption(norm_caption([{'bbox': normalized}], markers),
+                                                'moss_image_centered', src, dst))
+        want = json.loads(rewrite_layout_caption(moss_caption([{'bbox': centred}]), 'moss_image', src, dst))
+        assert got == want
+        assert (got['bbox_coord_space'], got['bbox_format']) == ('abs_centralized', 'yxyx')
+
+    def test_conversion_follows_the_pixels_through_the_crop(self):
+        image = image_with_rect((200, 100), 20, 100, 60, 150)
+        caption = norm_caption([{'bbox': [200, 500, 600, 750]}])
+        out = json.loads(rewrite_layout_caption(caption, 'moss_image_centered', (200, 100), (64, 64)))
+        y1, x1, y2, x2 = out['items'][0]['bbox']
+        top, left, bottom, right = dark_extent(fitted(image, (64, 64)))
+        # Resampling blurs an edge across about a pixel.
+        for got, want in zip((y1 + 32, x1 + 32, y2 + 32, x2 + 32), (top, left, bottom, right)):
+            assert abs(got - want) <= 1, (got, want)
+
+    def test_conversion_leaves_centred_captions_and_plain_formats_alone(self):
+        centred = moss_caption([{'bbox': [-20, 10, 20, 40]}])
+        assert rewrite_layout_caption(centred, 'moss_image_centered', (120, 80), (64, 64)) \
+            == rewrite_layout_caption(centred, 'moss_image', (120, 80), (64, 64))
+        # Items without boxes need no space and get no markers.
+        plain = compact({'summary': {'caption': 'x'}, 'items': [{'label': 'a'}]})
+        assert rewrite_layout_caption(plain, 'moss_image_centered', (120, 80), (64, 64)) == plain
+
+    def test_conversion_keeps_the_formatting_and_appends_the_markers_last(self):
+        obj = {'summary': {'caption': 'x'}, 'items': [{'bbox': [200, 500, 600, 750]}]}
+        caption = json.dumps(obj, indent=2)
+        out = rewrite_layout_caption(caption, 'moss_image_centered', (200, 100), (64, 64))
+        assert out.startswith('{\n  "summary"') and list(json.loads(out))[-2:] == ['bbox_coord_space', 'bbox_format']
+
+    def test_scene_element_schema_boxes_and_prefix(self):
+        obj = {'scene_type': 'poster', 'gen_brief': 'a red circle below SALE',
+               'elements': [{'type': 'obj', 'bbox': [300, 250, 800, 750]},
+                            {'type': 'text', 'text': 'SALE', 'bbox': [80, 250, 200, 750]}]}
+        caption = compact(obj)
+        out = json.loads(rewrite_layout_caption(caption, 'moss_image', (200, 100), (100, 100), 'sks, '))
+        assert out['gen_brief'] == 'sks, a red circle below SALE' and 'summary' not in out
+        # 200x100 to 100x100 keeps x 50..150 of 200, i.e. 250..750 of 1000: x 250..750 -> 0..1000.
+        assert [e['bbox'] for e in out['elements']] == [[300, 0, 800, 1000], [80, 0, 200, 1000]]
+        out = json.loads(rewrite_layout_caption(caption, 'moss_image_centered', (200, 100), (100, 100)))
+        assert [e['bbox'] for e in out['elements']] == [[-20, -50, 30, 50], [-42, -50, -30, 50]]
+        assert out['bbox_coord_space'] == 'abs_centralized'
+
+    def test_centred_scene_element_boxes_are_rewritten_too(self):
+        obj = {'gen_brief': 'x', 'elements': [{'bbox': [-20, 10, 20, 40]}],
+               'bbox_coord_space': 'abs_centralized', 'bbox_format': 'yxyx'}
+        out = json.loads(rewrite_layout_caption(compact(obj), 'moss_image', (120, 80), (64, 64)))
+        assert out['elements'][0]['bbox'] == [-16, 8, 16, 32]
+
+    def test_rewriter_and_formats(self):
+        from utils.layout_captions import LAYOUT_FORMATS
+        assert 'moss_image_centered' in LAYOUT_FORMATS
+        a, b = (LayoutCaptionRewriter(f) for f in ('moss_image', 'moss_image_centered'))
+        assert a.cache_tag != b.cache_tag, 'converted captions must not share cached embeddings'
 
 
 class TestIdeogramBoxes:
@@ -629,6 +761,26 @@ class TestDataset:
         assert len(found) == 2 and len(set(found.values())) == 2
         a, b = leaves(ds)
         assert a.text_embedding_datasets[0] is not b.text_embedding_datasets[0]
+
+    @pytest.mark.parametrize('layout_format', ['moss_image', 'moss_image_centered'])
+    def test_text_cache_holds_a_normalized_caption_for_each_bucket(self, tmp_path, layout_format):
+        # 120x80 images; boxes normalized to 0..1000. as_written keeps them in 0..1000, the
+        # centered format turns them into pixels of the bucket; either way per bucket.
+        caption = norm_caption([{'bbox': [250, 250, 750, 750]}])
+        ds = self.make(tmp_path, {'a': caption, 'b': 'plain'}, layout_format=layout_format,
+                       resolutions=[64, 128])
+        found = {}
+        for leaf in self.cache(ds):
+            bucket = tuple(leaf.size_bucket)[-3:]
+            found[bucket] = self.encoded(leaf, 'a')
+            assert found[bucket] == self.expected(caption, bucket, layout_format=layout_format)
+            assert self.encoded(leaf, 'b') == 'plain'
+        centered = layout_format == 'moss_image_centered'
+        # A normalized box does not depend on the resolution (the same aspect ratio gives the
+        # same text, and the crop is the same); centred pixels do.
+        assert len(found) == 2 and len(set(found.values())) == (2 if centered else 1)
+        for text in found.values():
+            assert ('bbox_coord_space' in json.loads(text)) == centered
 
     def test_plain_ar_buckets_still_share_one_text_cache(self, tmp_path):
         ds = self.make(tmp_path, {'a': 'plain', 'b': 'other'}, resolutions=[64, 128])

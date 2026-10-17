@@ -1837,7 +1837,9 @@ class DirectoryDataset:
                 total += 1
                 layout += any(is_layout_caption(c) for c in captions)
         if layout and is_main_process():
-            field = {'moss_image': 'summary.caption', 'ideogram4': 'high_level_description'}[self.layout_caption_format]
+            field = {'moss_image': 'summary.caption (gen_brief in the scene/element schema)',
+                     'moss_image_centered': 'summary.caption (gen_brief in the scene/element schema)',
+                     'ideogram4': 'high_level_description'}[self.layout_caption_format]
             print(f'{self.path}: {layout} of {total} images have {self.layout_caption_format} layout (JSON) captions: '
                   f'their boxes are rewritten for each bucket, caption_prefix goes into {field}, and tag '
                   f'shuffling, tag dropout, multiline splitting and non-Latin line removal skip them.')

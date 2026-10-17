@@ -903,6 +903,32 @@ and anything else is a plain caption with every caption option as usual. For lay
   once and every variant gets that embedding (whatever `caching_batch_size` is: the most recent
   256 MB of embeddings are remembered while caching).
 
+MOSS-Image's technical report (appendix C.3) stores boxes normalized to 0..1000 as
+`[y1, x1, y2, x2]` (origin at the top left) and trains the model on three representations of
+them: normalized, absolute pixels and pixels from the image centre. So a layout caption may be
+written in either of two spaces, detected per caption:
+- `bbox_coord_space = "abs_centralized"` with `bbox_format = "yxyx"`: the compiler's centred
+  pixels, as above.
+- boxes in 0..1000, with no `bbox_coord_space`/`bbox_format` keys (the form of the report's
+  Figure 6) or with `"bbox_coord_space": "normalized_1000"` and `"bbox_format": "yxyx"`. A box
+  outside 0..1000 is an error naming the file. Boxes under `items` (summary/items schema) and
+  under `elements` (scene/element schema, whose description is `gen_brief`, where
+  `caption_prefix` goes) are rewritten.
+
+Any other `bbox_coord_space` or `bbox_format` is refused. A caption with no marker keys is read as
+normalized, so a centred caption without its markers fails on its negative coordinates.
+`model.layout_bbox_space` in the training config chooses what a normalized caption becomes:
+```toml
+[model]
+layout_bbox_space = 'as_written'    # default: it stays in 0..1000, rewritten for each bucket
+#layout_bbox_space = 'abs_centralized'  # it becomes centred pixel boxes of the bucket, with the
+                                         # compiler's marker keys (the form the MOSS-Image USERGUIDE
+                                         # recommends; the report found it generalizes better to
+                                         # resolutions not seen in training)
+```
+Captions already centred are never converted. Mixed data works: each caption is handled by its own
+space. Normalized boxes with a marker the report does not name are not guessed at.
+
 A one-line notice per directory reports how many images have layout captions. Ideogram4 uses
 the same mechanism for its JSON prompts (ComfyUI's Build JSON Prompt (Ideogram) schema: boxes are
 `[ymin, xmin, ymax, xmax]` in 0..1000, a zero-height or zero-width box is allowed, and

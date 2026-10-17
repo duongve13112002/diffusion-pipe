@@ -1382,6 +1382,18 @@ def test_diffusers_path_finds_every_component(tmp_path):
         make_pipeline({'diffusers_path': str(root)})
 
 
+def test_layout_bbox_space_selects_the_layout_caption_format():
+    assert make_pipeline({'transformer_path': 'a', 'vae_path': 'b', 'text_encoder_path': 'c'}).layout_caption_format \
+        == 'moss_image'
+    for space, fmt in (('as_written', 'moss_image'), ('abs_centralized', 'moss_image_centered')):
+        pipe = make_pipeline({'transformer_path': 'a', 'vae_path': 'b', 'text_encoder_path': 'c',
+                              'layout_bbox_space': space})
+        assert pipe.layout_caption_format == fmt
+    with pytest.raises(ValueError, match='layout_bbox_space must be one of'):
+        make_pipeline({'transformer_path': 'a', 'vae_path': 'b', 'text_encoder_path': 'c',
+                       'layout_bbox_space': 'normalized'})
+
+
 @pytest.mark.parametrize('model,match', [
     ({'flux_shift': True}, 'flux_shift'),
     ({'diffusion_model': 'x'}, 'diffusion_model'),

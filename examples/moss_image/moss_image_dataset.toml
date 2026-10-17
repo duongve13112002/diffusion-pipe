@@ -17,7 +17,8 @@ num_repeats = 1
 #   - a layout caption: the whole file is the JSON prompt MOSS-Image's prompt compiler writes
 #     ({"summary": {"caption": ...}, "items": [{"bbox": [y1, x1, y2, x2], ...}],
 #       "bbox_coord_space": "abs_centralized", "bbox_format": "yxyx"}), boxes in pixels of
-#     the original image. Its boxes are rewritten for the crop and size of each bucket, and
+#     the original image; boxes normalized to 0..1000 (no marker keys, the technical report's
+#     own form) work too, see model.layout_bbox_space in the training config. Its boxes are rewritten for the crop and size of each bucket, and
 #     caption_prefix goes into summary.caption. Tag shuffling, tag dropout, multiline
 #     splitting and non-Latin line removal skip layout captions; caption dropout still applies.
 #caption_prefix = 'sks, '

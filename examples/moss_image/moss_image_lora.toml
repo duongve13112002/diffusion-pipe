@@ -42,6 +42,10 @@ dtype = 'bfloat16'
 # Captions are encoded on the fly by default: only latents are cached and the Qwen3.5-9B text
 # encoder stays on the GPU. true caches the embeddings once (~8 KB per token) instead.
 #cache_text_embeddings = false
+# Layout (JSON) captions with boxes normalized to 0..1000 (the technical report's form): 'as_written'
+# keeps them in 0..1000 per bucket; 'abs_centralized' converts them to centred pixel boxes, the form
+# the USERGUIDE recommends. Centred captions are left as they are either way.
+#layout_bbox_space = 'as_written'
 # The LoRA's learning rate per part and per block (default: [optimizer] lr). A LoRA on the blocks
 # has attn and ffn parameters only; norm_lr, text_refiner_lr, modulation_lr and embed_head_lr
 # are refused for it. See docs/supported_models.md#moss-image.

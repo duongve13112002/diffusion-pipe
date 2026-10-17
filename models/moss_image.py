@@ -705,6 +705,10 @@ class MossImageTokenizer(comfy.sd1_clip.SD1Tokenizer):
         return tokens
 
 
+# model.layout_bbox_space -> the layout caption format (utils/layout_captions.py) it selects.
+LAYOUT_BBOX_SPACES = {'as_written': 'moss_image', 'abs_centralized': 'moss_image_centered'}
+
+
 class Qwen35TextOnly(qwen35.Qwen35):
     """Qwen3.5-9B without the vision tower: MOSS-Image only reads text, and the tower is ~0.9 GB."""
     model_type = 'qwen35_9b'
@@ -963,6 +967,12 @@ class MossImagePipeline(ComfyPipeline):
         cache = mc.setdefault('cache_text_embeddings', False)
         if not isinstance(cache, bool):
             raise ValueError(f'cache_text_embeddings must be true or false, got {cache!r}')
+        # Layout captions written with boxes normalized to 0..1000 stay so ('as_written') or become
+        # centred pixel boxes of the bucket: see utils/layout_captions.py.
+        space = mc.get('layout_bbox_space', 'as_written')
+        if space not in LAYOUT_BBOX_SPACES:
+            raise ValueError(f'layout_bbox_space must be one of {", ".join(LAYOUT_BBOX_SPACES)}, got {space!r}')
+        self.layout_caption_format = LAYOUT_BBOX_SPACES[space]
         method = mc.get('timestep_sample_method', NOISE_DEFAULTS['timestep_sample_method'])
         if method == 'uniform':
             unused = [key for key in ('logit_mean', 'logit_std', 'sigma_cutoff', 'uniform_fraction') if key in mc]

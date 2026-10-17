@@ -55,6 +55,10 @@ dtype = 'bfloat16'
 # Captions are encoded on the fly by default: only latents are cached and the Qwen3.5-9B text
 # encoder stays on stage 0's GPUs. true caches the embeddings once (~8 KB per token) instead.
 #cache_text_embeddings = false
+# Layout (JSON) captions with boxes normalized to 0..1000 (the technical report's form): 'as_written'
+# keeps them in 0..1000 per bucket; 'abs_centralized' converts them to centred pixel boxes, the form
+# the USERGUIDE recommends. Centred captions are left as they are either way.
+#layout_bbox_space = 'as_written'
 timestep_sample_method = 'logit_normal'
 # Learning rates per part of the model (default: [optimizer] lr; 0 freezes the part):
 #attn_lr = 1e-5           # q, k, v, o and q_norm/k_norm of the 42 blocks
