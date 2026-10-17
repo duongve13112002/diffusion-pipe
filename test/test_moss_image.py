@@ -92,6 +92,10 @@ def bare_pipeline(model_config=None, config=None):
     pipe.text_dim = TEXT_DIM
     pipe.offloader = mi.ModelOffloader('dummy', [], 0, 0, True, torch.device('cpu'), False, debug=False)
     pipe.learning_rates = mi.LearningRates(pipe.model_config, pipe.config.get('optimizer', {}))
+    pipe.cache_text_embeddings = pipe.model_config.get('cache_text_embeddings', True)
+    pipe.tokenizer = None
+    pipe.overflow_warned = set()
+    pipe.on_caption_overflow = 'warn'
     return pipe
 
 
@@ -232,6 +236,217 @@ def test_prompt_template_matches_the_chat_template():
         expected = hf(formatted)['input_ids']
         got = [token for token, _ in ours.tokenize_with_weights(prompt)['qwen35_9b'][0]]
         assert got == expected, prompt
+
+
+ON_THE_FLY_CAPTIONS = [
+    'a red fox in the snow',
+    '{"summary": {"caption": "two cats"}, "items": [{"bbox": [10, 20, 300, 400], "caption": "a cat"}]}',
+    '',  # caption dropout
+]
+
+
+class CountingEncoder:
+    """The ModelWrapper around a text encoder, counting loads and encodes."""
+
+    def __init__(self, clip, monkeypatch):
+        self.clip = clip
+        self.loads = 0
+        self.encodes = 0
+        self.loader_encodes = 0
+        encode = clip.cond_stage_model.encode_token_weights
+
+        def counted(tokens):
+            self.encodes += 1
+            assert not torch.is_grad_enabled()
+            return encode(tokens)
+        monkeypatch.setattr(clip.cond_stage_model, 'encode_token_weights', counted)
+
+    def load_model_if_needed(self):
+        self.loads += 1
+
+    def encode_from_tokens(self, tokens, return_dict=False):
+        self.loader_encodes += 1
+        return self.clip.encode_from_tokens(tokens, return_dict=return_dict)
+
+    def __getattr__(self, name):
+        return getattr(self.clip, name)
+
+
+def on_the_fly_pipelines(monkeypatch):
+    """(cached, on the fly): the same tiny DiT and tiny Qwen3.5, one encoding while caching, the
+    other during training. ComfyUI's loader is recorded and still runs."""
+    clip = tiny_comfy_text_encoder(mi.qwen35_comfy_layout(mi.qwen35_vlm_layout(tiny_hf_text_encoder().state_dict())))
+    comfy.model_management.unload_all_models()
+    loads = []
+    load = comfy.model_management.load_models_gpu
+
+    def recorded(models, **kwargs):
+        loads.append((models, kwargs))
+        return load(models, **kwargs)
+    monkeypatch.setattr(comfy.model_management, 'load_models_gpu', recorded)
+    reference = tiny_reference(text_dim=64)
+    encoder = CountingEncoder(clip, monkeypatch)
+    pipes = []
+    for cache in (True, False):
+        pipe = loaded_pipeline(reference)
+        pipe.text_dim = 64
+        pipe.cache_text_embeddings = cache
+        pipe.text_encoders = [encoder]
+        pipe.noise_sampler = mi.NoiseLevelSampler('logit_normal', 0.0, 1.0, 1.0, 0.0, 1.0, 0.0, 1.0)
+        pipe.pipeline_model = Runner(pipe.to_layers())
+        pipes.append(pipe)
+    return clip, loads, pipes
+
+
+def caption_batch(pipe, captions=ON_THE_FLY_CAPTIONS, seed=6):
+    torch.manual_seed(5)
+    latents = torch.randn(len(captions), 128, 4, 6)
+    torch.manual_seed(seed)
+    return pipe.prepare_inputs({'latents': latents, 'mask': None, 'caption': list(captions)})
+
+
+def test_on_the_fly_text_encoding_matches_cached_embeddings(monkeypatch):
+    clip, loads, (cached, on_the_fly) = on_the_fly_pipelines(monkeypatch)
+    assert cached.get_text_encoders() == cached.text_encoders and on_the_fly.get_text_encoders() == []
+    layers = on_the_fly.pipeline_model.layers
+    assert type(layers[0]) is mi.TextEncoderLayer and type(layers[1]) is mi.InitialLayer
+    # The same layout either way: DeepSpeed loads each layer by its index.
+    assert [type(layer) for layer in layers] == [type(layer) for layer in cached.pipeline_model.layers]
+    assert cached.pipeline_model.layers[0].text_encoder == []
+    # The frozen encoder is not the layer's submodule: no parameters for DeepSpeed to save or train.
+    assert list(layers[0].parameters()) == [] and 'TextEncoderLayer' not in on_the_fly.checkpointable_layers
+
+    torch.manual_seed(5)
+    latents = torch.randn(len(ON_THE_FLY_CAPTIONS), 128, 4, 6)
+    with torch.inference_mode():  # as caching runs it
+        embeds = [cached.encode_prompt(clip, caption).clone() for caption in ON_THE_FLY_CAPTIONS]
+    torch.manual_seed(6)
+    cached_inputs, cached_target = cached.prepare_inputs({'latents': latents, 'mask': None, 'prompt_embeds': embeds})
+    inputs, target = caption_batch(on_the_fly)
+    ids, lengths = inputs[2:]
+    assert ids.dtype == lengths.dtype == torch.long
+    assert lengths.tolist() == [e.shape[0] for e in embeds]
+    torch.testing.assert_close(target[0], cached_target[0], rtol=0, atol=0)
+
+    encoder = on_the_fly.text_encoders[0]
+    comfy.model_management.unload_all_models()
+    loads.clear()
+    encoder.encodes = encoder.loader_encodes = 0
+    out = layers[0](inputs)
+    text, mask = out[2:]
+    torch.testing.assert_close(text, cached_inputs[2], rtol=0, atol=0)
+    assert torch.equal(mask, cached_inputs[3])
+    # Marked for the next layer (or the next stage's backward), as cached embeddings are.
+    assert all(t.requires_grad for t in out if torch.is_floating_point(t))
+    assert encoder.encodes == len(ON_THE_FLY_CAPTIONS) and encoder.loader_encodes == 0
+    # Fully loaded once; later steps leave ComfyUI's memory manager alone.
+    assert loads == [([clip.patcher], {'force_full_load': True})] and mi.fully_loaded(clip.patcher)
+    layers[0](inputs)
+    assert len(loads) == 1
+    with torch.no_grad():
+        torch.testing.assert_close(on_the_fly.pipeline_model(inputs), cached.pipeline_model(cached_inputs),
+                                   rtol=0, atol=0)
+
+
+def test_on_the_fly_layer_passes_embeddings_through(monkeypatch):
+    """Cached embeddings, and the previews' (--test_sample, sampling), pass through."""
+    _, loads, (cached, on_the_fly) = on_the_fly_pipelines(monkeypatch)
+    inputs = forward_inputs(dim=64)
+    with torch.no_grad():
+        torch.testing.assert_close(on_the_fly.pipeline_model(inputs), cached.pipeline_model(inputs), rtol=0, atol=0)
+    assert on_the_fly.text_encoders[0].encodes == 0 and loads == []
+    # Under no_grad the caller's tensors are left as they are (sampling reuses them).
+    fresh = forward_inputs(dim=64)
+    with torch.no_grad():
+        on_the_fly.pipeline_model.layers[0](fresh)
+    assert not any(t.requires_grad for t in fresh)
+    with pytest.raises(RuntimeError, match='caches its text embeddings'):
+        cached.pipeline_model.layers[0](caption_batch(on_the_fly)[0])
+
+
+def test_eval_passes_encode_each_caption_once(monkeypatch):
+    """train.py evaluates the same batches once per timestep quantile."""
+    _, _, (_, pipe) = on_the_fly_pipelines(monkeypatch)
+    layer, encoder = pipe.pipeline_model.layers[0], pipe.text_encoders[0]
+    inputs = caption_batch(pipe)[0]
+    with torch.no_grad():
+        first = layer(inputs)[2]
+        assert encoder.encodes == len(ON_THE_FLY_CAPTIONS)
+        torch.testing.assert_close(layer(inputs)[2], first, rtol=0, atol=0)
+        assert encoder.encodes == len(ON_THE_FLY_CAPTIONS)
+    # Training encodes afresh and drops what eval kept.
+    layer(inputs)
+    assert encoder.encodes == 2 * len(ON_THE_FLY_CAPTIONS) and layer.eval_cache == {}
+    monkeypatch.setattr(mi, 'EVAL_CACHE_BYTES', 0)
+    with torch.no_grad():
+        layer(inputs)
+        layer(inputs)
+    assert encoder.encodes == 4 * len(ON_THE_FLY_CAPTIONS)
+
+
+def test_the_first_stage_loads_the_encoder_before_training(monkeypatch, tmp_path):
+    path = tmp_path / 'transformer'
+    write_transformer_dir(tiny_state(tiny_reference()), path)
+    gpu_loads = []
+    monkeypatch.setattr(comfy.model_management, 'load_models_gpu',
+                        lambda models, **kwargs: gpu_loads.append((models, kwargs)))
+    for rank, cache, loads in [(0, False, 1), (1, False, 0), (0, True, 0)]:
+        monkeypatch.setattr(mi, 'rank_and_world_size', lambda: (rank, 2))
+        encoder = CountingEncoder.__new__(CountingEncoder)
+        encoder.loads = 0
+        encoder.clip = type('Clip', (), {'patcher': object()})()
+        gpu_loads.clear()
+        pipe = bare_pipeline({'cache_text_embeddings': cache}, {'pipeline_stages': 2})
+        pipe.text_encoders = [encoder]
+        pipe.transformer_path = str(path)
+        pipe.load_diffusion_model()
+        assert encoder.loads == loads, (rank, cache)
+        # Onto the GPU at once, so its copy in RAM goes before DeepSpeed takes the transformer.
+        assert gpu_loads == ([([encoder.clip.patcher], {'force_full_load': True})] if loads else []), (rank, cache)
+
+
+def test_checkpoints_from_before_the_text_encoder_layer_resume_shifted(tmp_path):
+    from utils.checkpoint_layout import check_checkpoint_layers
+    pipe = loaded_pipeline(tiny_reference())
+    layers = pipe.to_layers()
+    run = tmp_path / 'run'
+    (run / 'global_step9').mkdir(parents=True)
+    for i in range(len(layers) - 1):
+        (run / 'global_step9' / f'layer_{i:02d}-model_states.pt').write_bytes(b'')
+    (run / 'latest').write_text('global_step9')
+    assert check_checkpoint_layers(run, layers, pipe.checkpoint_layers_added_in_front) == 1
+
+
+def test_on_the_fly_captions_follow_on_caption_overflow(monkeypatch, capsys):
+    _, _, (_, pipe) = on_the_fly_pipelines(monkeypatch)
+    batch = {'latents': torch.randn(2, 128, 4, 6), 'mask': None, 'caption': ['a cat', 'word ' * 5000]}
+    _, _, ids, lengths = pipe.prepare_inputs(batch)[0]
+    assert lengths[1] == ids.shape[1] == mi.MAX_TEXT_TOKENS and 'truncated to 4096' in capsys.readouterr().out
+    # Once per caption, not every epoch.
+    pipe.prepare_inputs(batch)
+    assert 'truncated' not in capsys.readouterr().out
+    # The last pipeline stage tokenizes the same batches: it leaves the warning to the first.
+    pipe.overflow_warned.clear()
+    pipe.config['pipeline_stages'] = 2
+    monkeypatch.setattr(mi, 'rank_and_world_size', lambda: (1, 2))
+    pipe.prepare_inputs(batch)
+    assert 'truncated' not in capsys.readouterr().out
+    monkeypatch.setattr(mi, 'rank_and_world_size', lambda: (0, 2))
+    pipe.prepare_inputs(batch)
+    assert 'truncated to 4096' in capsys.readouterr().out
+    pipe.on_caption_overflow = 'error'
+    with pytest.raises(ValueError, match='truncated to 4096'):
+        pipe.prepare_inputs(batch)
+
+
+def test_on_the_fly_is_the_default(tmp_path):
+    root = diffusers_dir(tmp_path)
+    pipe = make_pipeline({'diffusers_path': str(root)})
+    # Written into the config: train.py reads it with a default of true.
+    assert pipe.model_config['cache_text_embeddings'] is False and pipe.get_text_encoders() == []
+    assert pipe.block_swap_supports_uncached_text_embeddings
+    pipe = make_pipeline({'diffusers_path': str(root), 'cache_text_embeddings': True})
+    assert pipe.get_text_encoders() == pipe.text_encoders
 
 
 def test_long_prompts_are_truncated_with_a_warning(capsys):
@@ -1176,7 +1391,7 @@ def test_diffusers_path_finds_every_component(tmp_path):
     ({'transformer_dtype': 'float8'}, 'transformer_dtype'),
     ({'text_encoder_fp8': True}, 'text_encoder_fp8'),
     ({'sigmoid_scale': 1.0}, 'sigmoid_scale'),
-    ({'cache_text_embeddings': False}, 'cache_text_embeddings'),
+    ({'cache_text_embeddings': 'false'}, 'cache_text_embeddings'),
     ({'timestep_sample_method': 'uniform', 'logit_mean': 0.0}, 'logit_mean'),
     ({'timestep_sample_method': 'gamma'}, 'timestep_sample_method'),
     ({'dtype': torch.float16}, 'bfloat16 or float32'),

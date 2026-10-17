@@ -31,6 +31,12 @@ checkpoint_every_n_minutes = 60
 keep_last_n_checkpoints = 3
 activation_checkpointing = true
 partition_method = 'parameters'
+# The on-the-fly text encoder (~18 GB) sits on stage 0 and has no trainable parameters, so
+# 'parameters' does not count it. To even the stages out, split by hand: the layers are the
+# text encoder layer (there cached or not), the input layer, the 42 blocks and the output layer
+# (45), and [22] puts the encoder and blocks 0-19 on stage 0, blocks 20-41 on stage 1.
+#partition_method = 'manual'
+#partition_split = [22]
 save_dtype = 'bfloat16'
 caching_batch_size = 4
 steps_per_print = 10
@@ -43,6 +49,9 @@ diffusers_path = '/pvc/models/MOSS-Image-Base'
 # A previous full fine-tune's save works as the transformer; the rest still comes from diffusers_path.
 #transformer_path = '/pvc/runs/moss_image_full/<run>/step5000'
 dtype = 'bfloat16'
+# Captions are encoded on the fly by default: only latents are cached and the Qwen3.5-9B text
+# encoder stays on stage 0's GPUs. true caches the embeddings once (~8 KB per token) instead.
+#cache_text_embeddings = false
 timestep_sample_method = 'logit_normal'
 # Learning rates per part of the model (default: [optimizer] lr; 0 freezes the part):
 #attn_lr = 1e-5           # q, k, v, o and q_norm/k_norm of the 42 blocks

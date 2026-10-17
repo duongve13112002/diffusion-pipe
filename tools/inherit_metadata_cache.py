@@ -535,7 +535,7 @@ def main(argv=None):
                         help='Replace an existing target snapshot by publishing a new generation (legacy '
                              'metadata: the old metadata/ is kept as metadata.replaced_<time>).')
     parser.add_argument('--cache-text-embeddings', action='store_true',
-                        help="The target's training config sets cache_text_embeddings = true (Iris default: false). "
+                        help="The target's training config sets cache_text_embeddings = true (Iris and MOSS-Image default: false). "
                              'Only matters with reuse_metadata_cache = false.')
     args = parser.parse_args(argv)
 

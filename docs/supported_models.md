@@ -781,9 +781,31 @@ Muon), [dataset](../examples/moss_image/moss_image_dataset.toml), and a
 LoRA, LoKr, OPLoRA and full fine-tuning are supported, as are fp8 (`diffusion_model_dtype`) and
 ComfyUI quantized checkpoints (adapters only), block swap (adapters only), pipeline parallelism,
 activation checkpointing, eval, masks, `merge_adapters`, any diffusion-pipe optimizer (including
-`genericoptim` with `muon = true`) and `--test_sample`. Text embeddings are always cached
-(`cache_text_embeddings = false` is refused): the 9B encoder runs once per caption, then is
-freed. Edit/control datasets are not supported.
+`genericoptim` with `muon = true`) and `--test_sample`. Edit/control datasets are not supported.
+
+Captions are encoded on the fly by default (`cache_text_embeddings = false`): only the latents
+are cached, and the Qwen3.5-9B encoder (about 18 GB in bf16, frozen, never trained or saved)
+stays on the GPU and encodes each step's captions inside the pipeline, one caption per forward
+as when caching, so the embeddings are the same. Caption shuffling, tag dropout and caption
+dropout then change every step, and layout captions are rewritten for their bucket as usual. A
+cached embedding is about 8 KB per token, which for millions of captions is terabytes;
+`cache_text_embeddings = true` caches them once anyway and frees the encoder before training.
+On the fly, every GPU of the first pipeline stage loads the encoder onto itself before training
+starts, which costs that stage 18 GB: with
+`pipeline_stages` above 1, give stage 0 fewer blocks with `partition_method = 'manual'` and
+`partition_split`. The pipeline's layers are the text encoder layer (a pass-through when
+embeddings are cached; it is there either way so checkpoints keep one layout), the input layer,
+the 42 blocks and the output layer, so `partition_split = [12, 23, 34]` puts the encoder and 10
+blocks on stage 0 of four. Encoding adds a forward of the 9B model per caption, small next to a
+training step for short captions and noticeable for long layout captions; eval encodes each
+caption once and reuses it for every timestep quantile (up to 2 GiB of embeddings per GPU, about
+260k tokens; captions past that are encoded again). A caption over 4096 tokens is reported
+once per caption text by the first stage; with `on_caption_overflow = 'error'` the run stops
+when such a caption first comes up in training. Checkpoints saved by MOSS-Image code from before
+the text encoder layer (44 layer files) resume with each layer loaded from the file before it
+(the encoder layer has no parameters, so the optimizer state still lines up); their next save
+has the new layout. A checkpoint of any other layout than the run builds is refused on resume
+rather than loaded with layers' weights in their neighbours.
 
 - Noise levels follow the technical report's final pretraining stage: logit-normal over sigma
   (`logit_mean = -1.09`, `logit_std = 0.95`) capped at `sigma_cutoff = 0.95`, with

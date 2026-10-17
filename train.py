@@ -24,7 +24,7 @@ import numpy as np
 
 from utils import dataset as dataset_util
 from utils import common
-from utils.common import is_main_process, get_rank, DTYPE_MAP, empty_cuda_cache
+from utils.common import is_main_process, get_rank, DTYPE_MAP, empty_cuda_cache, all_ok
 import utils.saver
 from utils.isolate_rng import isolate_rng
 from utils.patches import apply_patches
@@ -32,6 +32,7 @@ from utils.unsloth_utils import unsloth_checkpoint
 from utils.pipeline import ManualPipelineModule
 from utils.oplora import OPLoRAProjector, apply_oplora_config_defaults
 from utils.lr_schedule import create_lr_scheduler
+from utils.checkpoint_layout import check_checkpoint_layers, shift_checkpoint_layers
 from utils.param_groups import check_resumed_param_groups, group_names, split_2d_param_groups
 from utils.ema import ParameterEMA, apply_ema_config_defaults, load_ema_checkpoint, load_ema_weights
 from utils.optimizer_factory import resolve_optimizer_class
@@ -907,14 +908,32 @@ if __name__ == '__main__':
     # make sure to do this before calling model_engine.set_dataloader(), as that method creates an iterator
     # which starts creating dataloader internal state
     if resume_from_checkpoint:
+        # Every rank reads the checkpoint's file list; one failing (a volume error) stops all.
+        error = layer_shift = None
+        try:
+            layer_shift = check_checkpoint_layers(
+                run_dir, layers, getattr(model, 'checkpoint_layers_added_in_front', 0))
+        except Exception as e:
+            error = e
+        all_ok(error)
+        restore = None
+        if layer_shift:
+            if is_main_process():
+                print(f'The checkpoint has the layout from before {layer_shift} layer(s) without parameters '
+                      'were put in front; loading it shifted. Its next save has the new layout.')
+            restore = shift_checkpoint_layers(model_engine.module, layer_shift)
         param_groups = optimizer.param_groups.copy()
         names_before = group_names(optimizer.param_groups)
-        load_path, client_state = model_engine.load_checkpoint(
-            run_dir,
-            load_module_strict=False,
-            load_lr_scheduler_states='force_constant_lr' not in config and not args.reset_optimizer and not args.reset_optimizer_params,
-            load_optimizer_states=not args.reset_optimizer,
-        )
+        try:
+            load_path, client_state = model_engine.load_checkpoint(
+                run_dir,
+                load_module_strict=False,
+                load_lr_scheduler_states='force_constant_lr' not in config and not args.reset_optimizer and not args.reset_optimizer_params,
+                load_optimizer_states=not args.reset_optimizer,
+            )
+        finally:
+            if restore is not None:
+                restore()
         if not args.reset_optimizer:
             check_resumed_param_groups(names_before, group_names(optimizer.param_groups))
         if args.reset_optimizer_params:

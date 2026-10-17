@@ -24,7 +24,8 @@ partition_method = 'parameters'
 save_dtype = 'bfloat16'
 caching_batch_size = 4
 steps_per_print = 1
-# On a smaller GPU, swap blocks to the CPU (LoRA/LoKr only; MOSS-Image has 42).
+# On a smaller GPU, swap blocks to the CPU (LoRA/LoKr only; MOSS-Image has 42). The on-the-fly
+# text encoder stays on the GPU (~18 GB); cache_text_embeddings = true frees it before training.
 #blocks_to_swap = 16
 
 [model]
@@ -38,6 +39,9 @@ diffusers_path = '/data/models/MOSS-Image-Base'
 #text_encoder_path = '/data/comfyui/models/text_encoders/qwen35_9b.safetensors'
 #vae_path = '/data/comfyui/models/vae/flux2-vae.safetensors'
 dtype = 'bfloat16'
+# Captions are encoded on the fly by default: only latents are cached and the Qwen3.5-9B text
+# encoder stays on the GPU. true caches the embeddings once (~8 KB per token) instead.
+#cache_text_embeddings = false
 # The LoRA's learning rate per part and per block (default: [optimizer] lr). A LoRA on the blocks
 # has attn and ffn parameters only; norm_lr, text_refiner_lr, modulation_lr and embed_head_lr
 # are refused for it. See docs/supported_models.md#moss-image.

@@ -870,6 +870,12 @@ class LayerState:
 class MossImagePipeline(ComfyPipeline):
     name = 'moss_image'
     checkpointable_layers = ['InitialLayer', 'TransformerLayer']
+    # The on-the-fly text encoder is not a pipeline layer's submodule and ComfyUI moves it itself,
+    # so block swap's no-op PipelineModule.to does not strand it on the CPU.
+    block_swap_supports_uncached_text_embeddings = True
+    # TextEncoderLayer (no parameters) was put in front of the layers after the first MOSS-Image
+    # checkpoints were saved; train.py loads those one layer shifted.
+    checkpoint_layers_added_in_front = 1
     adapter_target_modules = ['Block']
     keep_in_high_precision = KEEP_IN_HIGH_PRECISION
     spatial_compression = 16
@@ -890,6 +896,9 @@ class MossImagePipeline(ComfyPipeline):
             raise ValueError('MOSS-Image runs in bfloat16 or float32; set dtype to one of them')
         self.model_config['dtype'] = self.dtype
         self._check_keys()
+        self.cache_text_embeddings = self.model_config['cache_text_embeddings']
+        self.tokenizer = None
+        self.overflow_warned = set()
         self.learning_rates = LearningRates(self.model_config, config.get('optimizer', {}))
         if self.learning_rates.active and 'force_constant_lr' in config:
             raise ValueError('force_constant_lr sets every parameter to one learning rate, so the <part>_lr keys '
@@ -937,7 +946,7 @@ class MossImagePipeline(ComfyPipeline):
             'text_encoders': 'use text_encoder_path (or diffusers_path)',
             'diffusion_model': 'use transformer_path (or diffusers_path)',
             'llm_path': 'use text_encoder_path (or diffusers_path)',
-            'text_encoder_fp8': 'a quantized text encoder is loaded from its own file; cached embeddings free it anyway',
+            'text_encoder_fp8': 'a quantized text encoder is loaded from its own file (text_encoder_path)',
             'transformer_dtype': 'use diffusion_model_dtype',
         }
         bad = [key for key in refused if key in mc]
@@ -949,10 +958,11 @@ class MossImagePipeline(ComfyPipeline):
         if unknown:
             raise ValueError(f'Learning rate keys not used by MOSS-Image: {", ".join(unknown)}. Its learning rate '
                              f'keys are {", ".join(sorted(lr_keys))}.')
-        if mc.get('cache_text_embeddings', True) is not True:
-            raise ValueError(
-                'MOSS-Image needs cache_text_embeddings = true: its 9B text encoder is run once '
-                'per caption while caching and freed before training.')
+        # On the fly by default: a cached embedding is ~8 KB per token, terabytes for a large
+        # dataset. train.py reads the key with a default of true, so the default is written in.
+        cache = mc.setdefault('cache_text_embeddings', False)
+        if not isinstance(cache, bool):
+            raise ValueError(f'cache_text_embeddings must be true or false, got {cache!r}')
         method = mc.get('timestep_sample_method', NOISE_DEFAULTS['timestep_sample_method'])
         if method == 'uniform':
             unused = [key for key in ('logit_mean', 'logit_std', 'sigma_cutoff', 'uniform_fraction') if key in mc]
@@ -1024,12 +1034,31 @@ class MossImagePipeline(ComfyPipeline):
                              'a quantized model, which will not work. Train an [adapter], or load an unquantized checkpoint.')
         self.learning_rates.check_blocks(len(self.diffusion_model.layers))
         self.layer_state = LayerState(self.diffusion_model.rope, self.dtype)
+        if not self.cache_text_embeddings and self.on_first_stage():
+            # Read now, before DeepSpeed starts, by the ranks whose first layer encodes: in the
+            # first step the other stages would wait on the read, and a failed read would leave
+            # them waiting instead of failing with it.
+            te = self.text_encoders[0]
+            te.load_model_if_needed()
+            # Straight onto the GPU, freeing its copy in RAM while the transformer is still there
+            # too (eight ranks per node each hold both otherwise).
+            comfy.model_management.load_models_gpu([te.patcher], force_full_load=True)
+
+    def on_first_stage(self):
+        """Whether this rank is on the first pipeline stage (DeepSpeed numbers ranks stage-major)."""
+        rank, world = rank_and_world_size()
+        return rank // max(1, world // int(self.config.get('pipeline_stages', 1))) == 0
 
     def get_call_vae_fn(self, vae):
         def fn(images):
             # fp32 pixels into the fp32 VAE: the reference encodes without a bf16 round trip.
             return {'latents': self.vae_encode(images.to('cuda', torch.float32))}
         return fn
+
+    def get_text_encoders(self):
+        # None to cache: the dataset then hands the batch its captions, which run through the
+        # encoder in TextEncoderLayer.
+        return self.text_encoders if self.cache_text_embeddings else []
 
     def get_call_text_encoder_fn(self, text_encoder):
         @torch.inference_mode()
@@ -1042,25 +1071,29 @@ class MossImagePipeline(ComfyPipeline):
         return fn
 
     def encode_prompt(self, text_encoder, caption):
-        # One prompt per forward and no padding, as the reference does: Qwen3.5's gated-delta
-        # layers would see the pad tokens of a padded batch.
-        tokens = text_encoder.tokenize(caption)
-        tokenizer = text_encoder.tokenizer
+        return encode_tokens(text_encoder, self.tokenize(caption, text_encoder.tokenizer), self.dtype, self.text_dim)
+
+    def tokenize(self, caption, tokenizer=None):
+        """The caption's tokens as ComfyUI's text encoder takes them, cut at MAX_TEXT_TOKENS
+        (on_caption_overflow says what else happens then)."""
+        if tokenizer is None:
+            if self.tokenizer is None:
+                self.tokenizer = MossImageTokenizer()
+            tokenizer = self.tokenizer
+        tokens = tokenizer.tokenize_with_weights(caption)
         if tokenizer.last_untruncated_length > MAX_TEXT_TOKENS:
             message = (f'Caption is {tokenizer.last_untruncated_length} tokens with the chat template, '
                        f'truncated to {MAX_TEXT_TOKENS}: {caption[:120]!r}...')
             if self.on_caption_overflow == 'error':
                 raise ValueError(message)
-            if self.on_caption_overflow == 'warn':
+            # Once per caption: on the fly, a caption comes back every epoch.
+            # On the fly, the first and the last pipeline stage both tokenize each batch.
+            digest = hashlib.sha1(caption.encode()).digest()
+            if (self.on_caption_overflow == 'warn' and digest not in self.overflow_warned
+                    and (self.cache_text_embeddings or self.on_first_stage())):
+                self.overflow_warned.add(digest)
                 print(f'WARNING: {message}')
-        out = text_encoder.encode_from_tokens(tokens, return_dict=True)
-        cond = out['cond']
-        mask = out.get('attention_mask')
-        if mask is not None and not bool(mask.bool().all()):
-            raise RuntimeError('The text encoder padded a single prompt; expected an all-ones mask')
-        if cond.shape[0] != 1 or cond.shape[-1] != self.text_dim:
-            raise RuntimeError(f'Expected one [1, L, {self.text_dim}] text embedding, got {tuple(cond.shape)}')
-        return cond[0].to(self.dtype)
+        return tokens
 
     def get_conds(self, inputs):
         embeds = inputs['prompt_embeds']
@@ -1109,7 +1142,12 @@ class MossImagePipeline(ComfyPipeline):
     def prepare_inputs(self, inputs, timestep_quantile=None):
         latents = inputs['latents'].float()
         mask = inputs['mask']
-        text, text_mask = self.get_conds(inputs)
+        if 'prompt_embeds' in inputs:
+            text, text_mask = self.get_conds(inputs)
+        else:
+            # Strings cannot cross pipeline stages: the token ids travel instead, with each
+            # caption's length, and TextEncoderLayer encodes them.
+            text, text_mask = token_batch([self.tokenize(caption) for caption in inputs['caption']])
         bs, _, h, w = latents.shape
         if mask is not None:
             mask = mask.unsqueeze(1)
@@ -1158,7 +1196,10 @@ class MossImagePipeline(ComfyPipeline):
     def to_layers(self):
         model = self.diffusion_model
         state = self.layer_state
-        layers = [InitialLayer(model, state)]
+        # The text encoder layer is there either way (see TextEncoderLayer), a pass-through when
+        # embeddings are cached.
+        text_encoder = None if self.cache_text_embeddings else self.text_encoders[0]
+        layers = [TextEncoderLayer(text_encoder, self.dtype, self.text_dim), InitialLayer(model, state)]
         for i, block in enumerate(model.layers):
             layers.append(TransformerLayer(block, i, self.offloader, state, len(model.layers)))
         layers.append(FinalLayer(model))
@@ -1275,6 +1316,139 @@ class MossImagePipeline(ComfyPipeline):
         img = self.vae_decode(x)
         comfy.model_management.unload_all_models()
         return img
+
+
+def encode_tokens(text_encoder, tokens, dtype, text_dim=TEXT_DIM, resident=False):
+    """One prompt's embedding: [tokens, text_dim] in dtype.
+
+    One prompt per forward and no padding, as the reference does: Qwen3.5's gated-delta layers
+    would see the pad tokens of a padded batch. resident: the encoder is already fully on its
+    device, so ComfyUI's loader is skipped. Its memory manager runs on every call otherwise, which
+    empties the CUDA cache and synchronizes the device, and may offload part of the encoder; the
+    computation is encode_from_tokens's either way.
+    """
+    if resident:
+        model = text_encoder.cond_stage_model
+        model.reset_clip_options()
+        if text_encoder.layer_idx is not None:
+            model.set_clip_options({'layer': text_encoder.layer_idx})
+        device = text_encoder.patcher.load_device
+        model.set_clip_options({'execution_device': device})
+        with comfy.model_management.cuda_device_context(device):
+            out = model.encode_token_weights(tokens)
+        out = {'cond': out[0], **(out[2] if len(out) > 2 else {})}
+    else:
+        out = text_encoder.encode_from_tokens(tokens, return_dict=True)
+    cond = out['cond']
+    mask = out.get('attention_mask')
+    if mask is not None and not bool(mask.bool().all()):
+        raise RuntimeError('The text encoder padded a single prompt; expected an all-ones mask')
+    if cond.shape[0] != 1 or cond.shape[-1] != text_dim:
+        raise RuntimeError(f'Expected one [1, L, {text_dim}] text embedding, got {tuple(cond.shape)}')
+    return cond[0].to(dtype)
+
+
+def fully_loaded(patcher):
+    """Whether ComfyUI holds the model entirely on its load device (no low-VRAM offload)."""
+    return (patcher in comfy.model_management.loaded_models() and not patcher.model.model_lowvram
+            and patcher.loaded_size() >= patcher.model_size()
+            and patcher.current_loaded_device() == patcher.load_device)
+
+
+def token_batch(token_lists):
+    """(ids, lengths): the prompts' token ids right-padded into one long tensor, and their counts."""
+    rows = []
+    for tokens in token_lists:
+        (row,) = tokens['qwen35_9b']
+        ids = []
+        for token, weight in row:
+            if not isinstance(token, int) or weight != 1.0:
+                raise ValueError('MOSS-Image takes plain token ids (no embeddings or weights) on the fly')
+            ids.append(token)
+        rows.append(ids)
+    ids = torch.zeros((len(rows), max(len(r) for r in rows)), dtype=torch.long)
+    for i, r in enumerate(rows):
+        ids[i, :len(r)] = torch.tensor(r, dtype=torch.long)
+    return ids, torch.tensor([len(r) for r in rows], dtype=torch.long)
+
+
+# Eval embeddings kept between eval passes (train.py evaluates the same captions once per timestep
+# quantile), on the CPU, up to this many bytes.
+EVAL_CACHE_BYTES = 2 << 30
+
+
+class TextEncoderLayer(nn.Module):
+    """Captions encoded during training (cache_text_embeddings = false): token ids and lengths
+    in, the same right-padded embeddings and mask as cached ones (get_conds) out. Embeddings
+    (cached ones, or the --test_sample preview's) pass through.
+
+    The first layer whether embeddings are cached or not: DeepSpeed saves and loads each layer by
+    its index, so the layout must not depend on the setting, or a resume after changing it would
+    load every block's weights into the next block.
+
+    The encoder is ComfyUI's, frozen, held in a list so it is not this layer's submodule: it
+    stays out of DeepSpeed's checkpoints and parameter counts, and ComfyUI moves it to the GPU.
+    Not checkpointable: recomputing a 9B forward to save its output would be a bad trade.
+    """
+
+    def __init__(self, text_encoder, dtype, text_dim=TEXT_DIM):
+        super().__init__()
+        self.text_encoder = [] if text_encoder is None else [text_encoder]
+        self.dtype = dtype
+        self.text_dim = text_dim
+        self.eval_cache = {}
+        self.eval_cache_bytes = 0
+
+    def encode(self, ids, lengths, device):
+        if not self.text_encoder:
+            raise RuntimeError('Got token ids but MOSS-Image caches its text embeddings (no text encoder is loaded)')
+        (te,) = self.text_encoder
+        te.load_model_if_needed()
+        # Fully on the GPU once; a partial (low VRAM) load would stream weights in every step.
+        if not fully_loaded(te.patcher):
+            comfy.model_management.load_models_gpu([te.patcher], force_full_load=True)
+        training = torch.is_grad_enabled()
+        if training and self.eval_cache:
+            self.eval_cache.clear()
+            self.eval_cache_bytes = 0
+        embeds = []
+        with torch.no_grad(), torch.autocast(device.type, enabled=False):
+            for row, n in zip(ids.tolist(), lengths):
+                key = tuple(row[:n])
+                embed = None if training else self.eval_cache.get(key)
+                if embed is None:
+                    tokens = {'qwen35_9b': [[(token, 1.0) for token in key]]}
+                    embed = encode_tokens(te, tokens, self.dtype, self.text_dim, resident=True)
+                    size = embed.numel() * embed.element_size()
+                    if not training and self.eval_cache_bytes + size <= EVAL_CACHE_BYTES:
+                        self.eval_cache[key] = embed.cpu()
+                        self.eval_cache_bytes += size
+                embeds.append(embed.to(device))
+        return embeds
+
+    @torch.compiler.disable
+    def forward(self, inputs):
+        x, sigma, ids, lengths = inputs
+        if torch.is_floating_point(ids):
+            text, mask = ids, lengths
+        else:
+            lengths = lengths.tolist()
+            embeds = self.encode(ids, lengths, x.device)
+            text = embeds[0].new_zeros((len(embeds), max(lengths), self.text_dim))
+            mask = torch.zeros((len(embeds), max(lengths)), dtype=torch.bool, device=x.device)
+            for i, e in enumerate(embeds):
+                text[i, :e.shape[0]] = e
+                mask[i, :e.shape[0]] = True
+        outputs = make_contiguous(x, sigma, text, mask)
+        # Marked here, in a layer that is never checkpointed, as Iris does: a stage that ends with
+        # this layer sends them to the next one and runs backward on them, and reentrant
+        # checkpointing decides from its inputs whether the next layer's parameters get gradients.
+        # Not under no_grad: sampling passes its own tensors (the prompt's embeddings) through.
+        if torch.is_grad_enabled():
+            for tensor in outputs:
+                if torch.is_floating_point(tensor) and not tensor.requires_grad:
+                    tensor.requires_grad_(True)
+        return outputs
 
 
 def _length_groups(lengths):
