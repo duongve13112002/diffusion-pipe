@@ -44,6 +44,15 @@ diffusers_path = '/pvc/models/MOSS-Image-Base'
 #transformer_path = '/pvc/runs/moss_image_full/<run>/step5000'
 dtype = 'bfloat16'
 timestep_sample_method = 'logit_normal'
+# Learning rates per part of the model (default: [optimizer] lr; 0 freezes the part):
+#attn_lr = 1e-5           # q, k, v, o and q_norm/k_norm of the 42 blocks
+#ffn_lr = 1e-5            # ffn_up_gate, ffn_down
+#norm_lr = 5e-6           # the blocks' norm1/norm2
+#text_refiner_lr = 5e-6   # text_embedder: the text refiner in front of the blocks
+#modulation_lr = 5e-6     # time_embedding, shared_block_modulation, video_head_modulation
+#embed_head_lr = 5e-6     # video_embedder, final_norm_video, final_linear_video
+# ...and per block, multiplying its part's rate (ranges are inclusive and may not overlap):
+#block_lr_scale = [{blocks = '0-9', scale = 0.5}, {blocks = '35-41', scale = 1.5}]
 
 [optimizer]
 type = 'adamw_optimi'

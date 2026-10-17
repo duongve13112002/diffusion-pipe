@@ -38,6 +38,12 @@ diffusers_path = '/data/models/MOSS-Image-Base'
 #text_encoder_path = '/data/comfyui/models/text_encoders/qwen35_9b.safetensors'
 #vae_path = '/data/comfyui/models/vae/flux2-vae.safetensors'
 dtype = 'bfloat16'
+# The LoRA's learning rate per part and per block (default: [optimizer] lr). A LoRA on the blocks
+# has attn and ffn parameters only; norm_lr, text_refiner_lr, modulation_lr and embed_head_lr
+# are refused for it. See docs/supported_models.md#moss-image.
+#attn_lr = 1e-4
+#ffn_lr = 5e-5
+#block_lr_scale = [{blocks = '0-9', scale = 0.5}]
 # Keep the 42 blocks in fp8 to save memory (LoRA/LoKr only); everything else stays in dtype.
 #diffusion_model_dtype = 'float8'
 # Adapters merged into the weights before training (for example a LoRA trained on Base).

@@ -32,6 +32,7 @@ from utils.unsloth_utils import unsloth_checkpoint
 from utils.pipeline import ManualPipelineModule
 from utils.oplora import OPLoRAProjector, apply_oplora_config_defaults
 from utils.lr_schedule import create_lr_scheduler
+from utils.param_groups import check_resumed_param_groups, group_names, split_2d_param_groups
 from utils.ema import ParameterEMA, apply_ema_config_defaults, load_ema_checkpoint, load_ema_weights
 from utils.optimizer_factory import resolve_optimizer_class
 
@@ -806,29 +807,7 @@ if __name__ == '__main__':
         elif optim_type_lower == 'genericoptim':
             kwargs['compile'] = config['compile']
             kwargs['mpu'] = pipeline_model.mpu()
-            new_param_groups = []
-            param_groups = model.get_param_groups(model_parameters)
-            for pg in param_groups:
-                params = pg.pop('params')
-                params_2d = []
-                params_other = []
-                for p in params:
-                    if p.ndim == 2:
-                        params_2d.append(p)
-                    else:
-                        params_other.append(p)
-                pg_2d = pg.copy()
-                pg_2d['params'] = params_2d
-                if kwargs.get('second_moment_type', None) == 'sn':
-                    pg_2d['subset_size'] = 'heuristics'
-                for key in ('rank', 'proj_type', 'update_proj_gap'):
-                    if key in kwargs:
-                        pg_2d[key] = kwargs.pop(key)
-                new_param_groups.append(pg_2d)
-                pg_other = pg
-                pg_other['params'] = params_other
-                new_param_groups.append(pg_other)
-            param_groups = new_param_groups
+            param_groups = split_2d_param_groups(model.get_param_groups(model_parameters), kwargs)
         else:
             param_groups = model.get_param_groups(model_parameters)
 
@@ -929,12 +908,15 @@ if __name__ == '__main__':
     # which starts creating dataloader internal state
     if resume_from_checkpoint:
         param_groups = optimizer.param_groups.copy()
+        names_before = group_names(optimizer.param_groups)
         load_path, client_state = model_engine.load_checkpoint(
             run_dir,
             load_module_strict=False,
             load_lr_scheduler_states='force_constant_lr' not in config and not args.reset_optimizer and not args.reset_optimizer_params,
             load_optimizer_states=not args.reset_optimizer,
         )
+        if not args.reset_optimizer:
+            check_resumed_param_groups(names_before, group_names(optimizer.param_groups))
         if args.reset_optimizer_params:
             optimizer.param_groups = param_groups
         dist.barrier()  # just so the print below doesn't get swamped

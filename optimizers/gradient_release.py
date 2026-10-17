@@ -13,6 +13,19 @@ class GradientReleaseOptimizerWrapper(torch.optim.Optimizer):
             ret.extend(opt.param_groups)
         return ret
 
+    @param_groups.setter
+    def param_groups(self, groups):
+        # train.py's --reset_optimizer_params puts back the groups it read before loading a
+        # checkpoint: the per-parameter optimizers' groups, in the order the getter lists them.
+        groups = list(groups)
+        if len(groups) != sum(len(opt.param_groups) for opt in self.optimizers):
+            raise ValueError(f'Expected one param group per wrapped optimizer group, got {len(groups)}')
+        i = 0
+        for opt in self.optimizers:
+            n = len(opt.param_groups)
+            opt.param_groups = groups[i:i + n]
+            i += n
+
     def state_dict(self):
         return {i: opt.state_dict() for i, opt in enumerate(self.optimizers)}
 

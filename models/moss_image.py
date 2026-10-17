@@ -25,6 +25,7 @@ ComfyUI or diffusers layout), or a mix: a component path overrides the same comp
 diffusers_path.
 """
 
+import hashlib
 import json
 import logging
 import math
@@ -40,6 +41,7 @@ import safetensors.torch
 import torch
 from torch import nn
 import torch.nn.functional as F
+import deepspeed.comm.comm as dist
 from tqdm import tqdm
 
 from models.base import ComfyPipeline, ModelWrapper, PreprocessMediaFile, make_contiguous
@@ -117,6 +119,161 @@ def _dtype(value, key):
     if value not in DTYPE_NAMES:
         raise ValueError(f'{key} must be one of {sorted(DTYPE_NAMES)}, got {value!r}')
     return DTYPE_NAMES[value]
+
+
+# ---- learning rates per part of the model ----------------------------------------------------------
+
+# Each parameter (an adapter's too: PEFT keeps the module path, layers.3.proj.q.lora_A...) belongs
+# to one of these, by name. The `<part>_lr` keys of [model] set a part's learning rate.
+LR_PARTS = {
+    'attn': re.compile(r'layers\.\d+\.(proj\.[qkvo]|q_norm|k_norm)\.'),
+    'ffn': re.compile(r'layers\.\d+\.proj\.ffn_(up_gate|down)\.'),
+    'norm': re.compile(r'layers\.\d+\.norm[12]\.'),
+    'text_refiner': re.compile(r'text_embedder\.'),
+    'modulation': re.compile(r'(time_embedding|shared_block_modulation|video_head_modulation)\.'),
+    'embed_head': re.compile(r'(video_embedder|final_norm_video|final_linear_video)\.'),
+}
+BLOCK_INDEX = re.compile(r'layers\.(\d+)\.')
+COSINE_ETA_MIN = 1e-6
+
+
+def rank_and_world_size():
+    if not dist.is_initialized():
+        return 0, 1
+    return dist.get_rank(), dist.get_world_size()
+
+
+def _number(value, key):
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
+        raise ValueError(f'{key} must be a number >= 0, got {value!r}')
+    return float(value)
+
+
+def parse_block_lr_scale(value):
+    """block_lr_scale: [(first, last, scale, label)], from a list of {blocks, scale} tables.
+
+    blocks is a block index or an inclusive 'first-last' range of them. Ranges may not overlap,
+    so which scale a block gets never depends on their order.
+    """
+    if not isinstance(value, list) or not value:
+        raise ValueError("block_lr_scale must be a list of tables like {blocks = '0-9', scale = 0.5}")
+    ranges = []
+    for i, entry in enumerate(value):
+        where = f'block_lr_scale[{i}]'
+        if not isinstance(entry, dict):
+            raise ValueError(f"{where} must be a table like {{blocks = '0-9', scale = 0.5}}, got {entry!r}")
+        unknown = sorted(set(entry) - {'blocks', 'scale'})
+        missing = [key for key in ('blocks', 'scale') if key not in entry]
+        if unknown or missing:
+            raise ValueError(f'{where}: ' + '; '.join(
+                ([f'unknown keys {unknown}'] if unknown else []) + ([f'missing {missing}'] if missing else [])))
+        blocks = entry['blocks']
+        if isinstance(blocks, int) and not isinstance(blocks, bool):
+            first = last = blocks
+        elif isinstance(blocks, str) and (m := re.fullmatch(r'\s*(\d+)\s*(?:-\s*(\d+)\s*)?', blocks)):
+            first = int(m[1])
+            last = int(m[2]) if m[2] is not None else first
+        else:
+            raise ValueError(f"{where}: blocks must be a block index or a range like '0-9', got {blocks!r}")
+        if first < 0 or last < first:
+            raise ValueError(f"{where}: blocks {blocks!r} is not a range first-last with 0 <= first <= last")
+        ranges.append((first, last, _number(entry['scale'], f'{where}.scale'), f'blocks {first}-{last}'))
+    ordered = sorted(ranges)
+    for (a_first, a_last, _, a), (b_first, _, _, b) in zip(ordered, ordered[1:]):
+        if b_first <= a_last:
+            raise ValueError(f'block_lr_scale: {a} and {b} overlap')
+    return ranges
+
+
+class LearningRates:
+    """The learning rate of every trainable parameter: its part's `<part>_lr` (default: the
+    optimizer's lr), times the block_lr_scale of its block for the parameters of the 42 blocks."""
+
+    def __init__(self, model_config, optimizer_config):
+        self.part_lrs = {part: _number(model_config[f'{part}_lr'], f'{part}_lr')
+                         for part in LR_PARTS if f'{part}_lr' in model_config}
+        self.ranges = parse_block_lr_scale(model_config['block_lr_scale']) if 'block_lr_scale' in model_config else []
+        self.active = bool(self.part_lrs or self.ranges)
+        self.base_lr = optimizer_config.get('lr')
+        if self.active and self.base_lr is None:
+            raise ValueError('[optimizer] needs an lr for the <part>_lr keys and block_lr_scale to work from')
+
+    def check_blocks(self, num_blocks):
+        beyond = [label for first, last, _, label in self.ranges if last >= num_blocks]
+        if beyond:
+            raise ValueError(f'block_lr_scale: {", ".join(beyond)} past the last block; this transformer '
+                             f'has blocks 0-{num_blocks - 1}')
+
+    def place(self, name):
+        """(part, block range label or None, learning rate) of a parameter."""
+        part = next((part for part, pattern in LR_PARTS.items() if pattern.match(name)), None)
+        if part is None:
+            raise RuntimeError(f'MOSS-Image parameter {name} belongs to no learning rate part')
+        lr = self.part_lrs.get(part, self.base_lr)
+        label = None
+        if m := BLOCK_INDEX.match(name):
+            block = int(m[1])
+            for first, last, scale, range_label in self.ranges:
+                if first <= block <= last:
+                    lr, label = lr * scale, range_label
+                    break
+        return part, label, lr
+
+    def check_used(self, names):
+        """Refuse settings that change nothing, and settings that leave nothing to train.
+
+        A setting changes nothing when it covers no trainable parameter (a LoRA on the blocks has
+        no text refiner parameters, say), or when everything it covers is frozen by another
+        setting (block_lr_scale on blocks whose parts all have lr 0). A setting of 0 freezes what
+        it covers, which is a change. names: every trainable parameter of the model, not one
+        pipeline stage's.
+        """
+        places = [self.place(name) for name in names]
+        parts = {part for part, _, _ in places}
+        unused = []
+        for part, lr in self.part_lrs.items():
+            covered = [final for p, _, final in places if p == part]
+            if not covered:
+                unused.append(f'{part}_lr (no trainable parameters)')
+            elif lr != 0 and not any(covered):
+                unused.append(f'{part}_lr (block_lr_scale freezes all of them)')
+        for _, _, scale, label in self.ranges:
+            covered = [final for _, l, final in places if l == label]
+            if not covered:
+                unused.append(f'block_lr_scale {label} (no trainable parameters)')
+            elif scale != 0 and not any(covered):
+                unused.append(f'block_lr_scale {label} (its parts have lr 0)')
+        if unused:
+            raise ValueError('These learning rate settings change nothing: ' + ', '.join(unused)
+                             + f'. Trainable parts: {", ".join(sorted(parts))}.')
+        if not any(final for _, _, final in places):
+            raise ValueError('The learning rate settings freeze every trainable parameter: nothing would train.')
+
+    def groups(self, parameters, report=True, where=''):
+        """Optimizer param groups, one per (part, block range); a group whose lr is 0 is frozen.
+
+        Each group is named after its part, block range and parameters ('name', which the saved
+        optimizer state keeps): a resumed run refuses optimizer state saved for other groups
+        (utils/param_groups.py), which torch would otherwise hand out by position.
+        """
+        grouped = OrderedDict()
+        for p in parameters:
+            part, label, lr = self.place(p.original_name)
+            grouped.setdefault((part, label), (lr, []))[1].append(p)
+        param_groups = []
+        for (part, label), (lr, params) in grouped.items():
+            if lr == 0:
+                for p in params:
+                    p.requires_grad_(False)
+            else:
+                digest = hashlib.sha1('\n'.join(p.original_name for p in params).encode()).hexdigest()[:12]
+                name = f'{part}' + (f' ({label})' if label else '') + f' #{digest}'
+                param_groups.append({'params': params, 'lr': lr, 'name': name})
+        if report:
+            print(f'MOSS-Image learning rates{where}: ' + ', '.join(
+                f'{part}{f" ({label})" if label else ""}: {len(params)} tensors @ {lr:g}'
+                + (' (frozen)' if lr == 0 else '') for (part, label), (lr, params) in grouped.items()))
+        return param_groups
 
 
 # ---- weights on disk -------------------------------------------------------------------------------
@@ -733,6 +890,10 @@ class MossImagePipeline(ComfyPipeline):
             raise ValueError('MOSS-Image runs in bfloat16 or float32; set dtype to one of them')
         self.model_config['dtype'] = self.dtype
         self._check_keys()
+        self.learning_rates = LearningRates(self.model_config, config.get('optimizer', {}))
+        if self.learning_rates.active and 'force_constant_lr' in config:
+            raise ValueError('force_constant_lr sets every parameter to one learning rate, so the <part>_lr keys '
+                             'and block_lr_scale would do nothing: remove them, or force_constant_lr')
         self.latent_format = comfy.latent_formats.Flux2()
         self.text_dim = TEXT_DIM
 
@@ -783,6 +944,11 @@ class MossImagePipeline(ComfyPipeline):
         if bad:
             raise ValueError('Config keys not used by MOSS-Image: '
                              + '; '.join(f'{key} ({refused[key]})' for key in bad))
+        lr_keys = {f'{part}_lr' for part in LR_PARTS} | {'block_lr_scale'}
+        unknown = sorted(key for key in mc if (key.endswith('_lr') or 'block_lr' in key) and key not in lr_keys)
+        if unknown:
+            raise ValueError(f'Learning rate keys not used by MOSS-Image: {", ".join(unknown)}. Its learning rate '
+                             f'keys are {", ".join(sorted(lr_keys))}.')
         if mc.get('cache_text_embeddings', True) is not True:
             raise ValueError(
                 'MOSS-Image needs cache_text_embeddings = true: its 9B text encoder is run once '
@@ -856,6 +1022,7 @@ class MossImagePipeline(ComfyPipeline):
         if self.patch_quantized_modules(self.diffusion_model) and 'adapter' not in self.config:
             raise ValueError(f'{self.transformer_path} is a quantized checkpoint: you are trying to full finetune '
                              'a quantized model, which will not work. Train an [adapter], or load an unquantized checkpoint.')
+        self.learning_rates.check_blocks(len(self.diffusion_model.layers))
         self.layer_state = LayerState(self.diffusion_model.rope, self.dtype)
 
     def get_call_vae_fn(self, vae):
@@ -956,6 +1123,37 @@ class MossImagePipeline(ComfyPipeline):
         return (noisy, sigma, text, text_mask), (target, mask)
 
     # ---- pipeline layers -------------------------------------------------------------------------
+
+    def get_param_groups(self, parameters):
+        rates = self.learning_rates
+        if not rates.active:
+            return super().get_param_groups(parameters)
+        # Checked against the whole model: under pipeline parallelism `parameters` is one stage's.
+        # A parameter this frozen on an earlier call still counts as trainable.
+        trainable = [p.original_name for p in self.diffusion_model.parameters()
+                     if p.requires_grad or getattr(p, '_moss_lr_frozen', False)]
+        rates.check_used(trainable)
+        # Each pipeline stage has its own parameters: the first data-parallel rank of every stage
+        # reports them (DeepSpeed numbers ranks stage-major: stage * data_parallel + data_rank).
+        stages = int(self.config.get('pipeline_stages', 1))
+        rank, world = rank_and_world_size()
+        data_parallel = max(1, world // stages)
+        report = rank % data_parallel == 0
+        where = f' (pipeline stage {rank // data_parallel})' if stages > 1 else ''
+        groups = rates.groups(parameters, report=report, where=where)
+        if not groups:
+            raise ValueError(f'The learning rate settings freeze every parameter of this pipeline stage{where}: '
+                             'block_lr_scale or a <part>_lr of 0 covers all it holds. Use fewer pipeline_stages, '
+                             'or let some of its blocks train.')
+        # The cosine schedules end at an absolute eta_min (utils/lr_schedule.py).
+        low = sorted({g['lr'] for g in groups if g['lr'] < COSINE_ETA_MIN})
+        if low and str(self.config.get('lr_scheduler', '')).startswith('cosine') and report:
+            logging.warning(f'Learning rates{where} {", ".join(f"{lr:g}" for lr in low)} are below the cosine '
+                            f'schedule\'s floor of {COSINE_ETA_MIN:g}: those groups rise towards it rather than decay.')
+        for p in parameters:
+            if not p.requires_grad:
+                p._moss_lr_frozen = True
+        return groups
 
     def to_layers(self):
         model = self.diffusion_model

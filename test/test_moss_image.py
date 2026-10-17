@@ -91,6 +91,7 @@ def bare_pipeline(model_config=None, config=None):
     pipe.dtype = torch.float32
     pipe.text_dim = TEXT_DIM
     pipe.offloader = mi.ModelOffloader('dummy', [], 0, 0, True, torch.device('cpu'), False, debug=False)
+    pipe.learning_rates = mi.LearningRates(pipe.model_config, pipe.config.get('optimizer', {}))
     return pipe
 
 
@@ -1301,3 +1302,253 @@ def test_example_configs_are_accepted(name):
     pipe.config, pipe.model_config = config, config['model']
     pipe._check_keys()
     assert config.get('keep_last_n_checkpoints', 2) >= 2
+
+
+# ---- learning rates per part and per block ---------------------------------------------------------
+
+BASE_LR = 1e-4
+PART_LRS = dict(attn_lr=1e-5, ffn_lr=2e-5, norm_lr=3e-5, text_refiner_lr=4e-5, modulation_lr=5e-5, embed_head_lr=6e-5)
+
+
+def lr_pipeline(tmp_path, model_config, adapter=None):
+    path = tmp_path / 'moss.safetensors'
+    if not path.exists():
+        safetensors.torch.save_file(tiny_state(tiny_reference()), path)
+    pipe = bare_pipeline(dict(model_config), {'optimizer': {'lr': BASE_LR}, **({'adapter': adapter} if adapter else {})})
+    pipe.transformer_path = str(path)
+    pipe.load_diffusion_model()
+    if adapter:
+        for q in pipe.diffusion_model.parameters():
+            q.requires_grad_(False)
+        pipe.configure_adapter(dict(adapter))
+    return pipe
+
+
+def lr_of(groups):
+    return {p.original_name: g['lr'] for g in groups for p in g['params']}
+
+
+def trainable(pipe):
+    return [q for q in pipe.diffusion_model.parameters() if q.requires_grad]
+
+
+def expected_part(name):
+    if name.startswith('text_embedder.'):
+        return 'text_refiner'
+    if name.startswith(('time_embedding.', 'shared_block_modulation.', 'video_head_modulation.')):
+        return 'modulation'
+    if name.startswith(('video_embedder.', 'final_norm_video.', 'final_linear_video.')):
+        return 'embed_head'
+    module = name.split('.')[2]
+    if module in ('norm1', 'norm2'):
+        return 'norm'
+    if module in ('q_norm', 'k_norm') or name.split('.')[3] in 'qkvo':
+        return 'attn'
+    assert name.split('.')[3] in ('ffn_up_gate', 'ffn_down'), name
+    return 'ffn'
+
+
+def test_without_learning_rate_keys_there_is_one_group(tmp_path):
+    pipe = lr_pipeline(tmp_path, {})
+    params = trainable(pipe)
+    groups = pipe.get_param_groups(params)
+    assert len(groups) == 1 and groups[0]['params'] == params and 'lr' not in groups[0]
+
+
+def test_every_parameter_gets_its_parts_learning_rate(tmp_path):
+    pipe = lr_pipeline(tmp_path, PART_LRS)
+    params = trainable(pipe)
+    lrs = lr_of(pipe.get_param_groups(params))
+    assert len(lrs) == len(params)
+    for name, lr in lrs.items():
+        assert lr == PART_LRS[expected_part(name) + '_lr'], name
+    # A part without a key keeps the optimizer's lr.
+    pipe = lr_pipeline(tmp_path, {'attn_lr': 1e-5})
+    lrs = lr_of(pipe.get_param_groups(trainable(pipe)))
+    assert {lr for name, lr in lrs.items() if expected_part(name) != 'attn'} == {BASE_LR}
+
+
+def test_block_lr_scale_multiplies_the_blocks_in_its_range(tmp_path):
+    pipe = lr_pipeline(tmp_path, {'ffn_lr': 2e-5, 'block_lr_scale': [{'blocks': '0-1', 'scale': 0.5}, {'blocks': 2, 'scale': 3}]})
+    lrs = lr_of(pipe.get_param_groups(trainable(pipe)))
+    for name, lr in lrs.items():
+        base = 2e-5 if expected_part(name) == 'ffn' else BASE_LR
+        if name.startswith(('layers.0.', 'layers.1.')):
+            assert lr == pytest.approx(base * 0.5), name
+        elif name.startswith('layers.2.'):
+            assert lr == pytest.approx(base * 3), name
+        else:
+            assert lr == base, name
+
+
+def test_a_zero_learning_rate_freezes_and_the_optimizer_applies_the_rest(tmp_path):
+    pipe = lr_pipeline(tmp_path, {'text_refiner_lr': 0, 'attn_lr': 1e-3, 'block_lr_scale': [{'blocks': '1', 'scale': 0}]})
+    params = trainable(pipe)
+    groups = pipe.get_param_groups(params)
+    lrs = lr_of(groups)
+    frozen = [q for q in params if not q.requires_grad]
+    assert frozen and all(q.original_name.startswith(('text_embedder.', 'layers.1.')) for q in frozen)
+    assert not any(n.startswith(('text_embedder.', 'layers.1.')) for n in lrs)
+    before = {q.original_name: q.detach().clone() for q in params}
+    for q in params:
+        q.grad = torch.ones_like(q) if q.requires_grad else None
+    torch.optim.SGD(groups, lr=BASE_LR).step()
+    for q in params:
+        step = (before[q.original_name] - q.detach()).flatten()[0].item()
+        assert step == pytest.approx(lrs.get(q.original_name, 0.0), rel=1e-3, abs=1e-9), q.original_name
+
+
+def test_one_pipeline_stage_and_a_second_call_are_not_refused(tmp_path):
+    pipe = lr_pipeline(tmp_path, {'text_refiner_lr': 0, 'embed_head_lr': 1e-5})
+    params = trainable(pipe)
+    # A later stage holds no text refiner nor video embedder: the check is on the whole model.
+    stage = [q for q in params if q.original_name.startswith('layers.2.')]
+    assert set(lr_of(pipe.get_param_groups(stage)).values()) == {BASE_LR}
+    pipe.get_param_groups(params)
+    pipe.get_param_groups([q for q in params if q.requires_grad])
+
+
+def test_lora_learning_rates_and_settings_a_lora_has_nothing_for(tmp_path):
+    pipe = lr_pipeline(tmp_path, {'attn_lr': 1e-5, 'block_lr_scale': [{'blocks': '0', 'scale': 2}]}, adapter=LORA)
+    lrs = lr_of(pipe.get_param_groups(trainable(pipe)))
+    assert lrs and all('lora_' in name for name in lrs)
+    assert lrs['layers.0.proj.q.lora_A.default.weight'] == pytest.approx(2e-5)
+    assert lrs['layers.1.proj.k.lora_B.default.weight'] == 1e-5
+    assert lrs['layers.0.proj.ffn_down.lora_A.default.weight'] == pytest.approx(2 * BASE_LR)
+    assert lrs['layers.2.proj.ffn_up_gate.lora_A.default.weight'] == BASE_LR
+    # The blocks' LoRA has no text refiner, norm or modulation parameters to train.
+    pipe = lr_pipeline(tmp_path, {'text_refiner_lr': 1e-5, 'norm_lr': 1e-5, 'attn_lr': 1e-5}, adapter=LORA)
+    with pytest.raises(ValueError, match=r'change nothing: norm_lr \(no trainable parameters\), text_refiner_lr \(no trainable'):
+        pipe.get_param_groups(trainable(pipe))
+    adapter = {**LORA, 'exclude_modules': ['layers.2.proj.q', 'layers.2.proj.k', 'layers.2.proj.v',
+                                            'layers.2.proj.o', 'layers.2.proj.ffn_up_gate', 'layers.2.proj.ffn_down']}
+    pipe = lr_pipeline(tmp_path, {'block_lr_scale': [{'blocks': '2', 'scale': 2}]}, adapter=adapter)
+    with pytest.raises(ValueError, match=r'block_lr_scale blocks 2-2 \(no trainable parameters\)'):
+        pipe.get_param_groups(trainable(pipe))
+
+
+@pytest.mark.parametrize('model_config,message', [
+    ({'attn_lr': -1e-5}, 'attn_lr must be a number >= 0'),
+    ({'ffn_lr': True}, 'ffn_lr must be a number >= 0'),
+    ({'ffn_lr': '1e-5'}, 'ffn_lr must be a number >= 0'),
+    ({'block_lr_scale': {'blocks': '0-9', 'scale': 0.5}}, 'must be a list of tables'),
+    ({'block_lr_scale': []}, 'must be a list of tables'),
+    ({'block_lr_scale': [{'blocks': '0-9', 'scale': 0.5, 'lr': 1}]}, r"block_lr_scale\[0\]: unknown keys \['lr'\]"),
+    ({'block_lr_scale': [{'blocks': '0-9'}]}, r"missing \['scale'\]"),
+    ({'block_lr_scale': [{'blocks': '9-0', 'scale': 1}]}, 'is not a range'),
+    ({'block_lr_scale': [{'blocks': 'early', 'scale': 1}]}, 'must be a block index or a range'),
+    ({'block_lr_scale': [{'blocks': -1, 'scale': 1}]}, 'is not a range'),
+    ({'block_lr_scale': [{'blocks': '0-9', 'scale': -1}]}, r'block_lr_scale\[0\]\.scale must be a number >= 0'),
+    ({'block_lr_scale': [{'blocks': '0-9', 'scale': 1}, {'blocks': '9-12', 'scale': 2}]}, 'blocks 0-9 and blocks 9-12 overlap'),
+])
+def test_bad_learning_rate_settings_are_refused(model_config, message):
+    with pytest.raises(ValueError, match=message):
+        mi.LearningRates(model_config, {'lr': BASE_LR})
+
+
+def test_learning_rate_settings_need_an_optimizer_lr_and_blocks_that_exist(tmp_path):
+    with pytest.raises(ValueError, match=r'\[optimizer\] needs an lr'):
+        mi.LearningRates({'attn_lr': 1e-5}, {})
+    mi.LearningRates({}, {})
+    with pytest.raises(ValueError, match='blocks 2-5 past the last block; this transformer has blocks 0-2'):
+        lr_pipeline(tmp_path, {'block_lr_scale': [{'blocks': '2-5', 'scale': 2}]})
+
+
+def test_the_pipeline_reads_learning_rate_settings_from_its_config(tmp_path):
+    pipe = make_pipeline({'transformer_path': 'a', 'vae_path': 'b', 'text_encoder_path': 'c', 'attn_lr': 1e-5,
+                          'block_lr_scale': [{'blocks': '0-9', 'scale': 0.5}]}, {'optimizer': {'lr': BASE_LR}})
+    assert pipe.learning_rates.part_lrs == {'attn': 1e-5} and pipe.learning_rates.ranges == [(0, 9, 0.5, 'blocks 0-9')]
+    with pytest.raises(ValueError, match='overlap'):
+        make_pipeline({'transformer_path': 'a', 'vae_path': 'b', 'text_encoder_path': 'c',
+                       'block_lr_scale': [{'blocks': '0-9', 'scale': 1}, {'blocks': 5, 'scale': 2}]}, {'optimizer': {'lr': 1}})
+
+
+def test_force_constant_lr_is_refused_with_learning_rate_settings():
+    paths = {'transformer_path': 'a', 'vae_path': 'b', 'text_encoder_path': 'c'}
+    with pytest.raises(ValueError, match='force_constant_lr sets every parameter'):
+        make_pipeline({**paths, 'attn_lr': 1e-5}, {'optimizer': {'lr': BASE_LR}, 'force_constant_lr': 1e-5})
+    make_pipeline(paths, {'optimizer': {'lr': BASE_LR}, 'force_constant_lr': 1e-5})
+
+
+def test_learning_rates_below_the_cosine_floor_are_warned_about(tmp_path, caplog):
+    pipe = lr_pipeline(tmp_path, {'block_lr_scale': [{'blocks': '0', 'scale': 0.005}]})
+    pipe.config['lr_scheduler'] = 'cosine'
+    with caplog.at_level(logging.WARNING):
+        pipe.get_param_groups(trainable(pipe))
+    assert 'Learning rates 5e-07 are below' in caplog.text
+    caplog.clear()
+    pipe.config['lr_scheduler'] = 'linear'
+    with caplog.at_level(logging.WARNING):
+        pipe.get_param_groups(trainable(pipe))
+    assert 'below' not in caplog.text
+
+
+@pytest.mark.parametrize('key', ['mlp_lr', 'self_attn_lr', 'refiner_lr', 'text_encoder_lr', 'atn_lr', 'block_lr_scales'])
+def test_learning_rate_keys_moss_image_does_not_have_are_refused(key):
+    paths = {'transformer_path': 'a', 'vae_path': 'b', 'text_encoder_path': 'c'}
+    with pytest.raises(ValueError, match=f'Learning rate keys not used by MOSS-Image: {key}\\.'):
+        make_pipeline({**paths, key: 1e-5}, {'optimizer': {'lr': BASE_LR}})
+
+
+@pytest.mark.parametrize('model_config,message', [
+    # The blocks' LoRA is all attn and ffn: frozen, block 0's scale has nothing left to scale.
+    ({'attn_lr': 0, 'ffn_lr': 0, 'block_lr_scale': [{'blocks': 0, 'scale': 2}]},
+     r'block_lr_scale blocks 0-0 \(its parts have lr 0\)'),
+    ({'attn_lr': 1e-5, 'block_lr_scale': [{'blocks': '0-2', 'scale': 0}]},
+     r'attn_lr \(block_lr_scale freezes all of them\)'),
+    ({'attn_lr': 0, 'ffn_lr': 0}, 'freeze every trainable parameter'),
+])
+def test_settings_that_change_nothing_or_freeze_everything_are_refused(tmp_path, model_config, message):
+    pipe = lr_pipeline(tmp_path, model_config, adapter=LORA)
+    with pytest.raises(ValueError, match=message):
+        pipe.get_param_groups(trainable(pipe))
+
+
+def test_a_pipeline_stage_left_with_nothing_to_train_is_refused(tmp_path):
+    pipe = lr_pipeline(tmp_path, {'block_lr_scale': [{'blocks': '1-2', 'scale': 0}]}, adapter=LORA)
+    params = trainable(pipe)
+    with pytest.raises(ValueError, match='freeze every parameter of this pipeline stage'):
+        pipe.get_param_groups([q for q in params if q.original_name.startswith('layers.2.')])
+
+
+def test_each_pipeline_stage_reports_its_learning_rates(tmp_path, monkeypatch, capsys, caplog):
+    pipe = lr_pipeline(tmp_path, {'block_lr_scale': [{'blocks': '2', 'scale': 0.005}]})
+    pipe.config.update(pipeline_stages=2, lr_scheduler='cosine')
+    params = trainable(pipe)
+    stage_1 = [q for q in params if q.original_name.startswith('layers.2.')]
+    for rank, reports in ((2, True), (3, False)):  # 4 GPUs: stage 1 is ranks 2 and 3
+        monkeypatch.setattr(mi, 'rank_and_world_size', lambda: (rank, 4))
+        capsys.readouterr()
+        caplog.clear()
+        with caplog.at_level(logging.WARNING):
+            pipe.get_param_groups(stage_1)
+        out = capsys.readouterr().out
+        assert ('learning rates (pipeline stage 1)' in out) == reports
+        assert ('Learning rates (pipeline stage 1) 5e-07 are below' in caplog.text) == reports
+
+
+def lr_groups_state(tmp_path, model_config, sub):
+    pipe = lr_pipeline(tmp_path / sub, model_config, adapter=LORA)
+    params = trainable(pipe)
+    optimizer = torch.optim.AdamW(pipe.get_param_groups(params), lr=BASE_LR)
+    for q in params:
+        q.grad = torch.randn_like(q) if q.requires_grad else None
+    optimizer.step()
+    return optimizer
+
+
+def test_resuming_optimizer_state_saved_for_other_groups_is_refused(tmp_path):
+    from utils.param_groups import check_resumed_param_groups, group_names
+    (tmp_path / 'a').mkdir(); (tmp_path / 'b').mkdir(); (tmp_path / 'c').mkdir()
+    saved = lr_groups_state(tmp_path, {'block_lr_scale': [{'blocks': 0, 'scale': 0}]}, 'a').state_dict()
+    # Same sizes, other parameters: torch alone would load it without a word.
+    other = lr_groups_state(tmp_path, {'block_lr_scale': [{'blocks': 2, 'scale': 0}]}, 'b')
+    before = group_names(other.param_groups)
+    other.load_state_dict(saved)
+    with pytest.raises(RuntimeError, match='belongs to other param groups'):
+        check_resumed_param_groups(before, group_names(other.param_groups))
+    same = lr_groups_state(tmp_path, {'block_lr_scale': [{'blocks': 0, 'scale': 0}]}, 'c')
+    before = group_names(same.param_groups)
+    assert all(before)
+    same.load_state_dict(saved)
+    check_resumed_param_groups(before, group_names(same.param_groups))

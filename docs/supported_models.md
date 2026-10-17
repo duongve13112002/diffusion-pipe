@@ -804,6 +804,30 @@ freed. Edit/control datasets are not supported.
   A transformer of another shape than ComfyUI detects (head size 128, `text_dim` 4096, 128
   latent channels) trains with a warning: ComfyUI's loader cannot load what it saves. So does a
   single file with other than 42 blocks, which may be truncated.
+- Learning rates per part and per block, in `[model]`; each defaults to `[optimizer] lr`, and 0
+  freezes what it covers:
+
+  | key | parameters |
+  |---|---|
+  | `attn_lr` | the blocks' `proj.q/k/v/o`, `q_norm`, `k_norm` |
+  | `ffn_lr` | the blocks' `proj.ffn_up_gate`, `proj.ffn_down` |
+  | `norm_lr` | the blocks' `norm1`, `norm2` |
+  | `text_refiner_lr` | `text_embedder` (the text refiner) |
+  | `modulation_lr` | `time_embedding`, `shared_block_modulation`, `video_head_modulation` |
+  | `embed_head_lr` | `video_embedder`, `final_norm_video`, `final_linear_video` |
+
+  `block_lr_scale = [{blocks = '0-9', scale = 0.5}, {blocks = 41, scale = 2}]` then multiplies
+  the rate of every parameter of those blocks (0-41, inclusive ranges that may not overlap).
+  Adapters follow the module they adapt. Refused by name: a setting that changes nothing (a
+  LoRA on the blocks has no `norm_lr`, `text_refiner_lr`, `modulation_lr` or `embed_head_lr`
+  parameters; a scale on blocks whose parts are all at 0), settings that freeze everything or a
+  whole pipeline stage, other `*_lr` keys (`mlp_lr`, `self_attn_lr`, ... belong to other models),
+  `force_constant_lr` with any of these, and ranges past the last block. Each pipeline stage
+  prints its groups and rates. The warmup, constant and linear schedules keep the ratios between
+  the rates; the cosine ones end at an absolute 1e-6, so a rate below that is warned about.
+  A resumed run keeps the rates its optimizer saved. `--reset_optimizer_params` takes new values
+  for the same groups, but also restarts the LR schedule (warmup included). Settings that change
+  the groups are refused on resume unless `--reset_optimizer` starts the optimizer state afresh.
 - `merge_adapters` also takes ai-toolkit's MOSS-Image LoRAs, which adapt the fused `proj.qkv`
   (ComfyUI, diffusers `transformer.` and kohya `lora_unet_` names): each of q, k and v gets the
   LoRA's A and its third of B, which is exact. Fused LoKr/LoHa/DoRA cannot be split and are
