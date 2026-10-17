@@ -791,12 +791,17 @@ dropout then change every step, and layout captions are rewritten for their buck
 cached embedding is about 8 KB per token, which for millions of captions is terabytes;
 `cache_text_embeddings = true` caches them once anyway and frees the encoder before training.
 On the fly, every GPU of the first pipeline stage loads the encoder onto itself before training
-starts, which costs that stage 18 GB: with
-`pipeline_stages` above 1, give stage 0 fewer blocks with `partition_method = 'manual'` and
+starts, which costs each of them 18 GB that `partition_method = 'parameters'` does not see (the
+encoder has no trainable parameters). On 141 GB GPUs this fits; if stage 0 runs out of memory
+with `pipeline_stages` above 1, move blocks off it with `partition_method = 'manual'` and
 `partition_split`. The pipeline's layers are the text encoder layer (a pass-through when
 embeddings are cached; it is there either way so checkpoints keep one layout), the input layer,
-the 42 blocks and the output layer, so `partition_split = [12, 23, 34]` puts the encoder and 10
-blocks on stage 0 of four. Encoding adds a forward of the 9B model per caption, small next to a
+the 42 blocks and the output layer, 45 in all. For a full fine-tune `'parameters'` splits at
+`[22]` over two stages (20 blocks on stage 0) and `[11, 22, 33]` over four (9 blocks on stage 0,
+as the input layer's 325M parameters weigh as much as three blocks). Each block moved frees about
+1 GB of weights, gradients and optimizer state plus its activations, and makes the stage it moves
+to slower, so moving blocks makes up only part of the 18 GB: `[18]` over two stages moves four,
+`[9, 20, 31]` over four moves two. Encoding adds a forward of the 9B model per caption, small next to a
 training step for short captions and noticeable for long layout captions; eval encodes each
 caption once and reuses it for every timestep quantile (up to 2 GiB of embeddings per GPU, about
 260k tokens; captions past that are encoded again). A caption over 4096 tokens is reported

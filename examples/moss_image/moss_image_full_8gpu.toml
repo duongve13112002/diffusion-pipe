@@ -31,12 +31,15 @@ checkpoint_every_n_minutes = 60
 keep_last_n_checkpoints = 3
 activation_checkpointing = true
 partition_method = 'parameters'
-# The on-the-fly text encoder (~18 GB) sits on stage 0 and has no trainable parameters, so
-# 'parameters' does not count it. To even the stages out, split by hand: the layers are the
-# text encoder layer (there cached or not), the input layer, the 42 blocks and the output layer
-# (45), and [22] puts the encoder and blocks 0-19 on stage 0, blocks 20-41 on stage 1.
+# The on-the-fly text encoder (~18 GB) is loaded on every GPU of stage 0 (ranks 0-3 here) and
+# has no trainable parameters, so 'parameters' does not count it: stage 0's GPUs hold ~18 GB more
+# than stage 1's. On H200s that fits. If stage 0 runs out of memory, move blocks to stage 1 by
+# hand. The layers are the text encoder layer (there cached or not), the input layer, the 42
+# blocks and the output layer (45); 'parameters' splits at [22] (blocks 0-19 on stage 0), and
+# each block moved frees ~1 GB of weights, gradients and optimizer state plus its activations.
+# [18] puts blocks 0-15 on stage 0 and blocks 16-41 on stage 1.
 #partition_method = 'manual'
-#partition_split = [22]
+#partition_split = [18]
 save_dtype = 'bfloat16'
 caching_batch_size = 4
 steps_per_print = 10
