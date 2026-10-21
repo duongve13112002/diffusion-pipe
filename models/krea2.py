@@ -17,6 +17,7 @@ from comfy.ldm.flux.layers import timestep_embedding
 
 class Krea2Pipeline(ComfyPipeline):
     name = 'krea2'
+    official_max_text_tokens = 546
     checkpointable_layers = ['InitialLayer', 'TransformerLayer']
     adapter_target_modules = ['SingleStreamBlock', 'TextFusionTransformer']
     keep_in_high_precision = ['first', 'last', 'tmlp', 'tproj', 'txtfusion', 'txtmlp']

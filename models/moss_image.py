@@ -855,13 +855,29 @@ def logit_mean_for_clean_end_share(share, logit_std, sigma_cutoff, uniform_fract
     Fizgig's "clean-end share" for MOSS-Image: the reference's logit_mean -1.09 puts about 11% of
     steps there, which Fizgig found too few for likeness. The share rises with logit_mean, so a
     bisection finds it."""
+    grid = training_grid(NUM_TRAIN_TIMESTEPS, shift)
+    kept = grid[(grid >= min_t - 1e-12) & (grid <= max_t + 1e-12)]
+    if not (kept < CLEAN_END_SIGMA).any() or (kept < CLEAN_END_SIGMA).all():
+        raise ValueError(f'clean_end_share needs noise levels both below and above sigma {CLEAN_END_SIGMA}; '
+                         f'min_t = {min_t}, max_t = {max_t} (shift {shift}) keep only one side')
+
     def share_at(mu):
-        return clean_end_share(NoiseLevelSampler('logit_normal', mu, logit_std, sigma_cutoff, uniform_fraction,
-                                                 shift, min_t, max_t))
+        try:
+            return clean_end_share(NoiseLevelSampler('logit_normal', mu, logit_std, sigma_cutoff, uniform_fraction,
+                                                     shift, min_t, max_t))
+        except ValueError:
+            # A logit_mean so far out that nothing it gives lies below sigma_cutoff (or in
+            # [min_t, max_t]) in floating point.
+            return None
 
     lo, hi = -12.0, 12.0
+    while share_at(lo) is None and lo < hi:
+        lo += 0.25
+    while share_at(hi) is None and hi > lo:
+        hi -= 0.25
     low, high = share_at(lo), share_at(hi)
-    if not low < share < high:
+    if low is None or not low < share < high:
+        low, high = (0.0, 0.0) if low is None else (low, high)
         raise ValueError(f'clean_end_share = {share}: with these noise settings the share of steps below sigma '
                          f'{CLEAN_END_SIGMA} can only be set between {low:.2f} and {high:.2f} percent')
     for _ in range(60):
@@ -871,7 +887,8 @@ def logit_mean_for_clean_end_share(share, logit_std, sigma_cutoff, uniform_fract
         else:
             hi = mid
     mu = 0.5 * (lo + hi)
-    if abs(share_at(mu) - share) > 0.01:
+    got = share_at(mu)
+    if got is None or abs(got - share) > 0.01:
         raise ValueError(f'clean_end_share = {share}: no logit_mean gives that share with these noise settings')
     return mu
 

@@ -22,6 +22,7 @@ IMAGE_POSITION_OFFSET = 65536
 
 class Ideogram4Pipeline(ComfyPipeline):
     name = 'ideogram4'
+    official_max_text_tokens = 2048
     checkpointable_layers = ['TransformerLayer']
     adapter_target_modules = ['Ideogram4TransformerBlock']
     keep_in_high_precision = ['input_proj', 'llm_cond_norm', 'llm_cond_proj', 't_embedding', 'adaln_proj', 'embed_image_indicator', 'final_layer', 'mlp_in']

@@ -32,7 +32,7 @@ def _differentiable_apply_rope_split_half(kitchen_op):
 # ComfyUI's Ernie attention calls comfy_kitchen's apply_rope_split_half on its training path, and
 # the kitchen ops have no autograd formula: the first backward fails. Run the same formula in
 # plain torch whenever a gradient is needed; everything else still gets the kitchen kernel.
-if not hasattr(comfy.quant_ops.ck.apply_rope_split_half, 'kitchen_op'):
+if getattr(comfy.quant_ops, '_CK_AVAILABLE', False) and not hasattr(comfy.quant_ops.ck.apply_rope_split_half, 'kitchen_op'):
     comfy.quant_ops.ck.apply_rope_split_half = _differentiable_apply_rope_split_half(comfy.quant_ops.ck.apply_rope_split_half)
 
 
@@ -50,6 +50,7 @@ def pad_captions_on_the_right(te):
 
 class ErnieImagePipeline(ComfyPipeline):
     name = 'ernie_image'
+    official_max_text_tokens = 2048
     checkpointable_layers = ['InitialLayer', 'TransformerLayer']
     adapter_target_modules = ['ErnieImageSharedAdaLNBlock']
     keep_in_high_precision = ['x_embedder', 'text_proj', 'time_proj', 'time_embedding', 'adaLN_modulation', 'final_norm', 'final_linear']

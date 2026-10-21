@@ -172,6 +172,7 @@ BasicAVTransformerBlock.forward = forward
 
 class LTX2Pipeline(ComfyPipeline):
     name = 'ltx2'
+    official_max_text_tokens = 1024
     checkpointable_layers = ['TransformerLayer']
     adapter_target_modules = ['BasicAVTransformerBlock']
     # TODO: first 2 and last 2 layers like in fp8 checkpoint?

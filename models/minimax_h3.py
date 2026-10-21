@@ -546,7 +546,11 @@ class InitialLayer(nn.Module):
         # sample is built as it would be alone: the refiner sees only the real tokens, and the rope
         # positions are those of the unpadded layout (where the video starts right after the real
         # text). The padding rows go at the end of the text span, masked out as keys.
-        real_text = context_mask.view(-1).to(torch.bool)
+        real_text = context_mask.view(-1).to(torch.bool).clone()
+        if not real_text.any():
+            # An empty caption is one pad token, masked by the encoder; ComfyUI runs it as a
+            # one-token context and attends to it.
+            real_text[0] = True
         n_text = int(real_text.sum())
         # extra_conds prebuilds the layout once per sampling run
         layout = payload.get("layout")
@@ -613,7 +617,7 @@ class InitialLayer(nn.Module):
         audio_embed = self.audio_patch_proj(all_audio_rows).to(dtype)
 
         text_states = context[:, real_text]
-        if text_states.shape[-1] != self.hidden_size and n_text > 0:
+        if text_states.shape[-1] != self.hidden_size:
             text_states = self.token_refiner(self.condition_proj(text_states),
                                              transformer_options=transformer_options)
         text_states = text_states[0]  # this happens after since token_refiner uses the new batch-enabled Attention

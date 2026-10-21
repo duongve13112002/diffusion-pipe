@@ -647,6 +647,22 @@ def maybe_pad(tokens, min_length, tokenizer):
 
 
 class ComfyPipeline(CommonPipeline):
+    # Tokens of a prompt, template included as ComfyUI tokenizes it, that the model's official
+    # pipeline keeps: it cuts (or refuses) longer prompts. ComfyUI keeps them whole, and so does
+    # training, so the trained model matches ComfyUI sampling; warn_long_captions says so.
+    official_max_text_tokens = None
+
+    def warn_long_captions(self, token_lengths):
+        limit = self.official_max_text_tokens
+        if limit is None or getattr(self, '_warned_long_captions', False):
+            return
+        longest = max(token_lengths, default=0)
+        if longest > limit:
+            self._warned_long_captions = True
+            print(f'WARNING: a caption is {longest} tokens long (template included). The official {self.name} '
+                  f'pipeline keeps only {limit}; ComfyUI and training keep the whole caption. '
+                  f'Sampling such a caption outside ComfyUI will not match what was trained.')
+
     def __init__(self, config):
         super().__init__()
         self.config = config
@@ -865,6 +881,8 @@ class ComfyPipeline(CommonPipeline):
                     L = len(v[0])
                     max_length = max(max_length, L)
                     token_lengths[i] = L
+
+            self.warn_long_captions(token_lengths)
 
             # Pad to max length in the batch. We need to do this ourselves or the ComfyUI backend code will fail (it concats tensors assumed to be the same length).
             tokenizer.min_length = max_length

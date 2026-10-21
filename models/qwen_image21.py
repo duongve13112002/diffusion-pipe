@@ -59,6 +59,21 @@ class QwenImage21Pipeline(ComfyPipeline):
         self.latent_format = comfy.latent_formats.QwenImage21()
         self.offloader = ModelOffloader('dummy', [], 0, 0, True, torch.device('cuda'), False, debug=False)
 
+    def get_call_text_encoder_fn(self, text_encoder):
+        fn = super().get_call_text_encoder_fn(text_encoder)
+
+        # ComfyUI's TextEncodeQwenImage21 tokenizes with prevent_empty_text=True, which encodes an
+        # empty prompt as ' '. Dropped captions are encoded the same way, so they train against the
+        # embedding an empty prompt gets at sampling time.
+        def wrapped(captions, is_video):
+            return fn([caption if caption else ' ' for caption in captions], is_video)
+
+        return wrapped
+
+    def text_encoder_cache_key(self, i):
+        # Empty captions cached before the ' ' mapping above were encoded as ''.
+        return 'comfy-prevent-empty-text'
+
     def to_layers(self):
         diffusion_model = self.diffusion_model
         transformer_options = {
@@ -210,10 +225,10 @@ class InitialLayer(nn.Module):
             mask = torch.ones((bs, 1, 1, txt_len + h*w), dtype=torch.bool, device=x.device)
             mask[:, 0, 0, :txt_len] = context_mask
             segments.append((length, length + h * w, mask))
-            pos += max(h, w)
+            pos = pos + max(h, w)
             length += h * w
 
-        # (1, N, 1, ...): the layout the fused rms_rope wants for (B, N, H, D) queries
+        # (B, N, 1, ...): the layout the fused rms_rope wants for (B, N, H, D) queries
         pe = self.pe_embedder(torch.cat(ids, dim=1)).transpose(1, 2).contiguous()
         return torch.cat(parts, dim=1), pe, segments
 

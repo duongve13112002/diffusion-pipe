@@ -16,6 +16,7 @@ import comfy.ldm.common_dit
 
 class ZImagePipeline(ComfyPipeline):
     name = 'z_image'
+    official_max_text_tokens = 512
     checkpointable_layers = ['InitialLayer', 'TransformerLayer']
     # This will also train the noise_refiner and context_refiner layers, which aren't part of the main stack of transformer
     # layers, since they also use this class.
@@ -29,6 +30,14 @@ class ZImagePipeline(ComfyPipeline):
 
     def to_layers(self):
         diffusion_model = self.diffusion_model
+        # Other models ComfyUI loads as NextDiT, whose forward this pipeline does not reproduce.
+        if diffusion_model.masked_pad_multiple is not None or hasattr(diffusion_model, '__ming_image__'):
+            raise NotImplementedError('Ming-Image checkpoints are not supported by the z_image pipeline')
+        if hasattr(diffusion_model, 'dec_net'):
+            raise NotImplementedError('Pixel-space Z-Image checkpoints are not supported by the z_image pipeline')
+        if diffusion_model.siglip_embedder is not None:
+            raise NotImplementedError('Z-Image Omni checkpoints (SigLIP image conditioning) are not supported by the '
+                                      'z_image pipeline')
         layers = [InitialLayer(diffusion_model)]
         for i, block in enumerate(diffusion_model.layers):
             layers.append(TransformerLayer(block, i, self.offloader))

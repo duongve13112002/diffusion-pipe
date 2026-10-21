@@ -1398,7 +1398,9 @@ def test_layout_bbox_space_selects_the_layout_caption_format():
     ({'clean_end_share': 30, 'logit_mean': -1.09}, 'remove one of them'),
     ({'clean_end_share': 100}, 'percentage between 0 and 100'),
     ({'clean_end_share': '30'}, 'percentage between 0 and 100'),
-    ({'clean_end_share': 30, 'min_t': 0.6}, 'can only be set between'),
+    ({'clean_end_share': 30, 'min_t': 0.6}, 'keep only one side'),
+    ({'clean_end_share': 30, 'max_t': 0.4}, 'keep only one side'),
+    ({'clean_end_share': 99.9}, 'can only be set between'),
     ({'clean_end_share': [[7, 60], [15, 99.9]]}, 'can only be set between'),
     ({'clean_end_share': [[7, 60], [7, 30]]}, 'epochs must increase'),
     ({'clean_end_share': [[0, 60]]}, 'whole numbers from 1'),
@@ -1442,6 +1444,9 @@ def test_clean_end_share_moves_logit_mean(tmp_path):
         assert mi.clean_end_share(pipe.noise_sampler) == pytest.approx(share, abs=1e-6)
         sigmas = pipe.noise_sampler.sigmas[pipe.noise_sampler.probabilities > 0]
         assert sigmas.max() <= settings.get('max_t', 1.0) + 1e-9
+    # A narrow logit-normal: the solver's search must not stop where erfc underflows.
+    narrow = make_pipeline({'diffusers_path': str(root), 'clean_end_share': 30, 'logit_std': 0.2})
+    assert mi.clean_end_share(narrow.noise_sampler) == pytest.approx(30, abs=1e-6)
     plain = make_pipeline({'diffusers_path': str(root)})
     torch.testing.assert_close(plain.noise_sampler.probabilities, reference.probabilities)
 

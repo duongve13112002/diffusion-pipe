@@ -17,6 +17,7 @@ from comfy.ldm.flux.layers import timestep_embedding, ModulationOut
 
 class Flux2Pipeline(ComfyPipeline):
     name = 'flux2'
+    official_max_text_tokens = 512
     checkpointable_layers = ['DoubleTransformerLayer', 'SingleTransformerLayer']
     adapter_target_modules = ['DoubleStreamBlock', 'SingleStreamBlock']
     keep_in_high_precision = ['img_in', 'time_in', 'guidance_in', 'txt_in', 'final_layer', 'double_stream_modulation_img', 'double_stream_modulation_txt', 'single_stream_modulation']
@@ -331,8 +332,13 @@ class InitialLayer(nn.Module):
         else:
             vec = (vec,)
 
-        attn_mask = torch.ones((bs, 1, 1, txt.shape[1] + img.shape[1]), dtype=torch.bool, device=device)
-        attn_mask[:, 0, 0, :txt.shape[1]] = txt_mask
+        # A batch without padding passes a (bs, 1, 1, 1) mask: the blocks then run unmasked, read
+        # from its shape without a device sync in every block.
+        if txt_mask.all():
+            attn_mask = torch.ones((bs, 1, 1, 1), dtype=torch.bool, device=device)
+        else:
+            attn_mask = torch.ones((bs, 1, 1, txt.shape[1] + img.shape[1]), dtype=torch.bool, device=device)
+            attn_mask[:, 0, 0, :txt.shape[1]] = txt_mask
 
         ids = torch.cat((txt_ids, img_ids), dim=1)
         pe = self.pe_embedder(ids)
@@ -364,7 +370,7 @@ class DoubleTransformerLayer(nn.Module):
             tmp_vec = ((mod_outs[0], mod_outs[1]), (mod_outs[2], mod_outs[3]))
 
         self.offloader.wait_for_block(self.block_idx)
-        img, txt = self.layer(img=img, txt=txt, vec=tmp_vec, pe=pe, attn_mask=None if attn_mask.all() else attn_mask)
+        img, txt = self.layer(img=img, txt=txt, vec=tmp_vec, pe=pe, attn_mask=None if attn_mask.shape[-1] == 1 else attn_mask)
         self.offloader.submit_move_blocks_forward(self.block_idx)
 
         return make_contiguous(img, txt, pe, attn_mask, txt_len, img_len, hw, vec_orig, *vec)
@@ -408,7 +414,7 @@ class SingleTransformerLayer(nn.Module):
             tmp_vec = ModulationOut(*vec)
 
         self.offloader.wait_for_block(self.block_idx)
-        img = self.layer(img, vec=tmp_vec, pe=pe, attn_mask=None if attn_mask.all() else attn_mask)
+        img = self.layer(img, vec=tmp_vec, pe=pe, attn_mask=None if attn_mask.shape[-1] == 1 else attn_mask)
         self.offloader.submit_move_blocks_forward(self.block_idx)
 
         return make_contiguous(img, pe, attn_mask, txt_len, img_len, hw, vec_orig, *vec)

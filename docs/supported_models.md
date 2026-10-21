@@ -38,6 +38,13 @@ See [source snapshots and cache profiles](caption-processing.md#source-snapshots
 |Iris-3B         |✅    |✅              |❌                |
 |MOSS-Image      |✅    |✅              |✅                |
 
+The models loaded from ComfyUI files (Z-Image, HunyuanVideo-1.5, Flux 2, Ernie-Image, LTX 2.3,
+Ideogram4, Krea 2, MiniMax H3, Qwen-Image-2.1, MOSS-Image) encode captions as ComfyUI encodes a
+prompt, so a LoRA trains on the embeddings it is sampled with in ComfyUI. Several official
+pipelines cut long prompts (Z-Image and Flux 2 at 512 tokens, Krea 2 at 507, LTX 2.3 at 1024,
+HunyuanVideo-1.5 at 1000, Ernie-Image and Ideogram4 at 2048) where ComfyUI keeps them whole.
+Training keeps them whole too, and prints a warning the first time a caption is longer.
+
 
 ## SDXL
 ```
@@ -487,9 +494,26 @@ diffusion_model_dtype = 'float8'
 timestep_sample_method = 'logit_normal'
 # Higher shift (default is 1) might be useful for video training.
 #shift = 3
+# 'comfyui' (default) or 'official'; see below.
+#prompt_template = 'official'
 ```
 
 All model files are the ComfyUI versions. LoRAs are saved in ComfyUI format.
+
+`prompt_template` picks how captions are encoded:
+
+- `'comfyui'` (default): as ComfyUI's text encoder node encodes a prompt. Use it when you sample in
+  ComfyUI, so the model trains on the same embeddings it samples with.
+- `'official'`: as the official [HunyuanVideo-1.5](https://github.com/Tencent-Hunyuan/HunyuanVideo-1.5)
+  pipeline and its training code encode them. The system prompt separates its numbered items with
+  spaces where ComfyUI has newlines, images get the official image template instead of the video
+  one, and the quoted text rendered by byT5 is taken as the official pipeline takes it (`"..."` and
+  `“...”` in order of appearance, without repeats, not `‘...’`, at most 256 byT5 tokens). ComfyUI's
+  node encodes prompts the ComfyUI way, so to sample with these embeddings you need a pipeline that
+  encodes the official way (the official repo, diffusers). Changing it rebuilds the text cache.
+
+The official pipeline keeps at most 1000 prompt tokens; ComfyUI and training keep the whole
+caption, and training prints a warning when a caption is longer.
 
 ## Flux 2
 Dev:

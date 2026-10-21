@@ -192,6 +192,18 @@ def test_z_image_padding_matches_comfyui():
     check_backward(layers, (x, t, text, mask), model)
 
 
+def test_z_image_refuses_other_nextdit_models():
+    from models import z_image
+    model = tiny_z_image()
+    model.masked_pad_multiple = 32
+    with pytest.raises(NotImplementedError, match='Ming-Image'):
+        bare_pipeline(z_image.ZImagePipeline, model).to_layers()
+    model.masked_pad_multiple = None
+    model.siglip_embedder = torch.nn.Identity()
+    with pytest.raises(NotImplementedError, match='Omni'):
+        bare_pipeline(z_image.ZImagePipeline, model).to_layers()
+
+
 def tiny_krea2():
     from comfy.ldm.krea2.model import SingleStreamDiT
     model = SingleStreamDiT(
@@ -412,6 +424,118 @@ def test_qwen_image21_padding_does_not_reach_the_image():
     for i, n in enumerate(lengths):
         expected = model(x[i:i + 1], t[i:i + 1], padded[i:i + 1, :n])
         assert_close(actual[i:i + 1], expected)
+
+
+def test_qwen_image21_empty_caption_is_encoded_as_comfyui_encodes_it(monkeypatch):
+    # TextEncodeQwenImage21 tokenizes with prevent_empty_text=True: an empty prompt becomes ' '.
+    from comfy.text_encoders.qwen_image21 import QwenImage21Tokenizer
+    from models import base, qwen_image21
+    tokenizer = QwenImage21Tokenizer()
+    comfy_empty = tokenizer.tokenize_with_weights('', prevent_empty_text=True)
+    assert comfy_empty != tokenizer.tokenize_with_weights('')
+
+    def call_text_encoder_fn(self, text_encoder):
+        return lambda captions, is_video: [tokenizer.tokenize_with_weights(c) for c in captions]
+
+    monkeypatch.setattr(base.ComfyPipeline, 'get_call_text_encoder_fn', call_text_encoder_fn)
+    pipe = bare_pipeline(qwen_image21.QwenImage21Pipeline, tiny_qwen_image21())
+    empty, caption = pipe.get_call_text_encoder_fn(None)(['', 'a cat'], [False, False])
+    assert empty == comfy_empty
+    assert caption == tokenizer.tokenize_with_weights('a cat')
+    assert pipe.text_encoder_cache_key(0)
+
+
+@pytest.mark.parametrize('module, cls, limit', [
+    ('z_image', 'ZImagePipeline', 512), ('krea2', 'Krea2Pipeline', 546), ('flux2', 'Flux2Pipeline', 512),
+    ('ideogram4', 'Ideogram4Pipeline', 2048), ('ltx2', 'LTX2Pipeline', 1024),
+    ('hunyuan_video_15', 'HunyuanVideo15Pipeline', 1108), ('ernie_image', 'ErnieImagePipeline', 2048)])
+def test_captions_longer_than_the_official_pipeline_keeps_are_warned_about_once(module, cls, limit, capsys):
+    import importlib
+    pipe_cls = getattr(importlib.import_module(f'models.{module}'), cls)
+    pipe = pipe_cls.__new__(pipe_cls)
+    pipe.warn_long_captions([limit, 3])
+    assert capsys.readouterr().out == ''
+    pipe.warn_long_captions([4, limit + 1])
+    assert f'keeps only {limit}' in capsys.readouterr().out
+    pipe.warn_long_captions([limit + 7])
+    assert capsys.readouterr().out == ''
+
+
+class RecordingHunyuanVideo15TextEncoder:
+    """ComfyUI's HunyuanVideo 1.5 tokenizer in front of a stand-in encoder that records the
+    tokens and returns zeros of the right shapes."""
+
+    def __init__(self):
+        from comfy.text_encoders.hunyuan_video import HunyuanVideo15Tokenizer
+        self.tokenizer = HunyuanVideo15Tokenizer()
+        self.tokenizer.clip = 'qwen25_7b'
+        self.calls = []
+
+    def tokenize(self, text, **kwargs):
+        return self.tokenizer.tokenize_with_weights(text, False, **kwargs)
+
+    def encode_from_tokens_scheduled(self, tokens):
+        self.calls.append(tokens)
+        qwen = tokens['qwen25_7b']
+        extra = {'attention_mask': torch.ones(len(qwen), len(qwen[0]), dtype=torch.int64)}
+        if 'byt5' in tokens:
+            extra['conditioning_byt5small'] = torch.zeros(len(tokens['byt5']), len(tokens['byt5'][0]), 1472)
+        return [[torch.zeros(len(qwen), len(qwen[0]), 8), extra]]
+
+
+def hunyuan_video_15_text_pipeline(model_config=None):
+    from models import hunyuan_video_15
+    pipe = bare_pipeline(hunyuan_video_15.HunyuanVideo15Pipeline, None, model_config)
+    te = RecordingHunyuanVideo15TextEncoder()
+    pipe.text_encoders = [te]
+    return pipe, te, pipe.get_call_text_encoder_fn(te)
+
+
+def test_hunyuan_video_15_byt5_mask_covers_only_a_captions_own_tokens():
+    # Each batch pads its captions to its longest; the next batch must not inherit that length.
+    pipe, te, fn = hunyuan_video_15_text_pipeline()
+    fn(['a sign that says "' + 'x' * 60 + '"', 'a dog'], [False, False])
+    alone = fn(['a sign that says "hi"'], [False])
+    own_length = len(te.tokenizer.byt5.tokenize_with_weights('Text "hi". ')[0])
+    assert alone['byt5_attention_mask'].sum().item() == own_length
+    assert alone['byt5_attention_mask'].shape[1] == own_length
+
+
+def test_hunyuan_video_15_official_prompt_template():
+    from models import hunyuan_video_15
+    pipe, te, fn = hunyuan_video_15_text_pipeline({'prompt_template': 'official'})
+    caption = 'a sign that says “OPEN” and "OPEN" and ‘closed’ and "sale"'
+    fn([caption, caption], [False, True])
+    tokens = te.calls[-1]
+    qwen = te.tokenizer.qwen25_7b
+    image_template = hunyuan_video_15.OFFICIAL_IMAGE_TEMPLATE.format(caption)
+    video_template = hunyuan_video_15.OFFICIAL_VIDEO_TEMPLATE.format(caption)
+    for row, text in zip(tokens['qwen25_7b'], [image_template, video_template]):
+        ids = [t for t, *_ in row if t != 151643]
+        assert ids == [t for t, *_ in qwen.tokenize_with_weights(text, disable_weights=True)[0]]
+    # In order of appearance, de-duplicated, without ‘...’: as the official pipeline extracts them.
+    expected = te.tokenizer.byt5.tokenize_with_weights('Text "OPEN". Text "sale". ')[0]
+    assert [t for t, *_ in tokens['byt5'][0]] == [t for t, *_ in expected]
+    assert pipe.text_encoder_cache_key(0) != hunyuan_video_15_text_pipeline()[0].text_encoder_cache_key(0)
+
+    _, te, fn = hunyuan_video_15_text_pipeline()
+    fn([caption], [False])
+    assert te.calls[-1]['qwen25_7b'][0] != tokens['qwen25_7b'][0]
+
+
+def test_hunyuan_video_15_official_byt5_is_cut_at_256_tokens():
+    _, te, fn = hunyuan_video_15_text_pipeline({'prompt_template': 'official'})
+    out = fn(['a sign that says "' + 'x' * 400 + '"'], [False])
+    row = te.calls[-1]['byt5'][0]
+    assert len(row) == 256 and row[-1][0] == 1
+    assert out['byt5_attention_mask'].sum().item() == 256
+
+
+def test_hunyuan_video_15_refuses_an_unknown_prompt_template():
+    from models import hunyuan_video_15
+    pipe = hunyuan_video_15.HunyuanVideo15Pipeline.__new__(hunyuan_video_15.HunyuanVideo15Pipeline)
+    with pytest.raises(ValueError, match='prompt_template'):
+        hunyuan_video_15.HunyuanVideo15Pipeline.__init__(pipe, {'model': {'dtype': torch.float32, 'prompt_template': 'diffusers'}})
 
 
 def tiny_hunyuan_video_15():
@@ -671,6 +795,25 @@ def test_minimax_h3_padding_does_not_reach_the_video():
         expected_video, expected_audio = reference([video[i:i + 1], audio[i:i + 1]], t[i:i + 1] * 1000, text[i:i + 1, :n])
         assert_close(actual_video[i:i + 1], expected_video)
         assert_close(actual_audio[i:i + 1], expected_audio)
+
+
+@pytest.mark.parametrize('with_other', [False, True], ids=['alone', 'batched'])
+def test_minimax_h3_empty_caption_matches_comfyui(with_other):
+    """An empty caption (caption dropout, the uncond of cfg > 1) is one pad token that the
+    encoder masks out. ComfyUI runs it as a one-token context and attends to it."""
+    model, reference = tiny_minimax_pair()
+    layers = minimax_pipeline(model).to_layers()
+    video, audio, valid_audio, t, text, mask = minimax_inputs([6, 6])
+    pad = torch.randn(40, generator=torch.Generator().manual_seed(4))
+    text[1] = 0
+    text[1, 0] = pad
+    mask[1] = False
+    first = 0 if with_other else 1
+    actual_video, actual_audio = run_layers(
+        layers, (video[first:], audio[first:], valid_audio[first:], t[first:], text[first:], mask[first:]))
+    expected_video, expected_audio = reference([video[1:2], audio[1:2]], t[1:2] * 1000, pad[None, None])
+    assert_close(actual_video[-1:], expected_video)
+    assert_close(actual_audio[-1:], expected_audio)
 
 
 def test_minimax_h3_builds_with_the_current_comfyui_signature():

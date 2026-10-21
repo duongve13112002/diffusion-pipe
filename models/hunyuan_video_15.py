@@ -1,4 +1,5 @@
 import os
+import re
 import sys
 from collections import defaultdict
 sys.path.insert(0, os.path.join(os.path.abspath(os.path.dirname(__file__)), '../submodules/ComfyUI'))
@@ -14,20 +15,58 @@ import comfy.ldm.common_dit
 from comfy.ldm.flux.layers import timestep_embedding
 
 
+# The official repo's templates (Tencent-Hunyuan/HunyuanVideo-1.5,
+# hyvideo/models/text_encoders/__init__.py). Their system prompts are written with backslash line
+# continuations inside the string, so the items are separated by the source's indentation (9
+# spaces) where ComfyUI has newlines. Official training uses the image template for images.
+OFFICIAL_VIDEO_SYSTEM_PROMPT = (
+    'You are a helpful assistant. Describe the video by detailing the following aspects: '
+    '        1. The main content and theme of the video. '
+    '        2. The color, shape, size, texture, quantity, text, and spatial relationships of the objects. '
+    '        3. Actions, events, behaviors temporal relationships, physical movement changes of the objects. '
+    '        4. background environment, light, style and atmosphere. '
+    '        5. camera angles, movements, and transitions used in the video.'
+)
+OFFICIAL_IMAGE_SYSTEM_PROMPT = (
+    'You are a helpful assistant. Describe the image by detailing the following aspects: '
+    '        1. The main content and theme of the image. '
+    '        2. The color, shape, size, texture, quantity, text, and spatial relationships of the objects. '
+    '        3. The background environment, light, style and atmosphere.'
+)
+OFFICIAL_VIDEO_TEMPLATE = '<|im_start|>system\n' + OFFICIAL_VIDEO_SYSTEM_PROMPT + '<|im_end|>\n<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n'
+OFFICIAL_IMAGE_TEMPLATE = '<|im_start|>system\n' + OFFICIAL_IMAGE_SYSTEM_PROMPT + '<|im_end|>\n<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n'
+
+
+def official_glyph_texts(prompt):
+    """The quoted text the official pipeline renders with byT5 (_extract_glyph_texts): "..." and
+    “...” spans in order of appearance, de-duplicated. ComfyUI also takes ‘...’ spans, groups
+    them by quote type and keeps repeats."""
+    texts = [a or b for a, b in re.findall(r'\"(.*?)\"|“(.*?)”', prompt)]
+    return list(dict.fromkeys(texts)) if len(texts) > 1 else texts
+
+
 class HunyuanVideo15Pipeline(ComfyPipeline):
     name = 'hunyuan_video_1.5'
+    official_max_text_tokens = 1108
     framerate = 24
     checkpointable_layers = ['TransformerLayer']
     adapter_target_modules = ['DoubleStreamBlock']
     keep_in_high_precision = ['img_in', 'time_in', 'txt_in', 'byt5_in', 'final_layer', 'vision_in', 'cond_type_embedding']
 
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
+    def __init__(self, config, *args, **kwargs):
+        prompt_template = config['model'].get('prompt_template', 'comfyui')
+        if prompt_template not in ('comfyui', 'official'):
+            raise ValueError(f"[model] prompt_template must be 'comfyui' or 'official', got {prompt_template!r}")
+        super().__init__(config, *args, **kwargs)
         self.latent_format = comfy.latent_formats.HunyuanVideo15()
         self.offloader = ModelOffloader('dummy', [], 0, 0, True, torch.device('cuda'), False, debug=False)
 
     def get_preprocess_media_file_fn(self):
         return PreprocessMediaFile(self.config, support_video=True, framerate=self.framerate)
+
+    def text_encoder_cache_key(self, i):
+        # Empty for ComfyUI's template, so existing caches stay valid.
+        return 'official-prompt-template' if self.model_config.get('prompt_template', 'comfyui') == 'official' else ''
 
     def get_call_text_encoder_fn(self, text_encoder):
         te_idx = None
@@ -38,15 +77,40 @@ class HunyuanVideo15Pipeline(ComfyPipeline):
         if te_idx is None:
             raise RuntimeError('Unknown text encoder')
 
+        official = self.model_config.get('prompt_template', 'comfyui') == 'official'
+
+        def tokenize(text, video):
+            if not official:
+                return text_encoder.tokenize(text)
+            template = OFFICIAL_VIDEO_TEMPLATE if video else OFFICIAL_IMAGE_TEMPLATE
+            tokens = text_encoder.tokenize(text, llama_template=template)
+            tokens.pop('byt5', None)
+            glyphs = official_glyph_texts(text)
+            if glyphs:
+                byt5 = text_encoder.tokenizer.byt5.tokenize_with_weights(''.join(f'Text "{t}". ' for t in glyphs))
+                # The official tokenizer truncates at 256 tokens, the end token included.
+                if len(byt5[0]) > 256:
+                    byt5[0] = byt5[0][:255] + byt5[0][-1:]
+                tokens['byt5'] = byt5
+            return tokens
+
         def fn(captions: list[str], is_video: list[bool]):
-            bs = len(captions)
             tokenizer = getattr(text_encoder.tokenizer, text_encoder.tokenizer.clip)
             byt5_tokenizer = getattr(text_encoder.tokenizer, 'byt5')
+            original_min_length = tokenizer.min_length, byt5_tokenizer.min_length
+            try:
+                return encode(captions, is_video, tokenizer, byt5_tokenizer)
+            finally:
+                # Left at this batch's longest, the next batch would count this one's padding as
+                # its captions' length: byT5 padding rows would be unmasked.
+                tokenizer.min_length, byt5_tokenizer.min_length = original_min_length
 
+        def encode(captions, is_video, tokenizer, byt5_tokenizer):
+            bs = len(captions)
             max_length = defaultdict(int)
             byt5_lengths = []
-            for text in captions:
-                tokens = text_encoder.tokenize(text)
+            for text, video in zip(captions, is_video):
+                tokens = tokenize(text, video)
                 # tokens looks like {'qwen3_4b': [[(0, 1.0), (1, 1.0), (2, 1.0)]]}
                 for k, v in tokens.items():
                     max_length[k] = max(max_length[k], len(v[0]))
@@ -54,13 +118,14 @@ class HunyuanVideo15Pipeline(ComfyPipeline):
                     byt5_lengths.append(len(tokens['byt5'][0]))
                 else:
                     byt5_lengths.append(0)
+            self.warn_long_captions([max_length[text_encoder.tokenizer.clip]])
 
             # Pad to max length in the batch. We need to do this ourselves or the ComfyUI backend code will fail (it concats tensors assumed to be the same length).
             tokenizer.min_length = max_length[text_encoder.tokenizer.clip]
             byt5_tokenizer.min_length = max_length['byt5']
             tokens_dict = defaultdict(list)
-            for text in captions:
-                tokens = text_encoder.tokenize(text)
+            for text, video in zip(captions, is_video):
+                tokens = tokenize(text, video)
                 for k, v in tokens.items():
                     tokens_dict[k].extend(v)
 
