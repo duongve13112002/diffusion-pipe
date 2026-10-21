@@ -17,6 +17,8 @@ The tests that matter most here are the ones covering things that fail *silently
     answer itself.
 """
 
+import zlib
+
 import pytest
 import torch
 from torch import nn
@@ -286,7 +288,11 @@ class _FakeTokenizer:
         import transformers
         ids, masks = [], []
         for prompt in prompts:
-            real = [(abs(hash(tok)) % (self.vocab - 1)) + 1 for tok in prompt.split()][:max_length]
+            # crc32 rather than hash(): str hashes are salted per process (PYTHONHASHSEED), so
+            # hash() gave every pytest run different token ids and the toy training runs in
+            # test_teacher_guidance_training a different trajectory each time.
+            real = [(zlib.crc32(tok.encode()) % (self.vocab - 1)) + 1
+                    for tok in prompt.split()][:max_length]
             pad = max_length - len(real)
             ids.append(real + [0] * pad)
             masks.append([1] * len(real) + [0] * pad)
@@ -294,6 +300,28 @@ class _FakeTokenizer:
             'input_ids': torch.tensor(ids),
             'attention_mask': torch.tensor(masks),
         })
+
+
+class TestTheFakeTokenizerIsTheSameInEveryProcess:
+    def test_two_hash_seeds_give_the_same_ids(self):
+        """The toy training runs compare trajectories with a few percent of margin, and which
+        side of it they land on depends on the token ids. Ids that change with the process's
+        string-hash salt made those tests pass or fail by chance."""
+        import os
+        import subprocess
+        import sys
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        code = ('from test.test_teacher_guidance import _FakeTokenizer; '
+                "print(_FakeTokenizer()(['1girl solo blue eyes', 'a small black cat'])"
+                "['input_ids'].tolist())")
+        outputs = []
+        for seed in ('1', '2'):
+            env = dict(os.environ, PYTHONHASHSEED=seed)
+            result = subprocess.run([sys.executable, '-c', code], cwd=root, env=env,
+                                    capture_output=True, text=True, timeout=600)
+            assert result.returncode == 0, result.stderr[-2000:]
+            outputs.append(result.stdout.strip().splitlines()[-1])
+        assert outputs[0] == outputs[1]
 
 
 class _FakeLLM(nn.Module):
