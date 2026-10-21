@@ -25,7 +25,7 @@ from comfy.ldm.lightricks.model import LTXRopeType
 
 # Patch this to handle attention_mask, and also return attention_mask.
 def encode_token_weights(self, token_weight_pairs):
-    token_weight_pairs = token_weight_pairs["gemma3_12b"]
+    token_weight_pairs = token_weight_pairs[self.text_encoder_key]
 
     out, pooled, extra = self.gemma3_12b.encode_token_weights(token_weight_pairs)
     out_device = out.device
@@ -398,6 +398,10 @@ class LTX2Pipeline(ComfyPipeline):
 class InitialLayer(nn.Module):
     def __init__(self, model, framerate):
         super().__init__()
+        if not model.cross_attention_adaln:
+            # LTX-2.0 has no prompt adaLN: the layers below pass its prompt timesteps between
+            # pipeline stages as tensors, and LTX-2.0 was never trained or tested here.
+            raise NotImplementedError('Only LTX 2.3 is supported (this checkpoint has no cross-attention adaLN: LTX-2.0?)')
         self.patchify_proj = model.patchify_proj
         self.adaln_single = model.adaln_single
         self.prompt_adaln_single = model.prompt_adaln_single
@@ -421,27 +425,27 @@ class InitialLayer(nn.Module):
     # Re-implement this ourselves to handle attention_mask properly
     def connector_forward(self, connector, hidden_states, attention_mask):
         if connector.num_learnable_registers:
-            lengths = attention_mask.sum(dim=-1)
-            max_length = lengths.max().item()
-            num_registers_duplications = math.ceil(
-                max(1024, max_length) / connector.num_learnable_registers
-            )
+            # Each caption as ComfyUI runs it alone: its real tokens (the Gemma tokenizer pads on
+            # the left, the batch is padded on the right), then registers up to a multiple of
+            # num_learnable_registers covering max(1024, tokens). The rows a longer caption of
+            # the batch adds past that are masked out.
+            num_registers = connector.num_learnable_registers
+            lengths = attention_mask.sum(dim=-1).tolist()
+            totals = [math.ceil(max(1024, n) / num_registers) * num_registers for n in lengths]
             learnable_registers = torch.tile(
-                connector.learnable_registers.to(hidden_states), (num_registers_duplications, 1)
+                connector.learnable_registers.to(hidden_states), (max(totals) // num_registers, 1)
             )
 
             hidden_states_list = []
-            for x, length in zip(hidden_states, lengths):
-                length = length.item()
-                x = x[:length]
+            for x, row_mask, length in zip(hidden_states, attention_mask, lengths):
+                x = x[row_mask]
                 padding = learnable_registers[length:]
                 x = torch.cat([x, padding], dim=0)
                 hidden_states_list.append(x)
             hidden_states = torch.stack(hidden_states_list, dim=0)
 
-            if attention_mask is not None:
-                # float or bool attention mask required for ComfyUI attention
-                attention_mask = torch.ones(hidden_states.shape[:2], dtype=torch.bool, device=hidden_states.device)
+            rows = torch.arange(hidden_states.shape[1], device=hidden_states.device)
+            attention_mask = rows[None] < torch.tensor(totals, device=hidden_states.device)[:, None]
 
         indices_grid = torch.arange(
             hidden_states.shape[1], dtype=torch.float32, device=hidden_states.device

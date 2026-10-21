@@ -10,6 +10,42 @@ from models.base import ComfyPipeline, make_contiguous
 from utils.common import AUTOCAST_DTYPE, get_lin_function, time_shift
 from utils.offloading import ModelOffloader
 import comfy.ldm.common_dit
+import comfy.quant_ops
+
+
+def _rope_split_half(t, freqs_cis):
+    # comfy_kitchen's formula for its split-half RoPE (pair k: elements k and k + head_dim // 2)
+    t_ = t.reshape(*t.shape[:-1], 2, -1).movedim(-2, -1).unsqueeze(-2).to(freqs_cis.dtype)
+    out = freqs_cis[..., 0] * t_[..., 0] + freqs_cis[..., 1] * t_[..., 1]
+    return out.movedim(-1, -2).reshape(t.shape).type_as(t)
+
+
+def _differentiable_apply_rope_split_half(kitchen_op):
+    def apply_rope_split_half(xq, xk, freqs_cis):
+        if torch.is_grad_enabled() and any(t.requires_grad for t in (xq, xk, freqs_cis)):
+            return _rope_split_half(xq, freqs_cis), _rope_split_half(xk, freqs_cis)
+        return kitchen_op(xq, xk, freqs_cis)
+    apply_rope_split_half.kitchen_op = kitchen_op
+    return apply_rope_split_half
+
+
+# ComfyUI's Ernie attention calls comfy_kitchen's apply_rope_split_half on its training path, and
+# the kitchen ops have no autograd formula: the first backward fails. Run the same formula in
+# plain torch whenever a gradient is needed; everything else still gets the kitchen kernel.
+if not hasattr(comfy.quant_ops.ck.apply_rope_split_half, 'kitchen_op'):
+    comfy.quant_ops.ck.apply_rope_split_half = _differentiable_apply_rope_split_half(comfy.quant_ops.ck.apply_rope_split_half)
+
+
+def pad_captions_on_the_right(te):
+    """Captions of a batch are padded to the longest (base.py). ComfyUI's Ministral tokenizer
+    pads on the left with id 11 while its encoder declares pad id 0, so the attention mask came
+    back all ones: a shorter caption was encoded with the padding as text, and its real tokens
+    moved. Pad on the right with the id the mask is built from, as flux2.py does for Mistral."""
+    tokenizer = getattr(te.tokenizer, te.tokenizer.clip)
+    tokenizer.pad_left = False
+    clip = getattr(te.cond_stage_model, te.cond_stage_model.clip)
+    clip.special_tokens['pad'] = tokenizer.pad_token
+    return te
 
 
 class ErnieImagePipeline(ComfyPipeline):
@@ -22,6 +58,19 @@ class ErnieImagePipeline(ComfyPipeline):
         super().__init__(*args, **kwargs)
         self.latent_format = comfy.latent_formats.Flux2()
         self.offloader = ModelOffloader('dummy', [], 0, 0, True, torch.device('cuda'), False, debug=False)
+
+        te_wrapper = self.text_encoders[0]
+        old_load_fn = te_wrapper._load_fn
+
+        def new_load_fn():
+            return pad_captions_on_the_right(old_load_fn())
+
+        te_wrapper._load_fn = new_load_fn
+
+    def text_encoder_cache_key(self, i):
+        # Embeddings cached before padding was fixed (pad_captions_on_the_right) took the left
+        # padding of a shorter caption in its batch as text; the new key rebuilds them.
+        return 'ministral3-right-padded'
 
     def to_layers(self):
         diffusion_model = self.diffusion_model
@@ -148,19 +197,23 @@ class InitialLayer(nn.Module):
 
         hidden_states = torch.cat([img_bsh, text_bth], dim=1)
 
+        # Different from source. The captions of a batch are padded to the longest, which ComfyUI
+        # never does: count a sample's positions over its real tokens only, so its image sits
+        # where it does when the caption is alone (index = its length, not Tmax).
+        real = context_mask.to(torch.float32)
         text_ids = torch.zeros((B, Tmax, 3), device=device, dtype=torch.float32)
-        text_ids[:, :, 0] = torch.linspace(0, Tmax - 1, steps=Tmax, device=x.device, dtype=torch.float32)
-        index = float(Tmax)
+        text_ids[:, :, 0] = (real.cumsum(dim=1) - 1).clamp(min=0)
+        index = real.sum(dim=1).view(B, 1, 1)
 
         h_len, w_len = float(Hp), float(Wp)
         h_offset, w_offset = 0.0, 0.0
 
         image_ids = torch.zeros((Hp, Wp, 3), device=device, dtype=torch.float32)
-        image_ids[:, :, 0] = image_ids[:, :, 1] + index
         image_ids[:, :, 1] = image_ids[:, :, 1] + torch.linspace(h_offset, h_len - 1 + h_offset, steps=Hp, device=device, dtype=torch.float32).unsqueeze(1)
         image_ids[:, :, 2] = image_ids[:, :, 2] + torch.linspace(w_offset, w_len - 1 + w_offset, steps=Wp, device=device, dtype=torch.float32).unsqueeze(0)
 
-        image_ids = image_ids.view(1, N_img, 3).expand(B, -1, -1)
+        image_ids = image_ids.view(1, N_img, 3).repeat(B, 1, 1)
+        image_ids[:, :, 0] = index.view(B, 1)
 
         rotary_pos_emb = self.pos_embed(torch.cat([image_ids, text_ids], dim=1)).to(x.dtype)
         del image_ids, text_ids

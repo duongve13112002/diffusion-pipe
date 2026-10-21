@@ -2913,6 +2913,10 @@ class PipelineDataLoader:
 
     def _pull_batches_from_dataloader(self):
         for batch in self.dataloader:
+            # For models whose training noise levels follow an epoch schedule (MOSS-Image's
+            # clean_end_share); eval batches are prepared with a quantile instead.
+            if self.eval_quantile is None and hasattr(self.model, 'set_training_epoch'):
+                self.model.set_training_epoch(self.epoch)
             features, label = self.model.prepare_inputs(batch, timestep_quantile=self.eval_quantile)
             *target_list, mask = label
             # The target depends on the noise, so we must broadcast it from the first stage to the last.

@@ -164,36 +164,35 @@ class InitialLayer(nn.Module):
         pH = pW = self.patch_size
         device = x.device
 
-        # The dynamic padding breaks pipeline parallelism because tensor shapes are different between micro batches. So just
-        # disable it. It has no measureable effect on validation loss so I think this is okay to do.
+        # As ComfyUI runs a caption alone: its tokens padded with cap_pad_token to a multiple of
+        # pad_tokens_multiple (which the blocks attend to), and the image positions starting after
+        # that. The batch then pads every caption to the longest of these, masked out.
+        cap_mask = cap_mask.to(torch.bool)
+        # real tokens first, whichever side the text encoder padded on
+        order = torch.argsort((~cap_mask).to(torch.int8), dim=1, stable=True)
+        cap_feats = torch.gather(cap_feats, 1, order[..., None].expand(-1, -1, cap_feats.shape[-1]))
+        n_tokens = cap_mask.sum(dim=1)
+        if self.pad_tokens_multiple is not None:
+            cap_lens = -(-n_tokens // self.pad_tokens_multiple) * self.pad_tokens_multiple
+        else:
+            cap_lens = n_tokens
+        cap_len = max(int(cap_lens.max()), cap_feats.shape[1] if self.pad_tokens_multiple is None else 0)
+        rows = torch.arange(cap_len, device=device)
+        cap_feats = torch.nn.functional.pad(cap_feats[:, :cap_len], (0, 0, 0, max(0, cap_len - cap_feats.shape[1])))
+        if self.pad_tokens_multiple is not None:
+            pad_token = self.cap_pad_token.to(device=device, dtype=cap_feats.dtype, copy=True).view(1, 1, -1)
+            cap_feats = torch.where((rows[None] >= n_tokens[:, None])[..., None], pad_token, cap_feats)
+        cap_mask = (rows[None] < cap_lens[:, None]).view(bsz, 1, 1, -1)  # for PyTorch SDPA
 
-        # if self.pad_tokens_multiple is not None:
-        #     cap_feats_list = []
-        #     for cap_feats_single, cap_mask_single in zip(cap_feats, cap_mask):
-        #         cap_feats_single = cap_feats_single[cap_mask_single]
-        #         pad_extra = (-cap_feats_single.shape[0]) % self.pad_tokens_multiple
-        #         cap_feats_single = torch.cat((cap_feats_single, self.cap_pad_token.to(device=device, dtype=cap_feats.dtype, copy=True).repeat(pad_extra, 1)), dim=0)
-        #         cap_feats_list.append(cap_feats_single)
-
-        #     cap_item_seqlens = [len(_) for _ in cap_feats_list]
-        #     assert all(_ % self.pad_tokens_multiple == 0 for _ in cap_item_seqlens)
-        #     cap_max_item_seqlen = max(cap_item_seqlens)
-        #     cap_feats = pad_sequence(cap_feats_list, batch_first=True, padding_value=0.0)
-        #     cap_mask = torch.zeros((bsz, cap_max_item_seqlen), dtype=torch.bool, device=device)
-        #     for i, seq_len in enumerate(cap_item_seqlens):
-        #         cap_mask[i, :seq_len] = 1
-
-        cap_mask = cap_mask.view(bsz, 1, 1, -1)  # for PyTorch SDPA
-
-        cap_pos_ids = torch.zeros(bsz, cap_feats.shape[1], 3, dtype=torch.float32, device=device)
-        cap_pos_ids[:, :, 0] = torch.arange(cap_feats.shape[1], dtype=torch.float32, device=device) + 1.0
+        cap_pos_ids = torch.zeros(bsz, cap_len, 3, dtype=torch.float32, device=device)
+        cap_pos_ids[:, :, 0] = rows.to(torch.float32) + 1.0
 
         B, C, H, W = x.shape
         x = self.x_embedder(x.view(B, C, H // pH, pH, W // pW, pW).permute(0, 2, 4, 3, 5, 1).flatten(3).flatten(1, 2))
 
         H_tokens, W_tokens = H // pH, W // pW
         x_pos_ids = torch.zeros((bsz, x.shape[1], 3), dtype=torch.float32, device=device)
-        x_pos_ids[:, :, 0] = cap_feats.shape[1] + 1
+        x_pos_ids[:, :, 0] = (cap_lens + 1).to(torch.float32)[:, None]
         x_pos_ids[:, :, 1] = torch.arange(H_tokens, dtype=torch.float32, device=device).view(-1, 1).repeat(1, W_tokens).flatten()
         x_pos_ids[:, :, 2] = torch.arange(W_tokens, dtype=torch.float32, device=device).view(1, -1).repeat(H_tokens, 1).flatten()
 

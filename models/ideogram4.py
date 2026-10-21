@@ -11,6 +11,7 @@ from utils.common import AUTOCAST_DTYPE, get_lin_function, time_shift
 from utils.offloading import ModelOffloader
 import comfy.latent_formats
 from comfy.text_encoders.llama import precompute_freqs_cis
+from comfy.ldm.ideogram4.model import _split_half_rope_matrix
 
 
 SEQUENCE_PADDING_INDICATOR = -1
@@ -216,13 +217,16 @@ class InitialLayer(nn.Module):
             self.head_dim, position_ids[0].transpose(0, 1), self.rope_theta,
             rope_dims=self.mrope_section, interleaved_mrope=True, device=position_ids.device,
         )
+        # The blocks take one rotation-matrix tensor, as ComfyUI's forward builds it (not the
+        # (cos, sin, -sin) tuple precompute_freqs_cis returns).
+        freqs_cis = _split_half_rope_matrix(freqs_cis)
 
         if attn_mask.dtype == torch.bool:
             attn_mask = torch.zeros_like(attn_mask, dtype=h.dtype).masked_fill_(~attn_mask, -torch.finfo(h.dtype).max)
 
         sizes = torch.tensor([L_text, gh, gw], device=h.device)
 
-        return make_contiguous(h, attn_mask, adaln_input, sizes, *freqs_cis)
+        return make_contiguous(h, attn_mask, adaln_input, sizes, freqs_cis)
 
 
 class TransformerLayer(nn.Module):
@@ -234,13 +238,13 @@ class TransformerLayer(nn.Module):
 
     @torch.autocast('cuda', dtype=AUTOCAST_DTYPE)
     def forward(self, inputs):
-        h, attn_mask, adaln_input, sizes, *freqs_cis = inputs
+        h, attn_mask, adaln_input, sizes, freqs_cis = inputs
 
         self.offloader.wait_for_block(self.block_idx)
         h = self.layer(h, attn_mask, freqs_cis, adaln_input)
         self.offloader.submit_move_blocks_forward(self.block_idx)
 
-        return make_contiguous(h, attn_mask, adaln_input, sizes, *freqs_cis)
+        return make_contiguous(h, attn_mask, adaln_input, sizes, freqs_cis)
 
 
 class FinalLayer(nn.Module):
@@ -253,7 +257,7 @@ class FinalLayer(nn.Module):
         return getattr(self.model[0], name)
 
     def forward(self, inputs):
-        h, attn_mask, adaln_input, sizes, *freqs_cis = inputs
+        h, attn_mask, adaln_input, sizes, freqs_cis = inputs
         out = self.final_layer(h, adaln_input)
         L_text, gh, gw = sizes
         out = -self._tokens_to_img(out[:, L_text:], gh, gw)

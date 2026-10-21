@@ -162,6 +162,23 @@ class InitialLayer(nn.Module):
     def __getattr__(self, name):
         return getattr(self.model[0], name)
 
+    def fuse_text(self, x, mask):
+        """ComfyUI's TextFusionTransformer, with the caption padding masked out of its attention.
+        ComfyUI never pads a prompt, so it runs these blocks without a mask; the batch's padding
+        would otherwise reach the real tokens."""
+        fusion = self.txtfusion
+        # (batch, tokens, text encoder layers, dim): the layerwise blocks attend across the layers
+        # of each token, not across tokens, so the padding only reaches the refiner blocks.
+        b, l, n, d = x.shape
+        x = x.reshape(b * l, n, d)
+        for block in fusion.layerwise_blocks:
+            x = block(x.contiguous())
+        x = rearrange(x, "(b l) n d -> b l d n", b=b, l=l)
+        x = fusion.projector(x).squeeze(-1)
+        for block in fusion.refiner_blocks:
+            x = block(x, mask=mask[:, None, None, :])
+        return x
+
     @torch.autocast('cuda', dtype=AUTOCAST_DTYPE)
     def forward(self, inputs):
         x, timesteps, context, attention_mask = inputs
@@ -184,7 +201,7 @@ class InitialLayer(nn.Module):
         t = self.tmlp(timestep_embedding(timesteps, self.tdim).unsqueeze(1).to(img.dtype))
         tvec = self.tproj(t)
 
-        context = self.txtfusion(context, mask=None)
+        context = self.fuse_text(context, attention_mask)
         context = self.txtmlp(context)
 
         txtlen, imglen = context.shape[1], img.shape[1]

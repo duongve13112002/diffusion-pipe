@@ -65,6 +65,14 @@ timestep_sample_method = 'logit_normal'
 #sigma_cutoff = 0.95
 #uniform_fraction = 0.01
 #shift = 1.0
+# Percent of training steps below sigma 0.5, where faces and fine detail are refined; sets
+# logit_mean to give it (so leave logit_mean out). The reference puts about 11% there. Fizgig
+# found likeness LoRAs converge much sooner with more: 30 is about where Krea 2 sits.
+#clean_end_share = 30
+# Or by epoch: 60% up to epoch 7, down to 30% by epoch 15, then every 2nd epoch at 60% again
+# (Fizgig's default for small likeness datasets).
+#clean_end_share = [[7, 60], [15, 30]]
+#clean_end_share_refresh_every = 2
 # Captions longer than the text encoder's 4096 tokens are cut: 'warn' (default), 'silent' or 'error'.
 #on_caption_overflow = 'warn'
 

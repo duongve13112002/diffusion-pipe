@@ -211,6 +211,9 @@ class InitialLayer(nn.Module):
         super().__init__()
         if model.params.guidance_embed:
             raise NotImplementedError('Training guidance distilled model is not supported.')
+        if model.time_r_in is not None:
+            # ComfyUI adds an embedding of the next sigma of the sampler's schedule (MeanFlow).
+            raise NotImplementedError('Training a MeanFlow (time_r_in) model is not supported.')
         assert model.vector_in is None
         self.img_in = model.img_in
         self.time_in = model.time_in
@@ -223,6 +226,22 @@ class InitialLayer(nn.Module):
 
     def __getattr__(self, name):
         return getattr(self.model[0], name)
+
+    def refine_text(self, x, timesteps, mask):
+        """ComfyUI's TokenRefiner for a padded batch. ComfyUI never pads a prompt, so its refiner
+        pools over every token and turns a bool mask into m | m.T, which lets the real tokens attend
+        to the padding. As for the caption alone (and as in Tencent's HunyuanVideo-1.5): pool over
+        the real tokens, and let no token attend to the padding."""
+        txt_in = self.txt_in
+        t = txt_in.t_embedder(timestep_embedding(timesteps, 256, time_factor=1.0).to(x.dtype))
+        m = mask.unsqueeze(-1).to(x.dtype)
+        c = (x * m).sum(dim=1) / m.sum(dim=1).clamp(min=1)
+        c = t + txt_in.c_embedder(c.to(x.dtype))
+        x = txt_in.input_embedder(x)
+        key_mask = mask[:, None, None, :]
+        for block in txt_in.individual_token_refiner.blocks:
+            x = block(x, c, key_mask)
+        return x
 
     @torch.autocast('cuda', dtype=AUTOCAST_DTYPE)
     def forward(self, inputs):
@@ -252,7 +271,7 @@ class InitialLayer(nn.Module):
         assert txt_mask.dtype == torch.bool
         assert txt_byt5_mask.dtype == torch.bool
 
-        txt = self.txt_in(txt, timesteps, txt_mask)
+        txt = self.refine_text(txt, timesteps, txt_mask)
 
         if self.cond_type_embedding is not None:
             self.cond_type_embedding.to(txt.device)
@@ -272,15 +291,14 @@ class InitialLayer(nn.Module):
             txt_byt5_ids = torch.zeros((txt_ids.shape[0], txt_byt5.shape[1], txt_ids.shape[-1]), device=txt_ids.device, dtype=txt_ids.dtype)
             txt_ids = torch.cat((txt_ids, txt_byt5_ids), dim=1)
 
-        ids = torch.cat((img_ids, txt_ids), dim=1)
+        # ComfyUI's DoubleStreamBlock attends over (text, image), text first.
+        ids = torch.cat((txt_ids, img_ids), dim=1)
         pe = self.pe_embedder(ids)
         pe.requires_grad_(True)
 
-        img_len = img.shape[1]
-
-        attn_mask_len = img_len + txt.shape[1]
+        attn_mask_len = txt.shape[1] + img.shape[1]
         attn_mask = torch.ones((bs, 1, 1, attn_mask_len), dtype=torch.bool, device=img.device)
-        attn_mask[:, 0, 0, img_len:] = txt_mask
+        attn_mask[:, 0, 0, :txt.shape[1]] = txt_mask
 
         return make_contiguous(img, txt, vec, pe, attn_mask, initial_shape)
 

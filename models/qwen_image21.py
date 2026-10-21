@@ -179,25 +179,33 @@ class InitialLayer(nn.Module):
         slots = (image_slots + [txt_len] * len(ref_latents))[:len(ref_latents)]
         bounds = [0] + slots + [txt_len]
 
+        # Different from source. The captions of a batch are padded to the longest, which ComfyUI
+        # never does: rope positions count only a sample's real tokens, so its image starts right
+        # after them, where it is alone. (The padding rows take a neighbour's position; masked,
+        # they reach no one.)
+        real = context_mask.to(torch.float32)
+        text_pos = (real.cumsum(1) - 1).clamp(min=0)
         parts, ids, segments = [], [], []
         pos, length = 0, 0
         for (start, end), img in zip(zip(bounds[:-1], bounds[1:]), ref_latents + [x]):
             n = end - start
             if n > 0:
                 parts.append(txt[:, start:end])
-                ids.append(torch.arange(pos, pos + n, device=x.device, dtype=torch.float32).unsqueeze(1).expand(n, 3))
+                ids.append((pos + text_pos[:, start:end, None]).expand(bs, n, 3))
                 # Different from source. Exactly 1 text segment, so we can do: 1D attention mask -> expand to n x n -> tril().
                 # Thus, padding tokens are masked + attention is causal.
                 mask = context_mask[:, None, None, :].expand(bs, 1, n, n).tril()
                 segments.append((length, length + n, mask))
-                pos += n
+                pos = pos + real[:, start:end].sum(1)
                 length += n
             h, w = img.shape[-2:]
             parts.append(self.img_in(img.flatten(2).transpose(1, 2)))
             # half a token where a reference grid has the other parity, so it centres on the target
             hh = torch.arange(h, device=x.device, dtype=torch.float32) - (h - h // 2) + 0.5 * (h % 2 - x.shape[-2] % 2)
             ww = torch.arange(w, device=x.device, dtype=torch.float32) - (w - w // 2) + 0.5 * (w % 2 - x.shape[-1] % 2)
-            ids.append(torch.stack([torch.full((h, w), pos, device=x.device, dtype=torch.float32), hh[:, None].expand(h, w), ww[None, :].expand(h, w)], dim=-1).flatten(0, 1))
+            pos = torch.as_tensor(pos, device=x.device, dtype=torch.float32).expand(bs)
+            grid = torch.stack([hh[:, None].expand(h, w), ww[None, :].expand(h, w)], dim=-1).flatten(0, 1)
+            ids.append(torch.cat([pos[:, None, None].expand(bs, h * w, 1), grid.expand(bs, h * w, 2)], dim=-1))
             # Different from source. Image tokens full attend to themselves, but must only attend to non-padding tokens in text.
             mask = torch.ones((bs, 1, 1, txt_len + h*w), dtype=torch.bool, device=x.device)
             mask[:, 0, 0, :txt_len] = context_mask
@@ -206,7 +214,7 @@ class InitialLayer(nn.Module):
             length += h * w
 
         # (1, N, 1, ...): the layout the fused rms_rope wants for (B, N, H, D) queries
-        pe = self.pe_embedder(torch.cat(ids, dim=0).unsqueeze(0)).transpose(1, 2).contiguous()
+        pe = self.pe_embedder(torch.cat(ids, dim=1)).transpose(1, 2).contiguous()
         return torch.cat(parts, dim=1), pe, segments
 
     @torch.autocast('cuda', dtype=AUTOCAST_DTYPE)

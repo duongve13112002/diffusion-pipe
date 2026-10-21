@@ -152,9 +152,15 @@ comfy.ldm.minimax.model.DiTBlock = DiTBlock
 
 
 class FinalLayer(nn.Module):
-    def __init__(self, hidden, t_dim, video_dim, audio_dim, eps, apply_silu=True, adaln_dtype=None,
+    def __init__(self, hidden, t_dim, video_dim, audio_dim, eps, apply_silu=True, adaln_dtype=None, pdd_steps=1,
                  dtype=None, device=None, operations=None):
         super().__init__()
+        if pdd_steps != 1:
+            # A PDD (distilled) checkpoint stacks pdd_steps output heads per stream, picked by the
+            # sampler's sigma schedule; this layer trains the single head of the base model.
+            raise NotImplementedError(
+                f'MiniMax H3 PDD checkpoints (pdd_steps = {pdd_steps}) cannot be trained; use the base model')
+        self.video_dim = video_dim
         self.norm = operations.RMSNorm(hidden, eps=eps, dtype=dtype, device=device)
         self.adaln_proj = AdalnProj(t_dim, hidden, 2, 1, apply_silu=apply_silu,
                                     dtype=adaln_dtype if adaln_dtype is not None else dtype,
@@ -536,6 +542,12 @@ class InitialLayer(nn.Module):
         latent_t, lat_h, lat_w = video_x.shape[2], video_x.shape[3], video_x.shape[4]
         audio_t = audio_x.shape[-1]
         text_len = context.shape[1]
+        # The captions of a batch are padded to the longest. ComfyUI never pads a prompt, so the
+        # sample is built as it would be alone: the refiner sees only the real tokens, and the rope
+        # positions are those of the unpadded layout (where the video starts right after the real
+        # text). The padding rows go at the end of the text span, masked out as keys.
+        real_text = context_mask.view(-1).to(torch.bool)
+        n_text = int(real_text.sum())
         # extra_conds prebuilds the layout once per sampling run
         layout = payload.get("layout")
         if layout is None or layout.signature != (text_len, latent_t, lat_h, lat_w, audio_t):
@@ -600,8 +612,8 @@ class InitialLayer(nn.Module):
         video_embed = self.video_patch_proj(all_video_rows).to(dtype)
         audio_embed = self.audio_patch_proj(all_audio_rows).to(dtype)
 
-        text_states = context
-        if text_states.shape[-1] != self.hidden_size:
+        text_states = context[:, real_text]
+        if text_states.shape[-1] != self.hidden_size and n_text > 0:
             text_states = self.token_refiner(self.condition_proj(text_states),
                                              transformer_options=transformer_options)
         text_states = text_states[0]  # this happens after since token_refiner uses the new batch-enabled Attention
@@ -613,8 +625,10 @@ class InitialLayer(nn.Module):
         for a, b, kind in layout.segments:
             n = b - a
             if kind == "text":
-                h[a:b] = text_states
-                attention_mask[a:b] = context_mask
+                h[a:a + n_text] = text_states.to(dtype)
+                h[a + n_text:b] = 0
+                attention_mask[a:a + n_text] = True
+                attention_mask[a + n_text:b] = False
             elif kind in ("cond", "ref_img", "video"):
                 h[a:b] = video_embed[voff:voff + n]
                 voff += n
@@ -633,7 +647,16 @@ class InitialLayer(nn.Module):
             t_emb = self.time_embedder(t_vals).to(dtype)
 
         # rotation table computed once per forward, consumed by the kitchen split-half rope
-        rope_freqs = rope_rotation_table(self.rope_freqs(layout.position_ids, device), dtype)
+        position_ids = layout.position_ids
+        if n_text != text_len:
+            assert layout.segments[0][:2] == (0, text_len) and layout.segments[0][2] == "text"
+            unpadded = PackedLayout(n_text, latent_t, lat_h, lat_w, audio_t,
+                                    keyframes=payload.get("keyframes"), refs=payload.get("refs")).position_ids
+            assert unpadded.shape[0] == layout.seq_len - (text_len - n_text)
+            # the padding rows take the positions after the real text; being masked, they reach no one
+            pad_positions = position_ids[n_text:text_len]
+            position_ids = torch.cat([unpadded[:n_text], pad_positions, unpadded[n_text:]])
+        rope_freqs = rope_rotation_table(self.rope_freqs(position_ids, device), dtype)
 
         video_seg = next((a, b, t_row[seg_t["video"]]) for a, b, k in layout.segments if k == "video")
         audio_seg = next((a, b, t_row[seg_t["audio"]]) for a, b, k in layout.segments if k == "audio")
@@ -645,7 +668,7 @@ class InitialLayer(nn.Module):
 
     def make_layer_inputs(self, video_x, audio_x, valid_audio, t, context, context_mask):
         first_mod_seqments = None
-        h_list, attention_mask_list, t_emb_list = [], [], []
+        h_list, attention_mask_list, t_emb_list, rope_freqs_list = [], [], [], []
         for items in zip(video_x, audio_x, valid_audio, t, context, context_mask):
             h, attention_mask, t_emb, mod_segments, rope_freqs, extra_ints = self.make_packed_sequence(*(x.unsqueeze(0) for x in items))
             if first_mod_seqments is None:
@@ -656,10 +679,13 @@ class InitialLayer(nn.Module):
             h_list.append(h)
             attention_mask_list.append(attention_mask)
             t_emb_list.append(t_emb)
+            rope_freqs_list.append(rope_freqs)
 
         h = torch.stack(h_list, dim=0)
         attention_mask = torch.stack(attention_mask_list, dim=0)[:, None, None, :]  # 4D bool for SDPA
         t_emb = torch.stack(t_emb_list)
+        # per sample: each sample's rope positions follow its own caption length
+        rope_freqs = torch.cat(rope_freqs_list, dim=0)
         outputs = make_contiguous(h, attention_mask, t_emb, mod_segments, rope_freqs, extra_ints)
         for item in outputs:
             if torch.is_floating_point(item):

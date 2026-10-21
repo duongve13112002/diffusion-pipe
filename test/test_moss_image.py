@@ -96,6 +96,9 @@ def bare_pipeline(model_config=None, config=None):
     pipe.tokenizer = None
     pipe.overflow_warned = set()
     pipe.on_caption_overflow = 'warn'
+    pipe.clean_end_schedule = None
+    pipe.clean_end_samplers = {}
+    pipe.training_epoch = 1
     return pipe
 
 
@@ -148,8 +151,6 @@ def test_layers_match_the_original_transformer(lengths):
         got = pipe.pipeline_model((x, t, text, mask))
     torch.testing.assert_close(got, expected, rtol=1e-5, atol=1e-5)
 
-
-# ---- text encoder ------------------------------------------------------------------------------
 
 TINY_TEXT = dict(
     hidden_size=64, intermediate_size=96, num_hidden_layers=4, num_attention_heads=2, num_key_value_heads=1,
@@ -476,8 +477,6 @@ def test_text_encoder_layouts_are_detected():
         mi.text_encoder_state(small)
 
 
-# ---- noise levels and the inference schedule ---------------------------------------------------
-
 REFERENCE_PIPELINE = Path('/home/user/MOSS-Image-hf/Base/pipeline_moss_image.py')
 
 
@@ -585,8 +584,6 @@ def test_prepare_inputs_builds_the_flow_matching_target():
     assert float(sigma[0]) == float(pipe.noise_sampler.sample(1, quantile=0.5))
 
 
-# ---- sampling ----------------------------------------------------------------------------------
-
 def reference_velocity(reference, x, t, conds, skip=()):
     """ComfyUI's forward with blocks skipped the way SkipLayerGuidanceDiTSimple skips them."""
     replace = {('single_block', i): (lambda args, extra: {'img': args['img']}) for i in skip}
@@ -687,8 +684,6 @@ def test_sample_settings_are_validated():
     with pytest.raises(ValueError, match='slg_start'):
         pipe.sample(w=32, h=32, decode=False)
 
-
-# ---- adapters, merging and saving --------------------------------------------------------------
 
 LORA = dict(type='lora', rank=4, alpha=4, dropout=0.0, dtype=torch.float32)
 
@@ -863,8 +858,6 @@ def test_a_saved_full_fine_tune_loads_in_comfyui_and_diffusers(tmp_path):
                                    rtol=1e-4, atol=1e-4)
 
 
-# ---- gradients ---------------------------------------------------------------------------------
-
 def assert_grad_close(got, expected, name):
     # Summation order differs from the reference's per-sample loop: compare to the gradient's scale.
     scale = float(expected.abs().max())
@@ -956,8 +949,6 @@ def test_activation_checkpointing_recomputes_the_same_gradients():
     for name, p in pipe.diffusion_model.named_parameters():
         assert_grad_close(p.grad, expected[name], name)
 
-
-# ---- low precision -----------------------------------------------------------------------------
 
 def fp8_rounded_reference(reference, keep):
     """The reference with every weight the pipeline stores in fp8 rounded through fp8."""
@@ -1351,8 +1342,6 @@ def test_bfloat16_matches_the_reference_in_bfloat16():
     assert (got - full).abs().mean() < 0.05 * full.abs().mean()
 
 
-# ---- configuration -----------------------------------------------------------------------------
-
 def diffusers_dir(tmp_path):
     for sub in ('transformer', 'vae', 'text_encoder'):
         (tmp_path / 'MOSS-Image' / sub).mkdir(parents=True)
@@ -1405,6 +1394,20 @@ def test_layout_bbox_space_selects_the_layout_caption_format():
     ({'sigmoid_scale': 1.0}, 'sigmoid_scale'),
     ({'cache_text_embeddings': 'false'}, 'cache_text_embeddings'),
     ({'timestep_sample_method': 'uniform', 'logit_mean': 0.0}, 'logit_mean'),
+    ({'timestep_sample_method': 'uniform', 'clean_end_share': 30}, 'clean_end_share'),
+    ({'clean_end_share': 30, 'logit_mean': -1.09}, 'remove one of them'),
+    ({'clean_end_share': 100}, 'percentage between 0 and 100'),
+    ({'clean_end_share': '30'}, 'percentage between 0 and 100'),
+    ({'clean_end_share': 30, 'min_t': 0.6}, 'can only be set between'),
+    ({'clean_end_share': [[7, 60], [15, 99.9]]}, 'can only be set between'),
+    ({'clean_end_share': [[7, 60], [7, 30]]}, 'epochs must increase'),
+    ({'clean_end_share': [[0, 60]]}, 'whole numbers from 1'),
+    ({'clean_end_share': [[1.5, 60]]}, 'whole numbers from 1'),
+    ({'clean_end_share': [60, 30]}, r'\[epoch, share\] pairs'),
+    ({'clean_end_share': []}, 'empty list'),
+    ({'clean_end_share': 30, 'clean_end_share_refresh_every': 2}, 'needs clean_end_share as a list'),
+    ({'clean_end_share_refresh_every': 2}, 'needs clean_end_share as a list'),
+    ({'clean_end_share': [[7, 60]], 'clean_end_share_refresh_every': 0}, 'whole number of epochs'),
     ({'timestep_sample_method': 'gamma'}, 'timestep_sample_method'),
     ({'dtype': torch.float16}, 'bfloat16 or float32'),
     ({'diffusion_model_dtype': 'float8'}, r'\[adapter\]'),
@@ -1422,6 +1425,83 @@ def test_noise_settings_reach_the_sampler(tmp_path):
                           'uniform_fraction': 0.0, 'min_t': 0.1, 'max_t': 0.9})
     expected = mi.NoiseLevelSampler('logit_normal', 0.0, 1.0, 1.0, 0.0, 1.0, 0.1, 0.9)
     torch.testing.assert_close(pipe.noise_sampler.probabilities, expected.probabilities)
+
+
+def test_clean_end_share_moves_logit_mean(tmp_path):
+    # The reference's logit_mean -1.09 puts about 11% of steps below sigma 0.5 (Fizgig's figure);
+    # clean_end_share solves for the logit_mean that gives the share asked for, with the other
+    # settings of the sampler kept.
+    reference = mi.NoiseLevelSampler('logit_normal', -1.09, 0.95, 0.95, 0.01, 1.0, 0.0, 1.0)
+    share = mi.clean_end_share(reference)
+    assert 11.0 < share < 11.2
+    assert mi.logit_mean_for_clean_end_share(share, 0.95, 0.95, 0.01, 1.0, 0.0, 1.0) == pytest.approx(-1.09, abs=1e-6)
+
+    root = diffusers_dir(tmp_path)
+    for share, settings in ((30, {}), (40, {'shift': 3.0, 'max_t': 0.9}), (60, {'uniform_fraction': 0.1})):
+        pipe = make_pipeline({'diffusers_path': str(root), 'clean_end_share': share, **settings})
+        assert mi.clean_end_share(pipe.noise_sampler) == pytest.approx(share, abs=1e-6)
+        sigmas = pipe.noise_sampler.sigmas[pipe.noise_sampler.probabilities > 0]
+        assert sigmas.max() <= settings.get('max_t', 1.0) + 1e-9
+    plain = make_pipeline({'diffusers_path': str(root)})
+    torch.testing.assert_close(plain.noise_sampler.probabilities, reference.probabilities)
+
+
+def test_clean_end_share_follows_an_epoch_schedule(tmp_path):
+    # Fizgig's default "Slide 60:7:30:15:2": 60% up to epoch 7, a straight line down to 30% at
+    # epoch 15, then every 2nd epoch back at 60%. Eval stays at the share the schedule settles on.
+    root = diffusers_dir(tmp_path)
+    pipe = make_pipeline({'diffusers_path': str(root), 'clean_end_share': [[7, 60], [15, 30]],
+                          'clean_end_share_refresh_every': 2})
+    expected = [60] * 7 + [56.25, 52.5, 48.75, 45, 41.25, 37.5, 33.75, 30, 30, 60, 30, 60, 30]
+    latents = torch.randn(1, 128, 2, 2)
+    batch = {'latents': latents, 'mask': None, 'prompt_embeds': [torch.randn(3, TEXT_DIM)]}
+    for epoch, share in enumerate(expected, start=1):
+        assert mi.clean_end_share_at(*pipe.clean_end_schedule, epoch) == pytest.approx(share)
+        pipe.set_training_epoch(epoch)
+        assert mi.clean_end_share(pipe.training_noise_sampler()) == pytest.approx(share, abs=1e-6)
+        generator_state = torch.get_rng_state()
+        (_, sigma, _, _), _ = pipe.prepare_inputs(batch)
+        torch.set_rng_state(generator_state)
+        assert float(sigma) == float(pipe.clean_end_sampler(share).sample(1))
+        (_, sigma, _, _), _ = pipe.prepare_inputs(batch, timestep_quantile=0.5)
+        assert float(sigma) == float(pipe.clean_end_sampler(30).sample(1, quantile=0.5))
+    assert mi.clean_end_share(pipe.noise_sampler) == pytest.approx(30, abs=1e-6)
+
+
+def test_the_training_dataloader_tells_the_model_its_epoch():
+    import types
+    from utils.dataset import PipelineDataLoader
+
+    class Model:
+        def __init__(self):
+            self.epoch = None
+            self.seen = []
+
+        def set_training_epoch(self, epoch):
+            self.epoch = epoch
+
+        def prepare_inputs(self, batch, timestep_quantile=None):
+            self.seen.append((self.epoch, timestep_quantile))
+            return (batch,), (batch, None)
+
+    class Dataset(torch.utils.data.Dataset):
+        def __len__(self):
+            return 2
+
+        def __getitem__(self, i):
+            return torch.tensor([float(i)])
+
+    engine = types.SimpleNamespace(is_pipe_parallel=False)
+    model = Model()
+    loader = iter(PipelineDataLoader(Dataset(), engine, 1, model, num_dataloader_workers=0))
+    for _ in range(5):
+        next(loader)
+    assert [epoch for epoch, _ in model.seen[:5]] == [1, 1, 2, 2, 3]
+    model.epoch, model.seen = 'untouched', []
+    eval_loader = PipelineDataLoader(Dataset(), engine, 1, model, num_dataloader_workers=0)
+    eval_loader.set_eval_quantile(0.5)
+    next(iter(eval_loader))
+    assert model.seen and all(seen == ('untouched', 0.5) for seen in model.seen)
 
 
 def test_transformer_config_must_describe_its_weights(tmp_path):
@@ -1458,8 +1538,6 @@ def test_control_datasets_are_refused():
     with pytest.raises(NotImplementedError, match='control'):
         bare_pipeline().model_specific_dataset_config_validation({'directory': [{'path': 'a', 'control_path': 'b'}]})
 
-
-# ---- VAE ---------------------------------------------------------------------------------------
 
 LOCAL_VAE = Path('/home/user/moss-weights/Base/vae')
 
@@ -1530,8 +1608,6 @@ def test_example_configs_are_accepted(name):
     pipe._check_keys()
     assert config.get('keep_last_n_checkpoints', 2) >= 2
 
-
-# ---- learning rates per part and per block ---------------------------------------------------------
 
 BASE_LR = 1e-4
 PART_LRS = dict(attn_lr=1e-5, ffn_lr=2e-5, norm_lr=3e-5, text_refiner_lr=4e-5, modulation_lr=5e-5, embed_head_lr=6e-5)

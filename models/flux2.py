@@ -116,16 +116,29 @@ class Flux2Pipeline(ComfyPipeline):
         return layers
 
     def get_conds(self, inputs):
-        text_embeds = inputs['text_embeds_0']
-        # text embeds are variable length (already padded to at least 512), Flux2 model uses fixed 512 length
-        text_embeds = torch.stack(
-            [u[:512, :] for u in text_embeds]
-        )
+        """The text as ComfyUI hands it to the model at inference, one prompt at a time, then
+        right-padded to the longest in the batch with the padding masked out.
+
+        Klein's Qwen3 tokenizer pads to at least 512 tokens and the model attends to that
+        padding. The 32B's Mistral tokenizer does not pad; ComfyUI (model_base.Flux2.extra_conds)
+        prepends zeros up to 512 tokens instead, which the model attends to as well. Captions
+        longer than 512 tokens are kept whole, as ComfyUI keeps them."""
+        embeds = []
+        for u, m in zip(inputs['text_embeds_0'], inputs['attention_mask_0']):
+            n = int(m.sum())
+            if self.is_32b:
+                u = F.pad(u[:n], (0, 0, max(512 - n, 0), 0))
+            else:
+                u = u[:max(512, n)]
+            embeds.append(u)
+        length = max(u.shape[0] for u in embeds)
+        text_embeds = torch.stack([F.pad(u, (0, 0, 0, length - u.shape[0])) for u in embeds])
+        txt_mask = torch.stack([torch.arange(length, device=u.device) < u.shape[0] for u in embeds])
         bs = text_embeds.shape[0]
         device = text_embeds.device
 
         guidance = torch.ones((bs,), device=device, dtype=torch.float32)
-        return text_embeds, guidance
+        return text_embeds, guidance, txt_mask
 
     def prepare_inputs(self, inputs, timestep_quantile=None):
         latents = inputs['latents'].float()
@@ -257,7 +270,7 @@ class InitialLayer(nn.Module):
                 item.requires_grad_(True)
 
         # Unpack inputs, handling optional control latents
-        x, timesteps, txt, guidance, *extra = inputs
+        x, timesteps, txt, guidance, txt_mask, *extra = inputs
         has_control = len(extra) > 0
         y = None
 
@@ -318,13 +331,16 @@ class InitialLayer(nn.Module):
         else:
             vec = (vec,)
 
+        attn_mask = torch.ones((bs, 1, 1, txt.shape[1] + img.shape[1]), dtype=torch.bool, device=device)
+        attn_mask[:, 0, 0, :txt.shape[1]] = txt_mask
+
         ids = torch.cat((txt_ids, img_ids), dim=1)
         pe = self.pe_embedder(ids)
         pe.requires_grad_(True)  # work around pipeline parallelism issue
         txt_len = torch.tensor(txt.shape[1], dtype=torch.int64, device=device)
         hw = torch.tensor([h_orig, w_orig], dtype=torch.int64, device=device)
 
-        return make_contiguous(img, txt, pe, txt_len, img_len, hw, vec_orig, *vec)
+        return make_contiguous(img, txt, pe, attn_mask, txt_len, img_len, hw, vec_orig, *vec)
 
 
 class DoubleTransformerLayer(nn.Module):
@@ -336,7 +352,7 @@ class DoubleTransformerLayer(nn.Module):
 
     @torch.autocast('cuda', dtype=AUTOCAST_DTYPE)
     def forward(self, inputs):
-        img, txt, pe, txt_len, img_len, hw, vec_orig, *vec = inputs
+        img, txt, pe, attn_mask, txt_len, img_len, hw, vec_orig, *vec = inputs
 
         if len(vec) == 1:
             tmp_vec = vec[0]
@@ -348,10 +364,10 @@ class DoubleTransformerLayer(nn.Module):
             tmp_vec = ((mod_outs[0], mod_outs[1]), (mod_outs[2], mod_outs[3]))
 
         self.offloader.wait_for_block(self.block_idx)
-        img, txt = self.layer(img=img, txt=txt, vec=tmp_vec, pe=pe, attn_mask=None)
+        img, txt = self.layer(img=img, txt=txt, vec=tmp_vec, pe=pe, attn_mask=None if attn_mask.all() else attn_mask)
         self.offloader.submit_move_blocks_forward(self.block_idx)
 
-        return make_contiguous(img, txt, pe, txt_len, img_len, hw, vec_orig, *vec)
+        return make_contiguous(img, txt, pe, attn_mask, txt_len, img_len, hw, vec_orig, *vec)
 
 
 class ConcatenateTxtImg(nn.Module):
@@ -364,14 +380,14 @@ class ConcatenateTxtImg(nn.Module):
 
     @torch.autocast('cuda', dtype=AUTOCAST_DTYPE)
     def forward(self, inputs):
-        img, txt, pe, txt_len, img_len, hw, vec_orig, *vec = inputs
+        img, txt, pe, attn_mask, txt_len, img_len, hw, vec_orig, *vec = inputs
 
         img = torch.cat((txt, img), 1)
         if self.single_stream_modulation is not None:
             mod_out, _ = self.single_stream_modulation(vec_orig)
             vec = [mod_out.shift, mod_out.scale, mod_out.gate]
 
-        return make_contiguous(img, pe, txt_len, img_len, hw, vec_orig, *vec)
+        return make_contiguous(img, pe, attn_mask, txt_len, img_len, hw, vec_orig, *vec)
 
 
 class SingleTransformerLayer(nn.Module):
@@ -383,7 +399,7 @@ class SingleTransformerLayer(nn.Module):
 
     @torch.autocast('cuda', dtype=AUTOCAST_DTYPE)
     def forward(self, inputs):
-        img, pe, txt_len, img_len, hw, vec_orig, *vec = inputs
+        img, pe, attn_mask, txt_len, img_len, hw, vec_orig, *vec = inputs
 
         if len(vec) == 1:
             tmp_vec = vec[0]
@@ -392,10 +408,10 @@ class SingleTransformerLayer(nn.Module):
             tmp_vec = ModulationOut(*vec)
 
         self.offloader.wait_for_block(self.block_idx)
-        img = self.layer(img, vec=tmp_vec, pe=pe, attn_mask=None)
+        img = self.layer(img, vec=tmp_vec, pe=pe, attn_mask=None if attn_mask.all() else attn_mask)
         self.offloader.submit_move_blocks_forward(self.block_idx)
 
-        return make_contiguous(img, pe, txt_len, img_len, hw, vec_orig, *vec)
+        return make_contiguous(img, pe, attn_mask, txt_len, img_len, hw, vec_orig, *vec)
 
 
 class FinalLayer(nn.Module):
@@ -409,7 +425,7 @@ class FinalLayer(nn.Module):
 
     @torch.autocast('cuda', dtype=AUTOCAST_DTYPE)
     def forward(self, inputs):
-        img, pe, txt_len, img_len, hw, vec_orig, *vec = inputs
+        img, pe, attn_mask, txt_len, img_len, hw, vec_orig, *vec = inputs
 
         # Extract image portion (after text)
         img = img[:, txt_len.item():, ...]

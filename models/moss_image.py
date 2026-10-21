@@ -121,8 +121,6 @@ def _dtype(value, key):
     return DTYPE_NAMES[value]
 
 
-# ---- learning rates per part of the model ----------------------------------------------------------
-
 # Each parameter (an adapter's too: PEFT keeps the module path, layers.3.proj.q.lora_A...) belongs
 # to one of these, by name. The `<part>_lr` keys of [model] set a part's learning rate.
 LR_PARTS = {
@@ -275,8 +273,6 @@ class LearningRates:
                 + (' (frozen)' if lr == 0 else '') for (part, label), (lr, params) in grouped.items()))
         return param_groups
 
-
-# ---- weights on disk -------------------------------------------------------------------------------
 
 def read_component(path, stem):
     """State dict and metadata of a diffusers component directory or a single safetensors file.
@@ -646,8 +642,6 @@ def default_rope_bands(head_dim, base=ROPE_BASE):
     return 1 / (base ** (torch.arange(num_bands, dtype=torch.float32) / num_bands))
 
 
-# ---- text encoder ----------------------------------------------------------------------------------
-
 def text_encoder_state(state):
     """A Qwen3.5-9B state dict in the layout ComfyUI's Qwen35 expects, without the vision tower.
 
@@ -757,8 +751,6 @@ def load_text_encoder(path):
                          state_dict=[state], model_options={}, disable_dynamic=True)
 
 
-# ---- noise levels ----------------------------------------------------------------------------------
-
 def training_grid(total=NUM_TRAIN_TIMESTEPS, shift=1.0, dtype=torch.float64):
     """Noise levels of the training grid, ascending: sigma_j for j = 1..total.
 
@@ -821,7 +813,10 @@ class NoiseLevelSampler:
         else:
             edges = sigma_cutoff * torch.arange(total + 1, dtype=torch.float64) / total
             with torch.no_grad():
-                cdf = 1 - torch.special.ndtr((torch.log((1 - edges) / edges) - logit_mean) / logit_std)
+                # erfc rather than 1 - ndtr, which rounds to 0 far out in the tail
+                cdf = 0.5 * torch.special.erfc((torch.log((1 - edges) / edges) - logit_mean) / (logit_std * math.sqrt(2)))
+            if not cdf[-1] > 0:
+                raise ValueError(f'logit_mean = {logit_mean} puts no probability below sigma_cutoff = {sigma_cutoff}')
             p = (cdf[1:] - cdf[:-1]) / cdf[-1]
             p = (1 - uniform_fraction) * p + uniform_fraction / total
         keep = (self.sigmas >= min_t - 1e-12) & (self.sigmas <= max_t + 1e-12)
@@ -845,7 +840,88 @@ class NoiseLevelSampler:
         return self.sigmas[idx].float()
 
 
-# ---- the pipeline ----------------------------------------------------------------------------------
+CLEAN_END_SIGMA = 0.5
+
+
+def clean_end_share(sampler):
+    """Percent of training steps at the clean end of the noise range (sigma below 0.5)."""
+    return 100.0 * float(sampler.probabilities[sampler.sigmas < CLEAN_END_SIGMA].sum())
+
+
+def logit_mean_for_clean_end_share(share, logit_std, sigma_cutoff, uniform_fraction, shift, min_t, max_t):
+    """The logit_mean that puts `share` percent of training steps below sigma 0.5, everything else
+    of the sampler (spread, cutoff, uniform part, shift, min_t / max_t) as configured.
+
+    Fizgig's "clean-end share" for MOSS-Image: the reference's logit_mean -1.09 puts about 11% of
+    steps there, which Fizgig found too few for likeness. The share rises with logit_mean, so a
+    bisection finds it."""
+    def share_at(mu):
+        return clean_end_share(NoiseLevelSampler('logit_normal', mu, logit_std, sigma_cutoff, uniform_fraction,
+                                                 shift, min_t, max_t))
+
+    lo, hi = -12.0, 12.0
+    low, high = share_at(lo), share_at(hi)
+    if not low < share < high:
+        raise ValueError(f'clean_end_share = {share}: with these noise settings the share of steps below sigma '
+                         f'{CLEAN_END_SIGMA} can only be set between {low:.2f} and {high:.2f} percent')
+    for _ in range(60):
+        mid = 0.5 * (lo + hi)
+        if share_at(mid) < share:
+            lo = mid
+        else:
+            hi = mid
+    mu = 0.5 * (lo + hi)
+    if abs(share_at(mu) - share) > 0.01:
+        raise ValueError(f'clean_end_share = {share}: no logit_mean gives that share with these noise settings')
+    return mu
+
+
+def parse_clean_end_schedule(value, refresh_every):
+    """clean_end_share as (epoch, share) points: a number is one share for the whole run; a list of
+    [epoch, share] pairs holds the first share up to its epoch, runs in a straight line between
+    points and holds the last share after. refresh_every = R puts every R-th epoch after the last
+    point back at the first share. Fizgig's "Slide 60:7:30:15:2" is [[7, 60], [15, 30]] with
+    refresh_every = 2."""
+    def check_share(share):
+        if isinstance(share, bool) or not isinstance(share, (int, float)) or not 0 < share < 100:
+            raise ValueError(f'clean_end_share is a percentage between 0 and 100, got {share!r}')
+        return float(share)
+
+    if isinstance(value, (list, tuple)):
+        points = []
+        for point in value:
+            if not isinstance(point, (list, tuple)) or len(point) != 2:
+                raise ValueError(f'clean_end_share takes [epoch, share] pairs, got {point!r}')
+            epoch, share = point
+            if isinstance(epoch, bool) or not isinstance(epoch, int) or epoch < 1:
+                raise ValueError(f'clean_end_share epochs are whole numbers from 1, got {epoch!r}')
+            if points and epoch <= points[-1][0]:
+                raise ValueError(f'clean_end_share epochs must increase, got {epoch} after {points[-1][0]}')
+            points.append((epoch, check_share(share)))
+        if not points:
+            raise ValueError('clean_end_share is an empty list')
+    else:
+        if refresh_every is not None:
+            raise ValueError('clean_end_share_refresh_every needs clean_end_share as a list of [epoch, share] points')
+        points = [(1, check_share(value))]
+    if refresh_every is not None and (isinstance(refresh_every, bool) or not isinstance(refresh_every, int)
+                                      or refresh_every < 1):
+        raise ValueError(f'clean_end_share_refresh_every is a whole number of epochs from 1, got {refresh_every!r}')
+    return points, refresh_every
+
+
+def clean_end_share_at(points, refresh_every, epoch):
+    last_epoch, last_share = points[-1]
+    if epoch >= last_epoch:
+        if refresh_every and epoch > last_epoch and (epoch - last_epoch) % refresh_every == 0:
+            return points[0][1]
+        return last_share
+    if epoch <= points[0][0]:
+        return points[0][1]
+    for (e0, s0), (e1, s1) in zip(points, points[1:]):
+        if e0 <= epoch <= e1:
+            return s0 + (s1 - s0) * (epoch - e0) / (e1 - e0)
+
 
 class LayerState:
     """What every pipeline layer shares and is not a module: the compute dtype, the layers to skip
@@ -923,11 +999,33 @@ class MossImagePipeline(ComfyPipeline):
         if self.on_caption_overflow not in ('warn', 'silent', 'error'):
             raise ValueError(f"on_caption_overflow must be 'warn', 'silent' or 'error', got {self.on_caption_overflow!r}")
 
-        noise = {key: self.model_config.get(key, default) for key, default in NOISE_DEFAULTS.items()}
-        self.noise_sampler = NoiseLevelSampler(
-            noise['timestep_sample_method'], float(noise['logit_mean']), float(noise['logit_std']),
-            float(noise['sigma_cutoff']), float(noise['uniform_fraction']), float(noise['shift']),
-            float(noise['min_t']), float(noise['max_t']))
+        self.noise_settings = {key: self.model_config.get(key, default) for key, default in NOISE_DEFAULTS.items()}
+        self.clean_end_schedule = None
+        self.clean_end_samplers = {}
+        self.training_epoch = 1
+        if 'clean_end_share' in self.model_config:
+            self.clean_end_schedule = parse_clean_end_schedule(
+                self.model_config['clean_end_share'], self.model_config.get('clean_end_share_refresh_every'))
+            # Every share of the schedule lies between those of its points.
+            for _, share in self.clean_end_schedule[0]:
+                self.clean_end_sampler(share)
+            # Eval losses stay comparable from epoch to epoch: eval runs at the share the schedule
+            # settles on.
+            self.noise_sampler = self.clean_end_sampler(self.clean_end_schedule[0][-1][1])
+        else:
+            noise = self.noise_settings
+            self.noise_sampler = NoiseLevelSampler(
+                noise['timestep_sample_method'], float(noise['logit_mean']), float(noise['logit_std']),
+                float(noise['sigma_cutoff']), float(noise['uniform_fraction']), float(noise['shift']),
+                float(noise['min_t']), float(noise['max_t']))
+        if is_main_process():
+            share = clean_end_share(self.noise_sampler)
+            if self.clean_end_schedule is not None and (len(self.clean_end_schedule[0]) > 1 or self.clean_end_schedule[1]):
+                first = clean_end_share_at(*self.clean_end_schedule, 1)
+                print(f'MOSS-Image: {first:.1f}% of training steps below sigma {CLEAN_END_SIGMA} in epoch 1, following '
+                      f'the clean_end_share schedule; eval at {share:.1f}%')
+            else:
+                print(f'MOSS-Image: {share:.1f}% of training steps below sigma {CLEAN_END_SIGMA}')
 
         def load_vae():
             vae = comfy.sd.VAE(sd=read_component(self.vae_path, 'diffusion_pytorch_model')[0], dtype=torch.float32)
@@ -940,6 +1038,31 @@ class MossImagePipeline(ComfyPipeline):
         self.diffusion_model = None
         self.layer_state = None
         self.conds = self.unconds = None
+
+    def clean_end_sampler(self, share):
+        share = round(float(share), 6)
+        if share not in self.clean_end_samplers:
+            noise = self.noise_settings
+            mu = logit_mean_for_clean_end_share(
+                share, float(noise['logit_std']), float(noise['sigma_cutoff']), float(noise['uniform_fraction']),
+                float(noise['shift']), float(noise['min_t']), float(noise['max_t']))
+            self.clean_end_samplers[share] = NoiseLevelSampler(
+                'logit_normal', mu, float(noise['logit_std']), float(noise['sigma_cutoff']),
+                float(noise['uniform_fraction']), float(noise['shift']), float(noise['min_t']), float(noise['max_t']))
+        return self.clean_end_samplers[share]
+
+    def set_training_epoch(self, epoch):
+        """Called by the training dataloader before each batch it prepares."""
+        if self.clean_end_schedule is not None and epoch != self.training_epoch and is_main_process():
+            before, after = (clean_end_share_at(*self.clean_end_schedule, e) for e in (self.training_epoch, epoch))
+            if round(before, 6) != round(after, 6):
+                print(f'MOSS-Image: epoch {epoch}, {after:.1f}% of training steps below sigma {CLEAN_END_SIGMA}')
+        self.training_epoch = epoch
+
+    def training_noise_sampler(self):
+        if self.clean_end_schedule is None:
+            return self.noise_sampler
+        return self.clean_end_sampler(clean_end_share_at(*self.clean_end_schedule, self.training_epoch))
 
     def _check_keys(self):
         mc = self.model_config
@@ -975,9 +1098,15 @@ class MossImagePipeline(ComfyPipeline):
         self.layout_caption_format = LAYOUT_BBOX_SPACES[space]
         method = mc.get('timestep_sample_method', NOISE_DEFAULTS['timestep_sample_method'])
         if method == 'uniform':
-            unused = [key for key in ('logit_mean', 'logit_std', 'sigma_cutoff', 'uniform_fraction') if key in mc]
+            unused = [key for key in ('logit_mean', 'logit_std', 'sigma_cutoff', 'uniform_fraction', 'clean_end_share')
+                      if key in mc]
             if unused:
                 raise ValueError(f"{', '.join(unused)} only apply to timestep_sample_method = 'logit_normal'")
+        if 'clean_end_share' in mc:
+            if 'logit_mean' in mc:
+                raise ValueError('clean_end_share sets logit_mean: remove one of them')
+        elif 'clean_end_share_refresh_every' in mc:
+            raise ValueError('clean_end_share_refresh_every needs clean_end_share as a list of [epoch, share] points')
         if (dmd := mc.get('diffusion_model_dtype')) is not None:
             dmd = _dtype(dmd, 'diffusion_model_dtype')
             mc['diffusion_model_dtype'] = dmd
@@ -996,12 +1125,8 @@ class MossImagePipeline(ComfyPipeline):
             raise FileNotFoundError(f'{path} does not exist. Set {key} if the {subfolder} lives elsewhere.')
         return str(path)
 
-    # ---- identities ------------------------------------------------------------------------------
-
     def text_encoder_cache_key(self, i):
         return f'moss_image|{self.text_encoder_path}|qwen35_9b|last|{MAX_TEXT_TOKENS}|trimmed-v1|prompt-strip-v1'
-
-    # ---- models ----------------------------------------------------------------------------------
 
     def load_diffusion_model(self):
         path = self.transformer_path
@@ -1119,8 +1244,6 @@ class MossImagePipeline(ComfyPipeline):
             mask[i, :e.shape[0]] = True
         return text, mask
 
-    # ---- adapters and saving ---------------------------------------------------------------------
-
     def load_and_fuse_adapter(self, path):
         raise NotImplementedError('Use merge_adapters in [model] to merge adapters into MOSS-Image')
 
@@ -1138,8 +1261,6 @@ class MossImagePipeline(ComfyPipeline):
         config = {'_class_name': 'MOSSImageTransformer', **unet_config}
         safetensors.torch.save_file(sd, Path(save_dir) / 'diffusion_pytorch_model.safetensors', metadata={'format': 'pt'})
         (Path(save_dir) / 'config.json').write_text(json.dumps(config, indent=2) + '\n')
-
-    # ---- data ------------------------------------------------------------------------------------
 
     def model_specific_dataset_config_validation(self, dataset_config):
         for directory in dataset_config.get('directory', []):
@@ -1162,15 +1283,14 @@ class MossImagePipeline(ComfyPipeline):
         if mask is not None:
             mask = mask.unsqueeze(1)
             mask = F.interpolate(mask.float(), size=(h, w), mode='nearest-exact')
-        sigma = self.noise_sampler.sample(bs, timestep_quantile).to(latents.device)
+        sampler = self.noise_sampler if timestep_quantile is not None else self.training_noise_sampler()
+        sigma = sampler.sample(bs, timestep_quantile).to(latents.device)
         noise = torch.randn_like(latents)
         s = sigma.view(-1, 1, 1, 1)
         noisy = (1 - s) * latents + s * noise
         target = noise - latents
         # ComfyUI's MOSS-Image takes sigma itself; its timestep embedding scales it by 1000.
         return (noisy, sigma, text, text_mask), (target, mask)
-
-    # ---- pipeline layers -------------------------------------------------------------------------
 
     def get_param_groups(self, parameters):
         rates = self.learning_rates
@@ -1240,8 +1360,6 @@ class MossImagePipeline(ComfyPipeline):
             self.offloader.disable_block_swap()
         self.offloader.set_forward_only(True)
         self.offloader.prepare_block_devices_before_forward()
-
-    # ---- sampling (--test_sample) ----------------------------------------------------------------
 
     def sample_setting(self, key):
         value = self.model_config.get(key, SAMPLE_DEFAULTS[key])
