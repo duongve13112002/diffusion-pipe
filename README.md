@@ -46,9 +46,6 @@ Models supported: SDXL, Flux, LTX-Video, HunyuanVideo (t2v), Cosmos, Lumina Imag
   - Support Ernie-Image.
 - 2026-02-04
   - Support Anima.
-- 2026-01-16
-  - Support Flux 2, both Dev and Klein.
-  - Updated DeepSpeed version. Should probably update all requirements: `pip install -r requirements.txt -U`.
 
 ## Windows support
 It will be difficult or impossible to make training work on native Windows. This is because Deepspeed only has [partial Windows support](https://github.com/microsoft/DeepSpeed/blob/master/blogs/windows/08-2024/README.md). Deepspeed is a hard requirement because the entire training script is built around Deepspeed pipeline parallelism. However, it will work on Windows Subsystem for Linux, specifically WSL 2. If you must use Windows I recommend trying WSL 2.
