@@ -854,13 +854,14 @@ rather than loaded with layers' weights in their neighbours.
   is refused together with `logit_mean` or `timestep_sample_method = 'uniform'`, and when the
   other settings cannot reach the share. The reference distribution puts about 11% of steps
   there. [Fizgig](https://github.com/shootthesound/Fizgig) found likeness LoRAs on MOSS-Image
-  converge much sooner with more ([v8.7.0 notes](https://github.com/shootthesound/Fizgig/blob/master/docs/RELEASE_NOTES_v8.7.0.md)):
-  30 (about where Krea 2 and Qwen-Image sit) beat 60 held for the whole run. The run prints the
+  converge much sooner with more ([v8.7.0 notes](https://github.com/shootthesound/Fizgig/blob/master/docs/RELEASE_NOTES_v8.7.0.md)),
+  and that 30 (about where Krea 2 and Qwen-Image sit) beat 60 held for the whole run
+  ([v8.7.1 notes](https://github.com/shootthesound/Fizgig/blob/master/docs/RELEASE_NOTES_v8.7.1.md)). The run prints the
   share it trains with.
 - The share can also follow the epochs: `clean_end_share = [[7, 60], [15, 30]]` holds 60% up to
   epoch 7, goes down in a straight line to 30% at epoch 15 and stays there, and
   `clean_end_share_refresh_every = 2` then puts every 2nd epoch back at the first share. That is
-  Fizgig's default since v8.8.1 ("Slide 60:7:30:15:2"), its best of eight settings on a small
+  Fizgig's default since [v8.8.1](https://github.com/shootthesound/Fizgig/blob/master/docs/RELEASE_NOTES_v8.8.1.md) ("Slide 60:7:30:15:2"), its best of eight settings on a small
   likeness dataset; with many more than about 55 images it suggests coming down from 60 sooner.
   Eval losses are computed at the last point's share in every epoch, so they stay comparable.
 - Captions are encoded with MOSS-Image's chat template, which trims the caption, and cut at
