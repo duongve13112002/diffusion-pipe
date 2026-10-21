@@ -686,6 +686,9 @@ shift = 3  # probably good for any model with Flux2 VAE
 
 Use ComfyUI-compatible model files. LoRAs are saved in ComfyUI format.
 
+Text embeddings cached by earlier versions are rebuilt once, `keep_text_embedding_cache` or not:
+a shorter caption in a batch used to be encoded with the padding as part of its text.
+
 ## LTX 2.3
 ```
 [model]
@@ -776,6 +779,10 @@ timestep_sample_method = 'logit_normal'
 #merge_adapters = ['/path/to/training_adapter.safetensors']  # merges adapters into weights before training starts
 ```
 Everything is ComfyUI model format. Only T2I is currently supported. I2I edit training would require significant refactors of the dataset processing code (it assumes the text embeddings can be computed from the text prompt alone, which isn't true for this model). Qwen-Image-2.1 is a CFG-distilled model. Training it without a de-distillation adapter breaks the distillation and you will need to use CFG for inference.
+
+Empty captions (caption dropout, the unconditional embedding) are encoded as `' '`, as ComfyUI's
+TextEncodeQwenImage21 node encodes an empty prompt. Text embeddings cached by earlier versions are
+rebuilt once, `keep_text_embedding_cache` or not.
 
 ## MOSS-Image
 [MOSS-Image](https://github.com/OpenMOSS/MOSS-Image) is a 5B single-stream text-to-image DiT

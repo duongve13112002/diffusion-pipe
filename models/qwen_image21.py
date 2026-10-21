@@ -74,6 +74,9 @@ class QwenImage21Pipeline(ComfyPipeline):
         # Empty captions cached before the ' ' mapping above were encoded as ''.
         return 'comfy-prevent-empty-text'
 
+    def text_encoder_requires_identity(self, i):
+        return True
+
     def to_layers(self):
         diffusion_model = self.diffusion_model
         transformer_options = {

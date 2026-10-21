@@ -181,7 +181,8 @@ def _content_digest(dataset, column, upto=None):
 
 def _map_and_cache(dataset, map_fn, cache_dir, cache_file_prefix='', new_fingerprint_args=None,
                    regenerate_cache=False, caching_batch_size=1, fingerprint_columns=None,
-                   keep_on_fingerprint_change=False, identity=None, content_column=None):
+                   keep_on_fingerprint_change=False, identity=None, content_column=None,
+                   require_identity=False):
     new_fingerprint_args = [] if new_fingerprint_args is None else list(new_fingerprint_args)
     if fingerprint_columns is None:
         new_fingerprint_args.append(dataset._fingerprint)
@@ -204,7 +205,8 @@ def _map_and_cache(dataset, map_fn, cache_dir, cache_file_prefix='', new_fingerp
 
     cache = Cache(cache_dir, new_fingerprint, shard_size_gb=10,
                   keep_on_fingerprint_change=keep_on_fingerprint_change, identity=identity,
-                  content_digest=_content_digest(dataset, content_column) if content_column else None)
+                  content_digest=_content_digest(dataset, content_column) if content_column else None,
+                  require_identity=require_identity)
 
     if map_fn is None:
         # loading directly from cache without mapping
@@ -443,7 +445,8 @@ def _has_content_digest(cache_path):
 def _cache_text_embeddings(metadata_dataset, map_fn, i, cache_dir, regenerate_cache,
                            caching_batch_size, text_encoder_key='',
                            keep_on_fingerprint_change=False, identity=None,
-                           profile_sources=None, profile_lookup_dir=None, layout_rewriter=None):
+                           profile_sources=None, profile_lookup_dir=None, layout_rewriter=None,
+                           require_identity=False):
     """layout_rewriter (a LayoutCaptionRewriter) rewrites each layout caption for its row's
     media and size bucket before it is encoded; the metadata must then have size_bucket set."""
 
@@ -509,6 +512,7 @@ def _cache_text_embeddings(metadata_dataset, map_fn, i, cache_dir, regenerate_ca
         cache_file_prefix=f'text_embeddings_{i}_',
         keep_on_fingerprint_change=keep_on_fingerprint_change,
         identity=identity,
+        require_identity=require_identity,
         # text_encoder_key identifies which text encoder produced these embeddings, and is
         # deliberately only in this fingerprint: latents are cached separately, so swapping
         # the text encoder must not invalidate them. Models that supply no key keep their
@@ -793,13 +797,14 @@ class SizeBucketDataset:
 
     def cache_text_embeddings(self, map_fn, i, regenerate_cache=False, caching_batch_size=1,
                               text_encoder_key='', keep_text_embedding_cache=False,
-                              identity=None):
+                              identity=None, require_identity=False):
         print(f'caching text embeddings: {self.size_bucket}')
         te_dataset = _cache_text_embeddings(
             self.metadata_dataset, map_fn, i, self.cache_dir, regenerate_cache,
             caching_batch_size, text_encoder_key,
             keep_on_fingerprint_change=keep_text_embedding_cache,
             identity=identity,
+            require_identity=require_identity,
             profile_sources=((lambda: self.directory_dataset.legacy_tensor_sources(
                 self.size_bucket, f'text_embeddings_{i}'))
                 if getattr(self.directory_dataset, 'reuse_metadata_cache', False) else None),
@@ -1290,7 +1295,7 @@ class ARBucketDataset:
 
     def cache_text_embeddings(self, map_fn, i, regenerate_cache=False, caching_batch_size=1,
                               text_encoder_key='', keep_text_embedding_cache=False,
-                              identity=None):
+                              identity=None, require_identity=False):
         if (getattr(self.directory_dataset, 'layout_rewriter', None) is not None
                 and any(is_layout_caption(c) for captions in self.metadata_dataset['caption'] for c in captions)):
             # A layout caption is a different text at each resolution (its boxes follow the
@@ -1299,7 +1304,7 @@ class ARBucketDataset:
                 size_bucket_dataset.cache_text_embeddings(
                     map_fn, i, regenerate_cache=regenerate_cache, caching_batch_size=caching_batch_size,
                     text_encoder_key=text_encoder_key, keep_text_embedding_cache=keep_text_embedding_cache,
-                    identity=identity)
+                    identity=identity, require_identity=require_identity)
             return
         print(f'caching text embeddings: {self.ar_frames}')
         te_dataset = _cache_text_embeddings(
@@ -1307,6 +1312,7 @@ class ARBucketDataset:
             caching_batch_size, text_encoder_key,
             keep_on_fingerprint_change=keep_text_embedding_cache,
             identity=identity,
+            require_identity=require_identity,
             profile_sources=((lambda: self.directory_dataset.legacy_tensor_sources(
                 self.ar_frames, f'text_embeddings_{i}'))
                 if getattr(self.directory_dataset, 'reuse_metadata_cache', False) else None),
@@ -2210,7 +2216,7 @@ class DirectoryDataset:
 
     def cache_text_embeddings(self, map_fn, i, regenerate_cache=False, caching_batch_size=1,
                               text_encoder_key='', keep_text_embedding_cache=False,
-                              identity=None):
+                              identity=None, require_identity=False):
         print(f'caching text embeddings: {self.path}')
         datasets_list = self.size_bucket_datasets if self.use_size_buckets else self.ar_bucket_datasets
         for ds in datasets_list:
@@ -2218,7 +2224,7 @@ class DirectoryDataset:
                 map_fn, i, regenerate_cache=regenerate_cache,
                 caching_batch_size=caching_batch_size, text_encoder_key=text_encoder_key,
                 keep_text_embedding_cache=self.keep_text_embedding_cache,
-                identity=identity,
+                identity=identity, require_identity=require_identity,
             )
         # TODO: do this separately for is_video True and False for models that support it?
         empty_caption_ds = datasets.Dataset.from_dict({'caption': [''], 'is_video': [False], 'image_spec': [(None, None)]})
@@ -2248,6 +2254,7 @@ class DirectoryDataset:
                 # rebuild while the unconditional one -- the embedding every CFG-dropped sample
                 # trains against -- came back from the old encoder.
                 identity=identity,
+                require_identity=require_identity,
                 regenerate_cache=regenerate_cache,
             )
         self.uncond_dict = uncond_text_embeddings_ds[0]
@@ -2475,6 +2482,7 @@ class Dataset:
         text_encoder_key = getattr(self.model, 'text_encoder_cache_key', lambda _i: '')(i)
         text_encoder_identity = getattr(
             self.model, 'text_encoder_identity', lambda _i: text_encoder_key)(i)
+        require_identity = getattr(self.model, 'text_encoder_requires_identity', lambda _i: False)(i)
         for ds in self.directory_datasets:
             ds.cache_text_embeddings(
                 map_fn, i, regenerate_cache=regenerate_cache,
@@ -2484,6 +2492,7 @@ class Dataset:
                 # these are. A model that keeps something out of its fingerprint, to avoid
                 # moving every existing install's cache path, can still declare it here.
                 identity=text_encoder_identity,
+                require_identity=require_identity,
             )
         # some techniques need access to the uncond
         self.model.uncond_dict = self.directory_datasets[0].uncond_dict

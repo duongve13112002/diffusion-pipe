@@ -9,9 +9,15 @@ import torch
 
 
 class Cache:
+    require_identity = False
+
     def __init__(self, path: str, fingerprint: str, shard_size_gb=1,
-                 keep_on_fingerprint_change=False, identity=None, content_digest=None):
+                 keep_on_fingerprint_change=False, identity=None, content_digest=None,
+                 require_identity=False):
         self.keep_on_fingerprint_change = keep_on_fingerprint_change
+        # Set when the caller's contents differ from what any cache that records no identity
+        # holds (a model changed how it encodes): such a cache is rebuilt, keep_* or not.
+        self.require_identity = require_identity
         # What produced this cache's contents -- the VAE for latents, the text encoder
         # for embeddings. None means the caller supplies no identity, which is the
         # behaviour every model had before this existed.
@@ -92,6 +98,10 @@ class Cache:
         else:
             print(f'[CACHE] Storing new fingerprint: {self.fingerprint}')
             self.con.execute('INSERT INTO fingerprint VALUES(?)', (self.fingerprint,))
+            if self.require_identity:
+                # Claimed from the start, not only once complete: without it a run interrupted
+                # while caching would find a cache that records no identity, and start over.
+                self.write_manifest(identity_only=True)
 
         # items table, current length, next shard index
         self.con.execute('CREATE TABLE IF NOT EXISTS items(shard, shard_index)')
@@ -123,26 +133,31 @@ class Cache:
     def check_identity(self):
         """Is this cache's content compatible with what the caller is about to ask for?
 
-        Returns (compatible, reason). Compatible in three cases: the caller supplies no
-        identity, no manifest exists, or the manifest agrees. The middle case is what keeps
-        every cache written before this existed valid -- nothing is known about it, so nothing
-        is claimed, and it gets a manifest the next time it is written in full.
+        Returns (compatible, reason). Compatible when no identity is recorded or the recorded
+        one agrees. The first case is what keeps every cache written before this existed valid
+        -- nothing is known about it, so nothing is claimed, and it gets a manifest the next
+        time it is written in full. Unless require_identity is set: the caller then knows such a
+        cache holds something else. A recorded identity and a caller with none disagree: an
+        option that adds an identity (an encoding variant) was turned off again.
         """
-        if not self.identity:
-            return True, ''
+        unrecorded = (False, (
+            f'This cache records no identity, so it was built before {self.identity!r}, which '
+            'encodes differently.')) if self.identity and self.require_identity else (True, '')
         if not self.manifest_file.exists():
-            return True, ''
+            return unrecorded
         try:
             with open(self.manifest_file, encoding='utf-8') as f:
                 recorded = json.load(f).get('identity', None)
         except (OSError, ValueError):
             # An unreadable manifest says nothing either way; do not destroy a cache over it.
             return True, ''
-        if recorded is None or recorded == self.identity:
+        if recorded is None:
+            return unrecorded
+        if recorded == (self.identity or None):
             return True, ''
         return False, (
-            f'This cache was built by {recorded!r} but this run is {self.identity!r}, so its '
-            'contents do not belong to this model.'
+            f'This cache was built by {recorded!r} but this run is {self.identity or "unspecified"!r}, '
+            'so its contents do not belong to this model.'
         )
 
     def recorded_content_digest(self):
@@ -160,15 +175,19 @@ class Cache:
         except (OSError, ValueError):
             return None
 
-    def write_manifest(self):
-        """Record what produced this cache, and from what. Called once contents are complete."""
-        if not self.identity and not self.content_digest:
+    def write_manifest(self, identity_only=False):
+        """Record what produced this cache, and from what. Called once contents are complete.
+
+        identity_only records only who produces the contents, which is true of a cache still
+        being filled; the content digest describes complete contents.
+        """
+        if not self.identity and (identity_only or not self.content_digest):
             return
         os.makedirs(self.path, exist_ok=True)
         record = {'schema': 2}
         if self.identity:
             record['identity'] = self.identity
-        if self.content_digest:
+        if self.content_digest and not identity_only:
             record['content_digest'] = self.content_digest
         tmp = self.manifest_file.with_name(self.manifest_file.name + '.tmp')
         with open(tmp, 'w', encoding='utf-8') as f:

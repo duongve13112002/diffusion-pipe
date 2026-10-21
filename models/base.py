@@ -1,6 +1,7 @@
 from pathlib import Path
 import re
 import tarfile
+import json
 import os
 import sys
 from collections import defaultdict
@@ -294,6 +295,14 @@ class CommonPipeline:
         Defaults to the fingerprint key, which is the right answer whenever they agree.
         """
         return self.text_encoder_cache_key(i)
+
+    def text_encoder_requires_identity(self, i):
+        """Whether a text cache that records no identity holds something other than what this
+        run encodes. A model that changed how it encodes says so here: its old caches are then
+        rebuilt even with keep_text_embedding_cache, which otherwise keeps a cache whose
+        fingerprint moved whenever the cache claims nothing about who built it.
+        """
+        return False
 
     def __init__(self, *args, **kwargs):
         # sampling only
@@ -646,7 +655,42 @@ def maybe_pad(tokens, min_length, tokenizer):
         tokens.extend([(tokenizer.pad_token, 1.0)] * amount)
 
 
+def read_diffusion_model_header(path):
+    """The tensor shapes (by name, without the state dict prefix ComfyUI strips) and the
+    metadata of a safetensors diffusion model, read from its header without loading a tensor.
+    None for another format."""
+    import comfy.model_detection
+    if not str(path).endswith('.safetensors'):
+        return None
+    with safetensors.safe_open(path, framework='pt', device='cpu') as f:
+        names = list(f.keys())
+        prefix = comfy.model_detection.unet_prefix_from_state_dict(dict.fromkeys(names))
+        shapes = {name[len(prefix):]: f.get_slice(name).get_shape() for name in names if name.startswith(prefix)}
+        metadata = f.metadata() or {}
+    return shapes, metadata
+
+
+def checkpoint_transformer_config(metadata):
+    """The 'transformer' table of a checkpoint's config metadata, as ComfyUI reads it."""
+    try:
+        return json.loads(metadata['config']).get('transformer', {})
+    except (KeyError, ValueError, AttributeError):
+        return {}
+
+
 class ComfyPipeline(CommonPipeline):
+    def refuse_unsupported_checkpoint(self):
+        """Refuse a diffusion model this pipeline cannot train before the dataset is cached
+        (train.py caches first and loads the model after), rather than once caching is done.
+        The model's layers check again when they are built."""
+        header = read_diffusion_model_header(self.model_config['diffusion_model'])
+        if header is not None and (reason := self.unsupported_checkpoint(*header)):
+            raise NotImplementedError(reason)
+
+    def unsupported_checkpoint(self, shapes, metadata):
+        """Why the checkpoint with these tensor shapes and metadata cannot be trained, or None."""
+        return None
+
     # Tokens of a prompt, template included as ComfyUI tokenizes it, that the model's official
     # pipeline keeps: it cuts (or refuses) longer prompts. ComfyUI keeps them whole, and so does
     # training, so the trained model matches ComfyUI sampling; warn_long_captions says so.

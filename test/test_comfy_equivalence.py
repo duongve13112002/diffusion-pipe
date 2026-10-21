@@ -381,6 +381,11 @@ def test_ernie_image_caption_padding_is_masked():
     assert [t for t, _, _ in tokens][:3] == [1, 500, 501]
     assert attention_mask.tolist() == [[1, 1, 1, 0, 0, 0]]
 
+    # Caches built before hold left-padded embeddings: keep_text_embedding_cache must not keep them.
+    from models.ernie_image import ErnieImagePipeline
+    pipe = ErnieImagePipeline.__new__(ErnieImagePipeline)
+    assert pipe.text_encoder_cache_key(0) and pipe.text_encoder_requires_identity(0)
+
 
 def tiny_qwen_image21():
     from comfy.ldm.qwen_image21.model import QwenImage21Transformer2DModel
@@ -442,7 +447,8 @@ def test_qwen_image21_empty_caption_is_encoded_as_comfyui_encodes_it(monkeypatch
     empty, caption = pipe.get_call_text_encoder_fn(None)(['', 'a cat'], [False, False])
     assert empty == comfy_empty
     assert caption == tokenizer.tokenize_with_weights('a cat')
-    assert pipe.text_encoder_cache_key(0)
+    # Caches built before encode empty captions as '': keep_text_embedding_cache must not keep them.
+    assert pipe.text_encoder_cache_key(0) and pipe.text_encoder_requires_identity(0)
 
 
 @pytest.mark.parametrize('module, cls, limit', [
@@ -516,7 +522,10 @@ def test_hunyuan_video_15_official_prompt_template():
     # In order of appearance, de-duplicated, without ‘...’: as the official pipeline extracts them.
     expected = te.tokenizer.byt5.tokenize_with_weights('Text "OPEN". Text "sale". ')[0]
     assert [t for t, *_ in tokens['byt5'][0]] == [t for t, *_ in expected]
-    assert pipe.text_encoder_cache_key(0) != hunyuan_video_15_text_pipeline()[0].text_encoder_cache_key(0)
+    comfyui_pipe = hunyuan_video_15_text_pipeline()[0]
+    assert pipe.text_encoder_cache_key(0) != comfyui_pipe.text_encoder_cache_key(0)
+    # Caches built before the option hold ComfyUI's template; ComfyUI's keeps them valid.
+    assert pipe.text_encoder_requires_identity(0) and not comfyui_pipe.text_encoder_requires_identity(0)
 
     _, te, fn = hunyuan_video_15_text_pipeline()
     fn([caption], [False])
@@ -536,6 +545,50 @@ def test_hunyuan_video_15_refuses_an_unknown_prompt_template():
     pipe = hunyuan_video_15.HunyuanVideo15Pipeline.__new__(hunyuan_video_15.HunyuanVideo15Pipeline)
     with pytest.raises(ValueError, match='prompt_template'):
         hunyuan_video_15.HunyuanVideo15Pipeline.__init__(pipe, {'model': {'dtype': torch.float32, 'prompt_template': 'diffusers'}})
+
+
+def write_checkpoint_header(path, names, metadata=None, shapes=None):
+    # As ComfyUI files store them: under model.diffusion_model., with a few other tensors.
+    import safetensors.torch
+    tensors = {f'model.diffusion_model.{name}': torch.zeros((shapes or {}).get(name, (1,))) for name in names}
+    tensors.update({f'model.diffusion_model.filler_{i}': torch.zeros(1) for i in range(6)})
+    tensors['vae.decoder.weight'] = torch.zeros(1)
+    safetensors.torch.save_file(tensors, str(path), metadata=metadata)
+    return str(path)
+
+
+Z_IMAGE = {'cap_embedder.1.weight': (3840, 1)}
+
+
+@pytest.mark.parametrize('module, cls, names, metadata, shapes, refused', [
+    ('z_image', 'ZImagePipeline', ['cap_embedder.1.weight', 'cap_pad_token'], None, Z_IMAGE, None),
+    ('z_image', 'ZImagePipeline', ['cap_embedder.1.weight', 'cap_pad_token', '__ming_image__'], None, Z_IMAGE, 'Ming-Image'),
+    ('z_image', 'ZImagePipeline', ['cap_embedder.1.weight', 'cap_pad_token'],
+     {'config': '{"transformer": {"image_model": "ming_image"}}'}, Z_IMAGE, 'Ming-Image'),
+    ('z_image', 'ZImagePipeline', ['cap_embedder.1.weight'], None, Z_IMAGE, 'Ming-Image'),
+    ('z_image', 'ZImagePipeline', ['cap_embedder.1.weight', 'dec_net.cond_embed.weight'], None, Z_IMAGE, 'Pixel-space'),
+    ('z_image', 'ZImagePipeline', ['cap_embedder.1.weight', 'cap_pad_token', 'siglip_embedder.0.weight'], None, Z_IMAGE, 'Omni'),
+    ('hunyuan_video_15', 'HunyuanVideo15Pipeline', ['img_in.proj.weight'], None, None, None),
+    ('hunyuan_video_15', 'HunyuanVideo15Pipeline', ['guidance_in.in_layer.weight'], None, None, 'guidance distilled'),
+    ('hunyuan_video_15', 'HunyuanVideo15Pipeline', ['time_r_in.in_layer.weight'], None, None, 'MeanFlow'),
+    ('minimax_h3', 'MinimaxH3Pipeline', ['blocks.0.weight'], {'config': '{"transformer": {"pdd_steps": 1}}'}, None, None),
+    ('minimax_h3', 'MinimaxH3Pipeline', ['blocks.0.weight'], {'config': '{"transformer": {"pdd_steps": 4}}'}, None, 'PDD'),
+    ('ltx2', 'LTX2Pipeline', ['transformer_blocks.0.prompt_scale_shift_table'], None, None, None),
+    ('ltx2', 'LTX2Pipeline', ['transformer_blocks.0.scale_shift_table'], None, None, 'Only LTX 2.3'),
+])
+def test_unsupported_checkpoints_are_refused_before_the_dataset_is_cached(
+        tmp_path, module, cls, names, metadata, shapes, refused):
+    # train.py caches the dataset before it loads the model: a refusal from to_layers() came
+    # after hours of caching. The pipeline reads the checkpoint's header when it is created.
+    import importlib
+    pipe_cls = getattr(importlib.import_module(f'models.{module}'), cls)
+    path = write_checkpoint_header(tmp_path / 'model.safetensors', names, metadata, shapes)
+    pipe = bare_pipeline(pipe_cls, None, {'diffusion_model': path})
+    if refused is None:
+        pipe.refuse_unsupported_checkpoint()
+    else:
+        with pytest.raises(NotImplementedError, match=refused):
+            pipe.refuse_unsupported_checkpoint()
 
 
 def tiny_hunyuan_video_15():

@@ -8,7 +8,7 @@ from torch import nn
 import torch.nn.functional as F
 import comfy_kitchen as ck
 
-from models.base import ComfyPipeline, make_contiguous, PreprocessMediaFile, ModelWrapper
+from models.base import ComfyPipeline, make_contiguous, PreprocessMediaFile, ModelWrapper, checkpoint_transformer_config
 from utils.common import AUTOCAST_DTYPE, get_lin_function, time_shift, one_at_a_time, round_down_to_multiple
 from utils.offloading import ModelOffloader
 import comfy.latent_formats
@@ -213,6 +213,7 @@ class MinimaxH3Pipeline(ComfyPipeline):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        self.refuse_unsupported_checkpoint()
         self.is_video_vae = True
         self.latent_format = comfy.latent_formats.MiniMaxH3Video()
         self.offloader = ModelOffloader('dummy', [], 0, 0, True, torch.device('cuda'), False, debug=False)
@@ -256,6 +257,12 @@ class MinimaxH3Pipeline(ComfyPipeline):
             return vae_list
 
         self.vae = ModelWrapper(load_fn)
+
+    def unsupported_checkpoint(self, shapes, metadata):
+        pdd_steps = checkpoint_transformer_config(metadata).get('pdd_steps', 1)
+        if pdd_steps != 1:
+            return f'MiniMax H3 PDD checkpoints (pdd_steps = {pdd_steps}) cannot be trained; use the base model'
+        return None
 
     def load_diffusion_model(self):
         # Model is so big, it's easy to OOM while loading with multiple GPUs.

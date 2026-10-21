@@ -759,6 +759,7 @@ class TestCacheCompatibilityManifest:
         from utils.dataset import DirectoryDataset
 
         seen = []
+        required = []
 
         class _FakeCache(dict):
             def __getitem__(self, key):
@@ -766,6 +767,7 @@ class TestCacheCompatibilityManifest:
 
         def fake_map_and_cache(dataset, map_fn, cache_dir, cache_file_prefix='', **kwargs):
             seen.append((cache_file_prefix, kwargs.get('identity')))
+            required.append((cache_file_prefix, kwargs.get('require_identity')))
             return _FakeCache()
 
         monkeypatch.setattr(dataset_mod, '_map_and_cache', fake_map_and_cache)
@@ -777,6 +779,7 @@ class TestCacheCompatibilityManifest:
 
             def cache_text_embeddings(self, *args, **kwargs):
                 seen.append((f'text_embeddings_{args[1]}_', kwargs.get('identity')))
+                required.append((f'text_embeddings_{args[1]}_', kwargs.get('require_identity')))
 
         bucket = _FakeBucket()
         stub = object.__new__(DirectoryDataset)
@@ -788,7 +791,7 @@ class TestCacheCompatibilityManifest:
         stub.reuse_metadata_cache = False
         stub.get_size_bucket_datasets = lambda: [bucket]
 
-        DirectoryDataset.cache_text_embeddings(stub, map_fn=None, i=0, identity='llm-A')
+        DirectoryDataset.cache_text_embeddings(stub, map_fn=None, i=0, identity='llm-A', require_identity=True)
 
         by_prefix = dict(seen)
         assert by_prefix['text_embeddings_0_'] == 'llm-A'
@@ -796,6 +799,7 @@ class TestCacheCompatibilityManifest:
             'the unconditional cache was written without an identity, so nothing could detect '
             'that it came from a different text encoder'
         )
+        assert dict(required) == {'text_embeddings_0_': True, 'uncond_text_embeddings_0_': True}
 
     def test_an_already_complete_cache_still_acquires_a_manifest(self, tmp_path):
         """Otherwise the guard is permanently inert on exactly the installs it is for.
@@ -892,9 +896,70 @@ class TestCacheCompatibilityManifest:
         assert len(cache) == 0, 'keep_* must not make an incompatible cache usable'
 
     def test_a_model_that_declares_no_identity_is_unaffected(self, tmp_path):
-        # Every model behaved this way before the manifest existed, and most still do.
-        self._closed_cache(tmp_path, identity='vae-A')
+        # Every model behaved this way before the manifest existed, and most still do: such a
+        # model never records an identity, so its caches never claim one.
+        self._closed_cache(tmp_path, identity='')
         assert self._cache(tmp_path, identity='').check_identity() == (True, '')
+
+    def test_a_cache_that_claims_a_producer_is_not_served_to_a_run_without_one(self, tmp_path):
+        # An encoding option that adds an identity (HunyuanVideo-1.5's official prompt template)
+        # turned off again: the cache holds the option's embeddings.
+        old = self._cache(tmp_path, identity='official-prompt-template')
+        old.add({'value': 1})
+        old.finalize_current_shard()
+        old.write_manifest()
+        old.con.close()
+        cache = self._cache(tmp_path, identity='', keep=True)
+        assert len(cache) == 0, 'the embeddings of the option were served without it'
+        cache.con.close()
+
+    @staticmethod
+    def _text_cache(tmp_path, captions, key, identity, keep, require_identity=False, calls=None):
+        import datasets as hf_datasets
+        from utils.dataset import _map_and_cache
+
+        def embed(example, rank):
+            if calls is not None:
+                calls.extend(example['caption'])
+            return {'embedding': [torch.tensor([float(len(c))]) for c in example['caption']]}
+
+        ds = hf_datasets.Dataset.from_dict({'caption': captions})
+        cache = _map_and_cache(ds, embed, tmp_path / 'cache', cache_file_prefix='text_embeddings_0_',
+                               new_fingerprint_args=[0, key] if key else [0],
+                               keep_on_fingerprint_change=keep, identity=identity,
+                               require_identity=require_identity, content_column='caption')
+        cache.con.close()
+        return cache
+
+    def test_keep_does_not_reuse_a_cache_built_before_the_model_changed_its_encoding(self, tmp_path, monkeypatch):
+        # Qwen-Image-2.1 and Ernie-Image changed how they encode and gave their text encoder a
+        # key. A cache built before records no identity; keep_text_embedding_cache tolerated the
+        # moved fingerprint and served the old embeddings.
+        import utils.dataset as dataset_mod
+        monkeypatch.setattr(dataset_mod, 'NUM_PROC', 1)
+        captions = ['', 'a cat']
+        self._text_cache(tmp_path, captions, key='', identity='', keep=True)
+        calls = []
+        self._text_cache(tmp_path, captions, key='new-encoding', identity='new-encoding', keep=True,
+                         require_identity=True, calls=calls)
+        assert calls == captions, 'the old embeddings were kept'
+
+        calls.clear()
+        self._text_cache(tmp_path, captions, key='new-encoding', identity='new-encoding', keep=True,
+                         require_identity=True, calls=calls)
+        assert calls == [], 'a cache built with the new encoding must be reused'
+
+    def test_a_cache_that_requires_an_identity_resumes_after_an_interruption(self, tmp_path):
+        from utils.cache import Cache
+        path = str(tmp_path / 'text_embeddings_0')
+        cache = Cache(path, 'fingerprint-a', identity='new-encoding', require_identity=True)
+        cache.add({'value': 1})
+        cache.finalize_current_shard()
+        cache.con.close()
+        resumed = Cache(path, 'fingerprint-a', identity='new-encoding', require_identity=True)
+        assert len(resumed) == 1, 'a partial cache must be resumed, not restarted'
+        assert resumed.recorded_content_digest() is None, 'nothing is claimed about the contents yet'
+        resumed.con.close()
 
     def test_an_unreadable_manifest_does_not_destroy_the_cache(self, tmp_path):
         cache = self._cache(tmp_path, identity='vae-A')

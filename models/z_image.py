@@ -8,7 +8,7 @@ from torch import nn
 import torch.nn.functional as F
 from torch.nn.utils.rnn import pad_sequence
 
-from models.base import ComfyPipeline, make_contiguous
+from models.base import ComfyPipeline, make_contiguous, checkpoint_transformer_config
 from utils.common import AUTOCAST_DTYPE, get_lin_function, time_shift
 from utils.offloading import ModelOffloader
 import comfy.ldm.common_dit
@@ -25,8 +25,22 @@ class ZImagePipeline(ComfyPipeline):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        self.refuse_unsupported_checkpoint()
         self.latent_format = comfy.latent_formats.Flux()
         self.offloader = ModelOffloader('dummy', [], 0, 0, True, torch.device('cuda'), False, debug=False)
+
+    def unsupported_checkpoint(self, shapes, metadata):
+        # As comfy.model_detection tells these apart from Z-Image (a NextDiT of width 3840).
+        if shapes.get('cap_embedder.1.weight', [None])[0] != 3840:
+            return None
+        if ('__ming_image__' in shapes or checkpoint_transformer_config(metadata).get('image_model') == 'ming_image'
+                or ('cap_pad_token' not in shapes and 'dec_net.cond_embed.weight' not in shapes)):
+            return 'Ming-Image checkpoints are not supported by the z_image pipeline'
+        if 'dec_net.cond_embed.weight' in shapes:
+            return 'Pixel-space Z-Image checkpoints are not supported by the z_image pipeline'
+        if 'siglip_embedder.0.weight' in shapes:
+            return 'Z-Image Omni checkpoints (SigLIP image conditioning) are not supported by the z_image pipeline'
+        return None
 
     def to_layers(self):
         diffusion_model = self.diffusion_model

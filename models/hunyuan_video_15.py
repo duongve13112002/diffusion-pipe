@@ -58,15 +58,31 @@ class HunyuanVideo15Pipeline(ComfyPipeline):
         if prompt_template not in ('comfyui', 'official'):
             raise ValueError(f"[model] prompt_template must be 'comfyui' or 'official', got {prompt_template!r}")
         super().__init__(config, *args, **kwargs)
+        self.refuse_unsupported_checkpoint()
         self.latent_format = comfy.latent_formats.HunyuanVideo15()
         self.offloader = ModelOffloader('dummy', [], 0, 0, True, torch.device('cuda'), False, debug=False)
 
     def get_preprocess_media_file_fn(self):
         return PreprocessMediaFile(self.config, support_video=True, framerate=self.framerate)
 
+    def unsupported_checkpoint(self, shapes, metadata):
+        # The keys comfy.model_detection reads guidance_embed and meanflow from.
+        if 'guidance_in.in_layer.weight' in shapes:
+            return 'Training guidance distilled model is not supported.'
+        if any(name.startswith('time_r_in.') for name in shapes):
+            return 'Training a MeanFlow (time_r_in) model is not supported.'
+        return None
+
     def text_encoder_cache_key(self, i):
         # Empty for ComfyUI's template, so existing caches stay valid.
-        return 'official-prompt-template' if self.model_config.get('prompt_template', 'comfyui') == 'official' else ''
+        return 'official-prompt-template' if self.official_prompt_template() else ''
+
+    def text_encoder_requires_identity(self, i):
+        # Every cache built before the option existed holds ComfyUI's template.
+        return self.official_prompt_template()
+
+    def official_prompt_template(self):
+        return self.model_config.get('prompt_template', 'comfyui') == 'official'
 
     def get_call_text_encoder_fn(self, text_encoder):
         te_idx = None
@@ -77,7 +93,7 @@ class HunyuanVideo15Pipeline(ComfyPipeline):
         if te_idx is None:
             raise RuntimeError('Unknown text encoder')
 
-        official = self.model_config.get('prompt_template', 'comfyui') == 'official'
+        official = self.official_prompt_template()
 
         def tokenize(text, video):
             if not official:

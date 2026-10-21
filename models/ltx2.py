@@ -201,6 +201,7 @@ class LTX2Pipeline(ComfyPipeline):
         self.latent_format = comfy.latent_formats.LTXAV()
         self.dtype = self.model_config['dtype']
         self.framerate = 24  # TODO: configurable
+        self.refuse_unsupported_checkpoint()
 
         # VAE
         def load_fn():
@@ -240,6 +241,12 @@ class LTX2Pipeline(ComfyPipeline):
         self.text_encoders = [ModelWrapper(load_fn)]
 
         self.offloader = ModelOffloader('dummy', [], 0, 0, True, torch.device('cuda'), False, debug=False)
+
+    def unsupported_checkpoint(self, shapes, metadata):
+        # Each block of a model with cross-attention adaLN has a prompt_scale_shift_table.
+        if not any(name.endswith('.prompt_scale_shift_table') for name in shapes):
+            return 'Only LTX 2.3 is supported (this checkpoint has no cross-attention adaLN: LTX-2.0?)'
+        return None
 
     def _load_diffusion_model(self):
         dtype = self.model_config['dtype']

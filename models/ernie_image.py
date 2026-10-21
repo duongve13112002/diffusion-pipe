@@ -73,6 +73,9 @@ class ErnieImagePipeline(ComfyPipeline):
         # padding of a shorter caption in its batch as text; the new key rebuilds them.
         return 'ministral3-right-padded'
 
+    def text_encoder_requires_identity(self, i):
+        return True
+
     def to_layers(self):
         diffusion_model = self.diffusion_model
         layers = [InitialLayer(diffusion_model)]
