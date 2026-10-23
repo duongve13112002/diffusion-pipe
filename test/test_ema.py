@@ -231,6 +231,7 @@ class _Engine:
     """DeepSpeed's save_checkpoint as far as the saver sees it: the files go through
     checkpoint_engine, then the ranks meet at a barrier."""
     grid = _Grid()
+    num_stages = 1
     global_steps = 12
 
     def __init__(self, barrier=lambda: None):
@@ -265,7 +266,6 @@ def _saved(save_dir):
 
 @pytest.fixture
 def no_barrier(monkeypatch):
-    monkeypatch.setattr(saver_util, 'dist', types.SimpleNamespace(barrier=lambda: None))
     monkeypatch.setattr(saver_util, 'is_main_process', lambda: True)
 
 
@@ -653,7 +653,7 @@ def _failing_save_worker(rank, world_size, init_file, save_root, results):
             Path(save_root).mkdir(exist_ok=True)
             config_file.write_text('')
         torch_dist.barrier()
-        engine = types.SimpleNamespace(grid=Grid(), global_steps=1)
+        engine = types.SimpleNamespace(grid=Grid(), num_stages=1, global_steps=1)
         saver = saver_util.Saver(types.SimpleNamespace(config=str(config_file)), {}, False, Path(save_root) / 'run',
                                  Failing(), types.SimpleNamespace(state_dict=lambda: {}), engine, module)
         try:

@@ -3,13 +3,11 @@ import os
 import wandb
 from datetime import datetime, timezone
 import shutil
-import glob
 import time
 import random
 import json
 import inspect
 from pathlib import Path
-from collections import defaultdict
 
 import toml
 import deepspeed
@@ -36,6 +34,8 @@ from utils.checkpoint_layout import check_checkpoint_layers, shift_checkpoint_la
 from utils.param_groups import check_resumed_param_groups, group_names, split_2d_param_groups
 from utils.ema import ParameterEMA, apply_ema_config_defaults, load_ema_checkpoint, load_ema_weights
 from utils.optimizer_factory import resolve_optimizer_class
+from utils.pipeline_optim import (DummyOptimizer, check_pipeline_optimizer, check_prodigy_learning_rates,
+                                  pipeline_collective, sync_prodigy)
 
 # needed for broadcasting Queue in dataset.py
 mp.current_process().authkey = b'afsaskgfdjh4'
@@ -58,29 +58,12 @@ parser.add_argument('--cache_only', action='store_true', help='Cache model input
 parser.add_argument('--trust_cache', action='store_true', help='Trust source metadata in the legacy cache workflow. Snapshot mode reuses sources automatically and always applies current caption configuration profiles.')
 parser.add_argument('--nan_check', action='store_true', help='Stop at the first NaN/inf in a layer output, gradient, loss or weight, and report the layer, step and images. Slow; for debugging.')
 parser.add_argument('--i_know_what_i_am_doing', action='store_true', help="Skip certain checks and overrides. You may end up using settings that won't work.")
-parser.add_argument('--master_port', type=int, default=29500, help='Master port for distributed training')
+parser.add_argument('--master_port', type=int, default=None,
+                    help="Master port for distributed training (default: the launcher's MASTER_PORT, else 29500)")
 parser.add_argument('--dump_dataset', type=Path, default=None, help='Decode cached latents and dump the dataset to this directory.')
 parser.add_argument('--test_sample', action='store_true', help='Generate and write an image to example.png and then quit.')
 parser = deepspeed.add_config_arguments(parser)
 args = parser.parse_args()
-
-
-class DummyOptimizer(torch.optim.Optimizer):
-    def __init__(self):
-        self.state = defaultdict(dict)
-        self.param_groups = []
-
-    def step(self, closure=None):
-        pass
-
-    def zero_grad(self, set_to_none: bool = True):
-        pass
-
-    def state_dict(self):
-        return {}
-
-    def load_state_dict(self, state_dict):
-        pass
 
 
 # Monkeypatch this so it counts all layer parameters, not just trainable parameters.
@@ -102,6 +85,8 @@ def set_config_defaults(config):
     assert 'save_every_n_epochs' in config or 'save_every_n_steps' in config or 'save_every_n_examples' in config
 
     config.setdefault('pipeline_stages', 1)
+    if 'optimizer' in config:
+        check_pipeline_optimizer(config['optimizer']['type'], config['pipeline_stages'])
     config.setdefault('activation_checkpointing', False)
     config.setdefault('reentrant_activation_checkpointing', False)
     if config['activation_checkpointing'] == 'unsloth':
@@ -169,10 +154,6 @@ def set_config_defaults(config):
     config.setdefault('eval_before_first_step', True)
     config.setdefault('compile', False)
     config.setdefault('x_axis_examples', False)
-
-
-def get_most_recent_run_dir(output_dir):
-    return list(sorted(glob.glob(os.path.join(output_dir, '*'))))[-1]
 
 
 def print_model_info(model):
@@ -270,19 +251,6 @@ def evaluate(model, model_engine, eval_dataloaders, tb_writer, step, eval_gradie
     model.prepare_block_swap_training()
 
 
-def distributed_init(args):
-    """Initialize distributed training environment."""
-    world_size = int(os.getenv('WORLD_SIZE', '1'))
-    rank = int(os.getenv('RANK', '0'))
-    local_rank = args.local_rank
-
-    # Set environment variables for distributed training
-    os.environ['MASTER_ADDR'] = os.getenv('MASTER_ADDR', 'localhost')
-    os.environ['MASTER_PORT'] = str(args.master_port)
-
-    return world_size, rank, local_rank
-
-
 def get_prodigy_d(optimizer):
     d = 0
     for group in optimizer.param_groups:
@@ -325,21 +293,18 @@ if __name__ == '__main__':
     common.ensure_writable_dir(config['output_dir'], 'output_dir')
     local_world_size = int(os.environ.get('LOCAL_WORLD_SIZE') or os.environ.get('LOCAL_SIZE')
                            or max(1, torch.cuda.device_count()))
-    if (cpu_threads := common.limit_cpu_threads(local_world_size)) is not None and args.local_rank in (0, -1):
+    if (cpu_threads := common.limit_cpu_threads(local_world_size)) is not None and \
+            int(os.environ.get('LOCAL_RANK', max(args.local_rank, 0))) == 0:
         print(f'CPU threads per GPU process: {cpu_threads} (set OMP_NUM_THREADS to override)')
     common.AUTOCAST_DTYPE = config['model']['dtype']
     dataset_util.UNCOND_FRACTION = config.get('uncond_fraction', 0.0)
     if map_num_proc := config.get('map_num_proc', None):
         dataset_util.NUM_PROC = map_num_proc
 
-    # Initialize distributed environment before deepspeed
-    world_size, rank, local_rank = distributed_init(args)
-
-    # Now initialize deepspeed
+    common.set_rendezvous_env(args.master_port)
     deepspeed.init_distributed()
-
-    # needed for broadcasting Queue in dataset.py
-    torch.cuda.set_device(local_rank)
+    # After init_distributed, which sets LOCAL_RANK itself when it discovers an MPI launch.
+    torch.cuda.set_device(common.resolve_local_rank(args.local_rank))
 
     resume_from_checkpoint = (
         args.resume_from_checkpoint if args.resume_from_checkpoint is not None
@@ -601,27 +566,45 @@ if __name__ == '__main__':
     else:
         is_adapter = False
 
-    # Determine run_dir on rank 0 and broadcast it
+    # Determine run_dir (and the checkpoint to resume) on rank 0 and broadcast it, or its error
     run_dir_container = [None]
     if is_main_process():
-        if resume_from_checkpoint is True:
-            run_dir_container[0] = get_most_recent_run_dir(config['output_dir'])
-        elif isinstance(resume_from_checkpoint, str):
-            run_dir_container[0] = os.path.join(config['output_dir'], resume_from_checkpoint)
-        else:
-            run_dir_container[0] = os.path.join(config['output_dir'], datetime.now(timezone.utc).strftime('%Y%m%d_%H-%M-%S'))
+        try:
+            if resume_from_checkpoint:
+                run_dir_container[0] = (*common.resume_run_dir(config['output_dir'], resume_from_checkpoint), None)
+            else:
+                run_dir = os.path.join(config['output_dir'], datetime.now(timezone.utc).strftime('%Y%m%d_%H-%M-%S'))
+                run_dir_container[0] = (run_dir, None, None)
+        except Exception as e:
+            run_dir_container[0] = (None, None, f'{type(e).__name__}: {e}')
 
     torch.distributed.broadcast_object_list(run_dir_container, src=0, group=dist.get_world_group())
-    run_dir = run_dir_container[0]
+    run_dir, resume_tag, error = run_dir_container[0]
+    if error is not None:
+        raise RuntimeError(error)
 
-    os.makedirs(run_dir, exist_ok=True)
+    error = None
     if not resume_from_checkpoint and is_main_process():
-        shutil.copy(args.config, run_dir)
-        shutil.copy(config['dataset'], run_dir)
-        for eval_dataset in config['eval_datasets']:
-            # Same two forms the loader accepts: a path, or {name, config}.
-            shutil.copy(eval_dataset if isinstance(eval_dataset, str) else eval_dataset['config'], run_dir)
-    dist.barrier()
+        try:
+            os.makedirs(run_dir, exist_ok=True)
+            shutil.copy(args.config, run_dir)
+            shutil.copy(config['dataset'], run_dir)
+            for eval_dataset in config['eval_datasets']:
+                # Same two forms the loader accepts: a path, or {name, config}.
+                shutil.copy(eval_dataset if isinstance(eval_dataset, str) else eval_dataset['config'], run_dir)
+        except Exception as e:
+            error = e
+    all_ok(error)
+    # Every rank writes checkpoints into run_dir and the pipeline stages pass saved weights through
+    # it, so every node must see what rank 0 wrote there. Found now rather than at the first save.
+    error = None
+    try:
+        common.wait_until_visible(
+            Path(run_dir) / ('latest' if resume_from_checkpoint else os.path.basename(args.config)),
+            'output_dir must be on a volume that every node shares')
+    except Exception as e:
+        error = e
+    all_ok(error)
 
     # WandB logging
     wandb_enable = config.get('monitoring', {}).get('enable_wandb', False)
@@ -728,12 +711,14 @@ if __name__ == '__main__':
         print(f"Computed eval_every_n_steps = {config['eval_every_n_steps']}")
 
     def get_optimizer(model_parameters):
-        if len(model_parameters) == 0:
-            return DummyOptimizer()
-
         optim_config = config['optimizer']
         optim_type = optim_config['type']
         optim_type_lower = optim_type.lower()
+        collective = pipeline_collective(optim_type_lower, optim_config.get('gradient_release', False), pipeline_model.num_stages)
+        pipeline_group = pipeline_model.mpu().get_model_parallel_group()
+
+        if len(model_parameters) == 0:
+            return DummyOptimizer(collective, pipeline_group)
 
         if beta2_half_life := optim_config.pop('beta2_half_life', None):
             betas = optim_config['betas']
@@ -854,15 +839,24 @@ if __name__ == '__main__':
                 new_param_groups.append(pg_no_wd)
         param_groups = new_param_groups
 
-        return klass(param_groups, *args, **kwargs)
+        optimizer = klass(param_groups, *args, **kwargs)
+        if collective == 'prodigy':
+            sync_prodigy(optimizer, pipeline_group)
+        return optimizer
 
-    model_engine._configure_optimizer(get_optimizer, parameters_to_train)
+    # A refusal raised on one pipeline stage only (no trainable parameter there, a model's
+    # get_param_groups check) must stop the other stages too, not leave them waiting.
+    error = None
+    try:
+        model_engine._configure_optimizer(get_optimizer, parameters_to_train)
+    except Exception as e:
+        error = e
+    all_ok(error)
     optimizer = model_engine.optimizer
+    check_prodigy_learning_rates(optimizer, config['optimizer']['type'].lower(),
+                                 config['optimizer'].get('gradient_release', False), config['pipeline_stages'])
 
     model.model_engine = model_engine
-    if model_engine.is_pipe_parallel:
-         grid = model_engine.grid
-         model_engine.first_last_stage_group = dist.new_group(ranks=[grid.pp_group[0], grid.pp_group[-1]])
 
     train_data.post_init(
         model_engine.grid.get_data_parallel_rank(),
@@ -881,8 +875,9 @@ if __name__ == '__main__':
         )
 
     # Might be useful because we set things in fp16 / bf16 without explicitly enabling Deepspeed fp16 mode.
-    # Unsure if really needed.
-    communication_data_type = config['lora']['dtype'] if 'lora' in config else config['model']['dtype']
+    # Unsure if really needed. The trained weights are the adapter's when there is one: an fp32
+    # adapter keeps its gradients in fp32 through the data-parallel all-reduce.
+    communication_data_type = config['adapter']['dtype'] if 'adapter' in config else config['model']['dtype']
     model_engine.communication_data_type = communication_data_type
 
     train_dataloader = dataset_util.PipelineDataLoader(
@@ -912,7 +907,7 @@ if __name__ == '__main__':
         error = layer_shift = None
         try:
             layer_shift = check_checkpoint_layers(
-                run_dir, layers, getattr(model, 'checkpoint_layers_added_in_front', 0))
+                run_dir, layers, getattr(model, 'checkpoint_layers_added_in_front', 0), tag=resume_tag)
         except Exception as e:
             error = e
         all_ok(error)
@@ -927,6 +922,7 @@ if __name__ == '__main__':
         try:
             load_path, client_state = model_engine.load_checkpoint(
                 run_dir,
+                tag=resume_tag,
                 load_module_strict=False,
                 load_lr_scheduler_states='force_constant_lr' not in config and not args.reset_optimizer and not args.reset_optimizer_params,
                 load_optimizer_states=not args.reset_optimizer,
@@ -987,7 +983,7 @@ if __name__ == '__main__':
             config['ema_device'], is_adapter=is_adapter, dtype=config['ema_dtype'],
         )
         if resume_from_checkpoint:
-            tag = (Path(run_dir) / 'latest').read_text().strip()
+            tag = resume_tag
             found, missing = load_ema_checkpoint(ema, run_dir, tag)
             if holds_ema and missing:
                 print(f'WARNING: stage {model_engine.grid.get_pipe_parallel_rank()}: checkpoint {tag} has no EMA for '

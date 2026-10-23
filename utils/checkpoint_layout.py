@@ -7,7 +7,7 @@ from pathlib import Path
 LAYER_FILE = re.compile(r'layer_(\d+)-.*model_states\.pt$')
 
 
-def check_checkpoint_layers(run_dir, layers, added_in_front=0):
+def check_checkpoint_layers(run_dir, layers, added_in_front=0, tag=None):
     """Refuse a checkpoint saved from another pipeline layout than `layers`; returns how many
     layers to shift its files by when loading (0, or added_in_front).
 
@@ -17,14 +17,15 @@ def check_checkpoint_layers(run_dir, layers, added_in_front=0):
     same keys take each other's weights without an error. added_in_front: the model put that many
     layers without parameters in front of its old layout, so a checkpoint of the old layout loads
     shifted by that many (its optimizer state, which follows the parameters, is unaffected).
-    Reads the checkpoint `latest` names; an OSError is left to propagate (a volume problem, not a
-    mismatch).
+    Reads checkpoint `tag`, by default the one `latest` names; an OSError is left to propagate (a
+    volume problem, not a mismatch).
     """
     run_dir = Path(run_dir)
-    latest = run_dir / 'latest'
-    if not latest.exists():
-        return 0
-    tag = latest.read_text().strip()
+    if tag is None:
+        latest = run_dir / 'latest'
+        if not latest.exists():
+            return 0
+        tag = latest.read_text().strip()
     found = set()
     for path in (run_dir / tag).iterdir():
         if match := LAYER_FILE.match(path.name):

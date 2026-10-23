@@ -5,6 +5,9 @@ from collections import OrderedDict, defaultdict
 import math
 import os
 import hashlib
+import pickle
+from queue import Empty
+from datetime import timedelta
 import json
 import shutil
 import socket
@@ -26,7 +29,7 @@ import multiprocess as mp
 from tqdm import tqdm
 from comfy_api.latest import InputImpl
 
-from utils.common import fsync_dir, is_main_process, VIDEO_EXTENSIONS, round_to_nearest_multiple
+from utils.common import all_ok, fsync_dir, is_main_process, VIDEO_EXTENSIONS, round_to_nearest_multiple
 from utils.cache import Cache
 from utils.cache_profiles import (align_legacy_metadata, IndexedTextEmbeddingDataset, RowsByImage,
                                   tensor_profile)
@@ -623,6 +626,19 @@ class OnTheFlyMediaDataset:
         return {'latents': latents, 'mask': mask, 'image_spec': row['image_spec'], 'caption': row['caption']}
 
 
+def shuffle_in_memory(dataset, seed):
+    """dataset.shuffle(seed=seed), with the same fingerprint (the caches key on it), but without
+    writing an indices cache file next to the dataset. Every rank of every node shuffles every
+    bucket; on a shared volume they would write that file and rename it over each other, and over
+    other nodes' memory maps of it."""
+    # The fingerprint depends only on the source fingerprint and the arguments: take it from a
+    # one-row stand-in, which datasets shuffles in memory anyway.
+    stand_in = datasets.Dataset.from_dict({'row': [0]})
+    stand_in._fingerprint = dataset._fingerprint
+    fingerprint = stand_in.shuffle(seed=seed)._fingerprint
+    return dataset.shuffle(seed=seed, keep_in_memory=True, new_fingerprint=fingerprint)
+
+
 # The smallest unit of a dataset. Represents a single size bucket from a single folder of images
 # and captions on disk. Not batched; returns individual items.
 class SizeBucketDataset:
@@ -634,7 +650,7 @@ class SizeBucketDataset:
         # so a trusted warm load would reorder the rows, move the latent fingerprint and
         # re-encode the whole bucket. A freshly grouped key is a tuple, as it always was.
         seed = seed_from_hash(tuple(size_bucket))
-        metadata_dataset = metadata_dataset.shuffle(seed=seed)
+        metadata_dataset = shuffle_in_memory(metadata_dataset, seed)
         self.metadata_dataset = metadata_dataset
         self.directory_config = directory_config
         self.size_bucket = size_bucket
@@ -2507,7 +2523,15 @@ def _cache_fn(datasets, queue, preprocess_media_file_fn, num_text_encoders, rege
     # See https://github.com/pytorch/pytorch/issues/10996
     # Alternatively, we could try fixing this by using spawn instead of fork.
     torch.set_num_threads(1)
+    try:
+        _cache_datasets(datasets, queue, preprocess_media_file_fn, num_text_encoders, regenerate_cache, trust_cache, caching_batch_size)
+    finally:
+        # Signal that we're done, also on an error: the GPU ranks stop waiting for work and global
+        # rank 0 finds this process's exit code.
+        queue.put(None)
 
+
+def _cache_datasets(datasets, queue, preprocess_media_file_fn, num_text_encoders, regenerate_cache, trust_cache, caching_batch_size):
     for ds in datasets:
         ds.cache_metadata(regenerate_cache=regenerate_cache, trust_cache=trust_cache)
 
@@ -2582,8 +2606,140 @@ def _cache_fn(datasets, queue, preprocess_media_file_fn, num_text_encoders, rege
         for ds in datasets:
             ds.cache_text_embeddings(text_embedding_map_fn, text_encoder_idx+1, regenerate_cache=regenerate_cache, caching_batch_size=caching_batch_size)
 
-    # signal that we're done
-    queue.put(None)
+
+# How long ranks that do no caching wait for the ones that do: caching millions of images takes
+# hours, far past the process group's timeout.
+CACHING_WAIT = timedelta(days=7)
+# How often the ranks taking caching work look for a failure while the queue is empty.
+CACHING_POLL_SECONDS = 10
+_caching_rounds = 0
+
+
+def _share_work_queue():
+    """(queue, manager, error): the caching work queue on the ranks that can reach it, None on the
+    others; error is this rank's failure to connect to it.
+
+    Global rank 0 serves the queue from a multiprocess Manager, behind a Unix socket in its own
+    machine's /tmp, so only the ranks on that machine can connect. Ranks on other nodes used to be
+    sent it too and failed to connect; they now do no caching and wait for it to finish. The
+    manager is returned on rank 0 only, to be kept alive while the queue is in use.
+    """
+    error = None
+    if is_main_process():
+        try:
+            manager = mp.Manager()
+            queue = manager.Queue()
+            shared = [(socket.gethostname(), manager.address, pickle.dumps(queue))]
+        except Exception as e:
+            # Told to every rank, which would otherwise wait in the broadcast until it times out.
+            error = e
+            shared = ['failed']
+    else:
+        shared = [None]
+    torch.distributed.broadcast_object_list(shared, src=0, group=dist.get_world_group())
+    if is_main_process():
+        if error is not None:
+            raise error
+        return queue, manager, None
+    if shared[0] == 'failed':
+        raise RuntimeError('Dataset caching could not start on global rank 0: see its log')
+    host, address, payload = shared[0]
+    reachable = host == socket.gethostname() and (not str(address).startswith('/') or os.path.exists(address))
+    if not reachable:
+        return None, None, None
+    try:
+        return pickle.loads(payload), None, None
+    except Exception as e:
+        # Raised from _run_caching, after telling the ranks taking work to stop.
+        return None, None, e
+
+
+def _caching_key(round_):
+    return f'diffusion_pipe_caching_{round_}'
+
+
+def _report_caching(round_, ok):
+    """Global rank 0 tells the ranks of other nodes, waiting in _wait_for_caching, how caching went."""
+    torch.distributed.distributed_c10d._get_default_store().set(_caching_key(round_), 'ok' if ok else 'failed')
+
+
+def _wait_for_caching(round_):
+    # The rendezvous store rather than a barrier: a barrier would time out long before caching ends.
+    store = torch.distributed.distributed_c10d._get_default_store()
+    store.wait([_caching_key(round_)], CACHING_WAIT)
+    if store.get(_caching_key(round_)) != b'ok':
+        raise RuntimeError('Dataset caching failed on global rank 0: see its log')
+
+
+def _abort_key(round_):
+    return _caching_key(round_) + '_abort'
+
+
+def _abort_caching(round_):
+    torch.distributed.distributed_c10d._get_default_store().set(_abort_key(round_), '1')
+
+
+def _work_on_queue(queue, handle_task, process, round_):
+    """Take caching tasks until the caching process is done. `process` is that process on global
+    rank 0, None elsewhere.
+
+    A rank that fails sets an abort key in the store, which the others look for between tasks: the
+    caching process may be waiting forever for that rank's result, and would never end the queue.
+    """
+    store = torch.distributed.distributed_c10d._get_default_store()
+    try:
+        while True:
+            if store.check([_abort_key(round_)]):
+                raise RuntimeError('Dataset caching failed on another rank: see its log')
+            try:
+                task = queue.get(timeout=CACHING_POLL_SECONDS)
+            except Empty:
+                if process is not None and not process.is_alive():
+                    raise RuntimeError(f'The dataset caching process ended with exit code {process.exitcode} '
+                                       'before finishing: see its log')
+                continue
+            if task is None:
+                # Propagate None so all worker processes break out of this loop.
+                # This is safe because it's a FIFO queue. The first None always comes after all work items.
+                queue.put(None)
+                break
+            handle_task(task)
+        if process is not None:
+            process.join()
+            if process.exitcode != 0:
+                raise RuntimeError(f'The dataset caching process failed with exit code {process.exitcode}: see its log')
+    except BaseException:
+        _abort_caching(round_)
+        raise
+
+
+def _run_caching(queue, handle_task, process, round_, error=None):
+    """Every rank's part in one round of dataset caching; raises on every rank if any failed.
+
+    error is a failure of this rank while setting the round up: it then takes no work, and tells
+    the ranks taking work to stop.
+    """
+    try:
+        if error is not None:
+            _abort_caching(round_)
+        elif queue is None:
+            # Another node: its GPUs are not reached by the queue. The cache is read from the shared
+            # filesystem once rank 0's node has written it.
+            if int(os.environ.get('LOCAL_RANK', '0')) == 0:
+                print(f'{socket.gethostname()}: dataset caching runs on the GPUs of global rank 0\'s node; '
+                      'waiting for it')
+            _wait_for_caching(round_)
+        else:
+            _work_on_queue(queue, handle_task, process, round_)
+    except Exception as e:
+        error = e
+    if is_main_process():
+        if process is not None:
+            if process.is_alive():
+                process.terminate()
+            process.join()
+        _report_caching(round_, ok=error is None)
+    all_ok(error)
 
 
 # Helper class to make caching multiple datasets more efficient by moving
@@ -2616,39 +2772,33 @@ class DatasetManager:
     # Mix and match native multiprocessing / torch.multiprocessing and multiprocess at your peril! Things can break.
     # In patches.py we register reductions so Tensors sent over Queues and Pipes are efficient just like in torch.multiprocessing.
     def cache(self, unload_models=True):
-        if is_main_process():
-            manager = mp.Manager()
-            queue = [manager.Queue()]
-        else:
-            queue = [None]
-        torch.distributed.broadcast_object_list(queue, src=0, group=dist.get_world_group())
-        queue = queue[0]
+        global _caching_rounds
+        _caching_rounds += 1
+        queue, manager, error = _share_work_queue()
 
         # start up a process to run through the dataset caching flow
+        process = None
         if is_main_process():
-            process = mp.Process(
-                target=_cache_fn,
-                args=(
-                    self.datasets,
-                    queue,
-                    self.model.get_preprocess_media_file_fn(),
-                    len(self.text_encoders),
-                    self.regenerate_cache,
-                    self.trust_cache,
-                    self.caching_batch_size,
+            try:
+                process = mp.Process(
+                    target=_cache_fn,
+                    args=(
+                        self.datasets,
+                        queue,
+                        self.model.get_preprocess_media_file_fn(),
+                        len(self.text_encoders),
+                        self.regenerate_cache,
+                        self.trust_cache,
+                        self.caching_batch_size,
+                    )
                 )
-            )
-            process.start()
+                process.start()
+            except Exception as e:
+                process = None
+                error = e
 
         # loop on the original processes (one per GPU) to handle tasks requiring GPU models (VAE, text encoders)
-        while True:
-            task = queue.get()
-            if task is None:
-                # Propagate None so all worker processes break out of this loop.
-                # This is safe because it's a FIFO queue. The first None always comes after all work items.
-                queue.put(None)
-                break
-            self._handle_task(task)
+        _run_caching(queue, self._handle_task, process, _caching_rounds, error)
 
         if unload_models:
             # Free memory in all unneeded submodels. This is easier than trying to delete every reference.
@@ -2666,8 +2816,6 @@ class DatasetManager:
             mm.unload_all_models()  # Comfy managed models
 
         dist.barrier()
-        if is_main_process():
-            process.join()
 
         # Now load all datasets from cache.
         for ds in self.datasets:
@@ -2975,14 +3123,28 @@ class PipelineDataLoader:
         return {
             'epoch': self.epoch,
             'num_batches_pulled': self.num_batches_pulled,
+            'batches_per_epoch': len(self.dataset),
         }
 
     def load_state_dict(self, state_dict):
         assert not self.iter_called
         self.epoch = state_dict['epoch']
         # -1 because by preloading the next micro_batch, it's always going to have one more batch
-        # pulled than the actual number of batches iterated by the caller.
-        self.num_batches_pulled = state_dict['num_batches_pulled'] - 1
+        # pulled than the actual number of batches iterated by the caller. A checkpoint saved right
+        # after the epoch rolled over has pulled none, and skips none.
+        self.num_batches_pulled = max(state_dict['num_batches_pulled'] - 1, 0)
+        saved = state_dict.get('batches_per_epoch')
+        now = len(self.dataset)
+        if saved is not None and saved != now:
+            # Resumed on another number of GPUs or nodes, or with another micro batch size or
+            # gradient_accumulation_steps: an epoch has another number of batches, so continue after
+            # the same share of it. At most saved - 1 were done, so this stays below now.
+            converted = self.num_batches_pulled * now // saved
+            if is_main_process():
+                print(f'WARNING: an epoch had {saved} batches when the checkpoint was saved and has {now} now: '
+                      f'resuming epoch {self.epoch} after {converted} batches instead of {self.num_batches_pulled}, '
+                      'about where it stopped.')
+            self.num_batches_pulled = converted
         # The resumed epoch decides which samples pad the final batch, so this has to happen
         # before the DataLoader is built or the first epoch after a resume walks a different
         # tail than the run that was interrupted.

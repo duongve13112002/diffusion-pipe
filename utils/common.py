@@ -4,6 +4,7 @@ import time
 import math
 from pathlib import Path
 import os
+import socket
 
 import torch
 import deepspeed.comm.comm as dist
@@ -41,6 +42,89 @@ def zero_first():
     yield
     if is_main_process():
         dist.barrier()
+
+
+def wait_until_visible(path, hint, seconds=180):
+    """Wait for a file written on another node to show up here; raise naming `hint` if it does not."""
+    deadline = time.monotonic() + seconds
+    while not Path(path).is_file():
+        if time.monotonic() > deadline:
+            raise RuntimeError(f'{path}, written by global rank 0, is not visible on {socket.gethostname()}: {hint}')
+        time.sleep(1)
+
+
+def resume_run_dir(output_dir, resume):
+    """(run_dir, tag) of the checkpoint to resume: `resume` is True for the newest run in output_dir
+    that has one, or a run directory's name. Raises ValueError when there is nothing to resume, rather
+    than leaving a fresh run to start from step 0 by accident.
+
+    Called on global rank 0 only, which tells the others: ranks on other nodes could otherwise list
+    the directory or read `latest` at different moments and resume from different checkpoints.
+    """
+    output_dir = Path(output_dir)
+    if resume is True:
+        # Run directories are named by their start time, so the newest sorts last.
+        runs = sorted(p for p in output_dir.glob('*') if (p / 'latest').is_file()) if output_dir.is_dir() else []
+        if not runs:
+            raise ValueError(f'Nothing to resume: no run directory in {output_dir} has a checkpoint (a `latest` file)')
+        run_dir = runs[-1]
+        # A run that stopped before its first checkpoint, or holds something else.
+        if newer := sorted(p.name for p in output_dir.iterdir() if p.is_dir() and p > run_dir):
+            print(f'WARNING: resuming {run_dir.name}, the newest run with a checkpoint; newer directories '
+                  f'without one are left as they are: {", ".join(newer)}')
+    else:
+        run_dir = output_dir / resume
+        if not (run_dir / 'latest').is_file():
+            raise ValueError(f'Nothing to resume in {run_dir}: it has no checkpoint (no `latest` file)')
+    tag = (run_dir / 'latest').read_text().strip()
+    if not (run_dir / tag).is_dir():
+        raise ValueError(f'{run_dir / "latest"} names checkpoint {tag!r}, which is not in {run_dir}')
+    print(f'Resuming {run_dir} from checkpoint {tag}')
+    return str(run_dir), tag
+
+
+def set_rendezvous_env(master_port_arg=None, environ=None):
+    """MASTER_ADDR and MASTER_PORT for deepspeed.init_distributed, defaulting to a local run.
+
+    The launcher's port is kept unless --master_port is given: torchrun's workers find its store
+    there, and overwriting it with 29500 left them waiting on a port nothing listens on.
+    """
+    environ = os.environ if environ is None else environ
+    environ.setdefault('MASTER_ADDR', 'localhost')
+    if master_port_arg is not None:
+        environ['MASTER_PORT'] = str(master_port_arg)
+    else:
+        environ.setdefault('MASTER_PORT', '29500')
+
+
+def resolve_local_rank(local_rank_arg=-1, environ=None):
+    """This process's local rank, from whichever launcher started it; also sets LOCAL_RANK and
+    LOCAL_SIZE for the code that reads them.
+
+    The deepspeed launcher passes --local_rank and sets LOCAL_RANK and LOCAL_SIZE. torchrun,
+    Kubeflow's PyTorchJob and similar launchers pass no argument and set LOCAL_RANK and
+    LOCAL_WORLD_SIZE: with --local_rank left at -1, torch.cuda.set_device(-1) did nothing and
+    every process of a node ran on its first GPU.
+    """
+    environ = os.environ if environ is None else environ
+    world_size = int(environ.get('WORLD_SIZE', '1'))
+    if (env_rank := environ.get('LOCAL_RANK')) is not None:
+        local_rank = int(env_rank)
+        if local_rank_arg >= 0 and local_rank_arg != local_rank:
+            raise ValueError(f'--local_rank {local_rank_arg} disagrees with LOCAL_RANK={env_rank}')
+    elif local_rank_arg >= 0:
+        local_rank = local_rank_arg
+    elif world_size == 1:
+        local_rank = 0
+    else:
+        raise ValueError(f'WORLD_SIZE is {world_size}, but neither LOCAL_RANK nor --local_rank says which GPU '
+                         'this process uses: start train.py with deepspeed, torchrun or a launcher that sets LOCAL_RANK')
+    environ['LOCAL_RANK'] = str(local_rank)
+    local_size = (environ.get('LOCAL_SIZE') or environ.get('LOCAL_WORLD_SIZE')
+                  or environ.get('OMPI_COMM_WORLD_LOCAL_SIZE') or ('1' if world_size == 1 else None))
+    if local_size is not None:
+        environ['LOCAL_SIZE'] = local_size
+    return local_rank
 
 
 @contextmanager

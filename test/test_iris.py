@@ -1328,7 +1328,6 @@ def test_ema_save_is_a_loadable_iris_checkpoint(ckpt, tmp_path, monkeypatch):
     import types
     from utils import saver as saver_util
     from utils.ema import ParameterEMA
-    monkeypatch.setattr(saver_util, 'dist', types.SimpleNamespace(barrier=lambda: None))
     monkeypatch.setattr(saver_util, 'is_main_process', lambda: True)
 
     path, _ = ckpt
@@ -1345,7 +1344,7 @@ def test_ema_save_is_a_loadable_iris_checkpoint(ckpt, tmp_path, monkeypatch):
     config_file = tmp_path / 'train.toml'
     config_file.write_text('')
     saver = saver_util.Saver(types.SimpleNamespace(config=str(config_file)), {}, False, tmp_path / 'run', pipe,
-                             None, types.SimpleNamespace(grid=grid), module, ema=ema)
+                             None, types.SimpleNamespace(grid=grid, num_stages=1), module, ema=ema)
     saver.save_model('epoch1')
 
     averaged = make_pipeline(tmp_path / 'run' / 'epoch1' / 'ema', cache_text_embeddings=True)

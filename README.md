@@ -264,6 +264,42 @@ The [wan_14b_min_vram.toml](./examples/wan_14b_min_vram.toml) example file has a
 ## Parallelism
 This code uses hybrid data- and pipeline-parallelism. Set the ```--num_gpus``` flag appropriately for your setup. Set ```pipeline_stages``` in the config file to control the degree of pipeline parallelism. Then the data parallelism degree will automatically be set to use all GPUs (number of GPUs must be divisible by pipeline_stages). For example, with 4 GPUs and pipeline_stages=2, you will run two instances of the model, each divided across two GPUs.
 
+Each pipeline stage runs its own optimizer over its own layers. Two optimizers that take one
+statistic over the whole model share it across stages: GenericOptim's gradient norm, and Prodigy's
+step size `d`. Prodigy steps every parameter group with one learning rate, so with
+`pipeline_stages > 1` it is refused when a model gives its groups different ones (with one stage,
+a warning says they are not applied). The DAdapt* optimizers estimate their step size from all the
+parameters they update and cannot share it, so they are refused with `pipeline_stages > 1`. Other
+optimizers with an option computed over all their parameters (a global gradient norm clip in
+pytorch_optimizer's Adan, Lamb, AdaGC and similar) compute it per stage.
+
+### Multi-node training
+The command is the usual one on every node, through any launcher that sets `RANK`, `WORLD_SIZE`,
+`LOCAL_RANK`, `MASTER_ADDR` and `MASTER_PORT`. That covers the deepspeed launcher with a hostfile (or
+`--no_ssh --num_nodes N --node_rank R --master_addr ...` on each node), torchrun
+(`torchrun --nnodes N --node_rank R --nproc_per_node 8 --master_addr ... --master_port ... train.py
+--deepspeed --config ...`), and a Kubernetes PyTorchJob. `--master_port` is only needed to override
+the launcher's port.
+
+- Ranks are numbered stage by stage: with 2 nodes of 8 GPUs and `pipeline_stages = 2`, stage 0 is the
+  first node and stage 1 the second. The data-parallel gradient all-reduce then stays inside each
+  node, and only the activations between the two stages cross the network. With
+  `pipeline_stages = 1`, the all-reduce crosses nodes on every step.
+- `output_dir` and the dataset directories (their `cache` folders) must be on a volume that every
+  node shares, such as NFS or a ReadWriteMany PVC. Training checks `output_dir` at start; pipeline
+  stages pass saved weights to stage 0 through it.
+- Dataset caching runs on the GPUs of global rank 0's node; the other nodes wait for it and then
+  read the cache from the shared volume. A caching failure stops every node.
+- Network: over Ethernet, set `NCCL_SOCKET_IFNAME` and `GLOO_SOCKET_IFNAME` to the interface the
+  nodes reach each other on. Over InfiniBand, give the pods the RDMA device (and `IPC_LOCK`), and set
+  `NCCL_IB_HCA` if needed. With `NCCL_DEBUG=INFO`, the log shows `NET/IB` rather than `NET/Socket`
+  when NCCL uses it, since NCCL silently falls back to TCP.
+- Collectives time out after 30 minutes by default. Raise `DEEPSPEED_TIMEOUT` (minutes) if the ranks
+  can drift further apart than that, for example while every rank loads a large dataset's metadata
+  from a slow volume at start.
+- Resuming on another number of GPUs or nodes keeps the epoch and continues it after about the same
+  number of examples, with a warning: a batch then holds a different number of examples.
+
 ## Pre-caching
 Latents and text embeddings are cached to disk before training happens. This way, the VAE and text encoders don't need to be kept loaded during training. The Huggingface Datasets library is used for all the caching. Cache files are reused between training runs if they exist. All cache files are written into a directory named "cache" inside each dataset directory.
 

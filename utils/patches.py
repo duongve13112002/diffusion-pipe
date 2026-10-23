@@ -164,6 +164,15 @@ def train_schedule_steps(self):
         yield cmds
 
 
+def _pipeline_backward_prologue_per_tensor(self, grad):
+    # DeepSpeed divides by gradient_accumulation_steps in a hook on the outputs of every forward,
+    # and every stage runs one. Only the last stage's division is wanted: the gradient it sends back
+    # already carries it, so each earlier stage would divide again (stage 0 by GAS^pipeline_stages).
+    if grad is not None and self._scale_wrt_gas and self.is_last_stage():
+        return grad / self.gradient_accumulation_steps()
+    return grad
+
+
 def _allocate_or_extend_buffers(self, idx, shape, dtype):
     # Upstream DeepSpeed reuses pooled recv buffers by numel only and ignores the requested dtype.
     # The pool is shared between activation recvs (which for some models include int64 tensors, e.g.
@@ -473,6 +482,10 @@ def apply_patches():
     # reallocated when the requested dtype differs, otherwise int64 tensors in the inter-stage tuple
     # get corrupted to float on middle stages and the grad send/recv counts diverge -> NCCL deadlock.
     PipelineEngine._allocate_or_extend_buffers = _allocate_or_extend_buffers
+
+    # With pipeline_stages > 1 and gradient_accumulation_steps > 1, scale the gradients by 1/GAS
+    # once, on the last stage, rather than once per stage from there back.
+    PipelineEngine._backward_prologue_per_tensor = _pipeline_backward_prologue_per_tensor
 
     # Efficiently send Tensors across Queues and Pipes when using the third-party multiprocess library.
     reduction.init_reductions()

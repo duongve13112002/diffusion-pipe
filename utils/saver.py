@@ -5,7 +5,6 @@ import time
 import sys
 
 import torch
-from deepspeed import comm as dist
 from deepspeed.runtime.checkpoint_engine.torch_checkpoint_engine import TorchCheckpointEngine
 from deepspeed.utils.logging import logger
 
@@ -208,6 +207,47 @@ def need_to_checkpoint(config, epoch=None):
     return result[0]
 
 
+# How long the writer of a save looks for the other stages' files: a volume shared between nodes
+# can show a file written on another node a little late.
+STAGE_FILE_WAIT_SECONDS = 180
+
+
+def stage_files(tmp_dir, num_stages):
+    """The weights file of every pipeline stage in tmp_dir, waiting a little for late ones. A save
+    missing a stage must fail rather than publish part of the model."""
+    paths = [Path(tmp_dir) / f'state_dict_{stage}.bin' for stage in range(num_stages)]
+    deadline = time.monotonic() + STAGE_FILE_WAIT_SECONDS
+    while missing := [p for p in paths if not p.is_file()]:
+        if time.monotonic() > deadline:
+            raise RuntimeError(
+                f'{", ".join(p.name for p in missing)} not found in {tmp_dir}: the other pipeline stages '
+                'wrote their weights there and it does not show them. output_dir must be on a volume that '
+                'every node shares.'
+            )
+        time.sleep(1)
+    return paths
+
+
+def manual_save_signal(save_root):
+    """(save, quit) from the signal files the user can create in save_root: `save`, or `save_quit`
+    to save and quit. Rank 0 alone looks and tells the others. Ranks reach this at different times
+    (pipeline stages, other nodes), and a file seen by only some of them would send those into the
+    save's collectives while the others go on training."""
+    signal = [(False, False)]
+    if is_main_process():
+        for name, quit in (('save', False), ('save_quit', True)):
+            path = save_root / name
+            if path.is_file():
+                signal[0] = (True, quit)
+                try:
+                    os.remove(path)
+                except OSError as e:
+                    print(f'WARNING: could not remove the signal file {path}: {e}')
+                break
+    torch.distributed.broadcast_object_list(signal, src=0)
+    return signal[0]
+
+
 class Saver:
     def __init__(self, args, config, is_adapter, save_root, model, train_dataloader, model_engine, pipeline_model,
                  ema=None):
@@ -260,7 +300,7 @@ class Saver:
                 partial_state_dict = collect()
                 if 'save_dtype' in self.config:
                     convert_state_dict_dtype(partial_state_dict, self.config['save_dtype'])
-                torch.save(partial_state_dict, tmp_dir / f'state_dict_{stage_id}.bin')
+                torch_save_atomic(partial_state_dict, tmp_dir / f'state_dict_{stage_id}.bin')
             except Exception as e:
                 error = e
         all_ok(error)
@@ -269,7 +309,7 @@ class Saver:
         if writer:
             try:
                 state_dict = {}
-                for path in tmp_dir.glob('*.bin'):
+                for path in stage_files(tmp_dir, self.model_engine.num_stages):
                     state_dict.update(torch.load(path, weights_only=True, map_location='cpu'))
                 shutil.rmtree(tmp_dir)
                 write(staging, state_dict)
@@ -393,21 +433,7 @@ class Saver:
     def process_step(self, step, examples):
         checkpointed, saved = False, False
         # Look at some simple "signal files" the user can write to save and optionally quit manually
-        should_manually_save = False
-        should_manually_quit = False
-        save_signal_file = self.save_root / 'save'
-        save_quit_signal_file = self.save_root / 'save_quit'
-        if save_signal_file.exists() and save_signal_file.is_file():
-            should_manually_save = True
-            dist.barrier()
-            if is_main_process():
-                os.remove(save_signal_file)
-        elif save_quit_signal_file.exists() and save_quit_signal_file.is_file():
-            should_manually_save = True
-            should_manually_quit = True
-            dist.barrier()
-            if is_main_process():
-                os.remove(save_quit_signal_file)
+        should_manually_save, should_manually_quit = manual_save_signal(self.save_root)
 
         if 'save_every_n_steps' in self.config and step % self.config['save_every_n_steps'] == 0:
             self.save_model(f'step{step}')
