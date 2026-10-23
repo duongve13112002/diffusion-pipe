@@ -100,6 +100,7 @@ def bare_pipeline(model_config=None, config=None):
     pipe.clean_end_schedule = None
     pipe.clean_end_samplers = {}
     pipe.training_epoch = 1
+    pipe.fallback_vaes = {}
     return pipe
 
 
@@ -1603,7 +1604,7 @@ def test_vae_encode_inverts_the_reference_decode(vaes):
     torch.testing.assert_close(got, expected, rtol=1e-3, atol=1e-3)
 
 
-@pytest.mark.parametrize('value, dtype', [(None, torch.bfloat16), ('float32', torch.float32),
+@pytest.mark.parametrize('value, dtype', [(None, torch.float16), ('float32', torch.float32),
                                           ('bfloat16', torch.bfloat16), ('float16', torch.float16)])
 def test_vae_dtype_reaches_the_vae(value, dtype, tmp_path, monkeypatch):
     built = []
@@ -1623,20 +1624,90 @@ def test_vae_dtype_is_part_of_the_latent_cache_identity(tmp_path):
     # all encoded in float32), so they stay valid; another vae_dtype rebuilds them.
     before = f'{root}||torch.bfloat16'
     assert make_pipeline({'diffusers_path': str(root), 'vae_dtype': 'float32'}).vae_cache_key() == before
-    assert make_pipeline({'diffusers_path': str(root)}).vae_cache_key() == before + '|vae_dtype=bfloat16'
-    assert make_pipeline({'diffusers_path': str(root), 'vae_dtype': 'fp16'}).vae_cache_key() \
-        == before + '|vae_dtype=float16'
+    assert make_pipeline({'diffusers_path': str(root)}).vae_cache_key() == before + '|vae_dtype=float16'
+    assert make_pipeline({'diffusers_path': str(root), 'vae_dtype': 'bf16'}).vae_cache_key() \
+        == before + '|vae_dtype=bfloat16'
 
 
-def test_non_finite_latents_are_not_cached():
+class FallbackRecorder:
+    """Stands in for the VAEs: latents are each image's mean pixel, non-finite for the images
+    (by mean pixel) a dtype is told to fail on."""
+
+    def __init__(self, pipe, fails):
+        self.fails, self.calls = fails, []
+        pipe.vae_encode = lambda pixels: self.encode(pixels, pipe.vae_dtype)
+        pipe.fallback_vae_encode = self.encode
+
+    def encode(self, pixels, dtype):
+        self.calls.append((dtype, pixels.mean((1, 2, 3)).tolist()))
+        latents = pixels.mean((1, 2, 3), keepdim=True).expand(-1, 4, 2, 2).clone()
+        for i, value in enumerate(pixels.mean((1, 2, 3)).tolist()):
+            if value in self.fails.get(dtype, ()):
+                latents[i] = float('nan')
+        return latents
+
+
+def fallback_batch(*values):
+    pixels = torch.stack([torch.full((3, 16, 16), v) for v in values])
+    return types.SimpleNamespace(to=lambda *args: pixels)
+
+
+def test_overflowed_images_are_encoded_again_in_a_wider_dtype(capsys):
     pipe = bare_pipeline()
     pipe.vae_dtype = torch.float16
-    pipe.vae_encode = lambda images: torch.tensor([[1.0, float('inf')]])
-    images = types.SimpleNamespace(to=lambda *args: torch.zeros(1, 3, 16, 16))
-    with pytest.raises(RuntimeError, match="non-finite latents in float16: set vae_dtype = 'float32'"):
-        pipe.get_call_vae_fn(None)(images)
-    pipe.vae_encode = lambda images: torch.ones(1, 2)
-    assert pipe.get_call_vae_fn(None)(images)['latents'].tolist() == [[1.0, 1.0]]
+    vaes = FallbackRecorder(pipe, {torch.float16: (0.5, 0.75), torch.bfloat16: (0.75,)})
+    latents = pipe.get_call_vae_fn(None)(fallback_batch(0.25, 0.5, 0.75))['latents']
+    # Only the images that failed are encoded again, each in the next dtype, and kept in place.
+    assert vaes.calls == [(torch.float16, [0.25, 0.5, 0.75]), (torch.bfloat16, [0.5, 0.75]), (torch.float32, [0.75])]
+    assert latents[:, 0, 0, 0].tolist() == [0.25, 0.5, 0.75]
+    out = capsys.readouterr().out
+    assert 'float16 gave non-finite latents for 2 of 3 images; encoding them again in bfloat16' in out
+    assert 'bfloat16 gave non-finite latents for 1 of 3 images; encoding them again in float32' in out
+
+
+def test_a_finite_batch_is_encoded_once(capsys):
+    pipe = bare_pipeline()
+    pipe.vae_dtype = torch.float16
+    vaes = FallbackRecorder(pipe, {})
+    pipe.get_call_vae_fn(None)(fallback_batch(0.25, 0.5))
+    assert vaes.calls == [(torch.float16, [0.25, 0.5])]
+    assert 'WARNING' not in capsys.readouterr().out
+
+
+@pytest.mark.parametrize('dtype, tried', [(torch.float16, 'float32'), (torch.bfloat16, 'float32'),
+                                          (torch.float32, 'float32')])
+def test_latents_non_finite_in_float32_too_are_not_cached(dtype, tried):
+    pipe = bare_pipeline()
+    pipe.vae_dtype = dtype
+    vaes = FallbackRecorder(pipe, {d: (0.5,) for d in (torch.float16, torch.bfloat16, torch.float32)})
+    with pytest.raises(RuntimeError, match=f'non-finite latents even in {tried}: an image in this batch'):
+        pipe.get_call_vae_fn(None)(fallback_batch(0.25, 0.5))
+    assert [d for d, _ in vaes.calls] == [dtype, *mi.VAE_FALLBACKS[dtype]]
+
+
+def test_a_fallback_vae_is_loaded_from_the_weights_once(monkeypatch):
+    built = []
+
+    class FakeVAE:
+        def __init__(self, sd, dtype):
+            built.append(dtype)
+            self.dtype = dtype
+
+        def throw_exception_if_invalid(self):
+            pass
+
+        def encode(self, pixels):
+            return torch.zeros(pixels.shape[0], 32, 2, 2)
+
+    monkeypatch.setattr(mi.comfy.sd, 'VAE', FakeVAE)
+    monkeypatch.setattr(mi, 'read_component', lambda path, stem: ({}, {}))
+    pipe = bare_pipeline()
+    pipe.vae_path, pipe.fallback_vaes, pipe.vae_dtype = 'vae', {}, torch.float16
+    pipe.latent_format = types.SimpleNamespace(process_in=lambda latents: latents)
+    for _ in range(2):
+        pipe.fallback_vae_encode(torch.zeros(1, 3, 16, 16), torch.float32)
+    pipe.fallback_vae_encode(torch.zeros(1, 3, 16, 16), torch.bfloat16)
+    assert built == [torch.float32, torch.bfloat16]
 
 
 def smooth_image(h, w):

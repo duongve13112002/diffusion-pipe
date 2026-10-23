@@ -52,10 +52,12 @@ diffusers_path = '/pvc/models/MOSS-Image-Base'
 # A previous full fine-tune's save works as the transformer; the rest still comes from diffusers_path.
 #transformer_path = '/pvc/runs/moss_image_full/<run>/step5000'
 dtype = 'bfloat16'
-# Precision the VAE encodes the training images in: 'bfloat16' (default), 'float32' (the reference
-# pipeline's) or 'float16'. Changing it re-encodes the latent cache; caches from before this
-# option were encoded in float32 and are kept with 'float32'. See docs/supported_models.md#moss-image.
-#vae_dtype = 'bfloat16'
+# Precision the VAE encodes the training images in: 'float16' (default), 'bfloat16' (cannot
+# overflow, a little less exact) or 'float32' (the reference pipeline's). An image that overflows
+# float16 is encoded again in bfloat16, then float32, with a warning. Changing it re-encodes the
+# latent cache; caches from before this option were encoded in float32 and are kept with 'float32'.
+# See docs/supported_models.md#moss-image.
+#vae_dtype = 'float16'
 # Captions are encoded on the fly by default: only latents are cached and the Qwen3.5-9B text
 # encoder stays on stage 0's GPUs. true caches the embeddings once (~8 KB per token) instead.
 #cache_text_embeddings = false
