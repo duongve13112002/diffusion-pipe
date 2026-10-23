@@ -250,8 +250,10 @@ def manual_save_signal(save_root):
 
 class Saver:
     def __init__(self, args, config, is_adapter, save_root, model, train_dataloader, model_engine, pipeline_model,
-                 ema=None):
+                 ema=None, loss_average=None):
         self.args = args
+        # utils.step_stats.LossAverage, or None. When set, every checkpoint carries its state.
+        self.loss_average = loss_average
         # utils.ema.ParameterEMA, or None. When set, every save also writes its average to
         # <save dir>/ema/ and every checkpoint carries it.
         self.ema = ema
@@ -391,6 +393,7 @@ class Saver:
                     'step': step,
                     'examples': examples,
                     'custom_loader': self.train_dataloader.state_dict(),
+                    **({'loss_average': self.loss_average.state_dict()} if self.loss_average is not None else {}),
                 },
                 save_latest=False,
                 exclude_frozen_parameters=True

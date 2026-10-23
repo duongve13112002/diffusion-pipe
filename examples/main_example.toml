@@ -144,6 +144,9 @@ steps_per_print = 1
 # Log the size of each step's change to the trained weights (train/update_norm, train/update_ratio).
 # On by default for an adapter; for a full fine-tune it keeps a copy of the weights through the step.
 #log_update_norm = true
+# train/loss_avg is the loss averaged over this many steps (default 100): one step's loss swings with
+# the timesteps and noise it drew, the average shows whether the loss is going down.
+#loss_average_steps = 100
 # How to extract video clips for training from a single input video file.
 # The video file is first assigned to one of the configured frame buckets, but then we must extract one or more clips of exactly the right
 # number of frames for that bucket.

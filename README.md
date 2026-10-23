@@ -246,6 +246,10 @@ A new directory will be created in ```output_dir``` for each training run. This 
 ### Step metrics
 Every `logging_steps` steps Tensorboard (and wandb) get, besides `train/loss`, the size of the step; every
 `steps_per_print` steps the console gets the same numbers on one line:
+- `train/loss_avg`: the loss averaged over the last `loss_average_steps` steps (100 by default). One step's
+  loss depends more on the timesteps and noise it drew than on the weights, so it jumps around; the average is
+  the one to read for whether the loss is still going down. `train/epoch_loss`, logged at the end of each epoch,
+  is the average over the epoch. The checkpoint carries both, so a resumed run goes on with them.
 - `train/grad_norm`: the norm of the whole model's gradient before clipping, over every pipeline stage. This is
   the number `gradient_clipping` is compared with.
 - `train/grad_clipped`: 1 on the steps that were clipped, 0 otherwise (with `gradient_clipping` above 0), so

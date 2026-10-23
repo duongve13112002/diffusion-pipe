@@ -11,6 +11,8 @@ Every rank calls before_step and after_step on the same steps: both norms are su
 pipeline's stages. Global rank 0 logs what after_step returns.
 """
 
+from collections import deque
+
 import torch
 from deepspeed import comm as dist
 from deepspeed.accelerator import get_accelerator
@@ -58,3 +60,42 @@ class StepStats:
             stats['train/update_norm'] = update
             stats['train/update_ratio'] = update / weight if weight > 0 else 0.0
         return stats
+
+
+class LossAverage:
+    """The loss averaged over the last `window` steps, and over the epoch so far.
+
+    One step's loss says little about where training is heading: each step draws its own timesteps
+    and noise, and the loss depends on those more than on the weights. The average over a window
+    of steps follows the trend. Every rank sees the same loss (the pipeline engine averages it over
+    the data-parallel ranks and broadcasts it to every stage), so every rank keeps the same state,
+    and the checkpoint carries it: a resumed run goes on with the same averages.
+    """
+
+    def __init__(self, window):
+        self.recent = deque(maxlen=window)
+        self.epoch_sum = 0.0
+        self.epoch_steps = 0
+
+    def add(self, loss):
+        self.recent.append(loss)
+        self.epoch_sum += loss
+        self.epoch_steps += 1
+
+    def average(self):
+        return sum(self.recent) / len(self.recent)
+
+    def end_epoch(self):
+        average = self.epoch_sum / self.epoch_steps
+        self.epoch_sum = 0.0
+        self.epoch_steps = 0
+        return average
+
+    def state_dict(self):
+        return {'recent': list(self.recent), 'epoch_sum': self.epoch_sum, 'epoch_steps': self.epoch_steps}
+
+    def load_state_dict(self, state):
+        # With a smaller window than the run had, the newest losses.
+        self.recent = deque(state['recent'], maxlen=self.recent.maxlen)
+        self.epoch_sum = state['epoch_sum']
+        self.epoch_steps = state['epoch_steps']

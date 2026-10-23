@@ -34,7 +34,7 @@ from utils.checkpoint_layout import check_checkpoint_layers, shift_checkpoint_la
 from utils.param_groups import check_resumed_param_groups, group_names, split_2d_param_groups
 from utils.ema import ParameterEMA, apply_ema_config_defaults, load_ema_checkpoint, load_ema_weights
 from utils.optimizer_factory import resolve_optimizer_class
-from utils.step_stats import StepStats
+from utils.step_stats import LossAverage, StepStats
 from utils.pipeline_optim import (DummyOptimizer, check_pipeline_optimizer, check_prodigy_learning_rates,
                                   pipeline_collective, sync_prodigy)
 
@@ -153,6 +153,11 @@ def set_config_defaults(config):
     config.setdefault('log_update_norm', 'adapter' in config)
     if not isinstance(config['log_update_norm'], bool):
         raise ValueError(f"log_update_norm must be true or false, got {config['log_update_norm']!r}")
+    # train/loss_avg: the loss averaged over this many steps, which shows the trend one step's
+    # loss hides.
+    config.setdefault('loss_average_steps', 100)
+    if type(config['loss_average_steps']) is not int or config['loss_average_steps'] < 1:
+        raise ValueError(f"loss_average_steps must be a whole number of steps, at least 1, got {config['loss_average_steps']!r}")
     config.setdefault('eval_datasets', [])
     config.setdefault('eval_gradient_accumulation_steps', 1)
     config.setdefault('eval_every_n_steps', None)
@@ -907,6 +912,7 @@ if __name__ == '__main__':
 
     step = 1
     examples = global_batch_size
+    loss_average = LossAverage(config['loss_average_steps'])
     # make sure to do this before calling model_engine.set_dataloader(), as that method creates an iterator
     # which starts creating dataloader internal state
     if resume_from_checkpoint:
@@ -952,6 +958,9 @@ if __name__ == '__main__':
             examples = client_state['examples'] + global_batch_size
         else:
             examples = step * global_batch_size
+        # Checkpoints from before it start the averages afresh.
+        if 'loss_average' in client_state:
+            loss_average.load_state_dict(client_state['loss_average'])
         del client_state
         if is_main_process():
             print(f'Resuming training from checkpoint. Resuming at epoch: {train_dataloader.epoch}, step: {step}')
@@ -1011,7 +1020,7 @@ if __name__ == '__main__':
     epoch = train_dataloader.epoch
     tb_writer = SummaryWriter(log_dir=run_dir) if is_main_process() else None
     saver = utils.saver.Saver(args, config, is_adapter, run_dir, model, train_dataloader, model_engine, pipeline_model,
-                              ema=ema)
+                              ema=ema, loss_average=loss_average)
 
     step_stats = StepStats(model_engine, config['log_update_norm'], config['optimizer'].get('gradient_release', False))
     steps_per_print = config.get('steps_per_print', 1)
@@ -1020,9 +1029,6 @@ if __name__ == '__main__':
     if config['eval_before_first_step'] and not resume_from_checkpoint:
         evaluate(model, model_engine, eval_dataloaders, tb_writer, 0, config['eval_gradient_accumulation_steps'], disable_block_swap_for_eval)
 
-    # TODO: this is state we need to save and resume when resuming from checkpoint. It only affects logging.
-    epoch_loss = 0
-    num_steps = 0
     empty_cuda_cache()
     while True:
         model_engine.reset_activation_shape()
@@ -1034,18 +1040,22 @@ if __name__ == '__main__':
         loss = model_engine.train_batch(iterator).item()
         if nan_check is not None:
             nan_check.after_step(step, loss)
+        loss_average.add(loss)
         if oplora_projector is not None:
             oplora_projector.project()
         # After the projection, which is part of what the step changes.
         stats = step_stats.after_step() if logged_step else {}
         if stats and optimizer.param_groups:
             stats['train/lr'] = optimizer.param_groups[0]['lr']
+        if logged_step:
+            stats = {'train/loss_avg': loss_average.average(), **stats}
         if ema is not None:
             ema.update(step)
-        epoch_loss += loss
-        num_steps += 1
         train_dataloader.sync_epoch()
 
+        # Before process_epoch, whose checkpoint must not carry the finished epoch's losses into
+        # the next one.
+        epoch_loss = loss_average.end_epoch() if train_dataloader.epoch != epoch else None
         new_epoch, checkpointed, saved = saver.process_epoch(epoch, step, examples)
         finished_epoch = True if new_epoch != epoch else False
 
@@ -1088,11 +1098,9 @@ if __name__ == '__main__':
 
         if finished_epoch:
             if is_main_process():
-                tb_writer.add_scalar(f'train/epoch_loss', epoch_loss/num_steps, epoch)
+                tb_writer.add_scalar(f'train/epoch_loss', epoch_loss, epoch)
                 if wandb_enable:
-                    wandb.log({'train/epoch_loss': epoch_loss/num_steps, 'epoch': epoch})
-            epoch_loss = 0
-            num_steps = 0
+                    wandb.log({'train/epoch_loss': epoch_loss, 'epoch': epoch})
             if new_epoch is None:
                 final_model_name = f'epoch{epoch}'
                 break
