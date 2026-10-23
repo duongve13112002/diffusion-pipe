@@ -208,7 +208,7 @@ def broadcast_model(self):
                 p.data = p.data.to(orig_device)
 
 
-def _counts_in_norm(p, mpu):
+def counts_in_norm(p, mpu):
     """Whether this rank adds p's gradient to the norm summed over mpu's model-parallel group."""
     if mpu is None:
         return True
@@ -251,6 +251,19 @@ def clip_grad_norm_(parameters, max_norm, norm_type=2, mpu=None):
     if isinstance(parameters, torch.Tensor):
         parameters = [parameters]
     parameters = list(filter(lambda p: p.grad is not None, parameters))
+    total_norm = grad_norm(parameters, norm_type, mpu)
+    max_norm = torch.tensor([float(max_norm)], device=total_norm.device)
+    clip_coef = max_norm / (total_norm + 1e-6)
+    tmp_tensor = torch.tensor([1.0], device=clip_coef.device)
+    clip_coef = torch.min(tmp_tensor, clip_coef)
+    for p in parameters:
+        p.grad.data.mul_(clip_coef)
+    return total_norm
+
+
+def grad_norm(parameters, norm_type=2, mpu=None):
+    """The gradient norm clip_grad_norm_ clips by, over every rank's share of the model; the same
+    on every rank. parameters are those with a gradient."""
     norm_type = float(norm_type)
     all_norms = []
     if norm_type == inf:
@@ -264,7 +277,7 @@ def clip_grad_norm_(parameters, max_norm, norm_type=2, mpu=None):
     else:
         total_norm = 0
         for p in parameters:
-            if _counts_in_norm(p, mpu):
+            if counts_in_norm(p, mpu):
                 all_norms.append(p.grad.data.detach().float().norm(norm_type))
         if len(all_norms) > 0:
             total_norm = torch.stack(all_norms).square().sum().float()
@@ -286,14 +299,23 @@ def clip_grad_norm_(parameters, max_norm, norm_type=2, mpu=None):
     # Change this from the original Deepspeed code.
     if len(parameters) > 0:
         total_norm = total_norm.to(parameters[0].device)
-
-    max_norm = torch.tensor([float(max_norm)], device=total_norm.device)
-    clip_coef = max_norm / (total_norm + 1e-6)
-    tmp_tensor = torch.tensor([1.0], device=clip_coef.device)
-    clip_coef = torch.min(tmp_tensor, clip_coef)
-    for p in parameters:
-        p.grad.data.mul_(clip_coef)
     return total_norm
+
+
+def _clip_fp32_gradients(self):
+    # Kept for the training log (utils/step_stats.py).
+    self.last_grad_norm = clip_grad_norm_(parameters=self.module.parameters(), max_norm=self.gradient_clipping(), mpu=self.mpu)
+
+
+_take_model_step = deepspeed.runtime.engine.DeepSpeedEngine._take_model_step
+
+
+def _take_model_step_measured(self, *args, **kwargs):
+    # Without clipping nothing measures the gradient norm; utils/step_stats.py asks for it on the
+    # steps it logs. Every rank asks on the same steps: the norm is summed over ranks.
+    if self.gradient_clipping() <= 0.0 and getattr(self, 'measure_grad_norm', False):
+        self.last_grad_norm = grad_norm([p for p in self.module.parameters() if p.grad is not None], mpu=self.mpu)
+    return _take_model_step(self, *args, **kwargs)
 
 
 def copy_args_to_cpu_if_needed(self, *args, **kwargs):
@@ -476,7 +498,8 @@ def apply_patches():
     deepspeed.runtime.engine.DeepSpeedEngine._broadcast_model = broadcast_model
 
     # Don't fail if there are no trainable parameters on a stage.
-    deepspeed.runtime.engine.DeepSpeedEngine.clip_fp32_gradients = lambda self: clip_grad_norm_(parameters=self.module.parameters(), max_norm=self.gradient_clipping(), mpu=self.mpu)
+    deepspeed.runtime.engine.DeepSpeedEngine.clip_fp32_gradients = _clip_fp32_gradients
+    deepspeed.runtime.engine.DeepSpeedEngine._take_model_step = _take_model_step_measured
 
     # Fix pipeline_stages > 2 hanging before the first step (#511): the pooled recv buffers must be
     # reallocated when the requested dtype differs, otherwise int64 tensors in the inter-stage tuple

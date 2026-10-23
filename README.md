@@ -243,6 +243,22 @@ Please note that resuming from checkpoint uses the **config file on the command 
 ## Output files
 A new directory will be created in ```output_dir``` for each training run. This contains the checkpoints, saved models, and Tensorboard metrics. Saved models/LoRAs will be in directories named like epoch1, epoch2, etc. Deepspeed checkpoints are in directories named like global_step1234. These checkpoints contain all training state, including weights, optimizer, and dataloader state, but can't be used directly for inference. The saved model directory will have the safetensors weights, PEFT adapter config JSON, as well as the diffusion-pipe config file for easier tracking of training run settings.
 
+### Step metrics
+Every `logging_steps` steps Tensorboard (and wandb) get, besides `train/loss`, the size of the step; every
+`steps_per_print` steps the console gets the same numbers on one line:
+- `train/grad_norm`: the norm of the whole model's gradient before clipping, over every pipeline stage. This is
+  the number `gradient_clipping` is compared with.
+- `train/grad_clipped`: 1 on the steps that were clipped, 0 otherwise (with `gradient_clipping` above 0), so
+  its average over a window is the share of clipped steps. Clipping most steps means `gradient_clipping` is
+  below the usual norm and no longer only catches spikes.
+- `train/update_norm` and `train/update_ratio`: the norm of the change the step made to the trained weights,
+  and that over the norm of the weights before it. The ratio is how much of the weights one step moves, what
+  the learning rate (and Prodigy's `d`, or a warmup) controls in the end. A ratio that climbs and stays well
+  above its usual level often comes before a loss spike; one at 0 means the updates round away in the weights'
+  dtype. Measuring it keeps a copy of the trained weights through the step: `log_update_norm` is on by default
+  when training an adapter and off for a full fine-tune, where the copy is as large as the model.
+- `train/lr`: the first parameter group's learning rate.
+
 ## Reducing VRAM requirements
 The [wan_14b_min_vram.toml](./examples/wan_14b_min_vram.toml) example file has all of these settings enabled.
 - Use AdamW8BitKahan optimizer:

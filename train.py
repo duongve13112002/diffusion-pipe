@@ -34,6 +34,7 @@ from utils.checkpoint_layout import check_checkpoint_layers, shift_checkpoint_la
 from utils.param_groups import check_resumed_param_groups, group_names, split_2d_param_groups
 from utils.ema import ParameterEMA, apply_ema_config_defaults, load_ema_checkpoint, load_ema_weights
 from utils.optimizer_factory import resolve_optimizer_class
+from utils.step_stats import StepStats
 from utils.pipeline_optim import (DummyOptimizer, check_pipeline_optimizer, check_prodigy_learning_rates,
                                   pipeline_collective, sync_prodigy)
 
@@ -146,6 +147,12 @@ def set_config_defaults(config):
     apply_ema_config_defaults(config)
 
     config.setdefault('logging_steps', 1)
+    # The size of each step's change to the weights (utils/step_stats.py): on by default for an
+    # adapter. It keeps a copy of the trained weights through the step, which for a full fine-tune
+    # is as large as they are.
+    config.setdefault('log_update_norm', 'adapter' in config)
+    if not isinstance(config['log_update_norm'], bool):
+        raise ValueError(f"log_update_norm must be true or false, got {config['log_update_norm']!r}")
     config.setdefault('eval_datasets', [])
     config.setdefault('eval_gradient_accumulation_steps', 1)
     config.setdefault('eval_every_n_steps', None)
@@ -1006,6 +1013,9 @@ if __name__ == '__main__':
     saver = utils.saver.Saver(args, config, is_adapter, run_dir, model, train_dataloader, model_engine, pipeline_model,
                               ema=ema)
 
+    step_stats = StepStats(model_engine, config['log_update_norm'], config['optimizer'].get('gradient_release', False))
+    steps_per_print = config.get('steps_per_print', 1)
+
     disable_block_swap_for_eval = config.get('disable_block_swap_for_eval', False)
     if config['eval_before_first_step'] and not resume_from_checkpoint:
         evaluate(model, model_engine, eval_dataloaders, tb_writer, 0, config['eval_gradient_accumulation_steps'], disable_block_swap_for_eval)
@@ -1019,11 +1029,17 @@ if __name__ == '__main__':
         iterator = get_data_iterator_for_step(train_dataloader, model_engine)
         if nan_check is not None:
             nan_check.before_step(step)
+        logged_step = step % config['logging_steps'] == 0 or step % steps_per_print == 0
+        step_stats.before_step(logged_step)
         loss = model_engine.train_batch(iterator).item()
         if nan_check is not None:
             nan_check.after_step(step, loss)
         if oplora_projector is not None:
             oplora_projector.project()
+        # After the projection, which is part of what the step changes.
+        stats = step_stats.after_step() if logged_step else {}
+        if stats and optimizer.param_groups:
+            stats['train/lr'] = optimizer.param_groups[0]['lr']
         if ema is not None:
             ema.update(step)
         epoch_loss += loss
@@ -1040,27 +1056,24 @@ if __name__ == '__main__':
         extra_scalars = getattr(model, 'get_extra_log_scalars', lambda: {})()
         # .get, because steps_per_print is read straight into the DeepSpeed config dict and is
         # never setdefault-ed onto config itself.
-        if is_main_process() and extra_scalars and step % config.get('steps_per_print', 1) == 0:
+        if is_main_process() and (extra_scalars or stats) and step % steps_per_print == 0:
             # Echoed to the console as well as Tensorboard. A run on a cluster usually has no
             # Tensorboard to hand, and a number nobody can see is not much better than no number:
             # teacher guidance in particular looks identical whether lambda is 0.9 or has decayed
             # to 0. On the steps_per_print cadence, because logging_steps defaults to every step.
-            summary = '  '.join(f'{name.rsplit("/", 1)[-1]}={value:.4f}'
-                                for name, value in extra_scalars.items())
+            summary = '  '.join(f'{name.rsplit("/", 1)[-1]}={value:.4g}'
+                                for name, value in {'train/loss': loss, **stats, **extra_scalars}.items())
             print(f'step {step}: {summary}')
 
         if is_main_process() and step % config['logging_steps'] == 0:
+            if 'train/grad_norm' not in stats and hasattr(optimizer, '_grad_norm'):
+                # Gradient release: GenericOptim's own norm, the only one there is.
+                stats['train/grad_norm'] = optimizer._grad_norm
             tb_writer.add_scalar(f'train/loss', loss, x_axis)
-            if hasattr(optimizer, '_grad_norm'):
-                tb_writer.add_scalar(f'train/grad_norm', optimizer._grad_norm, x_axis)
-            for name, value in extra_scalars.items():
+            for name, value in {**stats, **extra_scalars}.items():
                 tb_writer.add_scalar(name, value, x_axis)
             if wandb_enable:
-                wandb.log({'train/loss': loss, 'step': x_axis})
-                if hasattr(optimizer, '_grad_norm'):
-                    wandb.log({'train/grad_norm': optimizer._grad_norm, 'step': x_axis})
-                if extra_scalars:
-                    wandb.log({**extra_scalars, 'step': x_axis})
+                wandb.log({'train/loss': loss, **stats, **extra_scalars, 'step': x_axis})
             if optimizer.__class__.__name__ == 'Prodigy':
                 prodigy_d = get_prodigy_d(optimizer)
                 tb_writer.add_scalar(f'train/prodigy_d', prodigy_d, x_axis)
