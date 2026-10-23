@@ -14,6 +14,7 @@ from peft.tuners._buffer_dict import BufferDict
 from transformers import CLIPTextModel, AutoModel
 import deepspeed
 from deepspeed.runtime.pipe.engine import PipelineEngine
+from deepspeed.runtime.pipe.topology import PipelineParallelGrid
 from deepspeed.runtime.pipe.schedule import (
     SendGrad, RecvActivation, SendActivation, RecvGrad, LoadMicroBatch, ForwardPass, BackwardPass,
     ReduceTiedGrads, ReduceGrads, OptimizerStep,
@@ -198,6 +199,25 @@ def broadcast_model(self):
                 p.data = p.data.to(orig_device)
 
 
+def _counts_in_norm(p, mpu):
+    """Whether this rank adds p's gradient to the norm summed over mpu's model-parallel group."""
+    if mpu is None:
+        return True
+    # A tied layer's copies on later stages, which DeepSpeed marks for its own optimizers.
+    if getattr(p, 'ds_pipe_replicated', False):
+        return False
+    if deepspeed.runtime.utils.is_model_parallel_parameter(p):
+        return True
+    if isinstance(mpu, PipelineParallelGrid):
+        # Under a pipeline grid the model-parallel group is a whole pipeline, and every stage holds
+        # parameters of its own. DeepSpeed's rule (model-parallel rank 0 only) counted stage 0's
+        # and dropped the rest, so with pipeline_stages > 1 clipping saw a smaller norm than the
+        # real one. Only an unsliced parameter on tensor slices past the first is a copy.
+        return mpu.get_slice_parallel_rank() == 0
+    # Megatron-style tensor parallelism: unsliced parameters are copies on every rank.
+    return mpu.get_model_parallel_rank() == 0
+
+
 def clip_grad_norm_(parameters, max_norm, norm_type=2, mpu=None):
     """Clips gradient norm of an iterable of parameters.
 
@@ -235,13 +255,8 @@ def clip_grad_norm_(parameters, max_norm, norm_type=2, mpu=None):
     else:
         total_norm = 0
         for p in parameters:
-            if mpu is not None:
-                if (mpu.get_model_parallel_rank() == 0) or deepspeed.runtime.utils.is_model_parallel_parameter(p):
-                    param_norm = p.grad.data.detach().float().norm(norm_type)
-                    all_norms.append(param_norm)
-            else:
-                param_norm = p.grad.data.detach().float().norm(norm_type)
-                all_norms.append(param_norm)
+            if _counts_in_norm(p, mpu):
+                all_norms.append(p.grad.data.detach().float().norm(norm_type))
         if len(all_norms) > 0:
             total_norm = torch.stack(all_norms).square().sum().float()
         else:
