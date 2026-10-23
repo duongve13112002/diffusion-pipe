@@ -10,6 +10,7 @@ import json
 import logging
 import math
 import re
+import types
 from pathlib import Path
 
 import pytest
@@ -1412,6 +1413,8 @@ def test_layout_bbox_space_selects_the_layout_caption_format():
     ({'clean_end_share': [[7, 60]], 'clean_end_share_refresh_every': 0}, 'whole number of epochs'),
     ({'timestep_sample_method': 'gamma'}, 'timestep_sample_method'),
     ({'dtype': torch.float16}, 'bfloat16 or float32'),
+    ({'vae_dtype': 'float8'}, 'vae_dtype must be one of'),
+    ({'vae_dtype': ['bfloat16']}, 'vae_dtype must be one of'),
     ({'diffusion_model_dtype': 'float8'}, r'\[adapter\]'),
     ({'on_caption_overflow': 'drop'}, 'on_caption_overflow'),
 ])
@@ -1598,6 +1601,71 @@ def test_vae_encode_inverts_the_reference_decode(vaes):
         got = pipe.vae_encode(images)
     assert got.shape == (1, 128, 4, 6)
     torch.testing.assert_close(got, expected, rtol=1e-3, atol=1e-3)
+
+
+@pytest.mark.parametrize('value, dtype', [(None, torch.bfloat16), ('float32', torch.float32),
+                                          ('bfloat16', torch.bfloat16), ('float16', torch.float16)])
+def test_vae_dtype_reaches_the_vae(value, dtype, tmp_path, monkeypatch):
+    built = []
+    monkeypatch.setattr(mi.comfy.sd, 'VAE', lambda sd, dtype: built.append(dtype) or types.SimpleNamespace(
+        throw_exception_if_invalid=lambda: None))
+    monkeypatch.setattr(mi, 'read_component', lambda path, stem: ({}, {}))
+    pipe = make_pipeline({'diffusers_path': str(diffusers_dir(tmp_path)),
+                          **({} if value is None else {'vae_dtype': value})})
+    assert pipe.vae_dtype == dtype
+    pipe.vae.load_model_if_needed()
+    assert built == [dtype]
+
+
+def test_vae_dtype_is_part_of_the_latent_cache_identity(tmp_path):
+    root = diffusers_dir(tmp_path)
+    # float32 keeps the identity caches were written with before vae_dtype existed (they were
+    # all encoded in float32), so they stay valid; another vae_dtype rebuilds them.
+    before = f'{root}||torch.bfloat16'
+    assert make_pipeline({'diffusers_path': str(root), 'vae_dtype': 'float32'}).vae_cache_key() == before
+    assert make_pipeline({'diffusers_path': str(root)}).vae_cache_key() == before + '|vae_dtype=bfloat16'
+    assert make_pipeline({'diffusers_path': str(root), 'vae_dtype': 'fp16'}).vae_cache_key() \
+        == before + '|vae_dtype=float16'
+
+
+def test_non_finite_latents_are_not_cached():
+    pipe = bare_pipeline()
+    pipe.vae_dtype = torch.float16
+    pipe.vae_encode = lambda images: torch.tensor([[1.0, float('inf')]])
+    images = types.SimpleNamespace(to=lambda *args: torch.zeros(1, 3, 16, 16))
+    with pytest.raises(RuntimeError, match="non-finite latents in float16: set vae_dtype = 'float32'"):
+        pipe.get_call_vae_fn(None)(images)
+    pipe.vae_encode = lambda images: torch.ones(1, 2)
+    assert pipe.get_call_vae_fn(None)(images)['latents'].tolist() == [[1.0, 1.0]]
+
+
+def smooth_image(h, w):
+    """Gradients, a disc and a bar: smooth regions and sharp edges, like a photo, unlike noise."""
+    y, x = torch.meshgrid(torch.linspace(0, 1, h), torch.linspace(0, 1, w), indexing='ij')
+    disc = (((x - 0.35) ** 2 + (y - 0.5) ** 2) < 0.06).float()
+    bar = ((x > 0.6) & (x < 0.75)).float()
+    image = torch.stack([0.2 + 0.6 * x + 0.2 * disc, 0.3 + 0.5 * y * (1 - bar), 0.8 - 0.5 * x * y + 0.2 * bar])
+    return image.clamp(0, 1)[None]
+
+
+@pytest.mark.parametrize('dtype', [torch.bfloat16, torch.float16])
+def test_a_half_precision_vae_encodes_close_to_float32(vaes, dtype):
+    import comfy.sd
+    _, pipe = vaes
+    half = bare_pipeline()
+    half.vae = comfy.sd.VAE(sd=mi.read_component(str(LOCAL_VAE), 'diffusion_pytorch_model')[0], dtype=dtype)
+    half.latent_format = pipe.latent_format
+    assert half.vae.vae_dtype == dtype
+    images = smooth_image(128, 192)
+    with torch.no_grad():
+        exact = pipe.vae_encode(images)
+        got = half.vae_encode(images)
+        assert got.dtype == torch.float32 and torch.isfinite(got).all()
+        assert ((got - exact).norm() / exact.norm()).item() < 0.05
+        # What the latents describe: their decodes, both by the float32 VAE, agree to well
+        # above what the eye can tell apart.
+        mse = (pipe.vae_decode(got) - pipe.vae_decode(exact)).pow(2).mean().item()
+    assert 10 * math.log10(1 / mse) > 45
 
 
 @pytest.mark.parametrize('name', ['moss_image_lora.toml', 'moss_image_full_8gpu.toml'])

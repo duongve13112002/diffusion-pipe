@@ -864,6 +864,18 @@ rather than loaded with layers' weights in their neighbours.
   Fizgig's default since [v8.8.1](https://github.com/shootthesound/Fizgig/blob/master/docs/RELEASE_NOTES_v8.8.1.md) ("Slide 60:7:30:15:2"), its best of eight settings on a small
   likeness dataset; with many more than about 55 images it suggests coming down from 60 sooner.
   Eval losses are computed at the last point's share in every epoch, so they stay comparable.
+- `vae_dtype` is the precision the VAE encodes the training images (and decodes samples) in:
+  `'bfloat16'` (default), `'float32'` (what the reference pipeline uses) or `'float16'`. Latents
+  are stored in float32 either way. On six photos from Wikimedia Commons at about 1 MP (a shop
+  sign with text, people, animals, a landscape, buildings, flowers), bfloat16 latents differed
+  from float32 ones by 0.8-3.1% (relative L2, cosine similarity above 0.9995), and float16 ones
+  by 0.1-0.8%. Decoded by the same float32 VAE, a bfloat16 latent's image differed from the
+  float32 latent's by 58-62 dB PSNR (float16: 77-80 dB), while the VAE's own reconstruction of
+  the photos is at 27-41 dB, which bfloat16 moved by at most 0.05 dB. Encoding in bfloat16 took
+  about half the time of float32 (CPU). Non-finite latents (float16 can overflow) stop the
+  caching with an error rather than being cached. The latent cache records `vae_dtype`, so
+  changing it re-encodes the cache. Caches written before this option were encoded in float32:
+  `vae_dtype = 'float32'` keeps them, any other value re-encodes them.
 - Captions are encoded with MOSS-Image's chat template, which trims the caption, and cut at
   4096 tokens (`on_caption_overflow = 'warn' | 'silent' | 'error'`).
 - Checkpoints with each block's q, k and v fused into `proj.qkv` load too: the

@@ -113,6 +113,17 @@ DTYPE_NAMES = {
 }
 
 
+# The VAE only encodes the training images (and decodes samples). The reference pipeline runs it
+# in float32. In bfloat16 the latents of real photos differ from float32 ones by 1-3% (relative
+# L2), and their decodes by about 60 dB PSNR, far below the VAE's own reconstruction error (see
+# vae_dtype in the docs).
+VAE_DTYPES = {
+    'bfloat16': torch.bfloat16, 'bf16': torch.bfloat16, 'float32': torch.float32, 'fp32': torch.float32,
+    'float16': torch.float16, 'fp16': torch.float16,
+}
+VAE_DTYPE_NAMES = {torch.bfloat16: 'bfloat16', torch.float32: 'float32', torch.float16: 'float16'}
+
+
 def _dtype(value, key):
     if isinstance(value, torch.dtype):
         return value
@@ -1002,6 +1013,10 @@ class MossImagePipeline(ComfyPipeline):
                              'and block_lr_scale would do nothing: remove them, or force_constant_lr')
         self.latent_format = comfy.latent_formats.Flux2()
         self.text_dim = TEXT_DIM
+        vae_dtype = self.model_config.get('vae_dtype', 'bfloat16')
+        if not isinstance(vae_dtype, str) or vae_dtype not in VAE_DTYPES:
+            raise ValueError(f'vae_dtype must be one of {", ".join(sorted(VAE_DTYPES))}, got {vae_dtype!r}')
+        self.vae_dtype = VAE_DTYPES[vae_dtype]
 
         self.transformer_path = self._component('transformer_path', 'transformer')
         self.vae_path = self._component('vae_path', 'vae')
@@ -1045,7 +1060,7 @@ class MossImagePipeline(ComfyPipeline):
                 print(f'MOSS-Image: {share:.1f}% of training steps below sigma {CLEAN_END_SIGMA}')
 
         def load_vae():
-            vae = comfy.sd.VAE(sd=read_component(self.vae_path, 'diffusion_pytorch_model')[0], dtype=torch.float32)
+            vae = comfy.sd.VAE(sd=read_component(self.vae_path, 'diffusion_pytorch_model')[0], dtype=self.vae_dtype)
             vae.throw_exception_if_invalid()
             return vae
 
@@ -1142,6 +1157,14 @@ class MossImagePipeline(ComfyPipeline):
             raise FileNotFoundError(f'{path} does not exist. Set {key} if the {subfolder} lives elsewhere.')
         return str(path)
 
+    def vae_cache_key(self):
+        # A latent cache encoded at another vae_dtype is rebuilt. float32 keeps the identity of
+        # caches written before vae_dtype existed, which were all encoded in float32.
+        key = super().vae_cache_key()
+        if self.vae_dtype != torch.float32:
+            key += f'|vae_dtype={VAE_DTYPE_NAMES[self.vae_dtype]}'
+        return key
+
     def text_encoder_cache_key(self, i):
         return f'moss_image|{self.text_encoder_path}|qwen35_9b|last|{MAX_TEXT_TOKENS}|trimmed-v1|prompt-strip-v1'
 
@@ -1203,8 +1226,14 @@ class MossImagePipeline(ComfyPipeline):
 
     def get_call_vae_fn(self, vae):
         def fn(images):
-            # fp32 pixels into the fp32 VAE: the reference encodes without a bf16 round trip.
-            return {'latents': self.vae_encode(images.to('cuda', torch.float32))}
+            # fp32 pixels: ComfyUI maps them to -1..1 before casting to vae_dtype, so with a float32
+            # VAE nothing is rounded, as in the reference.
+            latents = self.vae_encode(images.to('cuda', torch.float32))
+            # float16 can overflow, and a non-finite latent would be cached and trained on.
+            if not torch.isfinite(latents).all():
+                raise RuntimeError(f'The VAE gave non-finite latents in {VAE_DTYPE_NAMES[self.vae_dtype]}: '
+                                   "set vae_dtype = 'float32' (or 'bfloat16') in [model]")
+            return {'latents': latents}
         return fn
 
     def get_text_encoders(self):
