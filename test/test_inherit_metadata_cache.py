@@ -191,6 +191,11 @@ def test_geometry_hash_is_unchanged_by_the_refactor(tmp_path):
                'round_to_multiple': ds.round_to_multiple, 'framerate': ds.framerate,
                'mask_path': str(ds.mask_path), 'control_path': str(ds.control_path),
                'default_mask_file': str(ds.default_mask_file), 'shuffle': ds.shuffle_metadata}
+        if geometry is SIZE_BUCKETS:
+            # Not in increasing aspect ratio: snapshots from before the size bucket matching fix
+            # have media in the wrong buckets, so these get a new geometry on purpose.
+            assert not ds.size_buckets_matched_before
+            old['size_bucket_matching'] = 2
         assert ds.geometry_dir.name == Hasher.hash(old)
         assert Hasher.hash(ds.snapshot_geometry(framerate=None)) != ds.geometry_dir.name
 
@@ -364,7 +369,7 @@ def test_legacy_metadata_is_inherited_and_trusted_without_scanning(tmp_path, mon
 
 
 @pytest.mark.parametrize('change', ['caption_prefix', 'augmentation', 'resolution', 'deleted', 'mask',
-                                    'snapshot_donor', 'no_donor'])
+                                    'snapshot_donor', 'no_donor', 'before_size_bucket_fix'])
 def test_legacy_refuses_metadata_built_differently(tmp_path, change, capsys):
     data = tmp_path / 'data'
     make_source(data)
@@ -380,6 +385,8 @@ def test_legacy_refuses_metadata_built_differently(tmp_path, change, capsys):
         geometry = {'size_buckets': [[64, 64, 1], [96, 64, 1]]}
     elif change == 'deleted':
         (data / '0.png').unlink()
+    elif change == 'before_size_bucket_fix':
+        (data / 'cache' / 'anima' / 'metadata' / 'size_bucket_matching.json').unlink()
     elif change == 'mask':
         masks = tmp_path / 'masks'
         masks.mkdir()
@@ -394,8 +401,56 @@ def test_legacy_refuses_metadata_built_differently(tmp_path, change, capsys):
     assert not (data / 'cache' / 'iris' / 'metadata' / 'inherited_from.json').exists()
     expected = {'caption_prefix': 'caption_prefix', 'augmentation': '--cache-text-embeddings',
                 'resolution': 'buckets', 'deleted': 'missing', 'mask': 'mask_path',
-                'snapshot_donor': 'reuse_metadata_cache = true', 'no_donor': 'no anima legacy metadata'}[change]
+                'snapshot_donor': 'reuse_metadata_cache = true', 'no_donor': 'no anima legacy metadata',
+                'before_size_bucket_fix': 'before the size_buckets matching fix'}[change]
     assert expected in out
+
+
+def _old_size_bucket_matching(self, log_ar, frames, is_video):
+    """The matching before the fix: an index into the sorted aspect ratios, used on the list."""
+    import numpy as np
+    return self.size_buckets[np.argsort(np.abs(log_ar - self.log_ars), kind='stable')][0]
+
+
+@pytest.mark.parametrize('marker', ['missing', 'stale'])
+def test_legacy_metadata_grouped_by_the_old_size_bucket_matching_is_rebuilt_despite_trust_cache(
+        tmp_path, monkeypatch, capsys, marker):
+    """SIZE_BUCKETS is a list the old matching got wrong. Metadata it grouped is not trusted: not
+    without a marker, and not under the marker of an earlier fixed grouping that a checkout
+    without the fix has since regrouped (the marker records what it grouped). The buckets'
+    iteration orders, which index the old rows, go with it."""
+    data = tmp_path / 'data'
+    make_source(data)
+    metadata = data / 'cache' / 'anima' / 'metadata'
+    if marker == 'stale':
+        cache_legacy_donor(data, SIZE_BUCKETS)
+        fixed_marker = (metadata / 'size_bucket_matching.json').read_text()
+    with monkeypatch.context() as patch:
+        patch.setattr(current.DirectoryDataset, '_find_closest_size_bucket', _old_size_bucket_matching)
+        old = cache_legacy_donor(data, SIZE_BUCKETS)
+        for bucket in old.size_bucket_datasets:
+            bucket._build_iteration_order(False, True)
+    if marker == 'stale':
+        (metadata / 'size_bucket_matching.json').write_text(fixed_marker)
+    else:
+        (metadata / 'size_bucket_matching.json').unlink()
+    fresh = build(data, 'fresh', 16, True, SIZE_BUCKETS, **LEGACY)
+    fresh.cache_metadata()
+    expected = grouped_rows(fresh)
+    assert grouped_rows(old) != expected
+
+    file = write_toml(tmp_path, data, SIZE_BUCKETS, **LEGACY)
+    assert tool.main(['--dataset', str(file)]) == 1
+    assert 'before the size_buckets matching fix' in capsys.readouterr().out
+
+    again = build(data, 'anima', 16, True, SIZE_BUCKETS, **LEGACY)
+    again.cache_metadata(trust_cache=True)
+    assert grouped_rows(again) == expected
+    for bucket in again.size_bucket_datasets:
+        bucket._build_iteration_order(False, True)
+        for entry in bucket.iteration_order:
+            assert bucket.metadata_dataset[entry['latents_idx']]['image_spec'] == entry['image_spec']
+    assert current.size_bucket_matching_is_current(metadata, '')
 
 
 def test_legacy_existing_metadata_is_kept_unless_forced(tmp_path, monkeypatch, capsys):

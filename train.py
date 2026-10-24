@@ -158,6 +158,11 @@ def set_config_defaults(config):
     config.setdefault('loss_average_steps', 100)
     if type(config['loss_average_steps']) is not int or config['loss_average_steps'] < 1:
         raise ValueError(f"loss_average_steps must be a whole number of steps, at least 1, got {config['loss_average_steps']!r}")
+    # Several nodes share dataset caching out by bucket, each node on its own GPUs (utils/dataset.py
+    # DatasetManager.cache). Off, global rank 0's node caches everything while the others wait.
+    config.setdefault('multi_node_caching', True)
+    if not isinstance(config['multi_node_caching'], bool):
+        raise ValueError(f"multi_node_caching must be true or false, got {config['multi_node_caching']!r}")
     config.setdefault('eval_datasets', [])
     config.setdefault('eval_gradient_accumulation_steps', 1)
     config.setdefault('eval_every_n_steps', None)
@@ -457,7 +462,8 @@ if __name__ == '__main__':
         'steps_per_print': config.get('steps_per_print', 1),
     }
     caching_batch_size = config.get('caching_batch_size', 1)
-    dataset_manager = dataset_util.DatasetManager(model, regenerate_cache=regenerate_cache, trust_cache=args.trust_cache, caching_batch_size=caching_batch_size, keep_models_loaded=args.test_sample)
+    dataset_manager = dataset_util.DatasetManager(model, regenerate_cache=regenerate_cache, trust_cache=args.trust_cache, caching_batch_size=caching_batch_size, keep_models_loaded=args.test_sample,
+                                                  multi_node=config['multi_node_caching'])
 
     # The batch fill keys belong in the dataset config, but several training configs share one
     # dataset TOML, so the same keys are accepted here and win. Applied to the eval datasets

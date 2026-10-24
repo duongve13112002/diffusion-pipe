@@ -305,6 +305,56 @@ def test_snapshot_stays_frozen_until_refresh_and_parent_observes_generation(tmp_
     close_directory(parent)
 
 
+def test_one_refreshed_snapshot_serves_every_profile_of_a_source(tmp_path, monkeypatch):
+    """The same path twice under other caption settings, with --regenerate_cache: both profiles
+    go in one fresh snapshot. A snapshot each left the first profile in an inactive one, so every
+    rank built its metadata again when loading."""
+    new_source(tmp_path)
+    monkeypatch.setattr(current, '_REFRESHED_SNAPSHOTS', {})  # as in a caching run
+    plain = build(tmp_path)
+    filtered = build(tmp_path, enable_remove_non_latin=True)
+    assert plain.profile_key != filtered.profile_key
+    plain.cache_metadata(regenerate_cache=True, trust_cache=True)
+    filtered.cache_metadata(regenerate_cache=True, trust_cache=True)
+    assert plain.snapshot_dir == filtered.snapshot_dir
+    for made in (plain, filtered):
+        loaded = build(tmp_path, enable_remove_non_latin=made is filtered)
+        loaded.cache_metadata(trust_cache=True)
+        assert loaded.cache_dir == made.cache_dir
+        close_directory(loaded)
+    close_directory(plain)
+    close_directory(filtered)
+
+
+@pytest.mark.parametrize('fails', [False, True])
+def test_refreshed_snapshots_are_shared_only_within_a_caching_run(monkeypatch, fails):
+    seen = []
+
+    def stage(*args):
+        seen.append(current._REFRESHED_SNAPSHOTS)
+        if fails:
+            raise RuntimeError('stage failed')
+    monkeypatch.setattr(current, '_cache_stage', stage)
+    if fails:
+        with pytest.raises(RuntimeError):
+            current._cache_datasets([], None, None, 0, True, False, 1)
+    else:
+        current._cache_datasets([], None, None, 0, True, False, 1)
+    assert seen == [{}] and current._REFRESHED_SNAPSHOTS is None
+
+
+def test_only_the_first_text_encoders_round_rebuilds_flattened_captions(monkeypatch):
+    """With several nodes each text encoder is a round of its own; the first one's round rebuilt
+    the flattened captions every encoder of a bucket shares."""
+    seen = {}
+    monkeypatch.setattr(current, '_cache_stage', lambda *args: seen.setdefault(args[-3:], current._regenerate_flattened))
+    for stage, text_encoder in (('all', None), ('latents', None), ('text', 0), ('text', 1), ('text', 2)):
+        current._cache_datasets([], None, None, 3, True, False, 1, stage, 0, text_encoder)
+    assert seen == {('all', 0, None): True, ('latents', 0, None): True, ('text', 0, 0): True,
+                    ('text', 0, 1): False, ('text', 0, 2): False}
+    assert current._regenerate_flattened
+
+
 def test_new_resolution_cannot_reference_old_latents(tmp_path):
     new_source(tmp_path)
     first = build(tmp_path)

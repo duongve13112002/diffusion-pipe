@@ -12,6 +12,8 @@ import json
 import shutil
 import socket
 import tarfile
+import threading
+import time
 from inspect import signature
 import sys
 sys.path.insert(0, os.path.join(os.path.abspath(os.path.dirname(__file__)), '../submodules/ComfyUI'))
@@ -69,6 +71,23 @@ from utils.captions import (
     validate_non_latin_caption_requirement,
 )
 from utils.layout_captions import LAYOUT_METADATA_VERSION, LayoutCaptionRewriter, is_layout_caption
+
+
+def size_bucket_matching_is_current(metadata_dir, suffix):
+    """Whether the legacy grouped metadata in metadata_dir was grouped by the fixed size bucket
+    matching: its marker records the grouped datasets' fingerprints, which follow their content,
+    so a later regrouping by a checkout without the fix no longer matches it."""
+    marker = metadata_dir / f'size_bucket_matching{suffix}.json'
+    keys_file = metadata_dir / f'grouping_keys{suffix}.json'
+    try:
+        recorded = json.loads(marker.read_text()).get('grouped')
+        keys = json.loads(keys_file.read_text())
+        current = {bucket_suffix(key): json.loads(
+            (metadata_dir / f'grouped_metadata_{bucket_suffix(key)}{suffix}' / 'state.json').read_text())['_fingerprint']
+            for key in keys}
+    except (FileNotFoundError, ValueError, KeyError, TypeError, AttributeError):
+        return False
+    return recorded == current
 
 
 def bucket_suffix(key):
@@ -415,13 +434,16 @@ def _remove_dead_temporaries(path, host):
 # Flattened-caption paths this process already rebuilt for --regenerate_cache: each text
 # encoder asks for the same one, and the earlier encoder's dataset still has it open.
 _regenerated_paths = set()
+# False in the caching rounds of the second and later text encoders on several nodes: the first
+# encoder's round rebuilt every flattened caption dataset of this caching run already.
+_regenerate_flattened = True
 
 
 def _flattened_captions(metadata_dataset, flatten_captions, path, regenerate=False):
     """The flattened (and rewritten) captions, kept at path. Rewriting reads every layout
     caption's image header, so it is done once, not on every rank at every launch; regenerate
     (--regenerate_cache) does it again, for images replaced under the same name."""
-    regenerate = regenerate and str(path) not in _regenerated_paths
+    regenerate = regenerate and _regenerate_flattened and str(path) not in _regenerated_paths
     if path.exists() and not regenerate:
         return datasets.load_from_disk(str(path))
     flattened = metadata_dataset.map(flatten_captions, batched=True, keep_in_memory=True,
@@ -1339,6 +1361,10 @@ class ARBucketDataset:
             size_bucket_dataset.add_text_embedding_dataset(te_dataset)
 
 
+# {geometry directory: the snapshot --regenerate_cache made for it in this caching run}. None
+# outside a run (cache_metadata called directly): every --regenerate_cache call makes its own.
+_REFRESHED_SNAPSHOTS = None
+
 # Default for DirectoryDataset.snapshot_geometry: use the dataset's own value. None is a real
 # framerate (an image model has none), so it cannot be the default.
 _OWN = object()
@@ -1480,6 +1506,13 @@ class DirectoryDataset:
             self.ars = np.geomspace(min_ar, max_ar, num=num_ar_buckets)
         self.ars = dedup_and_sort(self.ars)
         self.log_ars = np.log(self.ars)
+        if self.use_size_buckets:
+            # One per size bucket, in the same order: self.ars is deduplicated and sorted. Rounded
+            # as self.ars is, so buckets the old matching got right keep every answer it gave.
+            self.size_bucket_log_ars = np.log([round(w / h, ROUND_DECIMAL_DIGITS) for w, h, _ in self.size_buckets])
+            # Before this was fixed, size buckets were matched against self.ars, which gave the
+            # right bucket only when the buckets already came in increasing, distinct aspect ratios.
+            self.size_buckets_matched_before = [round(w / h, ROUND_DECIMAL_DIGITS) for w, h, _ in self.size_buckets] == self.ars.tolist()
         frame_buckets = self.directory_config.get('frame_buckets', self.dataset_config.get('frame_buckets', [1]))
         if 1 not in frame_buckets:
             # always have an image bucket for convenience
@@ -1528,13 +1561,18 @@ class DirectoryDataset:
         """The settings that decide which source metadata snapshot this directory uses. Its hash
         names the profiles/<geometry> directory. The arguments override this dataset's own
         values, for tools/inherit_metadata_cache.py to find another model's snapshot."""
-        return {'size_buckets': self.size_buckets.tolist() if self.use_size_buckets else None,
+        geometry = {'size_buckets': self.size_buckets.tolist() if self.use_size_buckets else None,
                 'ars': self.ars.tolist(), 'frames': self.frame_buckets.tolist(),
                 'resolutions': self.resolutions.tolist() if not self.use_size_buckets else None,
                 'round_to_multiple': self.round_to_multiple if round_to_multiple is _OWN else round_to_multiple,
                 'framerate': self.framerate if framerate is _OWN else framerate,
                 'mask_path': str(self.mask_path), 'control_path': str(self.control_path),
                 'default_mask_file': str(self.default_mask_file), 'shuffle': self.shuffle_metadata}
+        if self.use_size_buckets and not self.size_buckets_matched_before:
+            # A snapshot of these size buckets from before the matching fix has media in the
+            # wrong buckets, or none at all: make a new one.
+            geometry['size_bucket_matching'] = 2
+        return geometry
 
     def legacy_tensor_sources(self, bucket, cache_name):
         """Describe old tensor inputs without modifying their metadata or shard files."""
@@ -1623,7 +1661,8 @@ class DirectoryDataset:
                 if captions is None and row.get('caption_file'):
                     captions = read_caption_file(Path(row['caption_file']), False, True)
                 compatible = old is not None and (
-                    old['size_bucket'] in self.size_buckets.tolist() if self.use_size_buckets
+                    self.size_buckets_matched_before and old['size_bucket'] in self.size_buckets.tolist()
+                    if self.use_size_buckets
                     else old['ar_bucket'] is not None and old['ar_bucket'][0] in self.ars
                     and old['ar_bucket'][1] in self.frame_buckets)
                 if compatible and all(old.get(k) == row.get(k) for k in ('mask_file', 'control_file')):
@@ -1763,7 +1802,13 @@ class DirectoryDataset:
         if self.reuse_metadata_cache:
             if regenerate_cache:
                 import uuid
-                self.snapshot_dir = self.geometry_dir / ('refresh_' + uuid.uuid4().hex)
+                # One fresh snapshot per geometry: directories of the same source and geometry
+                # (the same path under other caption settings) share it, and publishing a second
+                # one would leave the first directory's profile behind in an inactive snapshot.
+                refresh = 'refresh_' + uuid.uuid4().hex
+                if _REFRESHED_SNAPSHOTS is not None:
+                    refresh = _REFRESHED_SNAPSHOTS.setdefault(str(self.geometry_dir.resolve()), refresh)
+                self.snapshot_dir = self.geometry_dir / refresh
                 self.snapshot_path = self.snapshot_dir / 'source_metadata'
                 self.cache_dir = self.snapshot_dir / self.profile_key
                 self.cache_dir.joinpath('metadata').mkdir(parents=True, exist_ok=True)
@@ -1783,6 +1828,17 @@ class DirectoryDataset:
                     self.cache_dir.joinpath('metadata').mkdir(parents=True, exist_ok=True)
                     self.grouping_keys_json_file = self.cache_dir / 'metadata' / 'grouping_keys.json'
             trust_cache = True
+        elif trust_cache and self.use_size_buckets and not self.size_buckets_matched_before \
+                and not size_bucket_matching_is_current(self.cache_dir / 'metadata', self.caption_cache_suffix):
+            # Legacy metadata grouped before the size bucket fix put some images in the wrong
+            # bucket for these size_buckets. --trust_cache would serve it as it is.
+            print(f'{self.path}: the cached metadata predates the size_buckets matching fix. Rebuilding it.')
+            trust_cache = False
+            # The buckets' iteration orders index their old rows, and --trust_cache would load
+            # them again over the regrouped ones. Removed before the marker is written, so an
+            # interrupted rebuild removes them again.
+            for iteration_order in self.cache_dir.glob('cache_*/iteration_order*'):
+                shutil.rmtree(iteration_order)
         def check_grouped_metadata():
             all_grouped_metadata_exists = False
             unique_grouping_keys = None
@@ -1851,7 +1907,7 @@ class DirectoryDataset:
             self._report_layout_captions()
 
     def _report_layout_captions(self):
-        buckets = self.size_bucket_datasets if self.use_size_buckets else self.ar_bucket_datasets
+        buckets = self.bucket_datasets()
         # Counted per image: cache_shuffle_num repeats each caption, which is not the user's count.
         total = layout = 0
         for bucket in buckets:
@@ -1883,10 +1939,12 @@ class DirectoryDataset:
         unique_grouping_keys = list(unique_grouping_keys)
 
         if self.use_size_buckets:
+            fingerprints = {}
             for size_bucket, metadata in grouped_metadata.items():
                 metadata = datasets.Dataset.from_dict(metadata)
                 grouped_cache_dir = self.cache_dir / f'metadata/grouped_metadata_{bucket_suffix(size_bucket)}{self.caption_cache_suffix}'
                 metadata.save_to_disk(str(grouped_cache_dir))
+                fingerprints[bucket_suffix(size_bucket)] = metadata._fingerprint
         else:
             for ar_bucket, metadata in grouped_metadata.items():
                 metadata = datasets.Dataset.from_dict(metadata)
@@ -1895,6 +1953,10 @@ class DirectoryDataset:
 
         with open(self.grouping_keys_json_file, 'w') as f:
             json.dump(unique_grouping_keys, f)
+        if self.use_size_buckets:
+            marker = self.cache_dir / f'metadata/size_bucket_matching{self.caption_cache_suffix}.json'
+            with open(marker, 'w') as f:
+                json.dump({'size_bucket_matching': 2, 'grouped': fingerprints}, f)
 
         return unique_grouping_keys
 
@@ -2181,7 +2243,7 @@ class DirectoryDataset:
 
     def _find_closest_size_bucket(self, log_ar, frames, is_video):
         # Best AR bucket is the one with the smallest AR difference in log space.
-        ar_diffs = np.abs(log_ar - self.log_ars)
+        ar_diffs = np.abs(log_ar - self.size_bucket_log_ars)
         candidate_size_buckets = self.size_buckets[np.argsort(ar_diffs, kind='stable')]
         # Find closest size bucket where the number of frames is greater than or equal to the bucket.
         # self.size_buckets was already sorted longest -> shortest frame length
@@ -2224,24 +2286,37 @@ class DirectoryDataset:
             result.extend(ar_bucket_dataset.get_size_bucket_datasets())
         return result
 
-    def cache_latents(self, map_fn, regenerate_cache=False, trust_cache=False, caching_batch_size=1):
-        print(f'caching latents: {self.path}')
-        datasets = self.size_bucket_datasets if self.use_size_buckets else self.ar_bucket_datasets
-        for ds in datasets:
+    def bucket_datasets(self):
+        """The buckets caching goes through one by one, each with caches of its own: a size
+        bucket, or an aspect ratio bucket with all its resolutions."""
+        return self.size_bucket_datasets if self.use_size_buckets else self.ar_bucket_datasets
+
+    def cache_latents(self, map_fn, regenerate_cache=False, trust_cache=False, caching_batch_size=1, takes=None):
+        """takes(bucket) picks the buckets to cache, None all of them: with several nodes caching,
+        each takes the units of work it draws (see tensor_units)."""
+        buckets = [ds for ds in self.bucket_datasets() if takes is None or takes(ds)]
+        if buckets:
+            print(f'caching latents: {self.path}')
+        for ds in buckets:
             ds.cache_latents(map_fn, regenerate_cache=regenerate_cache, trust_cache=trust_cache, caching_batch_size=caching_batch_size)
 
     def cache_text_embeddings(self, map_fn, i, regenerate_cache=False, caching_batch_size=1,
                               text_encoder_key='', keep_text_embedding_cache=False,
-                              identity=None, require_identity=False):
-        print(f'caching text embeddings: {self.path}')
-        datasets_list = self.size_bucket_datasets if self.use_size_buckets else self.ar_bucket_datasets
-        for ds in datasets_list:
+                              identity=None, require_identity=False, takes=None, uncond=True):
+        """takes as in cache_latents; uncond=False leaves the empty caption's embedding, which
+        the directory shares, to another node."""
+        buckets = [ds for ds in self.bucket_datasets() if takes is None or takes(ds)]
+        if buckets:
+            print(f'caching text embeddings: {self.path}')
+        for ds in buckets:
             ds.cache_text_embeddings(
                 map_fn, i, regenerate_cache=regenerate_cache,
                 caching_batch_size=caching_batch_size, text_encoder_key=text_encoder_key,
                 keep_text_embedding_cache=self.keep_text_embedding_cache,
                 identity=identity, require_identity=require_identity,
             )
+        if not uncond:
+            return
         # TODO: do this separately for is_video True and False for models that support it?
         empty_caption_ds = datasets.Dataset.from_dict({'caption': [''], 'is_video': [False], 'image_spec': [(None, None)]})
         if self.reuse_metadata_cache:
@@ -2490,11 +2565,12 @@ class Dataset:
         for ds in self.directory_datasets:
             ds.cache_metadata(regenerate_cache=regenerate_cache, trust_cache=trust_cache)
 
-    def cache_latents(self, map_fn, regenerate_cache=False, trust_cache=False, caching_batch_size=1):
+    def cache_latents(self, map_fn, regenerate_cache=False, trust_cache=False, caching_batch_size=1, takes=None):
         for ds in self.directory_datasets:
-            ds.cache_latents(map_fn, regenerate_cache=regenerate_cache, trust_cache=trust_cache, caching_batch_size=caching_batch_size)
+            ds.cache_latents(map_fn, regenerate_cache=regenerate_cache, trust_cache=trust_cache,
+                             caching_batch_size=caching_batch_size, takes=takes)
 
-    def cache_text_embeddings(self, map_fn, i, regenerate_cache=False, caching_batch_size=1):
+    def cache_text_embeddings(self, map_fn, i, regenerate_cache=False, caching_batch_size=1, takes=None, uncond=True):
         text_encoder_key = getattr(self.model, 'text_encoder_cache_key', lambda _i: '')(i)
         text_encoder_identity = getattr(
             self.model, 'text_encoder_identity', lambda _i: text_encoder_key)(i)
@@ -2509,12 +2585,15 @@ class Dataset:
                 # moving every existing install's cache path, can still declare it here.
                 identity=text_encoder_identity,
                 require_identity=require_identity,
+                takes=takes, uncond=uncond,
             )
-        # some techniques need access to the uncond
-        self.model.uncond_dict = self.directory_datasets[0].uncond_dict
+        if uncond:
+            # some techniques need access to the uncond
+            self.model.uncond_dict = self.directory_datasets[0].uncond_dict
 
 
-def _cache_fn(datasets, queue, preprocess_media_file_fn, num_text_encoders, regenerate_cache, trust_cache, caching_batch_size):
+def _cache_fn(datasets, queue, preprocess_media_file_fn, num_text_encoders, regenerate_cache, trust_cache, caching_batch_size,
+              stage='all', node=0, text_encoder=None):
     # Dataset map() starts a bunch of processes. Make sure torch uses a limited number of threads
     # to avoid CPU contention.
     # TODO: if we ever change Datasets map to use spawn instead of fork, this might not work.
@@ -2524,16 +2603,104 @@ def _cache_fn(datasets, queue, preprocess_media_file_fn, num_text_encoders, rege
     # Alternatively, we could try fixing this by using spawn instead of fork.
     torch.set_num_threads(1)
     try:
-        _cache_datasets(datasets, queue, preprocess_media_file_fn, num_text_encoders, regenerate_cache, trust_cache, caching_batch_size)
+        _cache_datasets(datasets, queue, preprocess_media_file_fn, num_text_encoders, regenerate_cache, trust_cache,
+                        caching_batch_size, stage, node, text_encoder)
     finally:
         # Signal that we're done, also on an error: the GPU ranks stop waiting for work and global
         # rank 0 finds this process's exit code.
         queue.put(None)
 
 
-def _cache_datasets(datasets, queue, preprocess_media_file_fn, num_text_encoders, regenerate_cache, trust_cache, caching_batch_size):
+def metadata_units(datasets):
+    """{source directory: its DirectoryDatasets}, in the order of the dataset configs: what one
+    node caches the metadata of. Directories reading the same source (a train and an eval
+    dataset, or two settings of one directory) share files under it, so one node caches them one
+    after the other, as a single node would."""
+    units = {}
     for ds in datasets:
-        ds.cache_metadata(regenerate_cache=regenerate_cache, trust_cache=trust_cache)
+        for directory in ds.directory_datasets:
+            # The real path: two spellings of one directory (relative, through a symlink) are
+            # one set of files.
+            units.setdefault(os.path.realpath(directory.path), []).append(directory)
+    return units
+
+
+def tensor_unit(bucket):
+    """The unit of work a bucket's caches belong to: its cache directory, or with
+    reuse_metadata_cache that bucket in every caption profile of its snapshot, since a profile
+    caches its latents from another's. Buckets of one unit (also a train and an eval dataset
+    reading the same directory) are cached by one node, one after the other, as a single node
+    would."""
+    directory = bucket.directory_dataset
+    if getattr(directory, 'reuse_metadata_cache', False):
+        return os.path.realpath(directory.snapshot_dir / bucket.cache_dir.name)
+    return os.path.realpath(bucket.cache_dir)
+
+
+def tensor_units(datasets):
+    """Units of work (see tensor_unit), largest first: what one node caches the latents, or the
+    text embeddings, of. The order is the same on every node that loads the same metadata."""
+    rows = defaultdict(int)
+    for ds in datasets:
+        for directory in ds.directory_datasets:
+            for bucket in directory.bucket_datasets():
+                # An aspect ratio bucket is encoded once for each of its resolutions.
+                rows[tensor_unit(bucket)] += len(bucket.metadata_dataset) * len(getattr(bucket, 'resolutions', [None]))
+    return [unit for unit, count in sorted(rows.items(), key=lambda item: (-item[1], item[0]))]
+
+
+def _claim(queue, pool, units):
+    """The index in units of the next unit of work in pool for this node, len(units) or more once
+    there is none left. Every node draws from the same counter, through a GPU rank of its node
+    (see _claim_work), so a node that finishes early takes more."""
+    parent_conn, child_conn = mp.Pipe(duplex=False)
+    queue.put(('claim', pool, hashlib.sha256(json.dumps(units).encode()).hexdigest(), child_conn))
+    return parent_conn.recv()
+
+
+def _work_from_pool(queue, pool, units, work):
+    count = 0
+    while (index := _claim(queue, pool, list(units))) < len(units):
+        unit = list(units)[index]
+        print(f'{socket.gethostname()}: caching {pool} of {unit} ({index + 1} of {len(units)})')
+        work(unit)
+        count += 1
+    print(f'{socket.gethostname()}: cached {pool} of {count} of {len(units)} on this node')
+
+
+def _cache_datasets(datasets, queue, preprocess_media_file_fn, num_text_encoders, regenerate_cache, trust_cache,
+                    caching_batch_size, stage='all', node=0, text_encoder=None):
+    global _REFRESHED_SNAPSHOTS, _regenerate_flattened
+    _REFRESHED_SNAPSHOTS = {}
+    _regenerate_flattened = stage != 'text' or text_encoder == 0
+    try:
+        _cache_stage(datasets, queue, preprocess_media_file_fn, num_text_encoders, regenerate_cache, trust_cache,
+                     caching_batch_size, stage, node, text_encoder)
+    finally:
+        _REFRESHED_SNAPSHOTS = None
+        _regenerate_flattened = True
+
+
+def _cache_stage(datasets, queue, preprocess_media_file_fn, num_text_encoders, regenerate_cache, trust_cache,
+                 caching_batch_size, stage, node, text_encoder):
+    """stage 'all' caches everything here. With several nodes, every node runs stage 'metadata',
+    then 'latents', then 'text' once per text encoder, each taking units of work from a pool all
+    the nodes share until none is left. Each is a round of its own, so a GPU swaps models once,
+    not for every unit, and no two nodes work on one bucket at once: the text encoders of a bucket
+    share its flattened captions."""
+    if stage == 'metadata':
+        units = metadata_units(datasets)
+        _work_from_pool(queue, 'metadata', units, lambda unit: [
+            directory.cache_metadata(regenerate_cache=regenerate_cache, trust_cache=trust_cache)
+            for directory in units[unit]])
+        return
+    if stage in ('latents', 'text'):
+        # Cached in the 'metadata' round; what any rank loads once caching is done.
+        for ds in datasets:
+            ds.cache_metadata(trust_cache=True)
+    else:
+        for ds in datasets:
+            ds.cache_metadata(regenerate_cache=regenerate_cache, trust_cache=trust_cache)
 
     pipes = {}
 
@@ -2590,11 +2757,8 @@ def _cache_datasets(datasets, queue, preprocess_media_file_fn, num_text_encoders
         results['caption'] = captions
         return results
 
-    for ds in datasets:
-        ds.cache_latents(latents_map_fn, regenerate_cache=regenerate_cache, trust_cache=trust_cache, caching_batch_size=caching_batch_size)
-
-    for text_encoder_idx in range(num_text_encoders):
-        def text_embedding_map_fn(example, rank):
+    def text_embedding_map_fn(text_encoder_idx):
+        def fn(example, rank):
             if rank not in pipes:
                 pipes[rank] = mp.Pipe(duplex=False)
             parent_conn, child_conn = pipes[rank]
@@ -2603,8 +2767,48 @@ def _cache_datasets(datasets, queue, preprocess_media_file_fn, num_text_encoders
             result = parent_conn.recv()  # dict
             result['image_spec'] = example['image_spec']
             return result
+        return fn
+
+    def cache_latents(takes=None):
         for ds in datasets:
-            ds.cache_text_embeddings(text_embedding_map_fn, text_encoder_idx+1, regenerate_cache=regenerate_cache, caching_batch_size=caching_batch_size)
+            ds.cache_latents(latents_map_fn, regenerate_cache=regenerate_cache, trust_cache=trust_cache,
+                             caching_batch_size=caching_batch_size, takes=takes)
+
+    def cache_text_embeddings(text_encoder_idx, takes=None, uncond=True):
+        for ds in datasets:
+            ds.cache_text_embeddings(text_embedding_map_fn(text_encoder_idx), text_encoder_idx+1,
+                                     regenerate_cache=regenerate_cache, caching_batch_size=caching_batch_size,
+                                     takes=takes, uncond=uncond)
+
+    if stage == 'all':
+        cache_latents()
+        for text_encoder_idx in range(num_text_encoders):
+            cache_text_embeddings(text_encoder_idx)
+        return
+
+    units = tensor_units(datasets)
+
+    def taking(unit):
+        return lambda bucket: tensor_unit(bucket) == unit
+
+    if stage == 'latents':
+        _work_from_pool(queue, 'latents', units, lambda unit: cache_latents(taking(unit)))
+        return
+
+    def text_embeddings(text_encoder_idx, unit):
+        takes = taking(unit)
+        # An aspect ratio bucket makes the size buckets its text embeddings go to while it caches
+        # its latents, which may have been on another node: load those here.
+        for ds in datasets:
+            ds.cache_latents(None, trust_cache=True, takes=lambda bucket: (
+                takes(bucket) and isinstance(bucket, ARBucketDataset) and not bucket.size_buckets))
+        cache_text_embeddings(text_encoder_idx, takes, uncond=False)
+
+    _work_from_pool(queue, f'text embeddings {text_encoder + 1}', units,
+                    lambda unit: text_embeddings(text_encoder, unit))
+    if node == 0:
+        # The empty caption's embedding is the directory's, not a bucket's.
+        cache_text_embeddings(text_encoder, takes=lambda bucket: False)
 
 
 # How long ranks that do no caching wait for the ones that do: caching millions of images takes
@@ -2612,6 +2816,10 @@ def _cache_datasets(datasets, queue, preprocess_media_file_fn, num_text_encoders
 CACHING_WAIT = timedelta(days=7)
 # How often the ranks taking caching work look for a failure while the queue is empty.
 CACHING_POLL_SECONDS = 10
+# How often each rank tells the store it is alive while caching, and how long a rank may stay
+# silent before the others take it for dead (see _Liveness).
+CACHING_HEARTBEAT_SECONDS = 30
+CACHING_SILENCE = timedelta(minutes=15)
 _caching_rounds = 0
 
 
@@ -2620,9 +2828,10 @@ def _share_work_queue():
     others; error is this rank's failure to connect to it.
 
     Global rank 0 serves the queue from a multiprocess Manager, behind a Unix socket in its own
-    machine's /tmp, so only the ranks on that machine can connect. Ranks on other nodes used to be
-    sent it too and failed to connect; they now do no caching and wait for it to finish. The
-    manager is returned on rank 0 only, to be kept alive while the queue is in use.
+    machine's /tmp, so only the ranks on that machine can connect; ranks on other nodes do no
+    caching and wait for it to finish. That is caching on one node, or with multi_node_caching
+    off (_share_node_queues has the queues of caching on every node). The manager is returned on
+    rank 0 only, to be kept alive while the queue is in use.
     """
     error = None
     if is_main_process():
@@ -2663,10 +2872,10 @@ def _report_caching(round_, ok):
     torch.distributed.distributed_c10d._get_default_store().set(_caching_key(round_), 'ok' if ok else 'failed')
 
 
-def _wait_for_caching(round_):
+def _wait_for_caching(round_, liveness):
     # The rendezvous store rather than a barrier: a barrier would time out long before caching ends.
     store = torch.distributed.distributed_c10d._get_default_store()
-    store.wait([_caching_key(round_)], CACHING_WAIT)
+    _wait_in_store([_caching_key(round_)], liveness)
     if store.get(_caching_key(round_)) != b'ok':
         raise RuntimeError('Dataset caching failed on global rank 0: see its log')
 
@@ -2679,7 +2888,68 @@ def _abort_caching(round_):
     torch.distributed.distributed_c10d._get_default_store().set(_abort_key(round_), '1')
 
 
-def _work_on_queue(queue, handle_task, process, round_):
+class _Liveness:
+    """Every rank beats a counter in the store from a thread while a round of caching runs, and
+    the ranks that wait (for a task, or for other nodes) watch the others' counters. A rank that
+    dies (killed for memory, say) answers no task and reports nothing: without this, its node's
+    caching process would wait for its answer forever and every rank would wait out CACHING_WAIT.
+    Counters, not clocks, so the nodes' clocks need not agree."""
+
+    def __init__(self, round_):
+        self.round_ = round_
+        self.store = torch.distributed.distributed_c10d._get_default_store()
+        self.seen = {}
+        self.checked = None
+        self.stop = threading.Event()
+        self.thread = threading.Thread(target=self._beat, daemon=True)
+        self.thread.start()
+
+    def _key(self, rank):
+        return f'{_caching_key(self.round_)}_alive{rank}'
+
+    def _beat(self):
+        key = self._key(dist.get_rank())
+        while True:
+            try:
+                self.store.add(key, 1)
+            except Exception:
+                # The store is out of reach: to the others this rank falls silent, as it should.
+                pass
+            if self.stop.wait(CACHING_HEARTBEAT_SECONDS):
+                return
+
+    def check(self):
+        """Raise if a rank has been silent for CACHING_SILENCE. Looks at most once a beat."""
+        now = time.monotonic()
+        if self.checked is not None and now - self.checked < CACHING_HEARTBEAT_SECONDS:
+            return
+        self.checked = now
+        for rank in range(dist.get_world_size()):
+            count = self.store.add(self._key(rank), 0)
+            if rank not in self.seen or self.seen[rank][0] != count:
+                self.seen[rank] = (count, now)
+            elif now - self.seen[rank][1] > CACHING_SILENCE.total_seconds():
+                raise RuntimeError(f'Global rank {rank} has given no sign of life for {CACHING_SILENCE} during '
+                                   'dataset caching: it may have died, see its log')
+
+    def close(self):
+        self.stop.set()
+        self.thread.join()
+
+
+def _wait_in_store(keys, liveness):
+    """Wait until every key is set: a poll rather than store.wait, to notice a dead rank, which
+    would never set its key."""
+    store = torch.distributed.distributed_c10d._get_default_store()
+    deadline = time.monotonic() + CACHING_WAIT.total_seconds()
+    while not store.check(keys):
+        if time.monotonic() > deadline:
+            raise RuntimeError(f'Dataset caching did not finish within {CACHING_WAIT}')
+        liveness.check()
+        time.sleep(CACHING_POLL_SECONDS)
+
+
+def _work_on_queue(queue, handle_task, process, round_, liveness):
     """Take caching tasks until the caching process is done. `process` is that process on global
     rank 0, None elsewhere.
 
@@ -2697,6 +2967,7 @@ def _work_on_queue(queue, handle_task, process, round_):
                 if process is not None and not process.is_alive():
                     raise RuntimeError(f'The dataset caching process ended with exit code {process.exitcode} '
                                        'before finishing: see its log')
+                liveness.check()
                 continue
             if task is None:
                 # Propagate None so all worker processes break out of this loop.
@@ -2719,6 +2990,7 @@ def _run_caching(queue, handle_task, process, round_, error=None):
     error is a failure of this rank while setting the round up: it then takes no work, and tells
     the ranks taking work to stop.
     """
+    liveness = _Liveness(round_)
     try:
         if error is not None:
             _abort_caching(round_)
@@ -2728,11 +3000,13 @@ def _run_caching(queue, handle_task, process, round_, error=None):
             if int(os.environ.get('LOCAL_RANK', '0')) == 0:
                 print(f'{socket.gethostname()}: dataset caching runs on the GPUs of global rank 0\'s node; '
                       'waiting for it')
-            _wait_for_caching(round_)
+            _wait_for_caching(round_, liveness)
         else:
-            _work_on_queue(queue, handle_task, process, round_)
+            _work_on_queue(queue, handle_task, process, round_, liveness)
     except Exception as e:
         error = e
+    finally:
+        liveness.close()
     if is_main_process():
         if process is not None:
             if process.is_alive():
@@ -2742,11 +3016,128 @@ def _run_caching(queue, handle_task, process, round_, error=None):
     all_ok(error)
 
 
+def _node_layout():
+    """(node, nodes, leader): this rank's node, numbered in the order of the nodes' lowest global
+    ranks (global rank 0's node is 0), the number of nodes, and whether this rank is the lowest of
+    its node. A node is a hostname."""
+    hosts = [None] * dist.get_world_size()
+    torch.distributed.all_gather_object(hosts, socket.gethostname(), group=dist.get_world_group())
+    rank = dist.get_rank()
+    nodes = list(dict.fromkeys(hosts))
+    return nodes.index(hosts[rank]), len(nodes), hosts.index(hosts[rank]) == rank
+
+
+def _share_node_queues(leader):
+    """(queue, manager, error) as _share_work_queue, for a queue on every node: the lowest rank of
+    each node serves one to the ranks of its node."""
+    error = None
+    entry = None
+    if leader:
+        try:
+            manager = mp.Manager()
+            queue = manager.Queue()
+            entry = (socket.gethostname(), manager.address, pickle.dumps(queue))
+        except Exception as e:
+            error = e
+            entry = 'failed'
+    entries = [None] * dist.get_world_size()
+    torch.distributed.all_gather_object(entries, entry, group=dist.get_world_group())
+    if 'failed' in entries:
+        if error is not None:
+            raise error
+        raise RuntimeError(f'Dataset caching could not start on global rank {entries.index("failed")}: see its log')
+    if leader:
+        return queue, manager, None
+    host = socket.gethostname()
+    _, address, payload = next(e for e in entries if e is not None and e[0] == host)
+    if str(address).startswith('/') and not os.path.exists(address):
+        return None, None, RuntimeError(
+            f'{host} cannot reach the caching queue of its node at {address}: does another machine have '
+            'the same hostname?')
+    try:
+        return pickle.loads(payload), None, None
+    except Exception as e:
+        return None, None, e
+
+
+def _claim_work(round_, pool, units_digest):
+    """The next index of pool's counter, for a node's caching process (see _claim). The first
+    claim records the digest of the units the counter indexes; a node that sees other units (other
+    metadata) fails rather than cache the wrong ones."""
+    store = torch.distributed.distributed_c10d._get_default_store()
+    key = f'{_caching_key(round_)}_{pool}'
+    if store.compare_set(key + '_units', '', units_digest).decode() != units_digest:
+        raise RuntimeError(
+            f'{socket.gethostname()} sees other dataset {pool} work than another node: every node must read the '
+            'same dataset configs, and cache files from a volume they share')
+    return store.add(key, 1) - 1
+
+
+def _with_claims(round_, handle_task):
+    """handle_task for a round in which caching processes draw work from pools: claims are
+    answered here, everything else goes to handle_task."""
+    def handle(task):
+        if task[0] == 'claim':
+            _, pool, units_digest, pipe = task
+            pipe.send(_claim_work(round_, pool, units_digest))
+        else:
+            handle_task(task)
+    return handle
+
+
+def _node_key(round_, node):
+    return f'{_caching_key(round_)}_node{node}'
+
+
+def _wait_for_nodes(round_, nodes, liveness):
+    store = torch.distributed.distributed_c10d._get_default_store()
+    keys = [_node_key(round_, node) for node in range(nodes)]
+    _wait_in_store(keys, liveness)
+    failed = [node for node, key in enumerate(keys) if store.get(key) != b'ok']
+    if failed:
+        raise RuntimeError(f'Dataset caching failed on node(s) {failed} (numbered by their lowest global rank): '
+                           'see their logs')
+
+
+def _run_caching_on_every_node(queue, handle_task, process, round_, node, nodes, leader, error=None):
+    """_run_caching for a round in which every node works through a queue of its own. The lowest
+    rank of each node reports how its node did, and every rank waits for every node in the store:
+    one node's share takes hours, far past a collective's timeout. A rank that fails sets the
+    abort key, which stops the ranks of every node."""
+    liveness = _Liveness(round_)
+    try:
+        if error is not None:
+            _abort_caching(round_)
+        else:
+            _work_on_queue(queue, handle_task, process, round_, liveness)
+    except Exception as e:
+        error = e
+    if leader:
+        if process is not None:
+            if process.is_alive():
+                process.terminate()
+            process.join()
+        torch.distributed.distributed_c10d._get_default_store().set(
+            _node_key(round_, node), 'ok' if error is None else 'failed')
+    try:
+        _wait_for_nodes(round_, nodes, liveness)
+    except Exception as e:
+        if error is None:
+            error = e
+    finally:
+        liveness.close()
+    all_ok(error)
+
+
 # Helper class to make caching multiple datasets more efficient by moving
 # models to GPU as few times as needed.
 class DatasetManager:
-    def __init__(self, model, regenerate_cache=False, trust_cache=False, caching_batch_size=1, keep_models_loaded=False):
+    def __init__(self, model, regenerate_cache=False, trust_cache=False, caching_batch_size=1, keep_models_loaded=False,
+                 multi_node=True):
         self.model = model
+        # With several nodes, each caches its share of the buckets on its own GPUs. Off, global
+        # rank 0's node caches everything while the others wait.
+        self.multi_node = multi_node
         self.vae = self.model.get_vae()
         self.text_encoders = self.model.get_text_encoders()
         self.submodels = [self.vae] + list(self.text_encoders)
@@ -2772,33 +3163,18 @@ class DatasetManager:
     # Mix and match native multiprocessing / torch.multiprocessing and multiprocess at your peril! Things can break.
     # In patches.py we register reductions so Tensors sent over Queues and Pipes are efficient just like in torch.multiprocessing.
     def cache(self, unload_models=True):
-        global _caching_rounds
-        _caching_rounds += 1
-        queue, manager, error = _share_work_queue()
-
-        # start up a process to run through the dataset caching flow
-        process = None
-        if is_main_process():
-            try:
-                process = mp.Process(
-                    target=_cache_fn,
-                    args=(
-                        self.datasets,
-                        queue,
-                        self.model.get_preprocess_media_file_fn(),
-                        len(self.text_encoders),
-                        self.regenerate_cache,
-                        self.trust_cache,
-                        self.caching_batch_size,
-                    )
-                )
-                process.start()
-            except Exception as e:
-                process = None
-                error = e
-
-        # loop on the original processes (one per GPU) to handle tasks requiring GPU models (VAE, text encoders)
-        _run_caching(queue, self._handle_task, process, _caching_rounds, error)
+        node, nodes, leader = _node_layout() if self.multi_node else (0, 1, is_main_process())
+        if nodes == 1:
+            self._cache_on_rank_0s_node()
+        else:
+            # Every node takes directories, then buckets, from pools they share, until none are
+            # left. Each round ends on every node before the next begins: the metadata of every
+            # directory is cached before any bucket is drawn, the latents of every bucket before
+            # any text embedding, and one text encoder's embeddings before the next encoder's.
+            self._cache_on_every_node('metadata', node, nodes, leader)
+            self._cache_on_every_node('latents', node, nodes, leader)
+            for text_encoder in range(len(self.text_encoders)):
+                self._cache_on_every_node('text', node, nodes, leader, text_encoder=text_encoder)
 
         if unload_models:
             # Free memory in all unneeded submodels. This is easier than trying to delete every reference.
@@ -2817,12 +3193,65 @@ class DatasetManager:
 
         dist.barrier()
 
-        # Now load all datasets from cache.
-        for ds in self.datasets:
-            ds.cache_metadata(trust_cache=True)
-            ds.cache_latents(None, trust_cache=True)
-            for i in range(1, len(self.text_encoders)+1):
-                ds.cache_text_embeddings(None, i)
+        # Now load all datasets from cache. A rank that cannot fails every rank, rather than leave
+        # the others waiting in the next collective until it times out.
+        error = None
+        try:
+            for ds in self.datasets:
+                ds.cache_metadata(trust_cache=True)
+                ds.cache_latents(None, trust_cache=True)
+                for i in range(1, len(self.text_encoders)+1):
+                    ds.cache_text_embeddings(None, i)
+        except Exception as e:
+            error = e
+        all_ok(error)
+
+    def _start_caching_process(self, queue, **stage):
+        # start up a process to run through the dataset caching flow
+        process = mp.Process(
+            target=_cache_fn,
+            args=(
+                self.datasets,
+                queue,
+                self.model.get_preprocess_media_file_fn(),
+                len(self.text_encoders),
+                self.regenerate_cache,
+                self.trust_cache,
+                self.caching_batch_size,
+            ),
+            kwargs=stage,
+        )
+        process.start()
+        return process
+
+    def _cache_on_rank_0s_node(self):
+        """All of caching on the GPUs of global rank 0's node."""
+        global _caching_rounds
+        _caching_rounds += 1
+        round_ = _caching_rounds
+        queue, manager, error = _share_work_queue()
+        process = None
+        if is_main_process():
+            try:
+                process = self._start_caching_process(queue)
+            except Exception as e:
+                error = e
+        # loop on the original processes (one per GPU) to handle tasks requiring GPU models (VAE, text encoders)
+        _run_caching(queue, self._handle_task, process, round_, error)
+
+    def _cache_on_every_node(self, stage, node, nodes, leader, **text_encoder):
+        global _caching_rounds
+        _caching_rounds += 1
+        round_ = _caching_rounds
+        queue, manager, error = _share_node_queues(leader)
+        process = None
+        if leader:
+            try:
+                process = self._start_caching_process(queue, stage=stage, node=node, **text_encoder)
+            except Exception as e:
+                error = e
+        _run_caching_on_every_node(queue, _with_claims(round_, self._handle_task), process, round_, node, nodes,
+                                   leader, error)
 
     @torch.no_grad()
     def _handle_task(self, task):

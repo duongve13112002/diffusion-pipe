@@ -5,6 +5,7 @@ import io
 import json
 import logging
 import os
+import socket
 from pathlib import Path
 import sqlite3
 
@@ -63,7 +64,8 @@ class DigestIndex:
         return np.where(self.keys[position] == keys, self.values[position], -1)
 
     def save(self, path):
-        temporary = path.with_name(f'{path.name}.{os.getpid()}.tmp')
+        # The host too: nodes caching at once share the volume, and their pids can coincide.
+        temporary = path.with_name(f'{path.name}.{socket.gethostname()}-{os.getpid()}.tmp')
         with open(temporary, 'wb') as handle:
             np.savez(handle, keys=self.keys, values=self.values)
         os.replace(temporary, path)
@@ -354,7 +356,8 @@ class IndexedTextEmbeddingDataset:
             return
         starts = np.asarray(starts, dtype=np.int64)[order]
         counts = np.asarray(counts, dtype=np.int32)[order]
-        temporary = arrays_path.with_name(f'{arrays_path.name}.{os.getpid()}.tmp')
+        # Every rank of every node may build it at once when loading; pods started alike can share a pid.
+        temporary = arrays_path.with_name(f'{arrays_path.name}.{socket.gethostname()}-{os.getpid()}.tmp')
         with open(temporary, 'wb') as handle:
             np.savez(handle, fingerprint=np.asarray(metadata._fingerprint),
                      hashes=hashes, starts=starts, counts=counts)

@@ -329,7 +329,7 @@ def plan_legacy_directory(plan, donor, target_model, force, sample, header_sampl
     """reuse_metadata_cache = false: plan copying the donor's legacy metadata/ into the target's."""
     import re
     import datasets
-    from utils.dataset import LEGACY_CAPTION_SETTINGS
+    from utils.dataset import LEGACY_CAPTION_SETTINGS, size_bucket_matching_is_current
     target = plan.target
     plan.legacy = True
     suffix = target.caption_cache_suffix
@@ -368,6 +368,11 @@ def plan_legacy_directory(plan, donor, target_model, force, sample, header_sampl
         plan.note(f'{donor_metadata}: grouped metadata missing for buckets {missing[:3]}; the donor scan did not '
                   'finish.')
         return plan
+    if (target.use_size_buckets and not target.size_buckets_matched_before
+            and not size_bucket_matching_is_current(donor_metadata, suffix)):
+        plan.note(f'{donor_metadata} was grouped before the size_buckets matching fix, which put some images '
+                  'in the wrong bucket for these size_buckets. Let training rebuild it.')
+        return plan
     bad = _bucket_mismatch(target, keys)
     if bad:
         plan.note(f'donor buckets {bad[:3]} are not among this dataset\'s buckets: the bucketing settings changed '
@@ -405,7 +410,8 @@ def plan_legacy_directory(plan, donor, target_model, force, sample, header_sampl
 
     pattern = re.compile(rf'^(metadata_intermediate|metadata_with_captions\.arrow|'
                          rf'metadata{re.escape(suffix)}(_\d+_of_\d+)?\.arrow|'
-                         rf'{re.escape(keys_file.name)}|{re.escape(settings_file.name)})$')
+                         rf'{re.escape(keys_file.name)}|{re.escape(settings_file.name)}|'
+                         rf'size_bucket_matching{re.escape(suffix)}\.json)$')
     grouped_names = {_grouped_name(key, suffix) for key in keys}
     plan.legacy_entries = sorted(p.name for p in donor_metadata.iterdir()
                                  if p.name in grouped_names or pattern.match(p.name))

@@ -136,6 +136,11 @@ caching_batch_size = 1
 # especially for video data.
 #map_num_proc = 32
 
+# With several nodes, every node caches: directories (metadata), then buckets (latents and text
+# embeddings), taken from pools the nodes share (default true). false caches everything on global
+# rank 0's node.
+#multi_node_caching = true
+
 # Use torch.compile on the model. Can speed up training throughput by a decent amount. Not tested on all models.
 #compile = true
 

@@ -14,6 +14,7 @@ import gc
 import sys
 from pathlib import Path
 
+import numpy as np
 import pytest
 import toml
 import torch
@@ -157,6 +158,74 @@ class TestDirectoryDatasetConstruction:
         ds.cache_metadata()
         captions = cached_captions(ds)
         assert captions[0] == ['x, y'], 'the marker must never reach the text encoder'
+
+
+class TestSizeBucketMatching:
+    """Media go to the size bucket of the closest aspect ratio, whatever order the buckets are
+    listed in. The buckets used to be matched against the deduplicated, sorted aspect ratios, so
+    the index picked another bucket, and with image and video buckets every image was dropped."""
+
+    SIZES = {'square': (64, 64), 'wide': (96, 64), 'tall': (64, 96)}
+
+    def build(self, tmp_path, size_buckets, reuse_metadata_cache=False):
+        d = tmp_path / 'imgs'
+        d.mkdir(parents=True)
+        for name, size in self.SIZES.items():
+            Image.new('RGB', size, (128, 128, 128)).save(d / f'{name}.png')
+            (d / f'{name}.txt').write_text(name)
+        ds = DirectoryDataset(directory_config(d, size_buckets=size_buckets, reuse_metadata_cache=reuse_metadata_cache),
+                              {'resolutions': [64]}, 'test_model', skip_dataset_validation=True)
+        ds.cache_metadata()
+        return ds
+
+    @staticmethod
+    def buckets_by_image(ds):
+        return {Path(spec[1]).stem: tuple(bucket.size_bucket)
+                for bucket in ds.size_bucket_datasets for spec in bucket.metadata_dataset['image_spec']}
+
+    @pytest.mark.parametrize('size_buckets', [
+        [[64, 64, 1], [96, 64, 1], [64, 96, 1]],
+        [[64, 96, 1], [64, 64, 1], [96, 64, 1]],
+        [[64, 64, 1], [96, 64, 1], [64, 96, 1], [64, 64, 33], [96, 64, 33], [64, 96, 33]],
+    ])
+    def test_each_image_goes_to_the_bucket_of_its_aspect_ratio(self, tmp_path, size_buckets):
+        ds = self.build(tmp_path, size_buckets)
+        assert self.buckets_by_image(ds) == {'square': (64, 64, 1), 'wide': (96, 64, 1), 'tall': (64, 96, 1)}
+
+    def test_buckets_the_old_matching_got_right_keep_its_answers(self, tmp_path):
+        # 1225x1500 lies all but exactly between 2:3 and 1:1; the old matching compared it with
+        # the aspect ratios rounded to 3 digits, which tips it to 2:3.
+        d = tmp_path / 'imgs'
+        d.mkdir()
+        Image.new('RGB', (1225, 1500), (128, 128, 128)).save(d / 'edge.png')
+        (d / 'edge.txt').write_text('edge')
+        ds = DirectoryDataset(directory_config(d, size_buckets=[[512, 768, 1], [640, 640, 1], [768, 512, 1]]),
+                              {'resolutions': [64]}, 'test_model', skip_dataset_validation=True)
+        assert ds.size_buckets_matched_before
+        ds.cache_metadata()
+        assert self.buckets_by_image(ds) == {'edge': (512, 768, 1)}
+
+    def test_snapshots_of_buckets_the_old_matching_got_wrong_are_rebuilt(self, tmp_path):
+        ordered = self.build(tmp_path / 'ordered', [[64, 96, 1], [64, 64, 1], [96, 64, 1]], reuse_metadata_cache=True)
+        assert 'size_bucket_matching' not in ordered.snapshot_geometry()
+        unordered = self.build(tmp_path / 'unordered', [[64, 64, 1], [96, 64, 1], [64, 96, 1]], reuse_metadata_cache=True)
+        assert unordered.snapshot_geometry()['size_bucket_matching'] == 2
+
+    def test_legacy_metadata_from_the_old_matching_is_not_carried_into_a_snapshot(self, tmp_path, monkeypatch):
+        size_buckets = [[64, 64, 1], [96, 64, 1], [64, 96, 1]]
+
+        def old_matching(self, log_ar, frames, is_video):
+            return self.size_buckets[np.argsort(np.abs(log_ar - self.log_ars), kind='stable')][0]
+
+        with monkeypatch.context() as patch:
+            patch.setattr(DirectoryDataset, '_find_closest_size_bucket', old_matching)
+            legacy = self.build(tmp_path, size_buckets)
+        assert self.buckets_by_image(legacy)['square'] == (96, 64, 1)
+        d = tmp_path / 'imgs'
+        snapshot = DirectoryDataset(directory_config(d, size_buckets=size_buckets, reuse_metadata_cache=True),
+                                    {'resolutions': [64]}, 'test_model', skip_dataset_validation=True)
+        snapshot.cache_metadata()
+        assert self.buckets_by_image(snapshot) == {'square': (64, 64, 1), 'wide': (96, 64, 1), 'tall': (64, 96, 1)}
 
 
 class TestCaptionSampling:

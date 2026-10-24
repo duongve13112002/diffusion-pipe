@@ -14,6 +14,9 @@ Models supported: SDXL, Flux, LTX-Video, HunyuanVideo (t2v), Cosmos, Lumina Imag
 - Optional OPLoRA (orthogonal projection LoRA) to reduce catastrophic forgetting when training LoRAs
 
 ## Recent changes
+- 2026-10-24
+  - Fixed `size_buckets`: media were matched to a bucket by an index into the sorted, deduplicated aspect ratios, so unless the buckets were listed in increasing aspect ratio (each ratio once), images went to a bucket of another aspect ratio, and with image and video buckets together every image was dropped. Datasets whose buckets were affected rebuild their metadata and latent caches on the next run, `--trust_cache` included, and `tools/inherit_metadata_cache.py` refuses to copy metadata grouped before the fix.
+  - Dataset caching on several nodes: the nodes take directories (metadata), then buckets (latents and text embeddings), from pools they share until none are left. See [multi-node training](#multi-node-training).
 - 2026-10-16
   - Support MOSS-Image (Base and SFT): LoRA, LoKr, OPLoRA and full fine-tuning, from a diffusers directory or ComfyUI single files (fp8 and comfy-quant included). See [supported models](docs/supported_models.md#moss-image) and `examples/moss_image/`. The transformer is ComfyUI's native MOSS-Image, and saved adapters and fine-tunes load in ComfyUI's own loaders.
   - Layout (JSON) captions for MOSS-Image and Ideogram4: a caption file holding the model's JSON prompt has its boxes rewritten for each bucket's crop, and tag operations skip it. Detection is per caption. The caption cache key of these two models changes, so their caption caches are rebuilt.
@@ -308,8 +311,18 @@ the launcher's port.
 - `output_dir` and the dataset directories (their `cache` folders) must be on a volume that every
   node shares, such as NFS or a ReadWriteMany PVC. Training checks `output_dir` at start; pipeline
   stages pass saved weights to stage 0 through it.
-- Dataset caching runs on the GPUs of global rank 0's node; the other nodes wait for it and then
-  read the cache from the shared volume. A caching failure stops every node.
+- Dataset caching runs on every node, from pools of work the nodes share: a node that finishes a
+  unit takes the next one, so faster nodes and lighter units even out by themselves. First the
+  metadata, one `[[directory]]` at a time (entries reading the same `path` count as one), then,
+  once every directory's metadata is cached, the latents, one bucket at a time, largest first (a
+  size bucket, or a whole aspect ratio bucket with all its resolutions), and after them the text
+  embeddings, bucket by bucket again, one text encoder at a time: each round ends on every node
+  before the next starts, so a GPU swaps models once per round. Every node then reads the whole cache from the
+  shared folders. A directory or a bucket is the
+  smallest unit, so a dataset with fewer of them than nodes leaves some nodes idle, and one very
+  large directory has its metadata cached by one node. A caching failure on any node stops every
+  node, and so does a rank that gives no sign of life for 15 minutes (a killed or hung process),
+  rather than leaving the others waiting. `multi_node_caching = false` caches everything on global rank 0's node instead, as before.
 - Network: over Ethernet, set `NCCL_SOCKET_IFNAME` and `GLOO_SOCKET_IFNAME` to the interface the
   nodes reach each other on. Over InfiniBand, give the pods the RDMA device (and `IPC_LOCK`), and set
   `NCCL_IB_HCA` if needed. With `NCCL_DEBUG=INFO`, the log shows `NET/IB` rather than `NET/Socket`
