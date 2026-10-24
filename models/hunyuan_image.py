@@ -77,7 +77,7 @@ class HunyuanImagePipeline(BasePipeline):
             if 'lm_head' in key:
                 key = 'lm_head.weight'
             set_module_tensor_to_device(text_encoder, key, device='cpu', dtype=dtype, value=tensor)
-        self.text_encoder = text_encoder
+        self.text_encoder = text_encoder.eval()
 
         self.byt5_tokenizer = transformers.ByT5Tokenizer.from_pretrained('configs/hunyuan_image/byt5-small', local_files_only=True)
 
@@ -86,7 +86,8 @@ class HunyuanImagePipeline(BasePipeline):
             byt5_full_model = transformers.T5ForConditionalGeneration(byt5_config)
         for key, tensor in iterate_safetensors(self.model_config['byt5_path']):
             set_module_tensor_to_device(byt5_full_model, key, device='cpu', dtype=dtype, value=tensor)
-        self.byt5_text_encoder = byt5_full_model.get_encoder()
+        # Built from its config, so in train mode: its dropout (0.1) would noise every embedding.
+        self.byt5_text_encoder = byt5_full_model.get_encoder().eval()
 
     def load_diffusion_model(self):
         dtype = self.model_config['dtype']
@@ -122,6 +123,13 @@ class HunyuanImagePipeline(BasePipeline):
 
     def get_text_encoders(self):
         return [self.text_encoder, self.byt5_text_encoder]
+
+    def text_encoder_cache_key(self, i):
+        # i counts from 1. ByT5 embeddings cached before it was put in eval mode carry its dropout.
+        return 'byt5-eval' if i == 2 else ''
+
+    def text_encoder_requires_identity(self, i):
+        return i == 2
 
     def save_adapter(self, save_dir, peft_state_dict):
         self.peft_config.save_pretrained(save_dir)

@@ -25,6 +25,7 @@ from utils import common
 from utils.common import is_main_process, get_rank, DTYPE_MAP, empty_cuda_cache, all_ok
 import utils.saver
 from utils.isolate_rng import isolate_rng
+from utils.text_encoding import TextEncodingOnTheFly, encodes_text_in_loader
 from utils.patches import apply_patches
 from utils.unsloth_utils import unsloth_checkpoint
 from utils.pipeline import ManualPipelineModule
@@ -469,6 +470,10 @@ if __name__ == '__main__':
     caching_batch_size = config.get('caching_batch_size', 1)
     dataset_manager = dataset_util.DatasetManager(model, regenerate_cache=regenerate_cache, trust_cache=args.trust_cache, caching_batch_size=caching_batch_size, keep_models_loaded=args.test_sample,
                                                   multi_node=config['multi_node_caching'])
+    # cache_text_embeddings = false on a model that does not encode its captions itself: its text
+    # encoders encode each batch's captions in the training process instead of filling a cache.
+    text_encoding = (TextEncodingOnTheFly(model, caching_batch_size=caching_batch_size)
+                     if encodes_text_in_loader(model) else None)
 
     # The batch fill keys belong in the dataset config, but several training configs share one
     # dataset TOML, so the same keys are accepted here and win. Applied to the eval datasets
@@ -572,8 +577,9 @@ if __name__ == '__main__':
 
     # Free up as much RAM as we can.
     del dataset_manager
-    if config['model'].get('cache_text_embeddings', True) and not args.test_sample:
+    if (config['model'].get('cache_text_embeddings', True) or text_encoding is not None) and not args.test_sample:
         # Only ComfyUI-based models, and only if we are caching text embeddings (which most models require).
+        # text_encoding holds its own references to the text encoders, so only the VAE goes then.
         model.free_vae_and_te()
 
     if args.test_sample:
@@ -648,9 +654,9 @@ if __name__ == '__main__':
     if blocks_to_swap := config.get('blocks_to_swap', 0):
         assert config['pipeline_stages'] == 1, 'Block swapping only works with pipeline_stages=1'
         assert 'adapter' in config, 'Block swapping only works when training LoRA'
-        assert (config['model'].get('cache_text_embeddings', True)
+        assert (config['model'].get('cache_text_embeddings', True) or text_encoding is not None
                 or getattr(model, 'block_swap_supports_uncached_text_embeddings', False)), (
-            'blocks_to_swap cannot be combined with cache_text_embeddings = false. Block '
+            'blocks_to_swap cannot be combined with cache_text_embeddings = false for this model. Block '
             'swapping replaces PipelineModule.to with a no-op and moves only the transformer to '
             'CUDA, so a resident text encoder -- which lives on the pipeline layer, not the '
             'transformer -- silently stays on CPU and returns CPU embeddings into a CUDA batch. '
@@ -908,6 +914,7 @@ if __name__ == '__main__':
         # More than one worker pays off when the dataset decodes media at __getitem__ time
         # (models with load_media_on_the_fly, e.g. iris); cached latents need only the default.
         num_dataloader_workers=config.get('dataloader_workers', 1),
+        text_encoding=text_encoding,
     )
     steps_per_epoch = len(train_dataloader) // model_engine.gradient_accumulation_steps()
 
@@ -982,7 +989,8 @@ if __name__ == '__main__':
             pg['lr'] = config['force_constant_lr']
 
     eval_dataloaders = {
-        name: dataset_util.PipelineDataLoader(eval_data, model_engine, config['eval_gradient_accumulation_steps'], model, num_dataloader_workers=0)
+        name: dataset_util.PipelineDataLoader(eval_data, model_engine, config['eval_gradient_accumulation_steps'], model,
+                                              num_dataloader_workers=0, text_encoding=text_encoding)
         for name, eval_data in eval_data_map.items()
     }
 

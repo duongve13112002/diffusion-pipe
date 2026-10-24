@@ -15,6 +15,8 @@ Models supported: SDXL, Flux, LTX-Video, HunyuanVideo (t2v), Cosmos, Lumina Imag
 
 ## Recent changes
 - 2026-10-24
+  - `cache_text_embeddings = false` works for every model: the latents stay cached and each batch's captions are encoded during training with the model's own text encoders, giving the same embeddings the cache would (at the default `caching_batch_size = 1`). Before, models other than Wan, Cosmos-Predict2/Anima, Iris and MOSS-Image ignored the setting and cached anyway. See [text embeddings: cached or on the fly](#text-embeddings-cached-or-on-the-fly).
+  - Fixed AuraFlow's UMT5 and HunyuanImage-2.1's ByT5 text encoders running in train mode: their dropout (0.1) noised every cached embedding. Their text embedding caches are rebuilt on the next run (latents are kept). AuraFlow also no longer encodes an unused negative prompt per caption.
   - Fixed `size_buckets`: media were matched to a bucket by an index into the sorted, deduplicated aspect ratios, so unless the buckets were listed in increasing aspect ratio (each ratio once), images went to a bucket of another aspect ratio, and with image and video buckets together every image was dropped. Datasets whose buckets were affected rebuild their metadata and latent caches on the next run, `--trust_cache` included, and `tools/inherit_metadata_cache.py` refuses to copy metadata grouped before the fix.
   - Dataset caching on several nodes: the nodes take directories (metadata), then buckets (latents and text embeddings), from pools they share until none are left. See [multi-node training](#multi-node-training).
   - With `reuse_metadata_cache = false`, `--trust_cache` no longer reuses metadata grouped for other buckets: the buckets (aspect ratios, frame buckets or `size_buckets`) are recorded with the grouping, and a change rescans the dataset, as a run without `--trust_cache` does. Metadata grouped before this is checked against the current buckets, and an interrupted scan is never trusted. A train and an eval dataset reading one directory with the same caption settings must use the same buckets here (they share the cache), or set `reuse_metadata_cache = true`. `tools/inherit_metadata_cache.py` refuses a donor grouped by other buckets. Also, each caption setting of a directory keeps its own per-resolution copy of an AR bucket's metadata (rebuilt once, a quick pass); under `--trust_cache` a second setting used to read the first one's captions.
@@ -164,10 +166,11 @@ deletion, not augmentation. Raise `cache_shuffle_num` to cache several draws; th
 you don't.
 
 They are applied fresh per sample in two cases: when the model caches no text embeddings at all
-(so the caption string is what gets tokenized every step — SDXL always, Cosmos with
+(so the caption string is what gets encoded every step — SDXL always, any model with
 `cache_text_embeddings = false`), and on the `online_captions` path below. A model that caches
-*some* encoders and reads the caption for others, like HiDream, is deliberately excluded:
-re-augmenting text whose embedding is already frozen would make the two disagree.
+*some* encoders and reads the caption for others, like HiDream with cached embeddings, is
+deliberately excluded: re-augmenting text whose embedding is already frozen would make the two
+disagree.
 
 ### Choosing which caption an image trains on
 
@@ -348,6 +351,25 @@ old one. With `reuse_metadata_cache = false`, the legacy workflow remains availa
 omitting `--trust_cache` rescans sources, and supplying it trusts existing metadata.
 First migration from older caches may read sidecars and build input indexes once;
 new profiles still process metadata, so startup is not constant-time on very large datasets.
+
+### Text embeddings: cached or on the fly
+
+`cache_text_embeddings` in `[model]` chooses, for every model:
+
+- `true` (the default for most models): text embeddings are cached with the latents and the text
+  encoders are freed before training.
+- `false`: only the latents are cached. The text encoders stay loaded on the GPU and encode each
+  batch's captions during training, so caption edits need no re-caching and tag shuffling and
+  `tag_dropout_rate` draw anew for every sample. It costs the encoders' VRAM and an encoder
+  pass per step. Wan, Cosmos-Predict2/Anima, Iris and MOSS-Image encode inside their own
+  pipeline (Iris and MOSS-Image default to `false`); every other model encodes each batch with
+  the same functions that fill the cache, in groups of `caching_batch_size`. At the default
+  `caching_batch_size = 1` a batch holds exactly the embeddings the cache would; a larger value
+  is faster but pads each caption to the longest one of its group, as caching does. With
+  `pipeline_stages` above 1 the first and last stages both load the text encoders.
+
+Switching between the two keeps the latent caches; the text embedding cache is only written and
+read with `true`.
 
 ### Changing the buckets
 

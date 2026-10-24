@@ -129,6 +129,7 @@ save_dtype = 'bfloat16'
 #                          # the weights: a save (or its .safetensors) of this same model and adapter
 #                          # settings, else an error. Ignored when resuming from a checkpoint.
 # Batch size for caching latents and text embeddings. Increasing can lead to higher GPU utilization during caching phase but uses more memory.
+# With cache_text_embeddings = false it is also how many captions are encoded together per step.
 caching_batch_size = 1
 
 # Number of parallel processes to use in map() calls when caching the dataset. Defaults to min(8, num_cpu_cores) if unset.
@@ -184,6 +185,9 @@ dtype = 'bfloat16'
 transformer_dtype = 'float8'
 # How to sample timesteps to train on. Can be logit_normal or uniform.
 timestep_sample_method = 'logit_normal'
+# Any model: false keeps the text encoders on the GPU and encodes each batch's captions during
+# training instead of caching their embeddings (see README "Text embeddings: cached or on the fly").
+#cache_text_embeddings = false
 
 # For models that support full fine tuning, simply delete or comment out the [adapter] table to FFT.
 [adapter]

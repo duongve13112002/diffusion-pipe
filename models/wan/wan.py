@@ -65,6 +65,7 @@ class VaeAndClip(nn.Module):
 
 
 class WanPipeline(BasePipeline):
+    encodes_text_on_the_fly = True
     name = 'wan'
     vae_config_keys = ('ckpt_path',)
     framerate = 16

@@ -43,7 +43,8 @@ class AuraFlowPipeline(BasePipeline):
             text_encoder = transformers.UMT5EncoderModel(text_encoder_config)
         for key, tensor in iterate_safetensors(self.model_config['text_encoder_path']):
             set_module_tensor_to_device(text_encoder, key, device='cpu', dtype=dtype, value=tensor)
-        text_encoder.requires_grad_(False)
+        # Built from its config, so in train mode: its dropout (0.1) would noise every embedding.
+        text_encoder.requires_grad_(False).eval()
 
         self.diffusers_pipeline = diffusers.AuraFlowPipeline(
             scheduler=None,
@@ -82,6 +83,13 @@ class AuraFlowPipeline(BasePipeline):
     def get_text_encoders(self):
         return [self.text_encoder]
 
+    def text_encoder_cache_key(self, i):
+        # Embeddings cached before the encoder was put in eval mode carry its dropout.
+        return 'umt5-eval'
+
+    def text_encoder_requires_identity(self, i):
+        return True
+
     def save_adapter(self, save_dir, peft_state_dict):
         self.save_lora_weights(save_dir, transformer_lora_layers=peft_state_dict)
 
@@ -100,7 +108,9 @@ class AuraFlowPipeline(BasePipeline):
     def get_call_text_encoder_fn(self, text_encoder):
         def fn(captions, is_video):
             # args are lists
-            prompt_embeds, prompt_attention_mask, _, _ = self.encode_prompt(captions, max_sequence_length=self.max_sequence_length, device=text_encoder.device)
+            prompt_embeds, prompt_attention_mask, _, _ = self.encode_prompt(
+                captions, do_classifier_free_guidance=False, max_sequence_length=self.max_sequence_length,
+                device=text_encoder.device)
             return {'prompt_embeds': prompt_embeds}
         return fn
 

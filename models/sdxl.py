@@ -356,6 +356,7 @@ def apply_debiased_estimation(loss, timesteps, noise_scheduler, v_prediction=Fal
 
 
 class SDXLPipeline(BasePipeline):
+    encodes_text_on_the_fly = True
     # Unique name, used to make the cache_dir path.
     name = 'sdxl'
     vae_config_keys = ('checkpoint_path',)

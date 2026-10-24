@@ -245,6 +245,10 @@ class PreprocessMediaFile:
 # shared functionality between BasePipeline and ComfyPipeline
 class CommonPipeline:
     framerate = None
+    # True for a model that encodes its captions itself during training (in its layers, when
+    # cache_text_embeddings = false or always). Any other model with cache_text_embeddings =
+    # false has each batch's captions encoded by utils/text_encoding.py with its text encoders.
+    encodes_text_on_the_fly = False
     pixels_round_to_multiple = 16
     keep_in_high_precision = []
     spatial_compression = 8

@@ -373,6 +373,7 @@ def pixels_to_uint8(tensor):
 
 
 class IrisPipeline(BasePipeline):
+    encodes_text_on_the_fly = True
     name = 'iris'
     framerate = None
     checkpointable_layers = ['InitialLayer', 'TransformerLayer', 'PiTLayer']

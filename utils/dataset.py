@@ -155,6 +155,7 @@ from utils.captions import (
     validate_non_latin_caption_requirement,
 )
 from utils.layout_captions import LAYOUT_METADATA_VERSION, LayoutCaptionRewriter, is_layout_caption
+from utils.text_encoding import CONTROL_FILE_KEY, IS_VIDEO_KEY, encodes_text_in_loader
 
 
 def size_bucket_matching_is_current(metadata_dir, suffix):
@@ -786,6 +787,7 @@ class SizeBucketDataset:
         os.makedirs(self.cache_dir, exist_ok=True)
         self.text_embedding_datasets = []
         self.uncond_text_embeddings = []
+        self.encode_text_in_loader = directory_config.get('encode_text_in_loader', False)
         self.num_repeats = self.directory_config['num_repeats']
         self.shuffle_skip = max(directory_config.get('cache_shuffle_num', 0), 1) # Should be provided in DirectoryDataset
         # Only used on the online_captions path, where the caption is chosen at __getitem__ time
@@ -1069,6 +1071,16 @@ class SizeBucketDataset:
             emb_dict = uncond_ds[0] if use_uncond else ds.get_text_embeddings(tuple(entry['image_spec']), caption_number)
             ret.update(emb_dict)
         ret['caption'] = caption
+        if self.encode_text_in_loader:
+            if use_uncond:
+                # As caching encodes the empty caption: not a video, no control image.
+                ret[IS_VIDEO_KEY], ret[CONTROL_FILE_KEY] = False, None
+            else:
+                # What caching passes to the text encoder with this row's caption. The latents
+                # are cached row for row with the metadata.
+                row = self.metadata_dataset[int(entry['latents_idx'])]
+                assert tuple(row['image_spec']) == tuple(entry['image_spec']), (row['image_spec'], entry['image_spec'])
+                ret[IS_VIDEO_KEY], ret[CONTROL_FILE_KEY] = row['is_video'], row.get('control_file')
         return ret
 
     def __len__(self):
@@ -1475,9 +1487,11 @@ class DirectoryDataset:
     def __init__(self, directory_config, dataset_config, model_name, framerate=None,
                  round_to_multiple=32, skip_dataset_validation=False,
                  caches_text_embeddings=True, vae_identity='', on_the_fly_media=None,
-                 layout_caption_format=None):
+                 layout_caption_format=None, encode_text_in_loader=False):
         self._set_defaults(directory_config, dataset_config)
         self.directory_config = directory_config
+        # Each sample then carries what utils/text_encoding.py needs to encode its caption.
+        self.directory_config['encode_text_in_loader'] = encode_text_in_loader
         # (media_loader, encode_fn) for a model that reads its media at __getitem__ time instead
         # of caching latents (see OnTheFlyMediaDataset). None for every other model.
         self.on_the_fly_media = on_the_fly_media
@@ -2588,6 +2602,8 @@ class Dataset:
                 self.model.get_call_vae_fn(self.model.get_vae()),
             )
 
+        # cache_text_embeddings = false on a model that cannot encode its captions itself.
+        encode_text_in_loader = encodes_text_in_loader(model)
         self.directory_datasets = []
         for directory_config in dataset_config['directory']:
             directory_dataset = DirectoryDataset(
@@ -2600,7 +2616,8 @@ class Dataset:
                 # When the model caches no text embeddings, the caption string itself is what
                 # gets tokenized every step, so augmentation can happen per sample instead of
                 # being frozen into the metadata. The dataset cannot work this out for itself.
-                caches_text_embeddings=len(model.get_text_encoders()) > 0,
+                caches_text_embeddings=len(model.get_text_encoders()) > 0 and not encode_text_in_loader,
+                encode_text_in_loader=encode_text_in_loader,
                 # What produced the latents. Declared per model via vae_config_keys; empty for
                 # a model that has not declared one, which keeps its caches exactly as before.
                 vae_identity=model.vae_cache_key(),
@@ -3361,7 +3378,8 @@ class DatasetManager:
         # rank 0's node caches everything while the others wait.
         self.multi_node = multi_node
         self.vae = self.model.get_vae()
-        self.text_encoders = self.model.get_text_encoders()
+        # Nothing to cache for text encoders that encode each batch during training instead.
+        self.text_encoders = [] if encodes_text_in_loader(model) else self.model.get_text_encoders()
         self.submodels = [self.vae] + list(self.text_encoders)
         self.call_vae_fn = self.model.get_call_vae_fn(self.vae)
         self.vae_supports_audio = 'audio' in signature(self.call_vae_fn).parameters
@@ -3627,7 +3645,8 @@ def split_batch(batch, pieces):
 # pipeline parallel training. Iterates indefinitely (deepspeed requirement). Keeps track of epoch.
 # Updates epoch as soon as the final batch is returned (notably different from qlora-pipe).
 class PipelineDataLoader:
-    def __init__(self, dataset, model_engine, gradient_accumulation_steps, model, num_dataloader_workers=1):
+    def __init__(self, dataset, model_engine, gradient_accumulation_steps, model, num_dataloader_workers=1,
+                 text_encoding=None):
         if len(dataset) == 0:
             raise RuntimeError(
                 'Processed dataset was empty. Probably caused by rounding down for each size bucket.\n'
@@ -3635,6 +3654,8 @@ class PipelineDataLoader:
                 f'The dataset config that triggered this error was:\n{dataset.dataset_config}'
             )
         self.model = model
+        # A utils.text_encoding.TextEncodingOnTheFly when the captions are encoded per batch.
+        self.text_encoding = text_encoding
         self.dataset = dataset
         self.model_engine = model_engine
         self.gradient_accumulation_steps = gradient_accumulation_steps
@@ -3726,6 +3747,8 @@ class PipelineDataLoader:
             # clean_end_share); eval batches are prepared with a quantile instead.
             if self.eval_quantile is None and hasattr(self.model, 'set_training_epoch'):
                 self.model.set_training_epoch(self.epoch)
+            if self.text_encoding is not None:
+                batch = self.text_encoding(batch)
             features, label = self.model.prepare_inputs(batch, timestep_quantile=self.eval_quantile)
             *target_list, mask = label
             # The target depends on the noise, so we must broadcast it from the first stage to the last.

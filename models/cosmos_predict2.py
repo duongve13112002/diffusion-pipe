@@ -356,6 +356,7 @@ def resolve_learning_rates(config, model_config, use_context_refiner):
 
 
 class CosmosPredict2Pipeline(BasePipeline):
+    encodes_text_on_the_fly = True
     name = 'cosmos_predict2'
     vae_config_keys = ('vae_path',)
     framerate = 16

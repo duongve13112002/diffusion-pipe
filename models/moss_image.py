@@ -979,6 +979,7 @@ class LayerState:
 
 
 class MossImagePipeline(ComfyPipeline):
+    encodes_text_on_the_fly = True
     name = 'moss_image'
     checkpointable_layers = ['InitialLayer', 'TransformerLayer']
     # The on-the-fly text encoder is not a pipeline layer's submodule and ComfyUI moves it itself,
