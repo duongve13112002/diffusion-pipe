@@ -188,6 +188,16 @@ def bucket_suffix(key):
         raise RuntimeError(f'Unexpected bucket: {key}')
 
 
+def legacy_copy_tag(caption_cache_suffix):
+    """Ends the name of an AR bucket's per-resolution metadata copy in a legacy cache."""
+    return f'_captions{caption_cache_suffix}'
+
+
+def legacy_iteration_order_names(caption_cache_suffix):
+    return [f'iteration_order{caption_cache_suffix}' + ('' if mode == 'all' else f'_{mode}')
+            for mode in CAPTION_SAMPLING_MODES]
+
+
 def dedup_and_sort(values):
     values = set(round(x, ROUND_DECIMAL_DIGITS) for x in values)
     values = list(values)
@@ -1397,6 +1407,13 @@ class ARBucketDataset:
             # to make sure the directory has a unique name
             naming_size_bucket = (self.ar_frames[0],) + size_bucket
             mapped_path = self.cache_dir / f'metadata/metadata_{bucket_suffix(naming_size_bucket)}.arrow'
+            if not getattr(self.directory_dataset, 'reuse_metadata_cache', False):
+                # Per caption profile: the copy carries the captions, and the profiles of a legacy
+                # directory share its cache directory. The name all profiles once shared may hold
+                # another profile's captions.
+                mapped_path.unlink(missing_ok=True)
+                mapped_path = mapped_path.with_name(
+                    f'{mapped_path.stem}{legacy_copy_tag(self.directory_config.get("caption_cache_suffix", ""))}.arrow')
             if (getattr(self.directory_dataset, 'reuse_metadata_cache', False)
                     and mapped_path.exists() and not regenerate_cache):
                 metadata_with_size_bucket = datasets.Dataset.from_file(str(mapped_path))
@@ -1915,17 +1932,12 @@ class DirectoryDataset:
                     self.cache_dir.joinpath('metadata').mkdir(parents=True, exist_ok=True)
                     self.grouping_keys_json_file = self.cache_dir / 'metadata' / 'grouping_keys.json'
             trust_cache = True
-        elif trust_cache and self.use_size_buckets and not self.size_buckets_matched_before \
-                and not size_bucket_matching_is_current(self.cache_dir / 'metadata', self.caption_cache_suffix):
-            # Legacy metadata grouped before the size bucket fix put some images in the wrong
-            # bucket for these size_buckets. --trust_cache would serve it as it is.
-            print(f'{self.path}: the cached metadata predates the size_buckets matching fix. Rebuilding it.')
+        elif trust_cache and (stale := self._legacy_grouping_is_stale()):
+            # --trust_cache would serve the old grouping as it is: the media scan is redone, as
+            # it is on every run without --trust_cache.
+            print(f'{self.path}: {stale} Rebuilding it.')
             trust_cache = False
-            # The buckets' iteration orders index their old rows, and --trust_cache would load
-            # them again over the regrouped ones. Removed before the marker is written, so an
-            # interrupted rebuild removes them again.
-            for iteration_order in self.cache_dir.glob('cache_*/iteration_order*'):
-                shutil.rmtree(iteration_order)
+            self._remove_legacy_bucket_caches()
         def check_grouped_metadata():
             all_grouped_metadata_exists = False
             unique_grouping_keys = None
@@ -1954,6 +1966,13 @@ class DirectoryDataset:
         else:
             print('Found grouped metadata cache. Directly loading it.')
             self._warn_if_caption_settings_changed()
+            if not self.reuse_metadata_cache and not self._bucketing_file().exists():
+                # Grouped before the buckets were recorded, by buckets that fit these: recorded
+                # now, so a later change of the buckets is seen. A read-only cache still loads.
+                try:
+                    self._record_bucketing()
+                except OSError as e:
+                    logger.warning(f'{self.path}: could not record the buckets of the cached metadata: {e}')
 
         if self.require_non_latin_caption is not None and not unique_grouping_keys:
             logger.warning(
@@ -2010,6 +2029,10 @@ class DirectoryDataset:
                   f'shuffling, tag dropout, multiline splitting and non-Latin line removal skip them.')
 
     def _group_metadata_and_save_to_disk(self, regenerate_cache=False, trust_cache=False):
+        if not self.reuse_metadata_cache:
+            # Until the grouping is complete, the ungrouped metadata and the grouped datasets may
+            # be from this scan or the last one: a run killed meanwhile must not be trusted.
+            self._record_bucketing({'incomplete': True})
         metadata_dataset = self._get_ungrouped_metadata(regenerate_cache=regenerate_cache, trust_cache=trust_cache)
         grouped_metadata = defaultdict(lambda: defaultdict(list))
         unique_grouping_keys = set()
@@ -2044,8 +2067,80 @@ class DirectoryDataset:
             marker = self.cache_dir / f'metadata/size_bucket_matching{self.caption_cache_suffix}.json'
             with open(marker, 'w') as f:
                 json.dump({'size_bucket_matching': 2, 'grouped': fingerprints}, f)
+        if not self.reuse_metadata_cache:
+            self._record_bucketing()
 
         return unique_grouping_keys
+
+    def _remove_legacy_bucket_caches(self):
+        """This caption profile's caches made from a grouping: --trust_cache would load them over a
+        new one. The buckets' iteration orders index their old rows, and the AR buckets' copies
+        per resolution hold their old images. Removed before a regrouping, so an interrupted one
+        removes them again."""
+        for name in legacy_iteration_order_names(self.caption_cache_suffix):
+            for iteration_order in self.cache_dir.glob(f'cache_*/{name}'):
+                shutil.rmtree(iteration_order)
+        tag = legacy_copy_tag(self.caption_cache_suffix)
+        for copy in self.cache_dir.glob(f'ar_frames_*/metadata/metadata_*{tag}.arrow'):
+            copy.unlink()
+
+    def _bucketing(self):
+        """What decides each image's bucket in the metadata scan: a video's frame count is
+        converted to the model's framerate."""
+        if self.use_size_buckets:
+            return {'size_buckets': self.size_buckets.tolist(), 'framerate': self.framerate}
+        return {'ars': self.ars.tolist(), 'frame_buckets': self.frame_buckets.tolist(), 'framerate': self.framerate}
+
+    def _bucketing_file(self):
+        return self.cache_dir / f'metadata/bucketing{self.caption_cache_suffix}.json'
+
+    def _record_bucketing(self, record=None):
+        path = self._bucketing_file()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_name(f'.{path.name}.{socket.gethostname()}-{os.getpid()}.tmp')
+        with open(temporary, 'w') as f:
+            json.dump(self._bucketing() if record is None else record, f)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(temporary, path)
+        fsync_dir(path.parent)
+
+    def _legacy_grouping_is_stale(self):
+        """Why the legacy grouped metadata does not fit this dataset's buckets, or None. Both the
+        ungrouped metadata and the grouping hold each image's bucket, and --trust_cache loads them
+        without looking."""
+        metadata_dir = self.cache_dir / 'metadata'
+        if self.use_size_buckets and not self.size_buckets_matched_before \
+                and not size_bucket_matching_is_current(metadata_dir, self.caption_cache_suffix):
+            # Grouped before the size bucket fix: some images are in the wrong bucket.
+            return 'the cached metadata predates the size_buckets matching fix.'
+        try:
+            recorded = json.loads(self._bucketing_file().read_text())
+        except FileNotFoundError:
+            recorded = None
+        except ValueError:
+            return 'the record of the buckets the cached metadata was grouped by is unreadable.'
+        if recorded is not None:
+            if recorded == {'incomplete': True}:
+                return 'the last metadata scan was interrupted.'
+            if recorded != self._bucketing():
+                return 'the cached metadata was grouped by other buckets than these.'
+            return None
+        # Grouped before the buckets were recorded: a bucket these settings never make shows
+        # they changed. New buckets that happen to include all the old ones go unseen.
+        try:
+            keys = json.loads(self.grouping_keys_json_file.read_text())
+        except (FileNotFoundError, ValueError):
+            return None
+        for key in keys:
+            if self.use_size_buckets:
+                fits = len(key) == 3 and list(key) in self.size_buckets.tolist()
+            else:
+                fits = (len(key) == 2 and key[1] in self.frame_buckets.tolist()
+                        and bool(np.isclose(self.ars, key[0], rtol=0, atol=1e-6).any()))
+            if not fits:
+                return f'the cached metadata was grouped by other buckets than these ({key} is not one of them).'
+        return None
 
     def _get_ungrouped_metadata(self, regenerate_cache=False, trust_cache=False):
         if self.reuse_metadata_cache:
@@ -2718,6 +2813,26 @@ def _cache_fn(datasets, queue, preprocess_media_file_fn, num_text_encoders, rege
         queue.put(None)
 
 
+def check_shared_legacy_caches(datasets):
+    """Directories reading one source (a train and an eval dataset) share its legacy metadata
+    cache, grouped datasets included, under one caption profile: other buckets would make each
+    run regroup over the other's grouping."""
+    seen = {}
+    for ds in datasets:
+        for directory in ds.directory_datasets:
+            if directory.reuse_metadata_cache:
+                continue
+            key = (os.path.realpath(directory.cache_dir), directory.caption_cache_suffix)
+            bucketing = directory._bucketing()
+            other = seen.setdefault(key, bucketing)
+            if other != bucketing:
+                raise ValueError(
+                    f'{directory.path} is read by two dataset directories with the same caption settings and other '
+                    f'buckets ({other} and {bucketing}). With reuse_metadata_cache = false they share one metadata '
+                    'cache. Give them the same buckets, or set reuse_metadata_cache = true, which keeps a grouping '
+                    'per bucket setting.')
+
+
 def metadata_units(datasets):
     """{source directory: its DirectoryDatasets}, in the order of the dataset configs: what one
     node caches the metadata of. Directories reading the same source (a train and an eval
@@ -3270,6 +3385,7 @@ class DatasetManager:
     # Mix and match native multiprocessing / torch.multiprocessing and multiprocess at your peril! Things can break.
     # In patches.py we register reductions so Tensors sent over Queues and Pipes are efficient just like in torch.multiprocessing.
     def cache(self, unload_models=True):
+        check_shared_legacy_caches(self.datasets)
         node, nodes, leader = _node_layout() if self.multi_node else (0, 1, is_main_process())
         if nodes == 1:
             self._cache_on_rank_0s_node()

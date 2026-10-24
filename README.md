@@ -17,6 +17,7 @@ Models supported: SDXL, Flux, LTX-Video, HunyuanVideo (t2v), Cosmos, Lumina Imag
 - 2026-10-24
   - Fixed `size_buckets`: media were matched to a bucket by an index into the sorted, deduplicated aspect ratios, so unless the buckets were listed in increasing aspect ratio (each ratio once), images went to a bucket of another aspect ratio, and with image and video buckets together every image was dropped. Datasets whose buckets were affected rebuild their metadata and latent caches on the next run, `--trust_cache` included, and `tools/inherit_metadata_cache.py` refuses to copy metadata grouped before the fix.
   - Dataset caching on several nodes: the nodes take directories (metadata), then buckets (latents and text embeddings), from pools they share until none are left. See [multi-node training](#multi-node-training).
+  - With `reuse_metadata_cache = false`, `--trust_cache` no longer reuses metadata grouped for other buckets: the buckets (aspect ratios, frame buckets or `size_buckets`) are recorded with the grouping, and a change rescans the dataset, as a run without `--trust_cache` does. Metadata grouped before this is checked against the current buckets, and an interrupted scan is never trusted. A train and an eval dataset reading one directory with the same caption settings must use the same buckets here (they share the cache), or set `reuse_metadata_cache = true`. `tools/inherit_metadata_cache.py` refuses a donor grouped by other buckets. Also, each caption setting of a directory keeps its own per-resolution copy of an AR bucket's metadata (rebuilt once, a quick pass); under `--trust_cache` a second setting used to read the first one's captions.
   - Faster metadata scan, on one node too: a directory is listed once without a stat per file, and image headers and caption files are read on `metadata_read_threads` threads per map process (default 16). On network storage the scan waits on each file open: measured with 3 ms per open, 16 threads scanned 5000 images 7x faster than one. On a local disk threads are slower (about 2.7x), so set `metadata_read_threads = 1` there. Cached metadata is unaffected.
 - 2026-10-16
   - Support MOSS-Image (Base and SFT): LoRA, LoKr, OPLoRA and full fine-tuning, from a diffusers directory or ComfyUI single files (fp8 and comfy-quant included). See [supported models](docs/supported_models.md#moss-image) and `examples/moss_image/`. The transformer is ComfyUI's native MOSS-Image, and saved adapters and fine-tunes load in ComfyUI's own loaders.
@@ -347,6 +348,26 @@ old one. With `reuse_metadata_cache = false`, the legacy workflow remains availa
 omitting `--trust_cache` rescans sources, and supplying it trusts existing metadata.
 First migration from older caches may read sidecars and build input indexes once;
 new profiles still process metadata, so startup is not constant-time on very large datasets.
+
+### Changing the buckets
+
+Each image's bucket is fixed when its metadata is scanned, so changing `num_ar_buckets`,
+`min_ar`/`max_ar`, `ar_buckets`, `frame_buckets` or `size_buckets` needs a new grouping. What it
+costs depends on the mode, per model (each model has its own `cache/<model>`):
+
+- `reuse_metadata_cache = true`: each bucket setting keeps its own snapshot and tensor caches
+  (`profiles/<hash>`). The first run with a new setting scans the dataset once (only the media
+  that no longer fit when this model has legacy metadata to start from); switching back to a
+  setting used before (16 to 64, then back to 16) loads its metadata, latents and text
+  embeddings as they were, with no scan and nothing re-encoded.
+  Prefer this when you switch between bucket settings.
+- `reuse_metadata_cache = false`: one grouping per caption setting. Every switch rescans the
+  dataset, `--trust_cache` included (the buckets are recorded with the grouping, so an old one
+  is never loaded for new buckets). Latents and text embeddings are kept per bucket and checked by
+  content: switching back reuses those of buckets the other setting did not also use, and
+  re-encodes the rest (for 16 and 64 aspect ratios from 0.5 to 2.0, the 0.5 and 2.0 buckets).
+  To scan once for several models, scan with one and copy its metadata to the others with
+  `tools/inherit_metadata_cache.py`, which requires the same buckets and caption settings.
 
 ## Extra
 You can check out my [qlora-pipe](https://github.com/tdrussell/qlora-pipe) project, which is basically the same thing as this but for LLMs.

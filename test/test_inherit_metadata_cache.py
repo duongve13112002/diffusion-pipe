@@ -499,3 +499,44 @@ def test_legacy_empty_target_metadata_dir_is_filled(tmp_path):
     file = write_toml(tmp_path, data, SIZE_BUCKETS, **LEGACY)
     assert tool.main(['--dataset', str(file)]) == 0
     assert (data / 'cache' / 'iris' / 'metadata' / 'inherited_from.json').exists()
+
+
+def test_legacy_refuses_a_donor_grouped_by_fewer_buckets_that_all_fit(tmp_path, capsys):
+    """9 aspect ratios from 0.5 to 2.0 include the donor's 5: the keys fit, the record does not."""
+    data = tmp_path / 'data'
+    make_source(data)
+    cache_legacy_donor(data, AR_BUCKETS)
+    finer = {**AR_BUCKETS, 'num_ar_buckets': 9}
+    file = write_toml(tmp_path, data, finer, **LEGACY)
+    assert tool.main(['--dataset', str(file)]) == 1
+    assert 'groups by' in capsys.readouterr().out
+    assert not (data / 'cache' / 'iris' / 'metadata' / 'inherited_from.json').exists()
+
+
+def test_legacy_inherited_metadata_records_the_targets_buckets(tmp_path, monkeypatch):
+    """The donor's record names its framerate, the target's model has another: for images that
+    does not matter, and the target records its own so training trusts it."""
+    data = tmp_path / 'data'
+    make_source(data)
+    cache_legacy_donor(data, AR_BUCKETS)
+    file = write_toml(tmp_path, data, AR_BUCKETS, **LEGACY)
+    assert tool.main(['--dataset', str(file)]) == 0
+    iris = build(data, 'iris', None, False, AR_BUCKETS, **LEGACY)
+    assert json.loads(iris._bucketing_file().read_text()) == iris._bucketing()
+    assert iris._legacy_grouping_is_stale() is None
+
+
+def test_legacy_force_drops_the_targets_caches_built_from_its_old_metadata(tmp_path):
+    data = tmp_path / 'data'
+    make_source(data)
+    cache_legacy_donor(data, AR_BUCKETS)
+    target = data / 'cache' / 'iris'
+    old = target / 'cache_1.000x64x64x1' / 'iteration_order'
+    old.mkdir(parents=True)
+    copy = target / 'ar_frames_1.000_1' / 'metadata' / 'metadata_1.000x64x64x1_captions.arrow'
+    copy.parent.mkdir(parents=True)
+    copy.write_bytes(b'old')
+    build(data, 'iris', None, False, AR_BUCKETS, **LEGACY).cache_metadata()
+    file = write_toml(tmp_path, data, AR_BUCKETS, **LEGACY)
+    assert tool.main(['--dataset', str(file), '--force']) == 0
+    assert not old.exists() and not copy.exists()

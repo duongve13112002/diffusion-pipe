@@ -13,6 +13,10 @@ resolutions = [512]
 # Source edits are invisible until --regenerate_cache creates a fresh generation. This also
 # freezes online_captions; uncached/on-the-fly text encoding still runs every training step.
 # Set false for the legacy rescan/live-online-caption workflow.
+# Changing the buckets (num_ar_buckets, min_ar/max_ar, ar_buckets, frame_buckets, size_buckets):
+# with true, each bucket setting keeps its own metadata and tensor caches, so going back to one
+# used before (16 -> 64 -> 16) scans and encodes nothing. With false, every switch rescans the
+# dataset, even with --trust_cache. See "Changing the buckets" in the README.
 # First migration from abd164e may read sidecars and build disk indexes once.
 # reuse_metadata_cache = true
 

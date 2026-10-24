@@ -98,6 +98,7 @@ class Plan:
         self.messages = []
         self.target = None
         self.donor_snapshot = None
+        self.donor_bucketing = None
         self.rows = 0
         self.legacy = False          # reuse_metadata_cache = false: copy metadata/, not a snapshot
         self.legacy_entries = []     # names in the donor's metadata/ to copy
@@ -378,6 +379,20 @@ def plan_legacy_directory(plan, donor, target_model, force, sample, header_sampl
         plan.note(f'donor buckets {bad[:3]} are not among this dataset\'s buckets: the bucketing settings changed '
                   'since the donor cached it.')
         return plan
+    # Recorded by grouping since buckets that include all the old ones pass the check above. The
+    # framerate (another model's) matters only for videos, checked once the rows are loaded.
+    record_file = donor_metadata / f'bucketing{suffix}.json'
+    recorded = None
+    if record_file.is_file():
+        try:
+            recorded = json.loads(record_file.read_text())
+        except ValueError:
+            recorded = {'unreadable': True}
+        wanted = target._bucketing()
+        if {k: v for k, v in recorded.items() if k != 'framerate'} != {k: v for k, v in wanted.items() if k != 'framerate'}:
+            plan.note(f'{record_file.name}: the donor was grouped by {recorded}, this dataset groups by {wanted}. '
+                      'Let training rebuild it.')
+            return plan
 
     settings_file = donor_metadata / f'caption_settings{suffix}.json'
     if not settings_file.is_file():
@@ -396,6 +411,11 @@ def plan_legacy_directory(plan, donor, target_model, force, sample, header_sampl
     log(f'{plan.path}: loading the donor\'s grouped metadata ({len(keys)} buckets)')
     grouped = datasets.concatenate_datasets(
         [datasets.load_from_disk(str(donor_metadata / _grouped_name(key, suffix))) for key in keys])
+    if (recorded is not None and recorded.get('framerate') != target.framerate
+            and any(grouped.select_columns(['is_video'])['is_video'])):
+        plan.note(f'the donor counted video frames at framerate {recorded.get("framerate")}, this model at '
+                  f'{target.framerate}: the videos would be in other frame buckets. Let training rebuild it.')
+        return plan
     masks = {m for m in grouped.select_columns(['mask_file'])['mask_file'] if m}
     expected = target.mask_path is not None or target.default_mask_file is not None
     foreign = [m for m in masks if Path(m).parent != target.mask_path
@@ -416,6 +436,7 @@ def plan_legacy_directory(plan, donor, target_model, force, sample, header_sampl
     plan.legacy_entries = sorted(p.name for p in donor_metadata.iterdir()
                                  if p.name in grouped_names or pattern.match(p.name))
     plan.donor_snapshot = donor_metadata
+    plan.donor_bucketing = recorded
     plan.note(f'will write {target_metadata} ({len(plan.legacy_entries)} entries from {donor_metadata})')
     plan.status = 'ready'
     return plan
@@ -437,6 +458,10 @@ def apply_legacy_plan(plan, donor):
                 shutil.copytree(source, staging / name, copy_function=_link_or_copy)
             else:
                 _link_or_copy(source, staging / name)
+        if plan.donor_bucketing is not None:
+            # This dataset's buckets, which the donor's recorded grouping was checked against.
+            # Without a donor record, training checks the grouping keys as for any older cache.
+            (staging / f'bucketing{target.caption_cache_suffix}.json').write_text(json.dumps(target._bucketing()))
         (staging / 'inherited_from.json').write_text(json.dumps({
             'donor_model': donor, 'donor_metadata': str(plan.donor_snapshot), 'rows': plan.rows,
             'created': datetime.datetime.now().isoformat(timespec='seconds'),
@@ -455,6 +480,12 @@ def apply_legacy_plan(plan, donor):
             if target_metadata.exists():
                 return None
             raise
+        # What the target built from its old metadata, which --trust_cache would load as it is:
+        # iteration orders index its old rows, and AR buckets' copies per resolution hold them.
+        for iteration_order in target.cache_dir.glob('cache_*/iteration_order*'):
+            shutil.rmtree(iteration_order)
+        for copy in target.cache_dir.glob('ar_frames_*/metadata/metadata_*.arrow'):
+            copy.unlink()
     finally:
         if staging.exists():
             shutil.rmtree(staging, ignore_errors=True)
