@@ -354,22 +354,50 @@ new profiles still process metadata, so startup is not constant-time on very lar
 
 ### Text embeddings: cached or on the fly
 
-`cache_text_embeddings` in `[model]` chooses, for every model:
+`cache_text_embeddings` in `[model]` chooses, for every model, whether the text embeddings are
+cached or the captions are encoded during training. Latents are cached either way.
 
-- `true` (the default for most models): text embeddings are cached with the latents and the text
-  encoders are freed before training.
-- `false`: only the latents are cached. The text encoders stay loaded on the GPU and encode each
-  batch's captions during training, so caption edits need no re-caching and tag shuffling and
-  `tag_dropout_rate` draw anew for every sample. It costs the encoders' VRAM and an encoder
-  pass per step. Wan, Cosmos-Predict2/Anima, Iris and MOSS-Image encode inside their own
-  pipeline (Iris and MOSS-Image default to `false`); every other model encodes each batch with
-  the same functions that fill the cache, in groups of `caching_batch_size`. At the default
-  `caching_batch_size = 1` a batch holds exactly the embeddings the cache would; a larger value
-  is faster but pads each caption to the longest one of its group, as caching does. With
-  `pipeline_stages` above 1 the first and last stages both load the text encoders.
+**`true`** (the default for most models): the text embeddings are cached with the latents, and
+the text encoders are freed before training. `caching_batch_size` is the batch size of caching
+(VAE and text encoders): each caption is padded to the longest one of its group of
+`caching_batch_size` captions, and its embedding is stored on its own. Training reads
+`micro_batch_size_per_gpu` rows from the cache per step, so the two settings are unrelated here
+(say `caching_batch_size = 32` with a micro batch of 8: caching encodes 32 at a time, training
+reads 8 per step).
 
-Switching between the two keeps the latent caches; the text embedding cache is only written and
-read with `true`.
+**`false`**: only the latents are cached. The text encoders stay loaded on the GPU and encode
+each batch's captions during training, so tag shuffling and `tag_dropout_rate` draw anew for
+every sample. It costs the encoders' VRAM and an encoder pass per step. The caption text still
+comes from the metadata cache, so an edited caption file is picked up the same way as with
+`true` (see [Pre-caching](#pre-caching)); only re-encoding is saved. How the captions are encoded
+depends on the model:
+
+| Model | How captions are encoded with `false` | What `caching_batch_size` does |
+|---|---|---|
+| Wan, Cosmos-Predict2 / Anima, Iris, MOSS-Image | Inside the model's own pipeline: the whole batch (see below) is tokenized and encoded at once on the GPU. Iris and MOSS-Image default to `false`. | Latent caching only. |
+| SDXL | Always encoded inside its pipeline (its text encoders can be trained); text embeddings are never cached. | Latent caching only. |
+| Every other model (Flux, Flux2, Chroma, HiDream, SD3, Lumina 2, OmniGen2, Cosmos, LTX-Video, LTX-2, HunyuanVideo, HunyuanVideo-1.5, HunyuanImage, Qwen-Image, Qwen-Image-2.1, AuraFlow, Z-Image, ERNIE-Image, Ideogram4, Krea2, MiniMax H3) | Each batch is encoded before the model sees it, with the same functions that fill the cache (`utils/text_encoding.py`). | Latent caching, and how many captions are encoded together: a batch is split into groups of `caching_batch_size` (a value above the batch size encodes the whole batch at once). |
+
+The "batch" encoded per step is `micro_batch_size_per_gpu` x `gradient_accumulation_steps`
+captions on each GPU. For example, with a micro batch of 16 (and no gradient accumulation) and
+`caching_batch_size = 4`, each text encoder runs 4 times per step on 4 captions, and the results
+are put back together as 16.
+
+Padding, for the models of the last row: each caption is padded to the longest one of its group,
+as caching does with the same `caching_batch_size`, except that the group is taken from the
+training batch instead of the caption files' order. So:
+
+- `caching_batch_size = 1` (the default): every caption is encoded alone, and a batch holds
+  exactly the embeddings the cache would hold at its default.
+- A larger value is faster but pads captions as caching with that value would. Chroma, HiDream,
+  Lumina 2, OmniGen2 and Cosmos always pad to a fixed length, so for them it only changes the
+  speed (apart from bf16 rounding). For the other models, whether the padding affects training
+  depends on whether the model masks it out; that has not been checked model by model, so keep
+  `1` if you need the result to match the cache exactly.
+
+With `pipeline_stages` above 1, the first and last stages both load the text encoders.
+Switching between `true` and `false` keeps the latent caches; the text embedding cache is only
+written and read with `true`.
 
 ### Changing the buckets
 

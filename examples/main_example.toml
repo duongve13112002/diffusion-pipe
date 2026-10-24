@@ -129,7 +129,8 @@ save_dtype = 'bfloat16'
 #                          # the weights: a save (or its .safetensors) of this same model and adapter
 #                          # settings, else an error. Ignored when resuming from a checkpoint.
 # Batch size for caching latents and text embeddings. Increasing can lead to higher GPU utilization during caching phase but uses more memory.
-# With cache_text_embeddings = false it is also how many captions are encoded together per step.
+# With cache_text_embeddings = false it is also how many captions are encoded together per step, for
+# models without their own on-the-fly encoder (README "Text embeddings: cached or on the fly").
 caching_batch_size = 1
 
 # Number of parallel processes to use in map() calls when caching the dataset. Defaults to min(8, num_cpu_cores) if unset.
