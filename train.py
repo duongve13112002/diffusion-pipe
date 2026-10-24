@@ -317,6 +317,11 @@ if __name__ == '__main__':
     dataset_util.UNCOND_FRACTION = config.get('uncond_fraction', 0.0)
     if map_num_proc := config.get('map_num_proc', None):
         dataset_util.NUM_PROC = map_num_proc
+    if 'metadata_read_threads' in config:
+        threads = config['metadata_read_threads']
+        if isinstance(threads, bool) or not isinstance(threads, int) or threads < 1:
+            raise ValueError(f'metadata_read_threads must be a whole number of at least 1, got {threads!r}')
+        dataset_util.METADATA_READ_THREADS = threads
 
     common.set_rendezvous_env(args.master_port)
     deepspeed.init_distributed()

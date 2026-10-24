@@ -9,11 +9,14 @@ import pickle
 from queue import Empty
 from datetime import timedelta
 import json
+import contextlib
+import errno
 import shutil
 import socket
 import tarfile
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from inspect import signature
 import sys
 sys.path.insert(0, os.path.join(os.path.abspath(os.path.dirname(__file__)), '../submodules/ComfyUI'))
@@ -45,8 +48,89 @@ IMAGE_SIZE_ROUND_TO_MULTIPLE = 32
 # mapping a small dataset. DIFFUSION_PIPE_NUM_PROC overrides the default; 1 maps in-process.
 NUM_PROC = int(os.environ.get('DIFFUSION_PIPE_NUM_PROC', 0)) or min(8, os.cpu_count())
 ROUND_DECIMAL_DIGITS = 3
+# Threads per metadata map process that read media headers and caption files. On network storage
+# the scan waits on a round trip per open, and many at once make it several times faster: with
+# 3 ms per open, 5000 images took 38 s on one thread and 5.4 s on 16. On a local disk the reads
+# are CPU work holding the GIL and threads slow it down (1.9 s on one thread, 5.2 s on 16), so
+# set 1 there. Config: metadata_read_threads.
+METADATA_READ_THREADS = 16
 
 UNCOND_FRACTION = 0.0
+
+
+_read_pool = None
+
+
+def _read_in_threads(fn, items, threads=None):
+    """fn over items, in order, on threads (default METADATA_READ_THREADS) of this process."""
+    global _read_pool
+    threads = METADATA_READ_THREADS if threads is None else threads
+    if threads <= 1 or len(items) <= 1:
+        return [fn(item) for item in items]
+    # One pool per process: a map worker forked from a process that had one inherits it
+    # without its threads.
+    if _read_pool is None or _read_pool[:2] != (os.getpid(), threads):
+        _read_pool = (os.getpid(), threads, ThreadPoolExecutor(threads, thread_name_prefix='metadata-read'))
+    return list(_read_pool[2].map(fn, items))
+
+
+def _rows_in_threads(row_fn, threads):
+    """A batched map function running row_fn, which takes and returns a batch of one row, on
+    each row of the batch in threads. The rows come out in the order row_fn would give them
+    one at a time. threads is passed, not read in the worker: a spawned map worker never sees
+    the configured METADATA_READ_THREADS."""
+    def fn(batch):
+        size = len(next(iter(batch.values())))
+        results = _read_in_threads(row_fn, [{key: [values[i]] for key, values in batch.items()}
+                                            for i in range(size)], threads)
+        out = {key: [] for key in results[0]}
+        for result in results:
+            for key, values in result.items():
+                out[key].extend(values)
+        return out
+    return fn
+
+
+def _is_file(entry):
+    """Path.is_file() for an os.scandir entry, without a stat unless the entry is a symlink."""
+    try:
+        return entry.is_file()
+    except OSError as e:
+        # The errors Path.is_file() reads as "not a file" (ELOOP: a symlink loop). Anything else,
+        # a stale handle or an I/O error on the volume, must not silently drop the file.
+        if e.errno in (errno.ENOENT, errno.ENOTDIR, errno.EBADF, errno.ELOOP):
+            return False
+        raise
+
+
+# {(pid, key): Lock}. Keyed by pid: a forked map worker must not wait on a lock some thread of
+# its parent held at the fork. dict.setdefault is atomic, so threads agree on one lock.
+_process_locks = {}
+# {(pid, tar path): TarFile}
+_tarfiles = {}
+
+
+def _process_lock(key):
+    return _process_locks.setdefault((os.getpid(), key), threading.Lock())
+
+
+def _shared_tarfile(path):
+    """(TarFile, lock) for path, one per process. Reading a member moves the TarFile's file
+    position, so the reader holds the lock. One TarFile per thread instead would keep a member
+    table and a descriptor per thread for every tar."""
+    lock = _process_lock(('tar', path))
+    with lock:
+        key = (os.getpid(), path)
+        if key not in _tarfiles:
+            _tarfiles[key] = tarfile.TarFile(path)
+        return _tarfiles[key], lock
+
+
+def _files_by_stem(directory):
+    """{stem: path} of the files in directory, a later file of a stem replacing an earlier one,
+    in the order Path.glob('*') lists them."""
+    with os.scandir(directory) as entries:
+        return {Path(entry.name).stem: directory / entry.name for entry in entries if _is_file(entry)}
 
 
 def shuffle_with_seed(l, seed=None):
@@ -1652,32 +1736,35 @@ class DirectoryDataset:
         def generate_snapshot():
             for batch in raw.iter(batch_size=1000):
                 rows = [dict(zip(batch, values)) for values in zip(*batch.values())]
-                yield from snapshot_rows(rows, media.get([row['image_spec'] for row in rows]))
+                # Caption files, and media the old metadata does not cover, are read in threads.
+                olds = media.get([row['image_spec'] for row in rows])
+                results = _read_in_threads(snapshot_row, list(zip(rows, olds)))
+                yield from (result for result in results if result is not None)
 
-        def snapshot_rows(rows, olds):
-            for row, old in zip(rows, olds):
-                captions = row.get('caption')
-                missing = not captions and not row.get('caption_file')
-                if captions is None and row.get('caption_file'):
-                    captions = read_caption_file(Path(row['caption_file']), False, True)
-                compatible = old is not None and (
-                    self.size_buckets_matched_before and old['size_bucket'] in self.size_buckets.tolist()
-                    if self.use_size_buckets
-                    else old['ar_bucket'] is not None and old['ar_bucket'][0] in self.ars
-                    and old['ar_bucket'][1] in self.frame_buckets)
-                if compatible and all(old.get(k) == row.get(k) for k in ('mask_file', 'control_file')):
-                    result = old
-                    result['caption'] = captions or ['']
-                else:
-                    batch = {key: [value] for key, value in row.items()}
-                    batch['caption'] = [captions or ['']]
-                    mapped = fallback(batch)
-                    if not mapped['image_spec']:
-                        continue
-                    result = {key: value[0] for key, value in mapped.items()}
-                result['_caption_missing'] = missing
-                result['_caption_sidecar'] = bool(row.get('caption_file'))
-                yield result
+        def snapshot_row(row_and_old):
+            row, old = row_and_old
+            captions = row.get('caption')
+            missing = not captions and not row.get('caption_file')
+            if captions is None and row.get('caption_file'):
+                captions = read_caption_file(Path(row['caption_file']), False, True)
+            compatible = old is not None and (
+                self.size_buckets_matched_before and old['size_bucket'] in self.size_buckets.tolist()
+                if self.use_size_buckets
+                else old['ar_bucket'] is not None and old['ar_bucket'][0] in self.ars
+                and old['ar_bucket'][1] in self.frame_buckets)
+            if compatible and all(old.get(k) == row.get(k) for k in ('mask_file', 'control_file')):
+                result = old
+                result['caption'] = captions or ['']
+            else:
+                batch = {key: [value] for key, value in row.items()}
+                batch['caption'] = [captions or ['']]
+                mapped = fallback(batch)
+                if not mapped['image_spec']:
+                    return None
+                result = {key: value[0] for key, value in mapped.items()}
+            result['_caption_missing'] = missing
+            result['_caption_sidecar'] = bool(row.get('caption_file'))
+            return result
 
         iterator = iter(generate_snapshot())
         first = next(iterator, None)
@@ -1969,13 +2056,31 @@ class DirectoryDataset:
 
         if regenerate_cache or not metadata_cache_file_1.exists() or not trust_cache:
             print('Intermediate metadata is not cached. Enumerating all files.')
-            files = list(self.path.glob('*'))
+            # One listing, and no stat per file: os.scandir tells files apart and the caption
+            # files are looked up in it. A stat per entry and an exists() per image, one after
+            # the other, took hours for millions of images on network storage.
+            files = []
+            caption_names = {}
+            with os.scandir(self.path) as entries:
+                for entry in entries:
+                    if entry.name.endswith('.txt'):
+                        caption_names[entry.name] = entry.is_symlink()
+                    if _is_file(entry) and Path(entry.name).suffix not in NON_MEDIA_SUFFIXES:
+                        files.append(self.path / entry.name)
             # deterministic order
             files.sort()
 
+            def caption_exists(caption_file):
+                symlink = caption_names.get(caption_file.name)
+                if symlink is None:
+                    # A filesystem that ignores case (CIFS, exFAT, Windows, macOS) finds X.TXT
+                    # for x.txt. This only costs a stat for media without a caption.
+                    return os.path.exists(caption_file)
+                return not symlink or os.path.exists(caption_file)
+
             # Mask can have any extension, it just needs to have the same stem as the image.
-            mask_file_stems = {path.stem: path for path in self.mask_path.glob('*') if path.is_file()} if self.mask_path is not None else {}
-            control_file_stems = {path.stem: path for path in self.control_path.glob('*') if path.is_file()} if self.control_path is not None else {}
+            mask_file_stems = _files_by_stem(self.mask_path) if self.mask_path is not None else {}
+            control_file_stems = _files_by_stem(self.control_path) if self.control_path is not None else {}
 
             def process_file(file):
                 if file.suffix != '.tar':
@@ -1991,12 +2096,12 @@ class DirectoryDataset:
             mask_files = []
             control_files = []
             for file in tqdm(files):
-                if not file.is_file() or file.suffix in NON_MEDIA_SUFFIXES:
-                    continue
                 for image_spec in process_file(file):
                     image_file = Path(image_spec[1])
                     caption_file = image_file.with_suffix('.txt')
-                    if has_captions_json or not os.path.exists(caption_file):
+                    # A tar member's caption is looked for where it always was.
+                    if has_captions_json or not (caption_exists(caption_file) if image_spec[0] is None
+                                                 else os.path.exists(caption_file)):
                         caption_file = ''
                     image_specs.append(image_spec)
                     caption_files.append(str(caption_file))
@@ -2059,7 +2164,7 @@ class DirectoryDataset:
         print('Loading intermediate metadata dataset.')
         metadata_dataset = datasets.load_from_disk(str(metadata_cache_file_1))
 
-        metadata_map_fn = self._metadata_map_fn()
+        metadata_map_fn = _rows_in_threads(self._metadata_map_fn(), METADATA_READ_THREADS)
         print('Caching ungrouped metadata.')
         input_rows = len(metadata_dataset)
         metadata_dataset = metadata_dataset.map(
@@ -2067,7 +2172,7 @@ class DirectoryDataset:
             cache_file_name=str(metadata_cache_file_2),
             load_from_cache_file=(not regenerate_cache and trust_cache),
             batched=True,
-            batch_size=1,
+            batch_size=8 * max(METADATA_READ_THREADS, 1),
             # None, not 1: datasets still starts a worker process for num_proc=1.
             num_proc=NUM_PROC if NUM_PROC > 1 else None,
             remove_columns=metadata_dataset.column_names,
@@ -2100,8 +2205,6 @@ class DirectoryDataset:
         directory_config.setdefault('shuffle_metadata', dataset_config.get('shuffle_metadata', True))
 
     def _metadata_map_fn(self):
-        tarfile_map = {}
-
         def fn(example):
             empty_return = {'image_spec': [], 'mask_file': [], 'caption': [], 'ar_bucket': [], 'size_bucket': [], 'is_video': []}
             if self.control_path:
@@ -2152,48 +2255,52 @@ class DirectoryDataset:
                     layout_captions=self.layout_rewriter is not None,
                 )
             if image_spec[0] is None:
-                tar_f = None
-                filepath_or_file = str(image_file)
+                tar_f, lock = None, contextlib.nullcontext()
             else:
-                tar_filename = image_spec[0]
-                if tar_filename not in tarfile_map:
-                    tarfile_map[tar_filename] = tarfile.TarFile(tar_filename)
-                tar_f = tarfile_map[tar_filename]
-                # as_posix(), not str(): a tar member name always uses forward slashes and
-                # extractfile matches it literally, so str() on a Path looks up a name with
-                # backslashes on Windows and raises KeyError for any member in a subdirectory.
-                filepath_or_file = tar_f.extractfile(image_file.as_posix())
-
-            if image_file.suffix == '.webp':
-                # Make sure this this object stays alive so it doesn't close the file on us.
-                reader = imageio.get_reader(filepath_or_file)
-                frames = reader.get_length()
-                if frames > 1:
-                    raise NotImplementedError('WebP videos are not supported.')
-            try:
-                if image_file.suffix in VIDEO_EXTENSIONS:
-                    comfy_video = InputImpl.VideoFromFile(filepath_or_file)
-                    if image_file.suffix.lower() == '.mkv':
-                        # Can't get number of frames (it would show as 0) unless we actually load the video tensor.
-                        components = comfy_video.get_components()
-                        source_frames, height, width, _ = components.images.shape
-                    else:
-                        width, height = comfy_video.get_dimensions()
-                        source_frames = comfy_video.get_frame_count()
-                    source_fps = float(comfy_video.get_frame_rate())
-
-                    assert self.framerate is not None, "Need model framerate but don't have it. This shouldn't happen. Is the framerate attribute on the model set?"
-                    frames = int(source_frames * self.framerate / source_fps)
+                tar_f, lock = _shared_tarfile(image_spec[0])
+            # A tar member is read under its tar's lock, from extractfile to close.
+            with lock:
+                if tar_f is None:
+                    filepath_or_file = str(image_file)
                 else:
-                    pil_img = Image.open(filepath_or_file)
-                    width, height = pil_img.size
-                    frames = 1
-            except Exception as e:
-                logger.warning(f'Media file {image_file} could not be opened. Skipping. The exception was: {e}')
-                return empty_return
-            finally:
-                if hasattr(filepath_or_file, 'close'):
-                    filepath_or_file.close()
+                    # as_posix(), not str(): a tar member name always uses forward slashes and
+                    # extractfile matches it literally, so str() on a Path looks up a name with
+                    # backslashes on Windows and raises KeyError for any member in a subdirectory.
+                    filepath_or_file = tar_f.extractfile(image_file.as_posix())
+
+                if image_file.suffix == '.webp':
+                    # Make sure this this object stays alive so it doesn't close the file on us.
+                    reader = imageio.get_reader(filepath_or_file)
+                    frames = reader.get_length()
+                    if frames > 1:
+                        raise NotImplementedError('WebP videos are not supported.')
+                try:
+                    if image_file.suffix in VIDEO_EXTENSIONS:
+                        comfy_video = InputImpl.VideoFromFile(filepath_or_file)
+                        if image_file.suffix.lower() == '.mkv':
+                            # Can't get number of frames (it would show as 0) unless we actually load the video tensor.
+                            # One decode at a time per process, as before reads ran in threads:
+                            # a whole video is in memory meanwhile.
+                            with _process_lock('mkv'):
+                                components = comfy_video.get_components()
+                            source_frames, height, width, _ = components.images.shape
+                        else:
+                            width, height = comfy_video.get_dimensions()
+                            source_frames = comfy_video.get_frame_count()
+                        source_fps = float(comfy_video.get_frame_rate())
+
+                        assert self.framerate is not None, "Need model framerate but don't have it. This shouldn't happen. Is the framerate attribute on the model set?"
+                        frames = int(source_frames * self.framerate / source_fps)
+                    else:
+                        pil_img = Image.open(filepath_or_file)
+                        width, height = pil_img.size
+                        frames = 1
+                except Exception as e:
+                    logger.warning(f'Media file {image_file} could not be opened. Skipping. The exception was: {e}')
+                    return empty_return
+                finally:
+                    if hasattr(filepath_or_file, 'close'):
+                        filepath_or_file.close()
 
             is_video = (frames > 1)
             log_ar = np.log(width / height)

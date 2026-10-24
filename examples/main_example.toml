@@ -135,6 +135,10 @@ caching_batch_size = 1
 # If you have a lot of cores and multiple GPUs, raising this can increase throughput of caching, but it may use more memory,
 # especially for video data.
 #map_num_proc = 32
+# Threads per map process that read image headers and caption files when scanning a dataset's
+# metadata (default 16). On network volumes (NFS, PVC) the scan waits on every file open and
+# threads make it several times faster. On a local disk they make it slower: set 1 there.
+#metadata_read_threads = 16
 
 # With several nodes, every node caches: directories (metadata), then buckets (latents and text
 # embeddings), taken from pools the nodes share (default true). false caches everything on global
