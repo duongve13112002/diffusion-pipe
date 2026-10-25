@@ -57,6 +57,7 @@ parser.add_argument('--reset_optimizer', action='store_true')
 parser.add_argument('--reset_optimizer_params', action='store_true')
 parser.add_argument('--regenerate_cache', action='store_true', help='Force regenerate cache.')
 parser.add_argument('--cache_only', action='store_true', help='Cache model inputs then exit.')
+parser.add_argument('--metadata_only', action='store_true', help='Scan the datasets, group them into buckets and cache that metadata, print the files per bucket, then exit. No latents or text embeddings: neither the VAE nor a text encoder runs.')
 parser.add_argument('--trust_cache', action='store_true', help='Trust source metadata in the legacy cache workflow. Snapshot mode reuses sources automatically and always applies current caption configuration profiles.')
 parser.add_argument('--nan_check', action='store_true', help='Stop at the first NaN/inf in a layer output, gradient, loss or weight, and report the layer, step and images. Slow; for debugging.')
 parser.add_argument('--i_know_what_i_am_doing', action='store_true', help="Skip certain checks and overrides. You may end up using settings that won't work.")
@@ -296,6 +297,14 @@ if __name__ == '__main__':
     with open(args.config) as f:
         # Inline TOML tables are not pickleable, which messes up the multiprocessing dataset stuff. This is a workaround.
         config = json.loads(json.dumps(toml.load(f)))
+
+    if args.metadata_only:
+        conflicting = [flag for flag, given in (
+            ('--cache_only', args.cache_only), ('--dump_dataset', args.dump_dataset is not None),
+            ('--test_sample', args.test_sample), ('--resume_from_checkpoint', args.resume_from_checkpoint is not None),
+            ('a [turbo] config', 'turbo' in config)) if given]
+        if conflicting:
+            raise SystemExit(f'--metadata_only only caches dataset metadata; it does not go with {", ".join(conflicting)}')
 
     if 'turbo' in config:
         # Iris-3B Turbo: few-step distillation with its own trainers, not this training loop.
@@ -540,6 +549,16 @@ if __name__ == '__main__':
     #         break
     #     count += 1
     # quit()
+
+    if args.metadata_only:
+        dataset_manager.cache(metadata_only=True)
+        if is_main_process():
+            for name, data in [('train', train_data)] + list(eval_data_map.items()):
+                print(f'Metadata of the {name} dataset:')
+                for line in dataset_util.describe_buckets(data):
+                    print(line)
+        dist.barrier()
+        quit()
 
     if args.dump_dataset:
         # only works for flux

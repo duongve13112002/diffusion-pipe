@@ -447,6 +447,78 @@ def test_nodes_cache_buckets_drawn_from_a_pool_and_every_rank_reads_all(tmp_path
         assert all(len(drawn_by) == 1 for drawn_by in nodes.values()), (kind, nodes)
 
 
+def _metadata_only_worker(rank, init_file, out_dir, hosts, config, multi_node):
+    from datetime import timedelta
+    from pathlib import Path
+    import deepspeed
+    import multiprocess
+    multiprocess.current_process().authkey = b'afsaskgfdjh4'
+    socket.gethostname = lambda: hosts[rank]
+    deepspeed.init_distributed('gloo', auto_mpi_discovery=False, init_method=f'file://{init_file}',
+                               rank=rank, world_size=len(hosts), verbose=False, timeout=timedelta(seconds=120))
+    from utils import dataset
+    dataset.CACHING_POLL_SECONDS = 0.5
+
+    def caching(manager, **kwargs):
+        tasks = []
+        handle_task = manager._handle_task
+        manager._handle_task = lambda task: (tasks.append(task[0]), handle_task(task))
+        manager.cache(unload_models=False, **kwargs)
+        return tasks
+
+    model = _Model()
+    data = dataset.Dataset(config, model)
+    manager = dataset.DatasetManager(model, multi_node=multi_node)
+    manager.register(data)
+    result = {'tasks': caching(manager, metadata_only=True)}
+    result['buckets'] = {f'{directory.path.name}/{"x".join(str(n) for n in bucket.size_bucket[:2])}':
+                         len(bucket.metadata_dataset)
+                         for directory in data.directory_datasets for bucket in directory.bucket_datasets()}
+    result['described'] = dataset.describe_buckets(data)
+    deepspeed.comm.barrier()
+    roots = {Path(directory.path) for directory in data.directory_datasets}
+    result['encoded_files'] = sorted(str(f) for root in roots for f in root.rglob('*')
+                                     if f.name.startswith('latents_') or f.name.startswith('text_embeddings'))
+
+    # The training run afterwards encodes everything from that metadata.
+    full = dataset.DatasetManager(model, multi_node=multi_node)
+    data = dataset.Dataset(config, model)
+    full.register(data)
+    result['tasks_full'] = len(caching(full))
+    result['rows_full'] = sum(len(bucket.iteration_order) for directory in data.directory_datasets
+                              for bucket in directory.bucket_datasets())
+    deepspeed.comm.barrier()
+    with open(f'{out_dir}/{rank}.json', 'w') as f:
+        json.dump(result, f)
+
+
+@pytest.mark.parametrize('multi_node', [False, True])
+def test_metadata_only_caches_the_buckets_and_runs_no_model(tmp_path, monkeypatch, multi_node):
+    import shutil
+    monkeypatch.setenv('DIFFUSION_PIPE_NUM_PROC', '1')
+    _image_dir(tmp_path / 'source')
+    for directory in DIRECTORIES:
+        shutil.copytree(tmp_path / 'source', tmp_path / directory)
+    out = tmp_path / 'out'
+    out.mkdir()
+    hosts = ['node-a', 'node-a', 'node-b']
+    mp.spawn(_metadata_only_worker, nprocs=len(hosts),
+             args=(str(tmp_path / 'init'), str(out), hosts, _dataset_config(tmp_path, False), multi_node))
+    expected = {f'{name}/{w}x{h}': count for name in DIRECTORIES for (w, h), count in BUCKET_IMAGES.items()}
+    total = sum(BUCKET_IMAGES.values())
+    for rank in range(len(hosts)):
+        result = json.loads((out / f'{rank}.json').read_text())
+        # Neither the VAE nor a text encoder ran, and nothing they would make was written.
+        assert result['tasks'] == []
+        assert result['encoded_files'] == []
+        # Every rank reads the buckets back.
+        assert result['buckets'] == expected
+        assert result['described'][0] == f'{tmp_path / DIRECTORIES[0]}: {total} files in {len(BUCKET_IMAGES)} buckets'
+        assert result['described'][1:4] == ['  32x32: 5', '  48x32: 3', '  32x48: 2']
+        assert result['rows_full'] == len(DIRECTORIES) * total
+    assert sum(json.loads((out / f'{rank}.json').read_text())['tasks_full'] for rank in range(len(hosts))) > 0
+
+
 def test_pools_go_largest_bucket_first_and_keep_what_shares_files_together(tmp_path):
     from pathlib import Path
     from utils.dataset import metadata_units, tensor_units

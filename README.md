@@ -14,6 +14,8 @@ Models supported: SDXL, Flux, LTX-Video, HunyuanVideo (t2v), Cosmos, Lumina Imag
 - Optional OPLoRA (orthogonal projection LoRA) to reduce catastrophic forgetting when training LoRAs
 
 ## Recent changes
+- 2026-10-25
+  - `--metadata_only`: scans the datasets, groups them into buckets and caches that metadata, prints the files per bucket, then exits, with no latents or text embeddings. See [pre-caching](#pre-caching).
 - 2026-10-24
   - `cache_text_embeddings = false` works for every model: the latents stay cached and each batch's captions are encoded during training with the model's own text encoders, giving the same embeddings the cache would (at the default `caching_batch_size = 1`). Before, models other than Wan, Cosmos-Predict2/Anima, Iris and MOSS-Image ignored the setting and cached anyway. See [text embeddings: cached or on the fly](#text-embeddings-cached-or-on-the-fly).
   - Fixed AuraFlow's UMT5 and HunyuanImage-2.1's ByT5 text encoders running in train mode: their dropout (0.1) noised every cached embedding. Their text embedding caches are rebuilt on the next run (latents are kept). AuraFlow also no longer encodes an unused negative prompt per caption.
@@ -351,6 +353,18 @@ old one. With `reuse_metadata_cache = false`, the legacy workflow remains availa
 omitting `--trust_cache` rescans sources, and supplying it trusts existing metadata.
 First migration from older caches may read sidecars and build input indexes once;
 new profiles still process metadata, so startup is not constant-time on very large datasets.
+
+`--metadata_only` does only the metadata part: it scans the datasets, groups them into
+buckets, caches that, prints how many files each bucket of each directory holds (train and
+eval datasets), then exits. Neither the VAE nor a text encoder runs and nothing is encoded,
+so it is a quick way to check the buckets before spending GPU time. Some models still read
+their weights into RAM when the pipeline is built, as for any run; nothing goes to the GPU.
+It is launched like training (`deepspeed train.py --deepspeed --config ... --metadata_only`)
+and splits the directories across nodes as caching does. The next run reuses this metadata
+as it reuses any metadata cache (with `reuse_metadata_cache = false`, pass `--trust_cache` to
+skip checking the sources again) and only caches the latents and text embeddings.
+`--regenerate_cache` and `--trust_cache` work with it as with `--cache_only`; it refuses
+`--cache_only`, `--dump_dataset`, `--test_sample`, `--resume_from_checkpoint` and Turbo configs.
 
 ### Text embeddings: cached or on the fly
 

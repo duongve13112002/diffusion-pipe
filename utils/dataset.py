@@ -2922,11 +2922,11 @@ def _cache_datasets(datasets, queue, preprocess_media_file_fn, num_text_encoders
 
 def _cache_stage(datasets, queue, preprocess_media_file_fn, num_text_encoders, regenerate_cache, trust_cache,
                  caching_batch_size, stage, node, text_encoder):
-    """stage 'all' caches everything here. With several nodes, every node runs stage 'metadata',
-    then 'latents', then 'text' once per text encoder, each taking units of work from a pool all
-    the nodes share until none is left. Each is a round of its own, so a GPU swaps models once,
-    not for every unit, and no two nodes work on one bucket at once: the text encoders of a bucket
-    share its flattened captions."""
+    """stage 'all' caches everything here, 'metadata_only' only the metadata (--metadata_only).
+    With several nodes, every node runs stage 'metadata', then 'latents', then 'text' once per
+    text encoder, each taking units of work from a pool all the nodes share until none is left.
+    Each is a round of its own, so a GPU swaps models once, not for every unit, and no two nodes
+    work on one bucket at once: the text encoders of a bucket share its flattened captions."""
     if stage == 'metadata':
         units = metadata_units(datasets)
         _work_from_pool(queue, 'metadata', units, lambda unit: [
@@ -2940,6 +2940,8 @@ def _cache_stage(datasets, queue, preprocess_media_file_fn, num_text_encoders, r
     else:
         for ds in datasets:
             ds.cache_metadata(regenerate_cache=regenerate_cache, trust_cache=trust_cache)
+        if stage == 'metadata_only':
+            return
 
     pipes = {}
 
@@ -3368,6 +3370,27 @@ def _run_caching_on_every_node(queue, handle_task, process, round_, node, nodes,
     all_ok(error)
 
 
+def describe_buckets(dataset):
+    """What --metadata_only prints: the files of each directory per bucket, largest first. An
+    aspect ratio bucket is encoded once for each of its resolutions."""
+    lines = []
+    for directory in dataset.directory_datasets:
+        buckets = sorted(directory.bucket_datasets(), key=lambda bucket: -len(bucket.metadata_dataset))
+        total = sum(len(bucket.metadata_dataset) for bucket in buckets)
+        lines.append(f'{directory.path}: {total} files in {len(buckets)} buckets')
+        for bucket in buckets:
+            if isinstance(bucket, ARBucketDataset):
+                ar, frames = bucket.ar_frames
+                name = f'aspect ratio {ar:.3f}, resolutions {", ".join(f"{float(r):g}" for r in bucket.resolutions)}'
+            else:
+                width, height, frames = bucket.size_bucket
+                name = f'{width}x{height}'
+            if frames > 1:
+                name += f', {frames} frames'
+            lines.append(f'  {name}: {len(bucket.metadata_dataset)}')
+    return lines
+
+
 # Helper class to make caching multiple datasets more efficient by moving
 # models to GPU as few times as needed.
 class DatasetManager:
@@ -3402,20 +3425,37 @@ class DatasetManager:
     # Use the third-party multiprocess library because HF Datasets uses it for the map() calls.
     # Mix and match native multiprocessing / torch.multiprocessing and multiprocess at your peril! Things can break.
     # In patches.py we register reductions so Tensors sent over Queues and Pipes are efficient just like in torch.multiprocessing.
-    def cache(self, unload_models=True):
+    def cache(self, unload_models=True, metadata_only=False):
+        """metadata_only (--metadata_only): scan the directories, group them into buckets and
+        cache that, with no latents or text embeddings, so neither the VAE nor a text encoder
+        runs. A later run reads this metadata as it reads any metadata cache."""
         check_shared_legacy_caches(self.datasets)
         node, nodes, leader = _node_layout() if self.multi_node else (0, 1, is_main_process())
         if nodes == 1:
-            self._cache_on_rank_0s_node()
+            self._cache_on_rank_0s_node('metadata_only' if metadata_only else 'all')
         else:
             # Every node takes directories, then buckets, from pools they share, until none are
             # left. Each round ends on every node before the next begins: the metadata of every
             # directory is cached before any bucket is drawn, the latents of every bucket before
             # any text embedding, and one text encoder's embeddings before the next encoder's.
             self._cache_on_every_node('metadata', node, nodes, leader)
-            self._cache_on_every_node('latents', node, nodes, leader)
-            for text_encoder in range(len(self.text_encoders)):
-                self._cache_on_every_node('text', node, nodes, leader, text_encoder=text_encoder)
+            if not metadata_only:
+                self._cache_on_every_node('latents', node, nodes, leader)
+                for text_encoder in range(len(self.text_encoders)):
+                    self._cache_on_every_node('text', node, nodes, leader, text_encoder=text_encoder)
+
+        if metadata_only:
+            # No model was used. Every rank reads the metadata back, so one that cannot (a node
+            # that does not see the volume rank 0 wrote to) fails the run here and not at training.
+            dist.barrier()
+            error = None
+            try:
+                for ds in self.datasets:
+                    ds.cache_metadata(trust_cache=True)
+            except Exception as e:
+                error = e
+            all_ok(error)
+            return
 
         if unload_models:
             # Free memory in all unneeded submodels. This is easier than trying to delete every reference.
@@ -3465,7 +3505,7 @@ class DatasetManager:
         process.start()
         return process
 
-    def _cache_on_rank_0s_node(self):
+    def _cache_on_rank_0s_node(self, stage='all'):
         """All of caching on the GPUs of global rank 0's node."""
         global _caching_rounds
         _caching_rounds += 1
@@ -3474,7 +3514,7 @@ class DatasetManager:
         process = None
         if is_main_process():
             try:
-                process = self._start_caching_process(queue)
+                process = self._start_caching_process(queue, stage=stage)
             except Exception as e:
                 error = e
         # loop on the original processes (one per GPU) to handle tasks requiring GPU models (VAE, text encoders)
