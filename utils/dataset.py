@@ -1483,6 +1483,16 @@ _REFRESHED_SNAPSHOTS = None
 _OWN = object()
 
 
+def directory_setting(directory_config, dataset_config, key, why):
+    """A [[directory]] setting, else the dataset's. Looked up in that order, so one set only on
+    the directory needs nothing at the top level."""
+    if key in directory_config:
+        return directory_config[key]
+    if key in dataset_config:
+        return dataset_config[key]
+    raise ValueError(f'{directory_config["path"]}: set {key} in the dataset config or its [[directory]] ({why})')
+
+
 class DirectoryDataset:
     def __init__(self, directory_config, dataset_config, model_name, framerate=None,
                  round_to_multiple=32, skip_dataset_validation=False,
@@ -1512,7 +1522,8 @@ class DirectoryDataset:
             self.size_bucket_datasets = []
         else:
             self.resolutions = self._process_user_provided_resolutions(
-                directory_config.get('resolutions', dataset_config['resolutions'])
+                directory_setting(directory_config, dataset_config, 'resolutions',
+                                  'the image area(s) to train on, unless size_buckets is given')
             )
             self.resolutions = dedup_and_sort(self.resolutions)
             self.ar_bucket_datasets = []
@@ -1615,9 +1626,11 @@ class DirectoryDataset:
         elif ars := self.directory_config.get('ar_buckets', self.dataset_config.get('ar_buckets', None)):
             self.ars = self._process_user_provided_ars(ars)
         else:
-            min_ar = self.directory_config.get('min_ar', self.dataset_config['min_ar'])
-            max_ar = self.directory_config.get('max_ar', self.dataset_config['max_ar'])
-            num_ar_buckets = self.directory_config.get('num_ar_buckets', self.dataset_config['num_ar_buckets'])
+            # No defaults: the aspect ratio buckets are not guessed from the images.
+            why = 'needed with enable_ar_bucket = true unless ar_buckets is given'
+            min_ar = directory_setting(self.directory_config, self.dataset_config, 'min_ar', why)
+            max_ar = directory_setting(self.directory_config, self.dataset_config, 'max_ar', why)
+            num_ar_buckets = directory_setting(self.directory_config, self.dataset_config, 'num_ar_buckets', why)
             self.ars = np.geomspace(min_ar, max_ar, num=num_ar_buckets)
         self.ars = dedup_and_sort(self.ars)
         self.log_ars = np.log(self.ars)

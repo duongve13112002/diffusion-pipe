@@ -209,3 +209,24 @@ def test_the_copy_name_every_profile_once_shared_is_not_loaded(tmp_path):
     assert all(len(captions) == 1 for _, captions in bucket_captions(ds))
     assert not [copy for copy in data.glob('cache/bucketing/ar_frames_*/metadata/metadata_*.arrow')
                 if '_captions' not in copy.name]
+
+
+def test_bucket_settings_given_only_on_the_directory_need_nothing_at_the_top_level(tmp_path):
+    data = make_data(tmp_path / 'data')
+    on_directory = DirectoryDataset(
+        {'path': str(data), 'num_repeats': 1, 'shuffle_metadata': False, 'reuse_metadata_cache': False,
+         'resolutions': [64], 'min_ar': 0.5, 'max_ar': 2.0, 'num_ar_buckets': 5},
+        {'enable_ar_bucket': True, 'frame_buckets': [1]}, 'bucketing', skip_dataset_validation=True)
+    assert on_directory.ars.tolist() == directory(data, 5).ars.tolist()
+    assert on_directory.resolutions.tolist() == directory(data, 5).resolutions.tolist()
+
+
+@pytest.mark.parametrize('missing', ['min_ar', 'max_ar', 'num_ar_buckets', 'resolutions'])
+def test_a_missing_bucket_setting_is_named(tmp_path, missing):
+    data = make_data(tmp_path / 'data')
+    dataset_config = {'resolutions': [64], 'enable_ar_bucket': True, 'min_ar': 0.5, 'max_ar': 2.0,
+                      'num_ar_buckets': 5, 'frame_buckets': [1]}
+    del dataset_config[missing]
+    with pytest.raises(ValueError, match=f'set {missing} in the dataset config or its'):
+        DirectoryDataset({'path': str(data), 'num_repeats': 1, 'shuffle_metadata': False,
+                          'reuse_metadata_cache': False}, dataset_config, 'bucketing', skip_dataset_validation=True)

@@ -16,6 +16,7 @@ Models supported: SDXL, Flux, LTX-Video, HunyuanVideo (t2v), Cosmos, Lumina Imag
 ## Recent changes
 - 2026-10-25
   - `--metadata_only`: scans the datasets, groups them into buckets and caches that metadata, prints the files per bucket, then exits, with no latents or text embeddings. See [pre-caching](#pre-caching).
+  - `resolutions`, `min_ar`, `max_ar` and `num_ar_buckets` set only on a `[[directory]]` no longer fail with a `KeyError` when the top level leaves them out; a setting missing from both is named in the error. With `enable_ar_bucket = true` and no `ar_buckets`, all three of `min_ar`, `max_ar` and `num_ar_buckets` are required: there are no defaults.
 - 2026-10-24
   - `cache_text_embeddings = false` works for every model: the latents stay cached and each batch's captions are encoded during training with the model's own text encoders, giving the same embeddings the cache would (at the default `caching_batch_size = 1`). Before, models other than Wan, Cosmos-Predict2/Anima, Iris and MOSS-Image ignored the setting and cached anyway. See [text embeddings: cached or on the fly](#text-embeddings-cached-or-on-the-fly).
   - Fixed AuraFlow's UMT5 and HunyuanImage-2.1's ByT5 text encoders running in train mode: their dropout (0.1) noised every cached embedding. Their text embedding caches are rebuilt on the next run (latents are kept). AuraFlow also no longer encodes an unused negative prompt per caption.
