@@ -173,7 +173,7 @@ def missing_files(snapshot, threads=32, batch_size=10000):
 
 
 def check_snapshot(plan, snapshot, sample, header_sample, seed=0, check_all=False, threads=32,
-                   required=REQUIRED_COLUMNS):
+                   required=REQUIRED_COLUMNS, compare_buckets=True):
     """Refuse a snapshot that is malformed, holds videos, or no longer matches the files."""
     import pyarrow.compute as pc
     from PIL import Image
@@ -217,7 +217,7 @@ def check_snapshot(plan, snapshot, sample, header_sample, seed=0, check_all=Fals
         if missing_path is not None:
             gone.append(missing_path)
             continue
-        if tar_file or headers_checked >= header_sample:
+        if tar_file or headers_checked >= header_sample or not compare_buckets:
             continue
         headers_checked += 1
         try:
@@ -314,6 +314,9 @@ def _legacy_complete(metadata_dir, suffix):
 def _bucket_mismatch(target, keys):
     """Grouping keys the target's bucketing would never produce, or None when all fit."""
     import numpy as np
+    if not target.use_size_buckets and target.ars is None:
+        # Buckets made from the images: the recorded bucketing settings decide.
+        return None
     bad = []
     for key in keys:
         if target.use_size_buckets:
@@ -393,6 +396,10 @@ def plan_legacy_directory(plan, donor, target_model, force, sample, header_sampl
             plan.note(f'{record_file.name}: the donor was grouped by {recorded}, this dataset groups by {wanted}. '
                       'Let training rebuild it.')
             return plan
+    elif not target.use_size_buckets and target.ars is None:
+        plan.note(f'{record_file.name} is missing, and this dataset makes its aspect ratio buckets from the '
+                  'images: the donor cannot be shown to be grouped the same way. Let training rebuild it.')
+        return plan
 
     settings_file = donor_metadata / f'caption_settings{suffix}.json'
     if not settings_file.is_file():
@@ -424,8 +431,10 @@ def plan_legacy_directory(plan, donor, target_model, force, sample, header_sampl
         plan.note('donor metadata and this dataset disagree about mask_path / default_mask_file'
                   + (f', e.g. {sorted(foreign)[:2]}' if foreign else '') + '.')
         return plan
+    # Grouped rows hold their bucket's aspect ratio, which an image's size gives only for buckets
+    # fixed by the settings.
     if not check_snapshot(plan, grouped, sample, header_sample, check_all=check_all, threads=threads,
-                          required=LEGACY_COLUMNS):
+                          required=LEGACY_COLUMNS, compare_buckets=target.use_size_buckets or target.ars is not None):
         return plan
 
     pattern = re.compile(rf'^(metadata_intermediate|metadata_with_captions\.arrow|'

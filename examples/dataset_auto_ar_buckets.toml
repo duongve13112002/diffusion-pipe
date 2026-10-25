@@ -1,0 +1,34 @@
+# Aspect ratio buckets made from the images (see "Aspect ratio buckets from the images" in the
+# README). With enable_ar_bucket = true and no ar_buckets:
+# - min_ar / max_ar left out (here and on the [[directory]]): the narrowest / widest image of
+#   each directory.
+# - num_ar_buckets left out: the fewest buckets that crop no image by more than max_ar_crop of
+#   its width or height.
+# Check the buckets before caching latents with:
+#   deepspeed train.py --deepspeed --config <train config> --metadata_only
+
+resolutions = [1024]
+enable_ar_bucket = true
+frame_buckets = [1]
+
+# At most ~7% of a side cropped. Default 0.1 when left out. Not together with num_ar_buckets.
+max_ar_crop = 0.07
+
+[[directory]]
+# Range and bucket count both from the settings above.
+path = '/data/photos'
+num_repeats = 1
+
+[[directory]]
+# Narrow end from the images, wide end capped at 2:1 (wider images are cropped to it),
+# and a tighter crop for this directory only.
+path = '/data/portraits'
+num_repeats = 1
+max_ar = 2.0
+max_ar_crop = 0.05
+
+[[directory]]
+# A fixed count: this directory ignores the top-level max_ar_crop.
+path = '/data/anime'
+num_repeats = 1
+num_ar_buckets = 9

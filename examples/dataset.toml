@@ -31,11 +31,15 @@ enable_ar_bucket = true
 # The aspect ratio and frame bucket settings may be specified for each [[directory]] entry as well.
 # Directory-level settings will override top-level settings.
 
-# Min and max aspect ratios, given as width/height ratio.
+# Min and max aspect ratios, given as width/height ratio. Left out (here and on the
+# [[directory]]): the narrowest / widest image of each directory.
 min_ar = 0.5
 max_ar = 2.0
 # Total number of aspect ratio buckets, evenly spaced (in log space) between min_ar and max_ar.
+# Left out: the fewest buckets that crop no image by more than max_ar_crop of its width or height.
 num_ar_buckets = 7
+# Used when num_ar_buckets is left out (not together with it). Default 0.1 (10%).
+# max_ar_crop = 0.1
 
 # Can manually specify ar_buckets instead of using the range-style config above.
 # Each entry can be width/height ratio, or (width, height) pair. But you can't mix them, because of TOML.

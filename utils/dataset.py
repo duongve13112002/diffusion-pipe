@@ -1483,6 +1483,61 @@ _REFRESHED_SNAPSHOTS = None
 _OWN = object()
 
 
+# max_ar_crop when neither it nor num_ar_buckets is set.
+DEFAULT_MAX_AR_CROP = 0.1
+
+
+def ar_bucket_count(min_ar, max_ar, max_crop):
+    """The fewest aspect ratio buckets, spaced evenly in log space from min_ar to max_ar, that crop
+    no image by more than max_crop of its width or height. An image halfway (in log space) between
+    two neighbouring buckets, whose aspect ratios differ by a factor step, loses 1 - 1/sqrt(step)
+    of one side."""
+    if max_ar <= min_ar:
+        return 1
+    largest_step = 1 / (1 - max_crop) ** 2
+    # The tolerance keeps a range of exactly n - 1 largest steps at n buckets.
+    return math.ceil(math.log(max_ar / min_ar) / math.log(largest_step) - 1e-9) + 1
+
+
+def ar_range_settings(directory_config, dataset_config):
+    """min_ar, max_ar, num_ar_buckets and max_ar_crop for enable_ar_bucket without ar_buckets.
+    min_ar or max_ar None: the narrowest or widest image's, found by the metadata scan.
+    num_ar_buckets None: as many as keep the crop within max_ar_crop. The bucket count is set by
+    the directory when it sets num_ar_buckets or max_ar_crop, else by the top level."""
+    settings = {}
+    for key in ('min_ar', 'max_ar'):
+        settings[key] = directory_config.get(key, dataset_config.get(key))
+        if settings[key] is not None and (isinstance(settings[key], bool)
+                                          or not isinstance(settings[key], (int, float)) or settings[key] <= 0):
+            raise ValueError(f'{directory_config["path"]}: {key} must be a positive number, got {settings[key]!r}')
+    if settings['min_ar'] is not None and settings['max_ar'] is not None and settings['min_ar'] > settings['max_ar']:
+        raise ValueError(f'{directory_config["path"]}: min_ar ({settings["min_ar"]}) is above max_ar ({settings["max_ar"]})')
+    level = directory_config if ('num_ar_buckets' in directory_config or 'max_ar_crop' in directory_config) \
+        else dataset_config
+    settings['num_ar_buckets'] = level.get('num_ar_buckets')
+    settings['max_ar_crop'] = level.get('max_ar_crop')
+    count = settings['num_ar_buckets']
+    if count is not None and (isinstance(count, bool) or not isinstance(count, int) or count < 1):
+        raise ValueError(f'{directory_config["path"]}: num_ar_buckets must be a whole number of at least 1, got {count!r}')
+    if count is None and settings['max_ar_crop'] is None:
+        settings['max_ar_crop'] = DEFAULT_MAX_AR_CROP
+    return settings
+
+
+def check_max_ar_crop(config, where):
+    """max_ar_crop sets the number of aspect ratio buckets: refused beside a setting that already
+    fixes the buckets on the same level, and outside (0, 1)."""
+    if 'max_ar_crop' not in config:
+        return
+    crop = config['max_ar_crop']
+    if isinstance(crop, bool) or not isinstance(crop, (int, float)) or not 0 < crop < 1:
+        raise ValueError(f'{where}: max_ar_crop must be a fraction between 0 and 1 (0.1 is 10%), got {crop!r}')
+    conflicting = [key for key in ('num_ar_buckets', 'ar_buckets', 'size_buckets') if key in config]
+    if conflicting:
+        raise ValueError(f'{where}: max_ar_crop does not go with {", ".join(conflicting)}, which already '
+                         'set the aspect ratio buckets')
+
+
 def directory_setting(directory_config, dataset_config, key, why):
     """A [[directory]] setting, else the dataset's. Looked up in that order, so one set only on
     the directory needs nothing at the top level."""
@@ -1512,6 +1567,10 @@ class DirectoryDataset:
         self.framerate = framerate
         self.round_to_multiple = round_to_multiple
         self.enable_ar_bucket = directory_config.get('enable_ar_bucket', dataset_config.get('enable_ar_bucket', False))
+        check_max_ar_crop(dataset_config, 'dataset config')
+        check_max_ar_crop(directory_config, f'[[directory]] {directory_config["path"]}')
+        if 'max_ar_crop' in directory_config and not self.enable_ar_bucket:
+            raise ValueError(f'[[directory]] {directory_config["path"]}: max_ar_crop needs enable_ar_bucket = true')
         # Configure directly from user-specified size buckets.
         self.size_buckets = directory_config.get('size_buckets', dataset_config.get('size_buckets', None))
         self.use_size_buckets = (self.size_buckets is not None)
@@ -1626,14 +1685,16 @@ class DirectoryDataset:
         elif ars := self.directory_config.get('ar_buckets', self.dataset_config.get('ar_buckets', None)):
             self.ars = self._process_user_provided_ars(ars)
         else:
-            # No defaults: the aspect ratio buckets are not guessed from the images.
-            why = 'needed with enable_ar_bucket = true unless ar_buckets is given'
-            min_ar = directory_setting(self.directory_config, self.dataset_config, 'min_ar', why)
-            max_ar = directory_setting(self.directory_config, self.dataset_config, 'max_ar', why)
-            num_ar_buckets = directory_setting(self.directory_config, self.dataset_config, 'num_ar_buckets', why)
-            self.ars = np.geomspace(min_ar, max_ar, num=num_ar_buckets)
-        self.ars = dedup_and_sort(self.ars)
-        self.log_ars = np.log(self.ars)
+            self.ar_range = ar_range_settings(self.directory_config, self.dataset_config)
+            if self.ar_range['min_ar'] is None or self.ar_range['max_ar'] is None:
+                # From the images: the metadata scan keeps each image's own aspect ratio, and
+                # the buckets are made when it is grouped (_ar_buckets_from_images).
+                self.ars = None
+            else:
+                self.ars = self._ars_in_range(self.ar_range['min_ar'], self.ar_range['max_ar'])
+        if self.ars is not None:
+            self.ars = dedup_and_sort(self.ars)
+            self.log_ars = np.log(self.ars)
         if self.use_size_buckets:
             # One per size bucket, in the same order: self.ars is deduplicated and sorted. Rounded
             # as self.ars is, so buckets the old matching got right keep every answer it gave.
@@ -1685,12 +1746,44 @@ class DirectoryDataset:
             self.cache_dir.joinpath('metadata').mkdir(parents=True, exist_ok=True)
             self._refresh_source = False
 
+    def _ars_in_range(self, min_ar, max_ar):
+        count = self.ar_range['num_ar_buckets'] or ar_bucket_count(min_ar, max_ar, self.ar_range['max_ar_crop'])
+        return np.geomspace(min_ar, max_ar, num=count)
+
+    def _ar_bucket_setting(self):
+        """The aspect ratio buckets as the caches record them: the list, or for buckets made from
+        the images the settings they are made by."""
+        if self.ars is not None:
+            return self.ars.tolist()
+        return {'from_images': self.ar_range}
+
+    def _ar_buckets_from_images(self, metadata_dataset):
+        """For buckets made from the images: a function from an image's own aspect ratio, as the
+        metadata scan keeps it, to its bucket's. The range runs from the narrowest image to the
+        widest, unless min_ar or max_ar is set."""
+        lowest, highest = math.inf, 0.0
+        for batch in metadata_dataset.iter(batch_size=10000):
+            ratios = [bucket[0] for bucket in batch['ar_bucket']]
+            if ratios:
+                lowest, highest = min(lowest, min(ratios)), max(highest, max(ratios))
+        if highest == 0.0:
+            return None
+        min_ar = self.ar_range['min_ar'] or lowest
+        max_ar = self.ar_range['max_ar'] or highest
+        ars = dedup_and_sort(self._ars_in_range(min_ar, max(min_ar, max_ar)))
+        log_ars = np.log(ars)
+        # Grouping runs in the caching process only.
+        crop = 1 - 1 / math.sqrt(ars[-1] / ars[0]) ** (1 / (len(ars) - 1)) if len(ars) > 1 else 0.0
+        print(f'{self.path}: {len(ars)} aspect ratio buckets from {ars[0]:.3f} to {ars[-1]:.3f} '
+              f'(images {lowest:.3f} to {highest:.3f}; at most {crop:.1%} of a side cropped between buckets)')
+        return lambda ratio: float(ars[np.argmin(np.abs(math.log(ratio) - log_ars))])
+
     def snapshot_geometry(self, framerate=_OWN, round_to_multiple=_OWN):
         """The settings that decide which source metadata snapshot this directory uses. Its hash
         names the profiles/<geometry> directory. The arguments override this dataset's own
         values, for tools/inherit_metadata_cache.py to find another model's snapshot."""
         geometry = {'size_buckets': self.size_buckets.tolist() if self.use_size_buckets else None,
-                'ars': self.ars.tolist(), 'frames': self.frame_buckets.tolist(),
+                'ars': self._ar_bucket_setting(), 'frames': self.frame_buckets.tolist(),
                 'resolutions': self.resolutions.tolist() if not self.use_size_buckets else None,
                 'round_to_multiple': self.round_to_multiple if round_to_multiple is _OWN else round_to_multiple,
                 'framerate': self.framerate if framerate is _OWN else framerate,
@@ -1794,7 +1887,7 @@ class DirectoryDataset:
             compatible = old is not None and (
                 self.size_buckets_matched_before and old['size_bucket'] in self.size_buckets.tolist()
                 if self.use_size_buckets
-                else old['ar_bucket'] is not None and old['ar_bucket'][0] in self.ars
+                else self.ars is not None and old['ar_bucket'] is not None and old['ar_bucket'][0] in self.ars
                 and old['ar_bucket'][1] in self.frame_buckets)
             if compatible and all(old.get(k) == row.get(k) for k in ('mask_file', 'control_file')):
                 result = old
@@ -2061,6 +2154,8 @@ class DirectoryDataset:
             # be from this scan or the last one: a run killed meanwhile must not be trusted.
             self._record_bucketing({'incomplete': True})
         metadata_dataset = self._get_ungrouped_metadata(regenerate_cache=regenerate_cache, trust_cache=trust_cache)
+        to_bucket = (self._ar_buckets_from_images(metadata_dataset)
+                     if not self.use_size_buckets and self.ars is None else None)
         grouped_metadata = defaultdict(lambda: defaultdict(list))
         unique_grouping_keys = set()
         for example in tqdm(metadata_dataset, desc='Grouping examples'):
@@ -2068,6 +2163,9 @@ class DirectoryDataset:
                 grouping_key = tuple(example['size_bucket'])
             else:
                 grouping_key = example['ar_bucket']
+                if to_bucket is not None:
+                    example['ar_bucket'] = [to_bucket(grouping_key[0]), grouping_key[1]]
+                    grouping_key = example['ar_bucket']
                 grouping_key = (grouping_key[0], int(grouping_key[1]))
             unique_grouping_keys.add(grouping_key)
             d = grouped_metadata[grouping_key]
@@ -2116,7 +2214,8 @@ class DirectoryDataset:
         converted to the model's framerate."""
         if self.use_size_buckets:
             return {'size_buckets': self.size_buckets.tolist(), 'framerate': self.framerate}
-        return {'ars': self.ars.tolist(), 'frame_buckets': self.frame_buckets.tolist(), 'framerate': self.framerate}
+        return {'ars': self._ar_bucket_setting(), 'frame_buckets': self.frame_buckets.tolist(),
+                'framerate': self.framerate}
 
     def _bucketing_file(self):
         return self.cache_dir / f'metadata/bucketing{self.caption_cache_suffix}.json'
@@ -2153,6 +2252,9 @@ class DirectoryDataset:
             if recorded != self._bucketing():
                 return 'the cached metadata was grouped by other buckets than these.'
             return None
+        if not self.use_size_buckets and self.ars is None:
+            # Buckets made from the images are always recorded.
+            return 'the buckets the cached metadata was grouped by were not recorded.'
         # Grouped before the buckets were recorded: a bucket these settings never make shows
         # they changed. New buckets that happen to include all the old ones go unseen.
         try:
@@ -2455,8 +2557,9 @@ class DirectoryDataset:
         return fn
 
     def _find_closest_ar_bucket(self, log_ar, frames, is_video):
-        # Best AR bucket is the one with the smallest AR difference in log space.
-        i = np.argmin(np.abs(log_ar - self.log_ars))
+        # Best AR bucket is the one with the smallest AR difference in log space. With buckets made
+        # from the images, the image's own aspect ratio until they are (_ar_buckets_from_images).
+        i = None if self.ars is None else np.argmin(np.abs(log_ar - self.log_ars))
         # find closest frame bucket where the number of frames is greater than or equal to the bucket
         diffs = frames - self.frame_buckets
         positive_diffs = diffs[diffs >= 0]
@@ -2467,7 +2570,7 @@ class DirectoryDataset:
         if is_video and self.frame_buckets[j] == 1:
             # don't let video be mapped to the image frame bucket
             return None
-        ar_bucket = (self.ars[i], self.frame_buckets[j])
+        ar_bucket = (math.exp(log_ar) if i is None else self.ars[i], self.frame_buckets[j])
         return ar_bucket
 
     def _find_closest_size_bucket(self, log_ar, frames, is_video):
@@ -2638,6 +2741,13 @@ class Dataset:
                 layout_caption_format=getattr(model, 'layout_caption_format', None),
             )
             self.directory_datasets.append(directory_dataset)
+        if 'max_ar_crop' in dataset_config and not any(
+                getattr(directory, 'ar_range', None) is not None and directory.ar_range['num_ar_buckets'] is None
+                and not ('num_ar_buckets' in directory.directory_config or 'max_ar_crop' in directory.directory_config)
+                for directory in self.directory_datasets):
+            raise ValueError('max_ar_crop at the top level of the dataset config applies to no [[directory]]: each '
+                             'one has enable_ar_bucket off, ar_buckets, size_buckets, or its own num_ar_buckets or '
+                             'max_ar_crop')
 
     def post_init(self, data_parallel_rank, data_parallel_world_size, per_device_batch_size: dict, gradient_accumulation_steps, per_device_batch_size_image: dict):
         self.data_parallel_rank = data_parallel_rank

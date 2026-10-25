@@ -16,7 +16,8 @@ Models supported: SDXL, Flux, LTX-Video, HunyuanVideo (t2v), Cosmos, Lumina Imag
 ## Recent changes
 - 2026-10-25
   - `--metadata_only`: scans the datasets, groups them into buckets and caches that metadata, prints the files per bucket, then exits, with no latents or text embeddings. See [pre-caching](#pre-caching).
-  - `resolutions`, `min_ar`, `max_ar` and `num_ar_buckets` set only on a `[[directory]]` no longer fail with a `KeyError` when the top level leaves them out; a setting missing from both is named in the error. With `enable_ar_bucket = true` and no `ar_buckets`, all three of `min_ar`, `max_ar` and `num_ar_buckets` are required: there are no defaults.
+  - `resolutions`, `min_ar`, `max_ar` and `num_ar_buckets` set only on a `[[directory]]` no longer fail with a `KeyError` when the top level leaves them out; a setting missing from both is named in the error.
+  - Aspect ratio buckets from the images: with `enable_ar_bucket = true` and no `ar_buckets`, a `min_ar` or `max_ar` set neither on the `[[directory]]` nor at the top level is the narrowest or widest image of that directory, and a missing `num_ar_buckets` is the fewest buckets that crop no image by more than `max_ar_crop` (new, default 0.1: 10% of its width or height). Before, all three were required. See [aspect ratio buckets from the images](#aspect-ratio-buckets-from-the-images).
 - 2026-10-24
   - `cache_text_embeddings = false` works for every model: the latents stay cached and each batch's captions are encoded during training with the model's own text encoders, giving the same embeddings the cache would (at the default `caching_batch_size = 1`). Before, models other than Wan, Cosmos-Predict2/Anima, Iris and MOSS-Image ignored the setting and cached anyway. See [text embeddings: cached or on the fly](#text-embeddings-cached-or-on-the-fly).
   - Fixed AuraFlow's UMT5 and HunyuanImage-2.1's ByT5 text encoders running in train mode: their dropout (0.1) noised every cached embedding. Their text embedding caches are rebuilt on the next run (latents are kept). AuraFlow also no longer encodes an unused negative prompt per caption.
@@ -413,6 +414,35 @@ training batch instead of the caption files' order. So:
 With `pipeline_stages` above 1, the first and last stages both load the text encoders.
 Switching between `true` and `false` keeps the latent caches; the text embedding cache is only
 written and read with `true`.
+
+### Aspect ratio buckets from the images
+
+With `enable_ar_bucket = true` and no `ar_buckets`, the buckets are spaced evenly (in log space)
+from `min_ar` to `max_ar`. Each of the three settings may be left out, on the `[[directory]]`
+and at the top level:
+
+- `min_ar` / `max_ar` left out: the narrowest / widest aspect ratio among that directory's
+  images, found by the metadata scan. Each directory gets its own range.
+- `num_ar_buckets` left out: the fewest buckets that crop no image by more than `max_ar_crop`
+  of its width or height (default `0.1`, i.e. 10%). An image halfway between two neighbouring
+  buckets, whose aspect ratios differ by a factor `step`, loses `1 - 1/sqrt(step)` of one side,
+  so the count follows the range: from 0.5 to 2.0 at 10% that is 8 buckets, at 5% 15.
+
+| Range | `max_ar_crop` | Buckets |
+|---|---|---|
+| 0.5 to 2.0 | 0.1 | 8 |
+| 0.5 to 2.0 | 0.05 | 15 |
+| 0.43 to 2.4 | 0.1 | 10 |
+
+A smaller `max_ar_crop` crops less but splits the images over more buckets, each holding fewer;
+with few images per bucket, batches are filled by `batch_fill_strategy`. `max_ar_crop` is refused
+beside `num_ar_buckets`, `ar_buckets` or `size_buckets` on the same level, on a directory
+without `enable_ar_bucket`, and at the top level when no directory uses it. A directory that sets `num_ar_buckets` or `max_ar_crop` overrides
+both top-level values. The caching log prints the buckets each directory gets; `--metadata_only`
+shows how many images went into each. A change of `max_ar_crop` regroups the dataset like any
+other bucket change (below). With a range from the images, each caption setting of a directory
+that keeps a different set of images (`require_non_latin_caption`, `skip_empty_caption`) may get
+a slightly different range.
 
 ### Changing the buckets
 
