@@ -37,6 +37,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'
 import peft
 import safetensors.torch
 
+from utils.dora import DORA_SCALE, has_dora_scale, saved_key
+
 PREFIX_RE = re.compile(r'^(model\.diffusion_model|diffusion_model|transformer|net)\.')
 
 # One factor of each adapter's delta, so scaling it scales the whole delta exactly once.
@@ -96,10 +98,13 @@ def apply_adapter(model, adapter_dir, strength=1.0):
     peft_config = peft.PeftConfig.from_pretrained(str(adapter_dir))
     peft_model = peft.get_peft_model(model, peft_config)
     by_saved_key = {
-        name.replace('.default', '').replace('.modules_to_save', ''): name
+        saved_key(name.replace('.default', '').replace('.modules_to_save', '')): name
         for name, _ in model.named_parameters()
     }
+    shapes = {name: p.shape for name, p in model.named_parameters()}
     adapter_sd = safetensors.torch.load_file(str(adapter_dir / 'adapter_model.safetensors'))
+    if strength != 1.0 and has_dora_scale(adapter_sd):
+        raise ValueError('--strength is not supported for a DoRA adapter: scaling the update would leave the magnitude vector at full strength')
     renamed = {}
     for key, tensor in adapter_sd.items():
         key = PREFIX_RE.sub('', key)
@@ -108,7 +113,8 @@ def apply_adapter(model, adapter_dir, strength=1.0):
         tensor = tensor.float()
         if strength != 1.0 and STRENGTH_FACTOR_RE.search(key):
             tensor = tensor * strength
-        renamed[by_saved_key[key]] = tensor
+        name = by_saved_key[key]
+        renamed[name] = tensor.reshape(shapes[name]) if key.endswith(DORA_SCALE) else tensor
     adapter_params = {name for name, _ in model.named_parameters()
                       if '.default' in name and any(s in name for s in ('lora_', 'lokr_'))}
     not_loaded = sorted(adapter_params - set(renamed))

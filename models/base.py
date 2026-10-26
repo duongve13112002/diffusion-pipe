@@ -20,6 +20,7 @@ from utils.common import is_main_process, VIDEO_EXTENSIONS, round_to_nearest_mul
 sys.path.insert(0, os.path.join(os.path.abspath(os.path.dirname(__file__)), '../submodules/ComfyUI'))
 
 import peft
+from utils.dora import DORA_SCALE, saved_key
 import torch
 # torchaudio is required, and not only for the one resample call further down. The vendored
 # ComfyUI imports it at module scope in several places -- comfy.sd pulls in
@@ -374,6 +375,7 @@ class CommonPipeline:
                 r=adapter_config['rank'],
                 lora_alpha=adapter_config['alpha'],
                 lora_dropout=adapter_config['dropout'],
+                use_dora=adapter_config.get('use_dora', False),
                 bias='none',
                 target_modules=target_modules,
                 exclude_modules=adapter_config.get('exclude_modules', None),
@@ -431,10 +433,11 @@ class CommonPipeline:
         if len(safetensors_files) > 1:
             raise RuntimeError(f'Multiple safetensors files found in {adapter_path}')
         adapter_state_dict = safetensors.torch.load_file(safetensors_files[0])
-        by_saved_key = {
-            name.replace('.default', '').replace('.modules_to_save', ''): name
-            for name, _ in target_model.named_parameters()
-        }
+        by_saved_key = {}
+        shapes = {}
+        for name, p in target_model.named_parameters():
+            by_saved_key[saved_key(name.replace('.default', '').replace('.modules_to_save', ''))] = name
+            shapes[name] = p.shape
         modified_state_dict = {}
         for k, v in adapter_state_dict.items():
             if rename_key is not None:
@@ -443,7 +446,8 @@ class CommonPipeline:
             k = re.sub(r'^(transformer|diffusion_model)\.', '', k)
             if k not in by_saved_key:
                 raise RuntimeError(f'modified_state_dict key {k} is not in the model parameters')
-            modified_state_dict[by_saved_key[k]] = v
+            name = by_saved_key[k]
+            modified_state_dict[name] = v.reshape(shapes[name]) if k.endswith(DORA_SCALE) else v
         target_model.load_state_dict(modified_state_dict, strict=False)
 
     @torch.no_grad()

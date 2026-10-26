@@ -14,6 +14,8 @@ Models supported: SDXL, Flux, LTX-Video, HunyuanVideo (t2v), Cosmos, Lumina Imag
 - Optional OPLoRA (orthogonal projection LoRA) to reduce catastrophic forgetting when training LoRAs
 
 ## Recent changes
+- 2026-10-26
+  - DoRA: set `use_dora = true` in a `type = "lora"` `[adapter]` table. It costs extra VRAM and step time and works with `oplora`. The magnitude vector is saved as `<module>.dora_scale` (shape `(out, 1)`, the kohya name for SDXL), which ComfyUI and kohya read; ComfyUI measures the norm on the original weight, a small approximation (a few percent for a small adapter) of what PEFT trains with. Flux and SDXL resume a DoRA adapter through their own loader (diffusers would drop the magnitude); `fuse_adapters` and `tools/iris_merge_adapter.py --strength` refuse a DoRA adapter.
 - 2026-10-25
   - `--metadata_only`: scans the datasets, groups them into buckets and caches that metadata, prints the files per bucket, then exits, with no latents or text embeddings. See [pre-caching](#pre-caching).
   - `resolutions`, `min_ar`, `max_ar` and `num_ar_buckets` set only on a `[[directory]]` no longer fail with a `KeyError` when the top level leaves them out; a setting missing from both is named in the error.

@@ -11,6 +11,7 @@ import safetensors
 from safetensors.torch import save_file
 
 from models.base import BasePipeline, make_contiguous
+from utils.dora import DORA_SCALE, has_dora_scale, kohya_module_name, saved_key
 from utils.common import AUTOCAST_DTYPE, is_main_process
 
 
@@ -453,6 +454,7 @@ class SDXLPipeline(BasePipeline):
                 r=adapter_config['rank'],
                 lora_alpha=adapter_config['alpha'],
                 lora_dropout=adapter_config['dropout'],
+                use_dora=adapter_config.get('use_dora', False),
                 bias='none',
                 target_modules=target_linear_modules
             )
@@ -470,7 +472,13 @@ class SDXLPipeline(BasePipeline):
             # TODO: should we do any additional checks here? This helpful function appears to completely convert
             # the PEFT format state_dict to kohya format. Every key in the lora is correctly loaded by Forge.
             # But all these different formats are a mess and I hardly understand it. This seems to work though.
+            # diffusers' converter cannot name a magnitude vector, so the DoRA entries go by
+            # the kohya name of their module with '.dora_scale' in place of '.lora_down.weight'.
+            dora = {k: v for k, v in peft_state_dict.items() if k.endswith(DORA_SCALE)}
+            peft_state_dict = {k: v for k, v in peft_state_dict.items() if k not in dora}
             kohya_sd = diffusers.utils.state_dict_utils.convert_state_dict_to_kohya(peft_state_dict)
+            for k, v in dora.items():
+                kohya_sd[kohya_module_name(k) + DORA_SCALE] = v
             safetensors.torch.save_file(kohya_sd, save_dir / 'lora.safetensors', metadata={'format': 'pt'})
         else:
             raise NotImplementedError(f'Adapter type {adapter_type} is not implemented')
@@ -483,8 +491,36 @@ class SDXLPipeline(BasePipeline):
         if len(safetensors_files) > 1:
             raise RuntimeError(f'Multiple safetensors files found in {adapter_path}')
         adapter_state_dict = safetensors.torch.load_file(safetensors_files[0])
+        if has_dora_scale(adapter_state_dict):
+            # diffusers' load_lora_weights drops dora_scale and would load a plain LoRA.
+            self._load_dora_adapter(adapter_state_dict)
+            return
         self.diffusers_pipeline.load_lora_weights(adapter_state_dict, adapter_name='default')
         self._set_param_original_name()
+
+    def _load_dora_adapter(self, adapter_state_dict):
+        adapter_config = {k: v for k, v in self.config['adapter'].items() if k != 'init_from_existing'}
+        self.configure_adapter(adapter_config)
+        by_kohya_key = {}
+        for module in (self.unet, self.text_encoder, self.text_encoder_2):
+            for name, p in module.named_parameters():
+                if not p.requires_grad:
+                    continue
+                key = saved_key(p.original_name.replace('.default', ''))
+                if key.endswith(DORA_SCALE):
+                    by_kohya_key[kohya_module_name(key) + DORA_SCALE] = p
+                else:
+                    by_kohya_key[kohya_module_name(key) + key[key.rindex('.lora_'):].replace('lora_A', 'lora_down').replace('lora_B', 'lora_up')] = p
+        with torch.no_grad():
+            for k, v in adapter_state_dict.items():
+                if k.endswith('.alpha'):
+                    continue
+                if k not in by_kohya_key:
+                    raise RuntimeError(f'Adapter key {k} does not match any parameter of this model')
+                p = by_kohya_key.pop(k)
+                p.copy_(v.reshape(p.shape).to(p.dtype))
+        if by_kohya_key:
+            raise RuntimeError(f'The adapter file has no value for {sorted(by_kohya_key)[:3]} and {len(by_kohya_key) - 3} more')
 
     def save_model(self, save_dir, diffusers_sd):
         unet_state_dict, text_enc_dict, text_enc_2_dict = {}, {}, {}

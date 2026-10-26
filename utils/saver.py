@@ -9,6 +9,7 @@ from deepspeed.runtime.checkpoint_engine.torch_checkpoint_engine import TorchChe
 from deepspeed.utils.logging import logger
 
 from utils.common import all_ok, fsync_dir, is_main_process, torch_save_atomic, write_atomic
+from utils.dora import saved_key, saved_value
 from utils.ema import EMA_SUBDIR, save_ema_checkpoint
 
 
@@ -331,7 +332,9 @@ class Saver:
                         continue
                     # TODO: maybe this needs to change if we ever have non-lora adapters?
                     key = p.original_name.replace('.default', '').replace('.modules_to_save', '')
-                    partial_state_dict[key] = self.ema.averaged(key, p) if ema else p.detach()
+                    value = self.ema.averaged(key, p) if ema else p.detach()
+                    # DoRA's magnitude vector goes by the name and shape ComfyUI and kohya read.
+                    partial_state_dict[saved_key(key)] = saved_value(key, value)
             return partial_state_dict
         self._save(name, ema, collect, self.model.save_adapter)
 

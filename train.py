@@ -29,6 +29,7 @@ from utils.text_encoding import TextEncodingOnTheFly, encodes_text_in_loader
 from utils.patches import apply_patches
 from utils.unsloth_utils import unsloth_checkpoint
 from utils.pipeline import ManualPipelineModule
+from utils.dora import apply_dora_config_defaults
 from utils.oplora import OPLoRAProjector, apply_oplora_config_defaults
 from utils.lr_schedule import create_lr_scheduler
 from utils.checkpoint_layout import check_checkpoint_layers, shift_checkpoint_layers
@@ -129,6 +130,7 @@ def set_config_defaults(config):
         adapter_config.setdefault('dtype', model_dtype_str)
         adapter_config['dtype'] = DTYPE_MAP[adapter_config['dtype']]
 
+        apply_dora_config_defaults(adapter_config)
         # per-adapter defaults
         if adapter_config['type'] == 'lora':
             adapter_config.setdefault('dropout', 0.0)
