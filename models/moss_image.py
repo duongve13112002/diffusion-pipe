@@ -1257,7 +1257,15 @@ class MossImagePipeline(ComfyPipeline):
             if not torch.isfinite(latents).all():
                 raise RuntimeError(f'The VAE gave non-finite latents even in {VAE_DTYPE_NAMES[tried]}: '
                                    'an image in this batch has non-finite pixels')
-            return {'latents': latents}
+            # ComfyUI returns float32 whatever the VAE ran in; the cache keeps vae_dtype. Every row
+            # is saved on its own and training reads latents with .float(), so rows cached in
+            # float32 before this (or kept below) mix with these.
+            stored = latents.to(self.vae_dtype)
+            if not torch.isfinite(stored).all():
+                print(f'WARNING: latents do not fit in {VAE_DTYPE_NAMES[self.vae_dtype]}; '
+                      f'caching this batch of {len(latents)} images in float32.')
+                stored = latents
+            return {'latents': stored}
         return fn
 
     def get_text_encoders(self):

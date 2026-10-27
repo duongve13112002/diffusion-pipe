@@ -14,6 +14,8 @@ from datasets.fingerprint import Hasher
 import numpy as np
 import torch
 
+from utils.embedding_dtype import decode_row
+
 
 logger = logging.getLogger(__name__)
 
@@ -230,7 +232,7 @@ class ReadOnlyCache:
             self.open_files[shard] = open(self.path / f'shard_{shard}.bin', 'rb')
         handle = self.open_files[shard]
         handle.seek(offset)
-        return torch.load(io.BytesIO(handle.read(size)), map_location='cpu')
+        return decode_row(torch.load(io.BytesIO(handle.read(size)), map_location='cpu'))
 
     def close(self):
         for handle in self.open_files.values():

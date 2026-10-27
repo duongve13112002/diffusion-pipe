@@ -189,6 +189,16 @@ timestep_sample_method = 'logit_normal'
 # Any model: false keeps the text encoders on the GPU and encodes each batch's captions during
 # training instead of caching their embeddings (see README "Text embeddings: cached or on the fly").
 #cache_text_embeddings = false
+# Any model, with cached text embeddings (cache_text_embeddings = true, the default): the dtype the
+# embeddings are stored in. Unset stores what the text encoder returns (usually bfloat16). Either
+# way the model reads them back in the encoder's own dtype. Changing it rebuilds the text embedding
+# cache only; removing it finds the old cache again.
+#   'float8'   e4m3 with a scale per token: about half the size of bfloat16, each value off by ~2%
+#              (up to ~6%). For very large datasets where the cache size matters.
+#   'bfloat16' same size as the usual cache, no loss when the encoder returns bfloat16.
+#   'float16'  same size as bfloat16, more precision, refused if a value is above 65504.
+#   'float32'  twice the size of bfloat16, no loss.
+#text_embedding_dtype = 'float8'
 
 # For models that support full fine tuning, simply delete or comment out the [adapter] table to FFT.
 [adapter]

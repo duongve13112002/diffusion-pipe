@@ -7,6 +7,8 @@ from collections import defaultdict
 
 import torch
 
+from utils.embedding_dtype import decode_row
+
 
 class Cache:
     require_identity = False
@@ -57,7 +59,7 @@ class Cache:
         byte_string = f.read(size)
         buffer = io.BytesIO(byte_string)
         item = torch.load(buffer, map_location='cpu')
-        return item
+        return decode_row(item)
 
 
     def init(self):

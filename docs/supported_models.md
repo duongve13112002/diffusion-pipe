@@ -882,6 +882,9 @@ rather than loaded with layers' weights in their neighbours.
   comes up often, `vae_dtype = 'bfloat16'` saves encoding those images twice. The latent cache records `vae_dtype`, so
   changing it re-encodes the cache. Caches written before this option were encoded in float32:
   `vae_dtype = 'float32'` keeps them, any other value re-encodes them.
+  The latents are cached in `vae_dtype` too (half the disk of float32 for float16 and bfloat16);
+  a batch whose latents do not fit in float16 is cached in float32, with a warning. Rows cached in
+  float32 before this change stay valid: training reads latents in float32 either way.
 - Captions are encoded with MOSS-Image's chat template, which trims the caption, and cut at
   4096 tokens (`on_caption_overflow = 'warn' | 'silent' | 'error'`).
 - Checkpoints with each block's q, k and v fused into `proj.qkv` load too: the

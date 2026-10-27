@@ -6,6 +6,11 @@ min_ar = 0.5
 max_ar = 2.0
 num_ar_buckets = 9
 
+# Images with several captions (e.g. multiline_captions = true): keep at most this many of each,
+# picked at random once per image (the same on every run); fewer keeps them all, unset keeps every
+# caption. Fewer captions means fewer text embeddings to cache. Also settable per [[directory]].
+#max_cached_captions = 3
+
 # Drop some captions so the empty-prompt branch that CFG samples with keeps training.
 caption_dropout_rate = 0.1
 

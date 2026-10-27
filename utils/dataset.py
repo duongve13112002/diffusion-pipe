@@ -36,6 +36,7 @@ from comfy_api.latest import InputImpl
 
 from utils.common import all_ok, fsync_dir, is_main_process, VIDEO_EXTENSIONS, round_to_nearest_multiple
 from utils.cache import Cache
+from utils.embedding_dtype import check_text_embedding_dtype, encode_results
 from utils.cache_profiles import (align_legacy_metadata, IndexedTextEmbeddingDataset, RowsByImage,
                                   tensor_profile)
 import comfy.model_management as mm
@@ -667,6 +668,8 @@ CAPTION_CACHE_SETTINGS = {
     # Set for a model with a layout_caption_format: its JSON captions skip the tag operations
     # and keep caption_prefix for the per-bucket rewrite.
     'layout_captions': '',
+    # At most this many of an image's captions are kept (and cached); unset keeps them all.
+    'max_cached_captions': None,
 }
 
 
@@ -681,6 +684,22 @@ LEGACY_CAPTION_SETTINGS = {
     'cache_shuffle_delimiter': ', ',
     'skip_empty_caption': True,
 }
+
+
+def check_max_cached_captions(value, where):
+    if value is not None and (isinstance(value, bool) or not isinstance(value, int) or value < 1):
+        raise ValueError(f'{where}: max_cached_captions must be an integer >= 1, got {value!r}. '
+                         'Remove it to keep every caption.')
+    return value
+
+
+def limit_captions(captions, limit, seed):
+    """`limit` of `captions`, picked at random with `seed` and kept in their order; all of them
+    when there are no more than `limit` (or `limit` is None)."""
+    if limit is None or len(captions) <= limit:
+        return captions
+    keep = sorted(random.Random(seed).sample(range(len(captions)), limit))
+    return [captions[i] for i in keep]
 
 
 def caption_cache_suffix(settings):
@@ -1614,7 +1633,11 @@ class DirectoryDataset:
             'keep_text_embedding_cache', dataset_config.get('keep_text_embedding_cache', False))
         # Every metadata artefact derived from the caption text carries this suffix. It is
         # empty at the default settings, so caches written before they existed stay valid.
+        self.max_cached_captions = check_max_cached_captions(
+            directory_config.get('max_cached_captions', dataset_config.get('max_cached_captions')),
+            directory_config['path'])
         self.caption_cache_suffix = caption_cache_suffix({
+            'max_cached_captions': self.max_cached_captions,
             'augment_at_runtime': (
                 not caches_text_embeddings
                 and (directory_config.get('cache_shuffle_num', dataset_config.get('cache_shuffle_num', 0)) > 0
@@ -1949,6 +1972,8 @@ class DirectoryDataset:
                 if not caption_matches_non_latin_requirement(
                         captions, self.require_non_latin_caption, self.prefix_tag_caption):
                     continue
+                captions = limit_captions(captions, self.max_cached_captions,
+                                          seed_from_hash((self.path, batch['image_spec'][index], 'max_cached_captions')))
                 if self.augment_at_runtime:
                     captions = [c for c in captions for _ in range(max(self.shuffle, 1))]
                 else:
@@ -2458,6 +2483,8 @@ class DirectoryDataset:
                     captions, self.require_non_latin_caption, self.prefix_tag_caption):
                 logger.debug(f'Skipping {image_file}: require_non_latin_caption={self.require_non_latin_caption}')
                 return empty_return
+            captions = limit_captions(captions, self.max_cached_captions,
+                                      seed_from_hash((self.path, image_spec, 'max_cached_captions')))
             if self.augment_at_runtime:
                 # Keep the captions exactly as they are on disk, marker included, and expand to
                 # the same number of variants cache_shuffle_num would have produced so the
@@ -2916,6 +2943,10 @@ class Dataset:
         text_encoder_key = getattr(self.model, 'text_encoder_cache_key', lambda _i: '')(i)
         text_encoder_identity = getattr(
             self.model, 'text_encoder_identity', lambda _i: text_encoder_key)(i)
+        if (embedding_dtype := getattr(self.model, 'model_config', {}).get('text_embedding_dtype')) is not None:
+            # Embeddings cached in another dtype are rebuilt; unset keeps every existing cache.
+            text_encoder_key += f'|text_embedding_dtype={embedding_dtype}'
+            text_encoder_identity += f'|text_embedding_dtype={embedding_dtype}'
         require_identity = getattr(self.model, 'text_encoder_requires_identity', lambda _i: False)(i)
         for ds in self.directory_datasets:
             ds.cache_text_embeddings(
@@ -3530,6 +3561,8 @@ class DatasetManager:
         self.call_vae_fn = self.model.get_call_vae_fn(self.vae)
         self.vae_supports_audio = 'audio' in signature(self.call_vae_fn).parameters
         self.call_text_encoder_fns = [self.model.get_call_text_encoder_fn(text_encoder) for text_encoder in self.text_encoders]
+        self.text_embedding_dtype = check_text_embedding_dtype(
+            getattr(model, 'model_config', {}), not encodes_text_in_loader(model))
         self.te_fn_requires_control_file = [
             len(signature(fn).parameters) == 3
             for fn in self.call_text_encoder_fns
@@ -3688,6 +3721,8 @@ class DatasetManager:
             if self.te_fn_requires_control_file[idx]:
                 args.append(control_file)
             results = self.recent_text_encodings.encode(idx, self.call_text_encoder_fns[idx], args)
+            if getattr(self, 'text_embedding_dtype', None) is not None:
+                results = encode_results(results, self.text_embedding_dtype)
         else:
             raise RuntimeError()
         # Need to move to CPU here. If we don't, we get this error:

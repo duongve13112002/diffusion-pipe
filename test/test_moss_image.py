@@ -1674,6 +1674,26 @@ def test_a_finite_batch_is_encoded_once(capsys):
     assert 'WARNING' not in capsys.readouterr().out
 
 
+@pytest.mark.parametrize('dtype', [torch.float16, torch.bfloat16, torch.float32])
+def test_latents_are_cached_in_vae_dtype(dtype):
+    pipe = bare_pipeline()
+    pipe.vae_dtype = dtype
+    FallbackRecorder(pipe, {})
+    latents = pipe.get_call_vae_fn(None)(fallback_batch(0.25, 0.5))['latents']
+    assert latents.dtype == dtype
+    assert latents[:, 0, 0, 0].tolist() == [0.25, 0.5]
+
+
+def test_latents_too_large_for_float16_are_cached_in_float32(capsys):
+    pipe = bare_pipeline()
+    pipe.vae_dtype = torch.float16
+    FallbackRecorder(pipe, {})
+    latents = pipe.get_call_vae_fn(None)(fallback_batch(0.25, 1e5))['latents']
+    assert latents.dtype == torch.float32
+    assert latents[:, 0, 0, 0].tolist() == [0.25, 1e5]
+    assert 'caching this batch of 2 images in float32' in capsys.readouterr().out
+
+
 @pytest.mark.parametrize('dtype, tried', [(torch.float16, 'float32'), (torch.bfloat16, 'float32'),
                                           (torch.float32, 'float32')])
 def test_latents_non_finite_in_float32_too_are_not_cached(dtype, tried):

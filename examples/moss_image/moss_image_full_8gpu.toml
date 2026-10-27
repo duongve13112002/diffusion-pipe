@@ -61,6 +61,10 @@ dtype = 'bfloat16'
 # Captions are encoded on the fly by default: only latents are cached and the Qwen3.5-9B text
 # encoder stays on stage 0's GPUs. true caches the embeddings once (~8 KB per token) instead.
 #cache_text_embeddings = false
+# With cache_text_embeddings = true: the dtype the embeddings are cached in. 'float8' (e4m3, a scale
+# per token) halves the ~8 KB per token of bfloat16, each value off by ~2%; 'bfloat16', 'float16' or
+# 'float32' work too. Read back in the encoder's own dtype. Changing it rebuilds that cache only.
+#text_embedding_dtype = 'float8'
 # Layout (JSON) captions with boxes normalized to 0..1000 (the technical report's form): 'as_written'
 # keeps them in 0..1000 per bucket; 'abs_centralized' converts them to centred pixel boxes, the form
 # the USERGUIDE recommends. Centred captions are left as they are either way.

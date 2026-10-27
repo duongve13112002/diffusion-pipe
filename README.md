@@ -14,6 +14,10 @@ Models supported: SDXL, Flux, LTX-Video, HunyuanVideo (t2v), Cosmos, Lumina Imag
 - Optional OPLoRA (orthogonal projection LoRA) to reduce catastrophic forgetting when training LoRAs
 
 ## Recent changes
+- 2026-10-27
+  - MOSS-Image caches its latents in `vae_dtype` instead of float32 (ComfyUI's VAE always returned float32). Existing caches are kept and still work.
+  - `text_embedding_dtype` in `[model]` chooses the dtype cached text embeddings are stored in, for every model: `'float8'` (e4m3 with a scale per token, about half the size of bfloat16), `'bfloat16'`, `'float16'` or `'float32'`. They are read back in the text encoder's own dtype. See [text embeddings: cached or on the fly](#text-embeddings-cached-or-on-the-fly).
+  - `max_cached_captions` (top level or per `[[directory]]`) keeps at most that many captions of each image, picked at random once per image; unset keeps them all.
 - 2026-10-26
   - DoRA: set `use_dora = true` in a `type = "lora"` `[adapter]` table. It costs extra VRAM and step time and works with `oplora`. The magnitude vector is saved as `<module>.dora_scale` (shape `(out, 1)`, the kohya name for SDXL), which ComfyUI and kohya read; ComfyUI measures the norm on the original weight, a small approximation (a few percent for a small adapter) of what PEFT trains with. Flux and SDXL resume a DoRA adapter through their own loader (diffusers would drop the magnitude); `fuse_adapters` and `tools/iris_merge_adapter.py --strength` refuse a DoRA adapter.
 - 2026-10-25
@@ -382,6 +386,22 @@ the text encoders are freed before training. `caching_batch_size` is the batch s
 `micro_batch_size_per_gpu` rows from the cache per step, so the two settings are unrelated here
 (say `caching_batch_size = 32` with a micro batch of 8: caching encodes 32 at a time, training
 reads 8 per step).
+
+`text_embedding_dtype` in `[model]` sets the dtype the cached embeddings are stored in; unset
+stores what the text encoder returns. The embeddings are put back in the encoder's own dtype when
+read, so the model is unchanged, and masks and token ids are stored as they are. A cache in another
+dtype is rebuilt, and removing the setting finds the old cache again. It needs
+`cache_text_embeddings = true`.
+
+| value | size (vs bfloat16) | precision |
+|---|---|---|
+| `'float8'` | about half | each value off by about 2% (up to about 6%) |
+| `'bfloat16'` | same | exact for an encoder that returns bfloat16 |
+| `'float16'` | same | finer than bfloat16; refused if a value is above 65504 |
+| `'float32'` | double | exact |
+
+`'float8'` stores float8_e4m3fn with each token's vector divided by a power-of-two scale (its
+largest value over 448, rounded up), so the outliers of text encoder hidden states are not clipped.
 
 **`false`**: only the latents are cached. The text encoders stay loaded on the GPU and encode
 each batch's captions during training, so tag shuffling and `tag_dropout_rate` draw anew for

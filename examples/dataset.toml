@@ -54,6 +54,11 @@ frame_buckets = [1, 33]
 # If you have >24GB VRAM, or multiple GPUs and use pipeline parallelism, or lower the spatial resolution, you could maybe train with longer frame buckets
 # frame_buckets = [1, 33, 65, 97]
 
+# At most this many captions of each image are kept and cached (with multiple captions per image,
+# e.g. multiline_captions). Picked at random once per image, the same on every run; an image with
+# fewer keeps them all. Unset keeps every caption. Can also be set per [[directory]].
+# max_cached_captions = 3
+
 # Shuffle tags before caching, 0 to keep original caption (unless shuffle_tags is set to true). Increases caching time a tiny bit for higher values.
 # cache_shuffle_num = 10
 # Delimiter for tags, only used if cache_shuffle_num is not 0. Defaults to ", ".
