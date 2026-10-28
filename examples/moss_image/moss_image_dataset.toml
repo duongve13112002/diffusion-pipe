@@ -10,6 +10,9 @@ num_ar_buckets = 9
 # picked at random once per image (the same on every run); fewer keeps them all, unset keeps every
 # caption. Fewer captions means fewer text embeddings to cache. Also settable per [[directory]].
 #max_cached_captions = 3
+# Train only on what a caching run that did not finish left (see examples/dataset.toml).
+#use_cached_latents_only = true
+#use_cached_embeddings_only = true
 
 # Drop some captions so the empty-prompt branch that CFG samples with keeps training.
 caption_dropout_rate = 0.1

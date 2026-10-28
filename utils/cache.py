@@ -3,6 +3,7 @@ import sqlite3
 from pathlib import Path
 import os
 import io
+import time
 from collections import defaultdict
 
 import torch
@@ -12,6 +13,10 @@ from utils.embedding_dtype import decode_row
 
 class Cache:
     require_identity = False
+    # How often the rows written so far are committed. Without it nothing was committed before a
+    # shard reached shard_size_gb, so a run interrupted before that kept nothing, and resumed from
+    # the start of the shard.
+    commit_seconds = 300
 
     def __init__(self, path: str, fingerprint: str, shard_size_gb=1,
                  keep_on_fingerprint_change=False, identity=None, content_digest=None,
@@ -100,9 +105,10 @@ class Cache:
         else:
             print(f'[CACHE] Storing new fingerprint: {self.fingerprint}')
             self.con.execute('INSERT INTO fingerprint VALUES(?)', (self.fingerprint,))
-            if self.require_identity:
+            if self.identity:
                 # Claimed from the start, not only once complete: without it a run interrupted
-                # while caching would find a cache that records no identity, and start over.
+                # while caching would find a cache that records no identity, and start over
+                # (require_identity), or append another encoder's rows to it.
                 self.write_manifest(identity_only=True)
 
         # items table, current length, next shard index
@@ -214,12 +220,23 @@ class Cache:
         self.con.execute(f'CREATE TABLE {self.shard_table}(offset, size)')
         self.shard_index = 0
         self.offset = 0
+        self.last_commit = time.monotonic()
+
+    def commit_written(self):
+        """Commit the rows written so far, after their bytes are on disk: a committed row whose
+        bytes were lost in a crash would be read back as garbage."""
+        self.shard_file.flush()
+        os.fsync(self.shard_file.fileno())
+        self.con.commit()
+        self.last_commit = time.monotonic()
 
 
     def finalize_current_shard(self):
         if self.shard_file is None:
             # no-op if already finalized
             return
+        self.shard_file.flush()
+        os.fsync(self.shard_file.fileno())
         self.shard_file.close()
         self.shard_file = None
         self.shard += 1
@@ -251,6 +268,8 @@ class Cache:
         current_size_gb = self.shard_file.tell() / 1_000_000_000
         if current_size_gb >= self.shard_size_gb:
             self.finalize_current_shard()
+        elif time.monotonic() - self.last_commit >= self.commit_seconds:
+            self.commit_written()
 
 
 # for testing

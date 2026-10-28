@@ -11,6 +11,7 @@ These tests build the real objects against a handful of real (tiny) images.
 """
 
 import gc
+import json
 import sys
 from pathlib import Path
 
@@ -806,7 +807,11 @@ class TestCacheCompatibilityManifest:
     def test_a_cache_with_no_manifest_is_treated_as_compatible(self, tmp_path):
         cache = self._cache(tmp_path, identity='vae-A')
         assert cache.check_identity() == (True, '')
-        assert not cache.manifest_file.exists(), 'nothing is claimed until contents are complete'
+        # Only who fills it is claimed from the start; what it was made from waits until it is complete.
+        record = json.loads(cache.manifest_file.read_text())
+        assert record.get('identity') == 'vae-A' and 'content_digest' not in record
+        cache.manifest_file.unlink()
+        assert cache.check_identity() == (True, '')
 
     def test_the_manifest_is_written_only_when_asked(self, tmp_path):
         cache = self._cache(tmp_path, identity='vae-A')
@@ -953,9 +958,8 @@ class TestCacheCompatibilityManifest:
         self._closed_cache(tmp_path, identity='vae-A')
         cache = self._cache(tmp_path, identity='vae-B')
         assert len(cache) == 0, 'an incompatible cache must be emptied, not served'
-        assert not cache.manifest_file.exists(), (
-            'the manifest describes contents that no longer exist and must go with them'
-        )
+        # The old manifest went with the contents it described; the rebuilt cache claims its own producer.
+        assert json.loads(cache.manifest_file.read_text()) == {'schema': 2, 'identity': 'vae-B'}
 
     def test_keep_cannot_rescue_an_incompatible_cache(self, tmp_path):
         # keep_* means "do not recache unnecessarily", never "reuse anything". Latents produced

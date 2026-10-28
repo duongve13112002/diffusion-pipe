@@ -55,6 +55,14 @@ class TestConfig:
         with pytest.raises(ValueError, match='use_dora'):
             apply_dora_config_defaults({'type': 'lora', 'use_dora': 'yes'})
 
+    def test_float8_base_weights_are_refused(self):
+        from utils.dora import check_model_dtypes
+        for key in ('transformer_dtype', 'diffusion_model_dtype'):
+            with pytest.raises(ValueError, match=f'use_dora cannot be combined with {key}'):
+                check_model_dtypes({'use_dora': True}, {key: torch.float8_e4m3fn})
+        check_model_dtypes({'use_dora': False}, {'transformer_dtype': torch.float8_e4m3fn})
+        check_model_dtypes({'use_dora': True}, {'transformer_dtype': torch.bfloat16})
+
     def test_refused_for_lokr(self):
         with pytest.raises(ValueError, match="'lokr'"):
             apply_dora_config_defaults({'type': 'lokr', 'use_dora': False})
@@ -103,32 +111,66 @@ class TestRoundTrip:
                     p.add_(torch.randn_like(p))
         save_like_saver(trained, tmp_path)
         fresh = make_model(True, seed=2)
-        loader = [c for c in vars(base).values() if isinstance(c, type) and hasattr(c, 'load_adapter_weights_into')][0]
-        loader.load_adapter_weights_into(None, fresh, tmp_path)
+        loader().load_adapter_weights_into(fresh, tmp_path)
+        x = torch.randn(5, 6)
+        assert torch.equal(trained(x), fresh(x))
+
+    def test_plain_lora_into_a_dora_model_is_refused(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(base, 'is_main_process', lambda: False)
+        save_like_saver(make_model(False, seed=1), tmp_path)
+        with pytest.raises(ValueError, match='use_dora = true.*plain LoRA'):
+            loader().load_adapter_weights_into(make_model(True, seed=2), tmp_path)
+
+    def test_plain_lora_into_a_plain_model_still_loads(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(base, 'is_main_process', lambda: False)
+        trained = make_model(False, seed=1)
+        with torch.no_grad():
+            for p in trained.parameters():
+                if p.requires_grad:
+                    p.add_(torch.randn_like(p))
+        save_like_saver(trained, tmp_path)
+        fresh = make_model(False, seed=2)
+        loader().load_adapter_weights_into(fresh, tmp_path)
         x = torch.randn(5, 6)
         assert torch.equal(trained(x), fresh(x))
 
 
+def loader():
+    cls = [c for c in vars(base).values() if isinstance(c, type) and hasattr(c, 'load_adapter_weights_into')][0]
+    return object.__new__(cls)
+
+
 class TestWithOPLoRA:
-    def test_projection_holds_on_a_dora_model(self):
+    def test_oplora_is_refused(self):
+        from utils.oplora import apply_oplora_config_defaults
+        with pytest.raises(ValueError, match='oplora cannot be combined with use_dora'):
+            apply_oplora_config_defaults({'type': 'lora', 'use_dora': True, 'oplora': True, 'oplora_rank': 4})
+        apply_oplora_config_defaults({'type': 'lora', 'use_dora': True, 'oplora': False})
+
+    def test_dora_moves_the_subspace_oplora_protects(self):
+        # Why oplora is refused: with the A/B factors projected exactly, the trained magnitude
+        # still changes W's top singular block.
         from utils.oplora import OPLoRAProjector
         torch.manual_seed(0)
         tiny = nn.Sequential()
         tiny.proj = nn.Linear(16, 12, bias=False)
+        w = tiny.proj.weight.detach().clone()
         model = peft.get_peft_model(
             tiny, peft.LoraConfig(r=4, lora_alpha=4, target_modules=['proj'], use_dora=True))
         projector = OPLoRAProjector.build(model, rank=3, full_svd=True)
-        assert len(projector) == 1
-        opt = torch.optim.SGD([p for p in model.parameters() if p.requires_grad], lr=0.05)
-        for _ in range(5):
-            loss = model(torch.randn(8, 16)).pow(2).mean()
+        opt = torch.optim.Adam([p for p in model.parameters() if p.requires_grad], lr=0.05)
+        for _ in range(20):
+            loss = (model(torch.randn(8, 16)) - 1).pow(2).mean()
             opt.zero_grad()
             loss.backward()
             opt.step()
             projector.project()
         assert projector.max_residual() < 1e-4
-        magnitude = model.base_model.model.proj.lora_magnitude_vector['default'].weight
-        assert magnitude.grad is not None
+        merged = model.merge_and_unload().proj.weight.detach()
+        u, _, vh = torch.linalg.svd(w)
+        block = u[:, :3].T @ (merged - w) @ vh[:3].T
+        assert block.abs().max() > 1e-2
+
 
 
 def tiny_sdxl(seed=0):
@@ -186,6 +228,37 @@ class TestSDXL:
                 assert torch.equal(a[n], b[n]), n
 
 
+    def test_plain_lora_with_use_dora_is_refused(self, tmp_path):
+        import diffusers
+        pipe = tiny_sdxl()
+        pipe.config['adapter']['use_dora'] = False
+        pipe.configure_adapter(dict(pipe.config['adapter']))
+        sd = {p.original_name.replace('.default', ''): p.detach().clone()
+              for module in (pipe.unet, pipe.text_encoder, pipe.text_encoder_2)
+              for p in module.parameters() if p.requires_grad}
+        pipe.save_adapter(tmp_path, sd)
+        fresh = tiny_sdxl()
+        fresh.config['adapter']['init_from_existing'] = str(tmp_path)
+        with pytest.raises(ValueError, match='use_dora = true.*plain LoRA'):
+            fresh.load_adapter_weights(str(tmp_path))
+
+    def test_dora_file_without_use_dora_is_refused(self, tmp_path):
+        pipe = tiny_sdxl()
+        pipe.configure_adapter(dict(pipe.config['adapter']))
+        sd = {}
+        for module in (pipe.unet, pipe.text_encoder, pipe.text_encoder_2):
+            for p in module.parameters():
+                if p.requires_grad:
+                    key = p.original_name.replace('.default', '')
+                    sd[saved_key(key)] = saved_value(key, p.detach().clone())
+        pipe.save_adapter(tmp_path, sd)
+        fresh = tiny_sdxl()
+        fresh.config['adapter']['use_dora'] = False
+        fresh.config['adapter']['init_from_existing'] = str(tmp_path)
+        with pytest.raises(ValueError, match='DoRA adapter.*use_dora'):
+            fresh.load_adapter_weights(str(tmp_path))
+
+
 def tiny_flux(seed=0):
     import diffusers
     from models.flux import FluxPipeline as WrappedFluxPipeline
@@ -225,6 +298,41 @@ class TestFlux:
         assert a.keys() == b.keys() and a
         for n in a:
             assert torch.equal(a[n], b[n]), n
+
+    def test_a_named_file_loads_with_other_safetensors_beside_it(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(base, 'is_main_process', lambda: False)
+        pipe = tiny_flux()
+        pipe.configure_adapter(dict(pipe.config['adapter']))
+        sd = {}
+        with torch.no_grad():
+            for name, p in pipe.transformer.named_parameters():
+                if p.requires_grad:
+                    p.add_(torch.randn_like(p))
+                    key = p.original_name.replace('.default', '')
+                    sd[saved_key(key)] = saved_value(key, p.detach().clone())
+        pipe.save_adapter(tmp_path, dict(sd))
+        file = list(tmp_path.glob('*.safetensors'))[0]
+        safetensors.torch.save_file({'other': torch.zeros(1)}, str(tmp_path / 'another_lora.safetensors'))
+        fresh = tiny_flux()
+        fresh.config['adapter']['init_from_existing'] = str(file)
+        fresh.load_adapter_weights(str(file))
+        a = {n: p for n, p in pipe.transformer.named_parameters() if p.requires_grad}
+        b = {n: p for n, p in fresh.transformer.named_parameters() if p.requires_grad}
+        for n in a:
+            assert torch.equal(a[n], b[n]), n
+
+    def test_plain_lora_with_use_dora_is_refused(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(base, 'is_main_process', lambda: False)
+        pipe = tiny_flux()
+        pipe.config['adapter']['use_dora'] = False
+        pipe.configure_adapter(dict(pipe.config['adapter']))
+        sd = {p.original_name.replace('.default', ''): p.detach().clone()
+              for p in pipe.transformer.parameters() if p.requires_grad}
+        pipe.save_adapter(tmp_path, sd)
+        fresh = tiny_flux()
+        fresh.config['adapter']['init_from_existing'] = str(tmp_path)
+        with pytest.raises(ValueError, match='use_dora = true.*plain LoRA'):
+            fresh.load_adapter_weights(str(tmp_path))
 
 
 class TestIrisMerge:

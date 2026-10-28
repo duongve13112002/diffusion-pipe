@@ -447,6 +447,14 @@ class TestAdapterRoundTrip:
         moved = [n for n in base if not torch.equal(base[n], merged[n])]
         assert moved, 'the adapter delta is zero, so this fixture proves nothing'
 
+    def test_strength_is_refused_for_dora(self, tmp_path):
+        import types
+        import peft
+        from tools.sample_anima_refiner import apply_adapters
+        peft.LoraConfig(r=2, lora_alpha=2, target_modules=['proj'], use_dora=True).save_pretrained(str(tmp_path))
+        with pytest.raises(ValueError, match='--lora-strength is not supported for the DoRA adapter'):
+            apply_adapters(types.SimpleNamespace(transformer=None), [(tmp_path, 0.5)])
+
     @pytest.mark.parametrize('adapter_type', ['lora', 'lokr'])
     def test_strength_scales_the_delta_linearly(self, tmp_path, monkeypatch, adapter_type):
         from tools.sample_anima_refiner import apply_adapters

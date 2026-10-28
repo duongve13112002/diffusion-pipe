@@ -135,11 +135,30 @@ def align_legacy_metadata(metadata, iteration_path, path):
     return datasets.load_from_disk(str(path / 'aligned'))
 
 
+def roll_back_interrupted_write(path):
+    """Roll the SQLite database of the cache at `path` back to its last commit if the process
+    writing it was killed. Cache keeps a transaction open between commits; once it held more rows
+    than SQLite's page cache, a hot journal is left beside metadata.db, which only a read-write
+    connection can roll back: a read-only one fails with 'attempt to write a readonly database'.
+    SQLite rolls a journal back only when no live process holds its lock, so a cache still being
+    written is left alone."""
+    db = Path(path) / 'metadata.db'
+    if not db.with_name('metadata.db-journal').exists():
+        return
+    con = sqlite3.connect(str(db))
+    try:
+        con.execute('SELECT COUNT(*) FROM sqlite_master').fetchone()
+    finally:
+        con.close()
+
+
 class ReadOnlyCache:
     """Read the legacy SQLite/shard format without ever clearing or claiming it."""
 
-    def __init__(self, path, identity=None, encoder_key=None):
+    def __init__(self, path, identity=None, encoder_key=None, allow_unrecorded=False):
         self.path = Path(path)
+        if allow_unrecorded:
+            roll_back_interrupted_write(self.path)
         self.con = sqlite3.connect(self.path.joinpath('metadata.db').resolve().as_uri() + '?mode=ro', uri=True)
         self.fingerprint = self.con.execute('SELECT value FROM fingerprint').fetchone()[0]
         self.count = self.con.execute('SELECT COUNT(*) FROM items').fetchone()[0]
@@ -147,11 +166,19 @@ class ReadOnlyCache:
         self.content_digest = None
         self.encoder_key = ''
         manifest = self.path / 'cache_manifest.json'
+        record = {}
         if manifest.exists():
             record = json.loads(manifest.read_text(encoding='utf-8'))
             self.identity = record.get('identity')
             self.content_digest = record.get('content_digest')
             self.encoder_key = record.get('encoder_key', '')
+        if allow_unrecorded:
+            # A cache still being filled records at most who fills it (Cache writes the identity
+            # when it starts, the rest once complete); what it does not record is not checked.
+            if self.identity is None:
+                identity = None
+            if 'encoder_key' not in record:
+                encoder_key = None
         if (identity and identity != self.identity) or (encoder_key is not None and encoder_key != self.encoder_key):
             self.con.close()
             raise ValueError(f'Incompatible encoder identity in {self.path}')
@@ -243,10 +270,84 @@ class ReadOnlyCache:
             self.con = None
 
 
+class PrefixCache:
+    """A cache that holds only the first `count` of `total` rows, read as it stands: what an
+    interrupted run leaves, since rows are written in order. Never written to, never cleared."""
+
+    def __init__(self, reader, total):
+        self.reader = reader
+        self.total = total
+        self.count = 0 if reader is None else len(reader)
+        if self.count > total:
+            raise ValueError(f'{reader.path} holds {self.count} rows but there are only {total} inputs.')
+        if reader is not None and hasattr(reader, 'load_index'):
+            reader.load_index()
+
+    def __len__(self):
+        return self.total
+
+    def is_available(self, index):
+        return 0 <= index < self.count
+
+    def available_mask(self):
+        return np.arange(self.total) < self.count
+
+    def __getitem__(self, index):
+        index = int(index)
+        if index < 0:
+            index += self.total
+        if not self.is_available(index):
+            raise IndexError(f'row {index} is not cached')
+        return self.reader[index]
+
+    def close(self):
+        if self.reader is not None:
+            self.reader.close()
+
+
+def open_prefix_cache(path, fingerprint, total, keep_on_fingerprint_change=False, identity=None,
+                      require_identity=False, content_digest=None):
+    """The rows already in the cache at `path`, for a run that encodes nothing.
+
+    The rows belong to the inputs and the encoder they were made from, so a cache for other inputs
+    (another fingerprint) or by another encoder (identity, the rule of Cache.check_identity) is
+    refused rather than cleared: it may be the complete one a later run wants. content_digest()
+    is the digest of the inputs, checked when keep_on_fingerprint_change keeps a moved fingerprint,
+    as _map_and_cache does."""
+    path = Path(path)
+    if not (path / 'metadata.db').exists():
+        return PrefixCache(None, total)
+    reader = ReadOnlyCache(path, allow_unrecorded=True)
+    if reader.identity is None:
+        other_encoder = bool(identity) and require_identity
+    else:
+        other_encoder = reader.identity != (identity or None)
+    if other_encoder:
+        reader.close()
+        raise RuntimeError(
+            f'{path} was made by {reader.identity or "an encoder it does not record"!r}, but this run '
+            f'encodes with {identity or "unspecified"!r}, so its rows do not belong to this model. Run once '
+            'without use_cached_latents_only / use_cached_embeddings_only to rebuild it, or restore the '
+            'settings it was started with.')
+    kept = (reader.fingerprint != fingerprint and keep_on_fingerprint_change and len(reader) == total
+            and (reader.content_digest is None or content_digest is None or reader.content_digest == content_digest()))
+    if reader.fingerprint != fingerprint and not kept:
+        reader.close()
+        raise RuntimeError(
+            f'{path} was made for other inputs than this run reads (the images, masks, controls or '
+            'captions, or a setting that changes them, differ from when it was started), so its rows '
+            'cannot be matched to this dataset. Run once without use_cached_latents_only / '
+            'use_cached_embeddings_only to rebuild it, or restore the settings it was started with.')
+    return PrefixCache(reader, total)
+
+
 class IndexedCache:
-    def __init__(self, references, sources):
+    def __init__(self, references, sources, available=None):
         self.references = references
         self.sources = sources
+        # Which rows can be read; None means all. Set for a profile whose own encoded rows were
+        # not all written yet.
+        self.available = available
         # Arrays, not per-sample Arrow row reads: see ReadOnlyCache.load_index.
         if len(references):
             self._source = references.data.column('source').to_numpy().astype(np.int32)
@@ -262,12 +363,20 @@ class IndexedCache:
     def __len__(self):
         return len(self._source)
 
+    def is_available(self, index):
+        return self.available is None or bool(self.available[index])
+
+    def available_mask(self):
+        return np.ones(len(self._source), dtype=bool) if self.available is None else self.available
+
     def __getitem__(self, index):
         index = int(index)
         if index < 0:
             index += len(self._source)
         if not 0 <= index < len(self._source):
             raise IndexError(index)
+        if not self.is_available(index):
+            raise IndexError(f'row {index} is not cached')
         return self.sources[int(self._source[index])][int(self._index[index])]
 
     def close(self):
@@ -396,6 +505,9 @@ class IndexedTextEmbeddingDataset:
     def get_text_embeddings(self, image_spec, caption_number):
         return self.te_dataset[self._row(image_spec, caption_number)]
 
+    def has_text_embeddings(self, image_spec, caption_number):
+        return self.te_dataset.is_available(self._row(image_spec, caption_number))
+
     def get_caption(self, image_spec, caption_number):
         """The text these embeddings were encoded from."""
         return self.flattened_captions[self._row(image_spec, caption_number)]['caption']
@@ -407,8 +519,12 @@ class IndexedTextEmbeddingDataset:
 
 
 def tensor_profile(metadata, map_fn, path, columns, identity, sources, map_cache, *,
-                   caching_batch_size=1, regenerate_cache=False, encoder_key=None, lookup_dir=None):
+                   caching_batch_size=1, regenerate_cache=False, encoder_key=None, lookup_dir=None,
+                   partial=False):
     """Reference exact legacy inputs; encode only inputs absent from a compatible donor.
+
+    partial: encode nothing and write nothing; the rows the donors and an interrupted run's own
+    encoded rows hold are readable (is_available), the others are not.
 
     Each donor's lookup is a sorted digest array built once and kept on disk, avoiding a
     30M-entry Python dictionary and per-row SQLite queries alike. Caption,
@@ -504,6 +620,24 @@ def tensor_profile(metadata, map_fn, path, columns, identity, sources, map_cache
                 pending = pending[~hit]
             index[pending] = np.arange(len(pending))
         missing_indices = np.flatnonzero(source == len(readers)).tolist()
+        if partial:
+            available = np.ones(len(metadata), dtype=bool)
+            if references is not None:
+                index = references.data.column('index').to_numpy()
+            if missing_indices:
+                generated_path = path / f'generated_{references_token}'
+                count = 0
+                if (generated_path / 'metadata.db').exists():
+                    generated = ReadOnlyCache(generated_path, allow_unrecorded=True)
+                    readers.append(generated)
+                    count = len(generated)
+                else:
+                    readers.append(PrefixCache(None, 0))
+                available[missing_indices] = np.asarray(index[missing_indices]) < count
+            if references is None:
+                references = datasets.Dataset.from_dict({'source': source, 'index': index})
+            print(f'[CACHE] Profile {path.name}: {int(available.sum())} of {len(metadata)} rows cached.')
+            return IndexedCache(references, readers, available)
         if missing_indices:
             if map_fn is None:
                 raise RuntimeError(f'{len(missing_indices)} inputs in {path} need an encoder; run caching first.')

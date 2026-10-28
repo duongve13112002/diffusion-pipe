@@ -20,7 +20,7 @@ from utils.common import is_main_process, VIDEO_EXTENSIONS, round_to_nearest_mul
 sys.path.insert(0, os.path.join(os.path.abspath(os.path.dirname(__file__)), '../submodules/ComfyUI'))
 
 import peft
-from utils.dora import DORA_SCALE, saved_key
+from utils.dora import DORA_SCALE, check_dora_matches_model, saved_key
 import torch
 # torchaudio is required, and not only for the one resample call further down. The vendored
 # ComfyUI imports it at module scope in several places -- comfy.sd pulls in
@@ -433,6 +433,11 @@ class CommonPipeline:
         if len(safetensors_files) > 1:
             raise RuntimeError(f'Multiple safetensors files found in {adapter_path}')
         adapter_state_dict = safetensors.torch.load_file(safetensors_files[0])
+        self.load_adapter_state_dict_into(target_model, adapter_state_dict, safetensors_files[0], rename_key=rename_key)
+
+    def load_adapter_state_dict_into(self, target_model, adapter_state_dict, source, rename_key=None):
+        """load_adapter_weights_into for an adapter state dict already read from the file `source`."""
+        check_dora_matches_model(target_model, adapter_state_dict, source)
         by_saved_key = {}
         shapes = {}
         for name, p in target_model.named_parameters():

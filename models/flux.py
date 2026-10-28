@@ -13,7 +13,7 @@ from safetensors import safe_open
 from safetensors.torch import save_file
 
 from models.base import BasePipeline, make_contiguous
-from utils.dora import has_dora_scale
+from utils.dora import check_init_matches, has_dora_scale
 from utils.common import AUTOCAST_DTYPE, is_main_process, load_state_dict
 from utils.offloading import ModelOffloader
 
@@ -249,13 +249,15 @@ class FluxPipeline(BasePipeline):
                 raise RuntimeError(f'Multiple safetensors files found in {adapter_path}')
             safetensors_file = safetensors_files[0]
         adapter_state_dict = load_state_dict(safetensors_file)
+        if not fuse:
+            check_init_matches(self.config['adapter'], adapter_state_dict, safetensors_file)
         if has_dora_scale(adapter_state_dict):
             # diffusers' load_lora_weights drops dora_scale and would load a plain LoRA.
             if fuse:
                 raise NotImplementedError('fuse_adapters does not support DoRA adapters')
             adapter_config = {k: v for k, v in self.config['adapter'].items() if k != 'init_from_existing'}
             super().configure_adapter(adapter_config)
-            self.load_adapter_weights_into(self.transformer, str(Path(safetensors_file).parent))
+            self.load_adapter_state_dict_into(self.transformer, adapter_state_dict, safetensors_file)
             return
         self.diffusers_pipeline.load_lora_weights(adapter_state_dict, adapter_name='default')
         for name, p in self.transformer.named_parameters():

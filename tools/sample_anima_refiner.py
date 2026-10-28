@@ -171,6 +171,11 @@ def apply_adapters(pipeline, adapters):
         # PeftConfig dispatches on the peft_type in adapter_config.json, so one call covers
         # LoRA and LoKr, and the target modules are the run's own rather than re-derived here.
         peft_config = peft.PeftConfig.from_pretrained(str(path))
+        if strength != 1.0 and getattr(peft_config, 'use_dora', False):
+            # PEFT keeps each row's norm at the trained magnitude whatever the scale, so a lower
+            # strength would not move the output toward the base model.
+            raise ValueError(f'--lora-strength is not supported for the DoRA adapter {path}: scaling the update '
+                             'would leave the magnitude vector at full strength')
         peft_model = peft.get_peft_model(pipeline.transformer, peft_config)
         pipeline.load_adapter_weights(path)
         if strength != 1.0:

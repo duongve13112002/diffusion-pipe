@@ -59,6 +59,12 @@ frame_buckets = [1, 33]
 # fewer keeps them all. Unset keeps every caption. Can also be set per [[directory]].
 # max_cached_captions = 3
 
+# Train on what an unfinished caching run left, encoding nothing more: only the images whose
+# latents are cached, and/or only the captions whose text embeddings are cached (both set: only
+# samples with both). The startup log says how many samples that is. Can also be set per [[directory]].
+# use_cached_latents_only = true
+# use_cached_embeddings_only = true
+
 # Shuffle tags before caching, 0 to keep original caption (unless shuffle_tags is set to true). Increases caching time a tiny bit for higher values.
 # cache_shuffle_num = 10
 # Delimiter for tags, only used if cache_shuffle_num is not 0. Defaults to ", ".

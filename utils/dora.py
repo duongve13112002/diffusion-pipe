@@ -21,6 +21,17 @@ def apply_dora_config_defaults(adapter_config):
         raise ValueError(f"use_dora must be true or false, got {adapter_config['use_dora']!r}")
 
 
+def check_model_dtypes(adapter_config, model_config):
+    """Refuse use_dora with float8 base weights: PEFT measures the row norms of the base weight
+    to build the magnitude, and float8 tensors have no arithmetic for that."""
+    if not adapter_config.get('use_dora', False):
+        return
+    for key in ('transformer_dtype', 'diffusion_model_dtype'):
+        if 'float8' in str(model_config.get(key, '')):
+            raise ValueError(f'use_dora cannot be combined with {key} = float8: DoRA needs the norm of each '
+                             f'base weight row, which float8 tensors cannot compute. Remove {key} or set use_dora = false.')
+
+
 def saved_key(key):
     """The saved name of a parameter name that has lost '.default'."""
     if key.endswith(DORA_MAGNITUDE):
@@ -35,6 +46,28 @@ def saved_value(key, value):
 
 def has_dora_scale(state_dict):
     return any(k.endswith(DORA_SCALE) for k in state_dict)
+
+
+def check_dora_matches_model(model, state_dict, source):
+    """Refuse a plain LoRA file for a model whose LoRA layers are DoRA (use_dora = true): its
+    magnitude would stay the one computed from the base weights alone, and the loaded LoRA would
+    not reproduce its own output. A DoRA file for a plain LoRA model fails on its dora_scale keys."""
+    if not has_dora_scale(state_dict) and any('lora_magnitude_vector' in name for name, _ in model.named_parameters()):
+        raise ValueError(f'The adapter is DoRA (use_dora = true), but {source} is a plain LoRA (no {DORA_SCALE} '
+                         'entries). Set use_dora = false to continue it as a LoRA, or start the DoRA from scratch.')
+
+
+def check_init_matches(adapter_config, state_dict, source):
+    """Refuse an init_from_existing file whose kind (DoRA or plain LoRA) is not the one use_dora
+    asks for. A plain LoRA loaded into a DoRA model keeps the magnitude computed from the base
+    weights alone, so the loaded LoRA would not reproduce its own output."""
+    use_dora = bool(adapter_config.get('use_dora', False))
+    if use_dora and not has_dora_scale(state_dict):
+        raise ValueError(f'use_dora = true, but init_from_existing {source} is a plain LoRA (no {DORA_SCALE} '
+                         'entries). Set use_dora = false to continue it as a LoRA, or start the DoRA from scratch.')
+    if not use_dora and has_dora_scale(state_dict):
+        raise ValueError(f'init_from_existing {source} is a DoRA adapter ({DORA_SCALE} entries), but use_dora '
+                         'is not set. Set use_dora = true in [adapter] to continue it.')
 
 
 def kohya_module_name(saved_name):

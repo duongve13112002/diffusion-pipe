@@ -498,6 +498,28 @@ def test_init_path_reads_an_adapter_save_with_its_prefix(tmp_path):
     torch.testing.assert_close(ema.shadow['0.lora_A.weight'], torch.ones(2, 2))
 
 
+def test_init_path_reads_a_dora_save(tmp_path):
+    import peft
+    import safetensors.torch
+    from utils.dora import saved_key as dora_key, saved_value as dora_value
+    tiny = nn.Sequential()
+    tiny.proj = nn.Linear(6, 4, bias=False)
+    model = peft.get_peft_model(tiny, peft.LoraConfig(r=2, lora_alpha=2, target_modules=['proj'], use_dora=True))
+    params = named(model)
+    ema = ParameterEMA([(n, p) for n, p in params if p.requires_grad], decay=0.9, is_adapter=True)
+    saved, want = {}, {}
+    for name, p in params:
+        if p.requires_grad:
+            key = name.replace('.default', '')
+            want[key] = torch.randn_like(p)
+            saved['diffusion_model.' + dora_key(key)] = dora_value(key, want[key])
+    assert any(k.endswith('.dora_scale') for k in saved)
+    safetensors.torch.save_file(saved, str(tmp_path / 'adapter_model.safetensors'))
+    assert load_ema_weights(ema, tmp_path) == 3
+    for key, value in want.items():
+        torch.testing.assert_close(ema.shadow[key], value)
+
+
 def test_init_path_reads_the_repa_projector_saved_beside_the_model(tmp_path):
     import safetensors.torch
     model = nn.ModuleDict({'blocks': nn.Linear(2, 2), 'repa': nn.Linear(2, 2)})

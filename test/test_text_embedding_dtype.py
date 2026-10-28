@@ -121,6 +121,38 @@ def test_float8_with_captions_encoded_on_the_fly_is_refused(tmp_path):
         batches(Float8Model('float8', cache_text_embeddings=False), dataset_config(images))
 
 
+class OnTheFlyModel(Float8Model):
+    """A model that encodes captions itself (MOSS-Image, SDXL, ...): with cache_text_embeddings =
+    false it has no text encoder to cache for."""
+    encodes_text_on_the_fly = True
+
+    def get_text_encoders(self):
+        return self.text_encoders if self.config['model']['cache_text_embeddings'] else []
+
+
+def test_float8_is_refused_for_a_model_that_encodes_captions_itself(tmp_path):
+    images = make_images(tmp_path / 'images', ['a red bus'])
+    with pytest.raises(ValueError, match='Remove text_embedding_dtype'):
+        dataset_util.DatasetManager(OnTheFlyModel('float8', cache_text_embeddings=False))
+    assert dataset_util.DatasetManager(OnTheFlyModel('float8')).text_embedding_dtype == FLOAT8
+
+
+def test_a_token_with_a_tiny_or_infinite_amax_decodes_without_nan():
+    x = torch.tensor([[[1e-43, -5e-44, 0.0], [1.0, 2.0, 3.0]]])
+    back = decode_row(rows(encode_results({'e': x}, FLOAT8), 0))['e']
+    assert not back.isnan().any() and back[1].tolist() == [1.0, 2.0, 3.0]
+
+
+def test_max_cached_captions_with_online_captions_is_refused(tmp_path):
+    import json
+    images = make_images(tmp_path / 'images', ['a\nb\nc'])
+    (images / 'captions.json').write_text(json.dumps({'0.png': ['a', 'b', 'c']}))
+    config = dataset_config(images, online_captions=True, reuse_metadata_cache=False, max_cached_captions=2)
+    with pytest.raises(ValueError, match='max_cached_captions cannot be combined with online_captions'):
+        dataset_util.Dataset(config, Float8Model(cache_text_embeddings=False))
+    dataset_util.Dataset(config, Float8Model())
+
+
 class TestMaxCachedCaptions:
     def test_limit_captions(self):
         captions = [f'c{i}' for i in range(6)]
@@ -131,6 +163,12 @@ class TestMaxCachedCaptions:
         assert len(picked) == 2 and picked == sorted(picked, key=captions.index)
         assert dataset_util.limit_captions(captions, 2, 1) == picked
         assert {tuple(dataset_util.limit_captions(captions, 2, s)) for s in range(20)} != {tuple(picked)}
+
+    def test_a_smaller_limit_keeps_a_subset_of_a_larger_one(self):
+        captions = [f'c{i}' for i in range(80)]
+        for seed in range(30):
+            picks = [set(dataset_util.limit_captions(captions, n, seed)) for n in range(1, 81)]
+            assert all(small < large for small, large in zip(picks, picks[1:]))
 
     @pytest.mark.parametrize('value', [0, -1, True, 1.5, '2'])
     def test_refused(self, value):

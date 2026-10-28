@@ -37,7 +37,7 @@ from comfy_api.latest import InputImpl
 from utils.common import all_ok, fsync_dir, is_main_process, VIDEO_EXTENSIONS, round_to_nearest_multiple
 from utils.cache import Cache
 from utils.embedding_dtype import check_text_embedding_dtype, encode_results
-from utils.cache_profiles import (align_legacy_metadata, IndexedTextEmbeddingDataset, RowsByImage,
+from utils.cache_profiles import (align_legacy_metadata, IndexedTextEmbeddingDataset, RowsByImage, open_prefix_cache,
                                   tensor_profile)
 import comfy.model_management as mm
 
@@ -297,10 +297,7 @@ def _content_digest(dataset, column, upto=None):
     return Hasher.hash(values if upto is None else values[:upto])
 
 
-def _map_and_cache(dataset, map_fn, cache_dir, cache_file_prefix='', new_fingerprint_args=None,
-                   regenerate_cache=False, caching_batch_size=1, fingerprint_columns=None,
-                   keep_on_fingerprint_change=False, identity=None, content_column=None,
-                   require_identity=False):
+def _cache_fingerprint(dataset, new_fingerprint_args, fingerprint_columns):
     new_fingerprint_args = [] if new_fingerprint_args is None else list(new_fingerprint_args)
     if fingerprint_columns is None:
         new_fingerprint_args.append(dataset._fingerprint)
@@ -317,7 +314,29 @@ def _map_and_cache(dataset, map_fn, cache_dir, cache_file_prefix='', new_fingerp
             # -- back into the digest and defeats the entire point of selecting columns.
             hasher.update(list(dataset[column]))
         new_fingerprint_args.append(hasher.hexdigest())
-    new_fingerprint = Hasher.hash(new_fingerprint_args)
+    return Hasher.hash(new_fingerprint_args)
+
+
+def _open_cached_prefix(dataset, cache_dir, cache_file_prefix='', new_fingerprint_args=None,
+                        fingerprint_columns=None, keep_on_fingerprint_change=False, identity=None,
+                        content_column=None, require_identity=False):
+    """What _map_and_cache(dataset, None, ...) would read, but also from a cache that is not
+    complete: the rows an interrupted run wrote (a PrefixCache), none if it wrote nothing.
+    Nothing is encoded, cleared or claimed."""
+    new_fingerprint = _cache_fingerprint(dataset, new_fingerprint_args, fingerprint_columns)
+    if cache_file_prefix:
+        cache_dir = cache_dir / cache_file_prefix.strip('_')
+    return open_prefix_cache(
+        cache_dir, new_fingerprint, len(dataset), keep_on_fingerprint_change=keep_on_fingerprint_change,
+        identity=identity, require_identity=require_identity,
+        content_digest=(lambda: _content_digest(dataset, content_column)) if content_column else None)
+
+
+def _map_and_cache(dataset, map_fn, cache_dir, cache_file_prefix='', new_fingerprint_args=None,
+                   regenerate_cache=False, caching_batch_size=1, fingerprint_columns=None,
+                   keep_on_fingerprint_change=False, identity=None, content_column=None,
+                   require_identity=False):
+    new_fingerprint = _cache_fingerprint(dataset, new_fingerprint_args, fingerprint_columns)
     if cache_file_prefix:
         cache_dir = cache_dir / cache_file_prefix.strip('_')
 
@@ -464,6 +483,9 @@ class TextEmbeddingDataset:
     def get_text_embeddings(self, image_spec, caption_number):
         return self.te_dataset[self.image_spec_to_te_idx[image_spec][caption_number]]
 
+    def has_text_embeddings(self, image_spec, caption_number):
+        return self.te_dataset.is_available(self.image_spec_to_te_idx[image_spec][caption_number])
+
     def get_caption(self, image_spec, caption_number):
         """The text these embeddings were encoded from."""
         return self.flattened_captions[self.image_spec_to_te_idx[image_spec][caption_number]]['caption']
@@ -567,9 +589,10 @@ def _cache_text_embeddings(metadata_dataset, map_fn, i, cache_dir, regenerate_ca
                            caching_batch_size, text_encoder_key='',
                            keep_on_fingerprint_change=False, identity=None,
                            profile_sources=None, profile_lookup_dir=None, layout_rewriter=None,
-                           require_identity=False):
+                           require_identity=False, partial=False):
     """layout_rewriter (a LayoutCaptionRewriter) rewrites each layout caption for its row's
-    media and size bucket before it is encoded; the metadata must then have size_bucket set."""
+    media and size bucket before it is encoded; the metadata must then have size_bucket set.
+    partial (use_cached_embeddings_only): encode nothing, read the rows that are cached."""
 
     def flatten_captions(example):
         result = {key: [] for key in example}
@@ -615,7 +638,7 @@ def _cache_text_embeddings(metadata_dataset, map_fn, i, cache_dir, regenerate_ca
             cache_dir / f'text_embeddings_{i}_{Hasher.hash([identity, text_encoder_key])}',
             sorted(flattened_captions.column_names), identity, donors, _map_and_cache,
             caching_batch_size=caching_batch_size, regenerate_cache=regenerate_cache,
-            encoder_key=text_encoder_key, lookup_dir=profile_lookup_dir)
+            encoder_key=text_encoder_key, lookup_dir=profile_lookup_dir, partial=partial)
         return IndexedTextEmbeddingDataset(
             te_dataset, flattened_captions, cache_dir / f'caption_index_{metadata_dataset._fingerprint}.sqlite')
     if layout_rewriter is None:
@@ -626,6 +649,13 @@ def _cache_text_embeddings(metadata_dataset, map_fn, i, cache_dir, regenerate_ca
             metadata_dataset, flatten_captions,
             cache_dir / f'flattened_captions_{metadata_dataset._fingerprint}_{rewrite_tag}',
             regenerate=regenerate_cache and map_fn is not None)
+    if partial:
+        te_dataset = _open_cached_prefix(
+            flattened_captions, cache_dir, cache_file_prefix=f'text_embeddings_{i}_',
+            new_fingerprint_args=[i, text_encoder_key] if text_encoder_key else [i],
+            keep_on_fingerprint_change=keep_on_fingerprint_change, identity=identity,
+            require_identity=require_identity, content_column='caption')
+        return TextEmbeddingDataset(te_dataset, flattened_captions)
     te_dataset = _map_and_cache(
         flattened_captions,
         map_fn,
@@ -693,13 +723,21 @@ def check_max_cached_captions(value, where):
     return value
 
 
+def check_cached_only(value, key, where):
+    if not isinstance(value, bool):
+        raise ValueError(f'{where}: {key} must be true or false, got {value!r}.')
+    return value
+
+
 def limit_captions(captions, limit, seed):
     """`limit` of `captions`, picked at random with `seed` and kept in their order; all of them
     when there are no more than `limit` (or `limit` is None)."""
     if limit is None or len(captions) <= limit:
         return captions
-    keep = sorted(random.Random(seed).sample(range(len(captions)), limit))
-    return [captions[i] for i in keep]
+    # The first `limit` of one seeded shuffle, so a smaller limit keeps a subset of what a larger
+    # one kept: changing the limit reuses the embeddings already cached and encodes only the new ones.
+    order = random.Random(seed).sample(range(len(captions)), len(captions))
+    return [captions[i] for i in sorted(order[:limit])]
 
 
 def caption_cache_suffix(settings):
@@ -775,6 +813,41 @@ def shuffle_in_memory(dataset, seed):
     return dataset.shuffle(seed=seed, keep_in_memory=True, new_fingerprint=fingerprint)
 
 
+def agree_on_kept(masks):
+    """`masks` (for each bucket, which of its samples have their cached data) as every data
+    parallel rank sees them: the samples all of them have. Ranks read one cache, so they
+    normally agree and this costs one gather of a hash; a node whose volume lags would otherwise
+    draw other samples than the rest and desynchronise the batches. Every rank calls this once,
+    with all its buckets, after every rank has loaded them: a rank that failed earlier must not
+    meet the others in these collectives."""
+    if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
+        return masks
+    world = torch.distributed.get_world_size()
+    if world == 1:
+        return masks
+    # None: a bucket with nothing to restrict (empty, or neither option set).
+    lengths = [-1 if mask is None else len(mask) for mask in masks]
+    present = [mask for mask in masks if mask is not None]
+    joined = np.concatenate(present) if present else np.zeros(0, dtype=bool)
+    mine = (hashlib.md5(joined.tobytes()).hexdigest(), lengths)
+    gathered = [None] * world
+    torch.distributed.all_gather_object(gathered, mine, group=dist.get_world_group())
+    if len({digest for digest, _ in gathered}) == 1:
+        return masks
+    if any(other != lengths for _, other in gathered):
+        # Every rank sees the same gathered list, so every rank raises here.
+        raise RuntimeError('The data parallel ranks see different datasets (bucket sizes '
+                           f'{[other for _, other in gathered]}): their metadata caches differ.')
+    packed = [None] * world
+    torch.distributed.all_gather_object(packed, np.packbits(joined), group=dist.get_world_group())
+    common = np.unpackbits(np.bitwise_and.reduce(np.stack(packed), axis=0), count=len(joined)).astype(bool)
+    if is_main_process():
+        print(f'WARNING: the data parallel ranks see different cached data; using the {int(common.sum())} '
+              f'samples all of them have ({int(joined.sum())} on this rank).')
+    agreed = iter(np.split(common, np.cumsum([len(mask) for mask in present])[:-1]))
+    return [None if mask is None else next(agreed) for mask in masks]
+
+
 # The smallest unit of a dataset. Represents a single size bucket from a single folder of images
 # and captions on disk. Not batched; returns individual items.
 class SizeBucketDataset:
@@ -847,21 +920,31 @@ class SizeBucketDataset:
             self.latent_dataset = OnTheFlyMediaDataset(self.metadata_dataset, *on_the_fly_media)
             self._build_iteration_order(regenerate_cache, trust_cache)
             return
-        print(f'caching latents: {self.size_bucket}')
+        cached_only = getattr(self.directory_dataset, 'use_cached_latents_only', False)
+        print(f'{"reading cached latents" if cached_only else "caching latents"}: {self.size_bucket}')
         # Latents depend on the image, its mask, its control image and the size bucket -- never
         # on the caption, which is only carried alongside them. Fingerprinting the caption
         # column too meant every caption setting change wiped the whole VAE cache.
         latent_columns = [c for c in self.metadata_dataset.column_names if c != 'caption']
         if getattr(self.directory_dataset, 'reuse_metadata_cache', False):
             self.latent_dataset = tensor_profile(
-                self.metadata_dataset, map_fn,
+                self.metadata_dataset, None if cached_only else map_fn,
                 self.cache_dir / f'latent_profile_{Hasher.hash(self.vae_identity)}',
                 sorted(latent_columns), self.vae_identity,
                 lambda: self.directory_dataset.legacy_tensor_sources(self.size_bucket, 'latents'),
                 _map_and_cache, caching_batch_size=caching_batch_size,
                 regenerate_cache=regenerate_cache,
-                lookup_dir=self.directory_dataset.snapshot_dir / 'tensor_lookups')
+                lookup_dir=self.directory_dataset.snapshot_dir / 'tensor_lookups',
+                partial=cached_only)
             trust_cache = True
+        elif cached_only:
+            self.latent_dataset = _open_cached_prefix(
+                self.metadata_dataset, self.cache_dir, cache_file_prefix='latents_',
+                fingerprint_columns=latent_columns,
+                keep_on_fingerprint_change=self.directory_config.get('keep_latent_cache', False),
+                identity=self.vae_identity,
+                content_column=('image_spec' if self.directory_config.get('require_non_latin_caption') is not None
+                                else None))
         else:
             self.latent_dataset = _map_and_cache(
                 self.metadata_dataset, map_fn, self.cache_dir, cache_file_prefix='latents_',
@@ -951,9 +1034,10 @@ class SizeBucketDataset:
     def cache_text_embeddings(self, map_fn, i, regenerate_cache=False, caching_batch_size=1,
                               text_encoder_key='', keep_text_embedding_cache=False,
                               identity=None, require_identity=False):
-        print(f'caching text embeddings: {self.size_bucket}')
+        cached_only = getattr(self.directory_dataset, 'use_cached_embeddings_only', False)
+        print(f'{"reading cached text embeddings" if cached_only else "caching text embeddings"}: {self.size_bucket}')
         te_dataset = _cache_text_embeddings(
-            self.metadata_dataset, map_fn, i, self.cache_dir, regenerate_cache,
+            self.metadata_dataset, None if cached_only else map_fn, i, self.cache_dir, regenerate_cache,
             caching_batch_size, text_encoder_key,
             keep_on_fingerprint_change=keep_text_embedding_cache,
             identity=identity,
@@ -964,8 +1048,74 @@ class SizeBucketDataset:
             profile_lookup_dir=(self.directory_dataset.snapshot_dir / 'tensor_lookups'
                                 if getattr(self.directory_dataset, 'reuse_metadata_cache', False) else None),
             layout_rewriter=self.layout_rewriter,
+            partial=cached_only,
         )
         self.text_embedding_datasets.append(te_dataset)
+
+    def cached_mask(self):
+        """use_cached_latents_only / use_cached_embeddings_only: which samples have their cached
+        data, once both caches are loaded; None when neither option is set or the bucket is empty.
+        A sample is a row of the iteration order, or with random_per_epoch and
+        use_cached_embeddings_only, one caption of a row (rows flattened), so that every rank also
+        agrees on which captions a row keeps. apply_cached_mask() takes the mask back."""
+        latents_only = getattr(self.directory_dataset, 'use_cached_latents_only', False)
+        embeddings_only = getattr(self.directory_dataset, 'use_cached_embeddings_only', False)
+        order = self.iteration_order
+        if not (latents_only or embeddings_only) or len(order) == 0:
+            return None
+        keep = np.ones(len(order), dtype=bool)
+        if latents_only:
+            keep &= self.latent_dataset.available_mask()[np.asarray(order['latents_idx'], dtype=np.int64)]
+        if not (embeddings_only and self.text_embedding_datasets):
+            return keep
+        random_per_epoch = self._caption_level_mask
+        numbers_column = 'caption_numbers' if random_per_epoch else 'caption_number'
+        mask = []
+        row = 0
+        for batch in order.select_columns(['image_spec', numbers_column]).iter(batch_size=100_000):
+            for spec, numbers in zip(batch['image_spec'], batch[numbers_column]):
+                spec = tuple(spec)
+                for number in (numbers if random_per_epoch else [numbers]):
+                    mask.append(bool(keep[row]) and all(
+                        ds.has_text_embeddings(spec, number) for ds in self.text_embedding_datasets))
+                row += 1
+        return np.asarray(mask, dtype=bool)
+
+    @property
+    def _caption_level_mask(self):
+        return (self.caption_sampling == 'random_per_epoch' and bool(self.text_embedding_datasets)
+                and getattr(self.directory_dataset, 'use_cached_embeddings_only', False))
+
+    def apply_cached_mask(self, mask):
+        """Keep the samples `mask` (cached_mask(), agreed across ranks) keeps. The iteration order
+        on disk is left as it is (it is the complete one); the rows without data are dropped from
+        this run's copy. Returns (kept, total) rows."""
+        order = self.iteration_order
+        total = len(order)
+        if mask is None:
+            return total, total
+        if not self._caption_level_mask:
+            kept_rows = np.flatnonzero(mask)
+            self.iteration_order = order.select(kept_rows.tolist())
+            return len(kept_rows), total
+        columns = defaultdict(list)
+        start = 0
+        # In batches: a row read at a time costs about a millisecond each.
+        for batch in order.select_columns(['image_spec', 'latents_idx', 'captions', 'caption_numbers']).iter(
+                batch_size=100_000):
+            for spec, latents_idx, captions, numbers in zip(
+                    batch['image_spec'], batch['latents_idx'], batch['captions'], batch['caption_numbers']):
+                chosen = np.flatnonzero(mask[start:start + len(captions)]).tolist()
+                start += len(captions)
+                if not chosen:
+                    continue
+                columns['image_spec'].append(spec)
+                columns['latents_idx'].append(latents_idx)
+                columns['captions'].append([captions[j] for j in chosen])
+                columns['caption_numbers'].append([numbers[j] for j in chosen])
+        assert start == len(mask), (start, len(mask))
+        self.iteration_order = datasets.Dataset.from_dict(dict(columns)) if columns else order.select([])
+        return len(self.iteration_order), total
 
     def _rewrite_layout(self, caption, image_spec):
         """A layout caption as this bucket trains it, for the paths that tokenize the caption
@@ -1476,9 +1626,10 @@ class ARBucketDataset:
                     text_encoder_key=text_encoder_key, keep_text_embedding_cache=keep_text_embedding_cache,
                     identity=identity, require_identity=require_identity)
             return
-        print(f'caching text embeddings: {self.ar_frames}')
+        cached_only = getattr(self.directory_dataset, 'use_cached_embeddings_only', False)
+        print(f'{"reading cached text embeddings" if cached_only else "caching text embeddings"}: {self.ar_frames}')
         te_dataset = _cache_text_embeddings(
-            self.metadata_dataset, map_fn, i, self.cache_dir, regenerate_cache,
+            self.metadata_dataset, None if cached_only else map_fn, i, self.cache_dir, regenerate_cache,
             caching_batch_size, text_encoder_key,
             keep_on_fingerprint_change=keep_text_embedding_cache,
             identity=identity,
@@ -1488,6 +1639,7 @@ class ARBucketDataset:
                 if getattr(self.directory_dataset, 'reuse_metadata_cache', False) else None),
             profile_lookup_dir=(self.directory_dataset.snapshot_dir / 'tensor_lookups'
                                 if getattr(self.directory_dataset, 'reuse_metadata_cache', False) else None),
+            partial=cached_only,
         )
         for size_bucket_dataset in self.size_buckets:
             size_bucket_dataset.add_text_embedding_dataset(te_dataset)
@@ -1636,6 +1788,20 @@ class DirectoryDataset:
         self.max_cached_captions = check_max_cached_captions(
             directory_config.get('max_cached_captions', dataset_config.get('max_cached_captions')),
             directory_config['path'])
+        # Not in the suffix: they change which cached samples are read, not what is cached.
+        self.use_cached_latents_only = check_cached_only(
+            directory_config.get('use_cached_latents_only', dataset_config.get('use_cached_latents_only', False)),
+            'use_cached_latents_only', directory_config['path'])
+        self.use_cached_embeddings_only = check_cached_only(
+            directory_config.get('use_cached_embeddings_only', dataset_config.get('use_cached_embeddings_only', False)),
+            'use_cached_embeddings_only', directory_config['path'])
+        if self.use_cached_latents_only and on_the_fly_media is not None:
+            raise ValueError(f'{directory_config["path"]}: use_cached_latents_only does not apply: this model reads '
+                             'its media when a sample is drawn and caches no latents. Remove use_cached_latents_only.')
+        if self.use_cached_embeddings_only and not caches_text_embeddings:
+            raise ValueError(f'{directory_config["path"]}: use_cached_embeddings_only does not apply: this run '
+                             'encodes captions on the fly and caches no text embeddings. Remove '
+                             'use_cached_embeddings_only.')
         self.caption_cache_suffix = caption_cache_suffix({
             'max_cached_captions': self.max_cached_captions,
             'augment_at_runtime': (
@@ -1742,6 +1908,11 @@ class DirectoryDataset:
             # raising. The corrupted text then reaches the cache and the text encoder.
             with open(captions_json, encoding='utf-8-sig') as f:
                 self.captions_dict = json.load(f)
+            if self.max_cached_captions is not None and not caches_text_embeddings:
+                # The live caption is read by its number in captions.json, which counts every
+                # caption, while the metadata numbers only the ones max_cached_captions kept.
+                raise ValueError(f'{self.path}: max_cached_captions cannot be combined with online_captions '
+                                 'when text embeddings are not cached. Remove one of them.')
         else:
             self.captions_dict = None
 
@@ -2637,6 +2808,34 @@ class DirectoryDataset:
             result.append(res)
         return result
 
+    def cached_masks(self):
+        """For each size bucket, which samples have their cached data (SizeBucketDataset.cached_mask);
+        empty unless one of the two options is set."""
+        if not (self.use_cached_latents_only or self.use_cached_embeddings_only):
+            return []
+        return [ds.cached_mask() for ds in self.get_size_bucket_datasets()]
+
+    def apply_cached_masks(self, masks):
+        """Drop the samples whose cached data is missing (masks from cached_masks(), agreed across
+        ranks) and say how many are left."""
+        if not (self.use_cached_latents_only or self.use_cached_embeddings_only):
+            return
+        kept = total = 0
+        buckets = self.get_size_bucket_datasets()
+        assert len(buckets) == len(masks), (len(buckets), len(masks))
+        for ds, mask in zip(buckets, masks):
+            bucket_kept, bucket_total = ds.apply_cached_mask(mask)
+            kept += bucket_kept
+            total += bucket_total
+        used = ' and '.join(name for name, on in (('latents', self.use_cached_latents_only),
+                                                  ('text embeddings', self.use_cached_embeddings_only)) if on)
+        if is_main_process():
+            print(f'{self.path}: training on the cached {used} only: {kept} of {total} samples '
+                  f'({100 * kept / max(total, 1):.1f}%).')
+        if kept == 0:
+            raise RuntimeError(f'{self.path}: no sample has its {used} cached, so there is nothing to train on. '
+                               'Cache some first, or remove use_cached_latents_only / use_cached_embeddings_only.')
+
     def get_size_bucket_datasets(self):
         if self.use_size_buckets:
             return self.size_bucket_datasets
@@ -2654,6 +2853,9 @@ class DirectoryDataset:
         """takes(bucket) picks the buckets to cache, None all of them: with several nodes caching,
         each takes the units of work it draws (see tensor_units)."""
         buckets = [ds for ds in self.bucket_datasets() if takes is None or takes(ds)]
+        if buckets and regenerate_cache and self.use_cached_latents_only:
+            raise ValueError(f'{self.path}: --regenerate_cache rebuilds the latent cache and use_cached_latents_only '
+                             'reads what is cached without encoding. Use one or the other.')
         if buckets:
             print(f'caching latents: {self.path}')
         for ds in buckets:
@@ -2665,6 +2867,9 @@ class DirectoryDataset:
         """takes as in cache_latents; uncond=False leaves the empty caption's embedding, which
         the directory shares, to another node."""
         buckets = [ds for ds in self.bucket_datasets() if takes is None or takes(ds)]
+        if buckets and regenerate_cache and self.use_cached_embeddings_only:
+            raise ValueError(f'{self.path}: --regenerate_cache rebuilds the text embedding cache and '
+                             'use_cached_embeddings_only reads what is cached without encoding. Use one or the other.')
         if buckets:
             print(f'caching text embeddings: {self.path}')
         for ds in buckets:
@@ -2933,6 +3138,27 @@ class Dataset:
     def cache_metadata(self, regenerate_cache=False, trust_cache=False):
         for ds in self.directory_datasets:
             ds.cache_metadata(regenerate_cache=regenerate_cache, trust_cache=trust_cache)
+
+    def cached_masks(self):
+        """One list of bucket masks per directory (DirectoryDataset.cached_masks), flattened."""
+        self._mask_counts = []
+        masks = []
+        for ds in self.directory_datasets:
+            directory_masks = ds.cached_masks()
+            self._mask_counts.append(len(directory_masks))
+            masks.extend(directory_masks)
+        return masks
+
+    def apply_cached_masks(self, masks):
+        start = 0
+        for ds, count in zip(self.directory_datasets, self._mask_counts):
+            ds.apply_cached_masks(masks[start:start + count])
+            start += count
+
+    def restrict_to_cached(self):
+        """use_cached_latents_only / use_cached_embeddings_only: train on the samples with cached
+        data only. DatasetManager.cache runs the two halves itself, around its error sharing."""
+        self.apply_cached_masks(agree_on_kept(self.cached_masks()))
 
     def cache_latents(self, map_fn, regenerate_cache=False, trust_cache=False, caching_batch_size=1, takes=None):
         for ds in self.directory_datasets:
@@ -3561,8 +3787,10 @@ class DatasetManager:
         self.call_vae_fn = self.model.get_call_vae_fn(self.vae)
         self.vae_supports_audio = 'audio' in signature(self.call_vae_fn).parameters
         self.call_text_encoder_fns = [self.model.get_call_text_encoder_fn(text_encoder) for text_encoder in self.text_encoders]
+        # Cached only when there is an encoder to cache for: a model that encodes on the fly
+        # (cache_text_embeddings = false) returns none.
         self.text_embedding_dtype = check_text_embedding_dtype(
-            getattr(model, 'model_config', {}), not encodes_text_in_loader(model))
+            getattr(model, 'model_config', {}), len(self.text_encoders) > 0)
         self.te_fn_requires_control_file = [
             len(signature(fn).parameters) == 3
             for fn in self.call_text_encoder_fns
@@ -3633,12 +3861,24 @@ class DatasetManager:
         # Now load all datasets from cache. A rank that cannot fails every rank, rather than leave
         # the others waiting in the next collective until it times out.
         error = None
+        masks = []
         try:
             for ds in self.datasets:
                 ds.cache_metadata(trust_cache=True)
                 ds.cache_latents(None, trust_cache=True)
                 for i in range(1, len(self.text_encoders)+1):
                     ds.cache_text_embeddings(None, i)
+                masks.append(ds.cached_masks())
+        except Exception as e:
+            error = e
+        all_ok(error)
+        # One agreement for every bucket, once every rank has loaded them (see agree_on_kept).
+        agreed = agree_on_kept([mask for dataset_masks in masks for mask in dataset_masks])
+        try:
+            start = 0
+            for ds, dataset_masks in zip(self.datasets, masks):
+                ds.apply_cached_masks(agreed[start:start + len(dataset_masks)])
+                start += len(dataset_masks)
         except Exception as e:
             error = e
         all_ok(error)

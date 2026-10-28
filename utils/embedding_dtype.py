@@ -47,7 +47,9 @@ def _store(x, dtype):
         # and values float8 holds exactly (0 and 1 of a mask) come back unchanged.
         amax = x.float().abs().amax(dim=-1, keepdim=True)
         scale = torch.exp2(torch.ceil(torch.log2(amax / FLOAT8_MAX)))
-        scale = torch.where(amax > 0, scale, torch.ones_like(scale))
+        # 1 for a token of zeros, and for one whose scale underflows (amax below ~6e-43) or is not
+        # finite: dividing by those gives NaN.
+        scale = torch.where((amax > 0) & (scale > 0) & torch.isfinite(scale), scale, torch.ones_like(scale))
         return (x.float() / scale).to(FLOAT8), scale
     stored = x.to(dtype)
     if torch.isfinite(x).all() and not torch.isfinite(stored).all():

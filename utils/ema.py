@@ -43,6 +43,7 @@ from pathlib import Path
 import torch
 
 from utils.common import torch_save_atomic
+from utils.dora import DORA_SCALE, saved_key as dora_saved_key
 
 DEVICES = ('cpu', 'gpu')
 DTYPES = {'float32': torch.float32, 'bfloat16': torch.bfloat16}
@@ -133,7 +134,8 @@ def load_ema_weights(ema, path):
 
         plan, missing, wrong_shape = {}, [], []
         for key, shadow in ema.shadow.items():
-            found = by_suffix.get(key, [])
+            # A DoRA magnitude vector (out,) is saved as <module>.dora_scale (out, 1).
+            found = by_suffix.get(key, []) or by_suffix.get(dora_saved_key(key), [])
             exact = [(prefix, name) for prefix, name in found if prefix + name == key]
             found = exact or found
             if not found:
@@ -144,6 +146,8 @@ def load_ema_weights(ema, path):
                                  f'{[prefix + name for prefix, name in found]}')
             prefix, name = found[0]
             shape = list(handles[prefix].get_slice(name).get_shape())
+            if name.endswith(DORA_SCALE) and shape == [*shadow.shape, 1]:
+                shape = shape[:-1]
             if shape != list(shadow.shape):
                 wrong_shape.append(f'{prefix + name} {shape} (trained {key} is {list(shadow.shape)})')
             plan[key] = found[0]
@@ -165,7 +169,7 @@ def load_ema_weights(ema, path):
                              f'{"; ".join(problems)}.{kind} Point it at the ema/ directory (or its .safetensors) '
                              'of a run with this model and these adapter settings.')
         for key, (prefix, name) in plan.items():
-            ema.shadow[key].copy_(handles[prefix].get_tensor(name).to(torch.float32))
+            ema.shadow[key].copy_(handles[prefix].get_tensor(name).to(torch.float32).reshape(ema.shadow[key].shape))
     if plan:
         ema.following = False
     return len(plan)

@@ -212,7 +212,7 @@ dtype = 'bfloat16'
 #fuse_adapters = [
 #    {path = '/data2/imagegen_models/loras/some_lora.safetensors', weight = 1.0}
 #]
-# DoRA: learn a per-output magnitude beside the LoRA direction. LoRA only. Works with oplora.
+# DoRA: learn a per-output magnitude beside the LoRA direction. LoRA only. Not with oplora.
 # Costs extra VRAM and step time. Saved as <module>.dora_scale.
 #use_dora = true
 # OPLoRA (orthogonal projection LoRA) reduces catastrophic forgetting by projecting every

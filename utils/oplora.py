@@ -37,6 +37,11 @@ def apply_oplora_config_defaults(adapter_config):
         return
     if adapter_config.get('type') != 'lora':
         raise ValueError(f"oplora is only supported for adapter type 'lora', not '{adapter_config.get('type')}'")
+    if adapter_config.get('use_dora', False):
+        # DoRA rescales each row of W + BA by its trained magnitude, which moves the top singular
+        # directions of W that OPLoRA keeps BA away from.
+        raise ValueError('oplora cannot be combined with use_dora: the DoRA magnitude rescales the base '
+                         'weight and moves the subspace oplora protects. Set one of them to false.')
     if 'oplora_rank' not in adapter_config:
         raise ValueError('oplora is enabled but oplora_rank is not set. Set oplora_rank to the size of the protected top-k singular subspace.')
     rank = adapter_config['oplora_rank']

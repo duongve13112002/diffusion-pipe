@@ -11,7 +11,7 @@ import safetensors
 from safetensors.torch import save_file
 
 from models.base import BasePipeline, make_contiguous
-from utils.dora import DORA_SCALE, has_dora_scale, kohya_module_name, saved_key
+from utils.dora import DORA_SCALE, check_init_matches, has_dora_scale, kohya_module_name, saved_key
 from utils.common import AUTOCAST_DTYPE, is_main_process
 
 
@@ -491,6 +491,7 @@ class SDXLPipeline(BasePipeline):
         if len(safetensors_files) > 1:
             raise RuntimeError(f'Multiple safetensors files found in {adapter_path}')
         adapter_state_dict = safetensors.torch.load_file(safetensors_files[0])
+        check_init_matches(self.config['adapter'], adapter_state_dict, safetensors_files[0])
         if has_dora_scale(adapter_state_dict):
             # diffusers' load_lora_weights drops dora_scale and would load a plain LoRA.
             self._load_dora_adapter(adapter_state_dict)
