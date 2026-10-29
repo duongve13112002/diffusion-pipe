@@ -14,6 +14,9 @@ Models supported: SDXL, Flux, LTX-Video, HunyuanVideo (t2v), Cosmos, Lumina Imag
 - Optional OPLoRA (orthogonal projection LoRA) to reduce catastrophic forgetting when training LoRAs
 
 ## Recent changes
+- 2026-10-29
+  - `--cache_status`: prints how many files of each dataset directory (and of each bucket) have their latents and their text embeddings cached, counted in files, not captions, then exits. It reads what is cached, also from a run that was interrupted or is still caching, and encodes, clears and writes nothing. See [pre-caching](#pre-caching).
+  - The progress bar of caching now shows the files done (`latents: 41%|... 4120/10000 [..., 4120/10000 files]`, `text_embeddings_1: ... 880/3000 files`), also for text embeddings, whose bar counts a file's captions one by one.
 - 2026-10-28
   - `use_cached_latents_only` and `use_cached_embeddings_only` (top level or per `[[directory]]`, default `false`) train on what an unfinished caching run left, without encoding more. With the latents option, only images whose latents are cached are trained; with the embeddings option, only captions whose embeddings (for every text encoder) are cached; with both, only samples that have both. The option left off still caches as usual, and with `cache_text_embeddings = false` the captions are encoded during training as ever, so the latents option alone is what limits the data. The startup log says how many samples are used (`training on the cached latents only: 41200 of 90000 samples`). The empty caption's embedding is still encoded when it is missing (one caption). A cache made for other inputs (images, captions or a setting changed since) or by another VAE or text encoder is refused, never cleared; `--regenerate_cache` is refused with these options. Data parallel ranks train on the samples every one of them can read. The cache now commits what it has written every 5 minutes, so an interrupted run keeps (and a resumed run skips) nearly everything it encoded; before, nothing was kept until a 10 GB shard was full.
   - A cache records the VAE or text encoder that fills it from its first row, not only once complete: a run resumed with another one rebuilds the cache instead of appending its rows to the other encoder's.
@@ -379,6 +382,36 @@ as it reuses any metadata cache (with `reuse_metadata_cache = false`, pass `--tr
 skip checking the sources again) and only caches the latents and text embeddings.
 `--regenerate_cache` and `--trust_cache` work with it as with `--cache_only`; it refuses
 `--cache_only`, `--dump_dataset`, `--test_sample`, `--resume_from_checkpoint` and Turbo configs.
+
+`--cache_status` tells how much is cached. It loads the metadata like `--metadata_only`, then
+reads the latent and text embedding caches of every directory (train and eval datasets) and prints,
+per directory and per bucket, how many files have them:
+
+```
+/data/photos: 12000 files in 9 buckets
+  latents: 8123 of 12000 files (67.7%)
+  text embeddings, text encoder 1: 5000 of 12000 files (41.7%); 40 more have the embeddings of only some of their captions
+  text embeddings, text encoder 2: 4980 of 12000 files (41.5%)
+    1024x1024: 3000 files, latents 2400, text encoder 1 1500, text encoder 2 1490
+```
+
+It counts files, not captions: a file has its text embeddings when every one of its captions has
+them, for each text encoder; a file with only some is counted apart. An aspect ratio bucket's file
+has its latents when all its resolutions do. It encodes nothing, puts no model on the GPU (some models still read their weights into RAM when the
+pipeline is built, as for `--metadata_only`), and does not clear or rewrite any cache: a cache made for other inputs (the images, captions or a
+setting changed) or by another VAE or text encoder is reported on its bucket's line, not rebuilt.
+A directory whose model reads its media while training, or with `cache_text_embeddings = false`,
+says so instead of counting. A run that is caching commits what it wrote every 5 minutes, so the
+count can be up to that far behind; when another run is caching the same dataset, add
+`--trust_cache` so that this one does not rescan the sources (with `reuse_metadata_cache = true`
+nothing is rescanned anyway). Launch it like training (`deepspeed train.py --deepspeed --config ... --cache_status`);
+it refuses `--metadata_only`, `--cache_only`, `--regenerate_cache`, `--dump_dataset`,
+`--test_sample`, `--resume_from_checkpoint` and Turbo configs.
+
+While caching, the progress bar shows the same count for the cache it is filling:
+`latents: 41%|████ | 4120/10000 [...]` ends with `4120/10000 files`, and
+`text_embeddings_1` shows the files whose captions are all encoded, although its bar moves one
+caption at a time.
 
 ### Text embeddings: cached or on the fly
 

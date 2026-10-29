@@ -332,6 +332,30 @@ def _open_cached_prefix(dataset, cache_dir, cache_file_prefix='', new_fingerprin
         content_digest=(lambda: _content_digest(dataset, content_column)) if content_column else None)
 
 
+def _file_ends(dataset):
+    """The row counts at which each file's rows end: one row per file for latents, a file's
+    captions in a row each for text embeddings. None for a dataset that has no image_spec."""
+    if 'image_spec' not in dataset.column_names:
+        return None
+    ends = []
+    previous = None
+    row = 0
+    for batch in dataset.select_columns(['image_spec']).iter(batch_size=100_000):
+        for image_spec in batch['image_spec']:
+            image_spec = tuple(image_spec)
+            if row and image_spec != previous:
+                ends.append(row)
+            previous = image_spec
+            row += 1
+    if row:
+        ends.append(row)
+    return np.asarray(ends, dtype=np.int64)
+
+
+def _files_done(file_ends, rows):
+    return int(np.searchsorted(file_ends, rows, side='right'))
+
+
 def _map_and_cache(dataset, map_fn, cache_dir, cache_file_prefix='', new_fingerprint_args=None,
                    regenerate_cache=False, caching_batch_size=1, fingerprint_columns=None,
                    keep_on_fingerprint_change=False, identity=None, content_column=None,
@@ -404,6 +428,7 @@ def _map_and_cache(dataset, map_fn, cache_dir, cache_file_prefix='', new_fingerp
         # them is true; write_manifest records nothing when there is nothing to record.
         cache.write_manifest()
         return cache
+    file_ends = _file_ends(dataset)
     dataset = dataset.select(range(cache_size, dataset_size), keep_in_memory=True)
 
     pool = None
@@ -455,9 +480,16 @@ def _map_and_cache(dataset, map_fn, cache_dir, cache_file_prefix='', new_fingerp
 
     map_iter = (pool.imap(wrapper, dataset.iter(batch_size=caching_batch_size)) if pool
                 else map(wrapper, dataset.iter(batch_size=caching_batch_size)))
-    for batch in tqdm(map_iter, initial=completed_batches, total=total_batches):
+    # Counted in files, which is what a user asks about: a file's captions are rows of their own.
+    progress = tqdm(map_iter, initial=completed_batches, total=total_batches,
+                    desc=cache_file_prefix.strip('_') or None)
+    if file_ends is not None:
+        progress.set_postfix_str(f'{_files_done(file_ends, cache_size)}/{len(file_ends)} files')
+    for batch in progress:
         for example in unbatch_iter(batch):
             cache.add(example)
+        if file_ends is not None:
+            progress.set_postfix_str(f'{_files_done(file_ends, len(cache))}/{len(file_ends)} files')
 
     if pool is not None:
         pool.close()
@@ -918,7 +950,8 @@ class SizeBucketDataset:
             # rows the decoder reads, so everything downstream is unchanged.
             print(f'media read on the fly (nothing cached): {self.size_bucket}')
             self.latent_dataset = OnTheFlyMediaDataset(self.metadata_dataset, *on_the_fly_media)
-            self._build_iteration_order(regenerate_cache, trust_cache)
+            if not getattr(self.directory_dataset, 'reading_cache_status', False):
+                self._build_iteration_order(regenerate_cache, trust_cache)
             return
         cached_only = getattr(self.directory_dataset, 'use_cached_latents_only', False)
         print(f'{"reading cached latents" if cached_only else "caching latents"}: {self.size_bucket}')
@@ -955,7 +988,8 @@ class SizeBucketDataset:
                 content_column=('image_spec' if self.directory_config.get('require_non_latin_caption') is not None
                                 else None))
         assert len(self.latent_dataset) == len(self.metadata_dataset), (len(self.latent_dataset), len(self.metadata_dataset))
-        self._build_iteration_order(regenerate_cache, trust_cache)
+        if not getattr(self.directory_dataset, 'reading_cache_status', False):
+            self._build_iteration_order(regenerate_cache, trust_cache)
 
     def _build_iteration_order(self, regenerate_cache, trust_cache):
         suffix = self.directory_config.get('caption_cache_suffix', '')
@@ -1731,6 +1765,7 @@ class DirectoryDataset:
         # (media_loader, encode_fn) for a model that reads its media at __getitem__ time instead
         # of caching latents (see OnTheFlyMediaDataset). None for every other model.
         self.on_the_fly_media = on_the_fly_media
+        self.caches_text_embeddings = caches_text_embeddings
         self.dataset_config = dataset_config
         if not skip_dataset_validation:
             self.validate()
@@ -3750,6 +3785,18 @@ def _run_caching_on_every_node(queue, handle_task, process, round_, node, nodes,
     all_ok(error)
 
 
+def _bucket_name(bucket):
+    if isinstance(bucket, ARBucketDataset):
+        ar, frames = bucket.ar_frames
+        name = f'aspect ratio {ar:.3f}, resolutions {", ".join(f"{float(r):g}" for r in bucket.resolutions)}'
+    else:
+        width, height, frames = bucket.size_bucket
+        name = f'{width}x{height}'
+    if frames > 1:
+        name += f', {frames} frames'
+    return name
+
+
 def describe_buckets(dataset):
     """What --metadata_only prints: the files of each directory per bucket, largest first. An
     aspect ratio bucket is encoded once for each of its resolutions."""
@@ -3759,15 +3806,157 @@ def describe_buckets(dataset):
         total = sum(len(bucket.metadata_dataset) for bucket in buckets)
         lines.append(f'{directory.path}: {total} files in {len(buckets)} buckets')
         for bucket in buckets:
-            if isinstance(bucket, ARBucketDataset):
-                ar, frames = bucket.ar_frames
-                name = f'aspect ratio {ar:.3f}, resolutions {", ".join(f"{float(r):g}" for r in bucket.resolutions)}'
-            else:
-                width, height, frames = bucket.size_bucket
-                name = f'{width}x{height}'
-            if frames > 1:
-                name += f', {frames} frames'
-            lines.append(f'  {name}: {len(bucket.metadata_dataset)}')
+            lines.append(f'  {_bucket_name(bucket)}: {len(bucket.metadata_dataset)}')
+    return lines
+
+
+def _text_embedding_flags(metadata, te_dataset):
+    """For each file (row) of metadata: whether every one of its captions has its embedding in
+    te_dataset, and whether at least one has."""
+    full, some = [], []
+    for batch in metadata.select_columns(['image_spec', 'caption']).iter(batch_size=100_000):
+        for image_spec, captions in zip(batch['image_spec'], batch['caption']):
+            image_spec = tuple(image_spec)
+            have = [te_dataset.has_text_embeddings(image_spec, number) for number in range(len(captions))]
+            full.append(all(have))
+            some.append(any(have))
+    return np.asarray(full, dtype=bool), np.asarray(some, dtype=bool)
+
+
+def _one_line(error):
+    return ' '.join(f'{type(error).__name__}: {error}'.split())
+
+
+def _cache_status_of_bucket(dataset, directory, bucket, text_encoders):
+    files = len(bucket.metadata_dataset)
+    status = {'name': _bucket_name(bucket), 'files': files, 'latents': None, 'text': [None] * text_encoders,
+              'notes': []}
+
+    def takes(candidate):
+        return candidate is bucket
+
+    def size_buckets():
+        return bucket.get_size_bucket_datasets() if isinstance(bucket, ARBucketDataset) else [bucket]
+
+    try:
+        # Also for a model that reads its media while training: this sets up the size buckets of an
+        # aspect ratio bucket, which its text embeddings are added to.
+        dataset.cache_latents(None, trust_cache=True, takes=takes)
+        if directory.on_the_fly_media is None:
+            have = np.ones(files, dtype=bool)
+            for size_bucket in size_buckets():
+                have &= size_bucket.latent_dataset.available_mask()
+            status['latents'] = int(have.sum())
+    except Exception as error:
+        status['notes'].append(f'latents not readable: {_one_line(error)}')
+    if not directory.caches_text_embeddings:
+        return status
+    for k in range(text_encoders):
+        members = size_buckets()
+        if not members:
+            status['notes'].append(f'text encoder {k + 1} not readable: the latents of this bucket could not be set up')
+            continue
+        marks = [(member, len(member.text_embedding_datasets)) for member in members]
+        try:
+            dataset.cache_text_embeddings(None, k + 1, takes=takes, uncond=False)
+            full = np.ones(files, dtype=bool)
+            some = np.zeros(files, dtype=bool)
+            seen = set()
+            for member, count in marks:
+                assert len(member.text_embedding_datasets) == count + 1
+                te_dataset = member.text_embedding_datasets[-1]
+                if id(te_dataset) in seen:
+                    continue
+                seen.add(id(te_dataset))
+                member_full, member_some = _text_embedding_flags(bucket.metadata_dataset, te_dataset)
+                full &= member_full
+                some |= member_some
+            status['text'][k] = (int(full.sum()), int((some & ~full).sum()))
+        except Exception as error:
+            for member, count in marks:
+                del member.text_embedding_datasets[count:]
+            status['notes'].append(f'text encoder {k + 1} not readable: {_one_line(error)}')
+    return status
+
+
+def cache_status(dataset, text_encoders):
+    """How much of each directory's latents and text embeddings is cached, per bucket, counted in
+    files (an image or video). A file has its text embeddings when every one of its captions has
+    them for every text encoder. Reads what is there, as use_cached_latents_only and
+    use_cached_embeddings_only do: nothing is encoded, cleared or written, and a cache made for other
+    inputs or by another encoder is reported, not rebuilt. The metadata must be loaded."""
+    result = []
+    for directory in dataset.directory_datasets:
+        saved = (directory.use_cached_latents_only, directory.use_cached_embeddings_only,
+                 getattr(directory, 'reading_cache_status', False))
+        directory.use_cached_latents_only = True
+        directory.use_cached_embeddings_only = directory.caches_text_embeddings
+        directory.reading_cache_status = True
+        try:
+            buckets = sorted(directory.bucket_datasets(), key=lambda bucket: -len(bucket.metadata_dataset))
+            result.append({
+                'path': directory.path,
+                'latents_cached': directory.on_the_fly_media is None,
+                'text_cached': directory.caches_text_embeddings and text_encoders > 0,
+                'buckets': [_cache_status_of_bucket(dataset, directory, bucket, text_encoders)
+                            for bucket in buckets],
+            })
+        finally:
+            (directory.use_cached_latents_only, directory.use_cached_embeddings_only,
+             directory.reading_cache_status) = saved
+    return result
+
+
+def describe_cache_status(status, text_encoders):
+    """What --cache_status prints for cache_status(): per directory, files with latents and with
+    text embeddings, then per bucket."""
+    def share(count, total):
+        return f'{count} of {total} files ({100 * count / max(total, 1):.1f}%)'
+
+    def summary(label, counts, total, partial=None):
+        line = f'  {label}: {share(counts, total)}'
+        if partial:
+            line += f'; {partial} more have the embeddings of only some of their captions'
+        return line
+
+    lines = []
+    totals = {'files': 0, 'latents': 0, 'text': [0] * text_encoders, 'partial': [0] * text_encoders}
+    for directory in status:
+        files = sum(bucket['files'] for bucket in directory['buckets'])
+        lines.append(f'{directory["path"]}: {files} files in {len(directory["buckets"])} buckets')
+        latents = sum(bucket['latents'] or 0 for bucket in directory['buckets'])
+        text = [sum((bucket['text'][k] or (0, 0))[0] for bucket in directory['buckets']) for k in range(text_encoders)]
+        partial = [sum((bucket['text'][k] or (0, 0))[1] for bucket in directory['buckets']) for k in range(text_encoders)]
+        totals['files'] += files
+        totals['latents'] += latents
+        for k in range(text_encoders):
+            totals['text'][k] += text[k]
+            totals['partial'][k] += partial[k]
+        if directory['latents_cached']:
+            lines.append(summary('latents', latents, files))
+        else:
+            lines.append('  latents: none cached, this model reads its media while training')
+        if directory['text_cached']:
+            for k in range(text_encoders):
+                lines.append(summary(f'text embeddings, text encoder {k + 1}', text[k], files, partial[k]))
+        else:
+            lines.append('  text embeddings: none cached, the captions are encoded while training')
+        for bucket in directory['buckets']:
+            parts = []
+            if directory['latents_cached']:
+                parts.append(f'latents {bucket["latents"] or 0}')
+            if directory['text_cached']:
+                parts.extend(f'text encoder {k + 1} {(bucket["text"][k] or (0, 0))[0]}' for k in range(text_encoders))
+            lines.append(f'    {bucket["name"]}: {bucket["files"]} files' + (', ' + ', '.join(parts) if parts else ''))
+            lines.extend(f'      {note}' for note in bucket['notes'])
+    if len(status) > 1:
+        lines.append(f'All directories: {totals["files"]} files')
+        if any(directory['latents_cached'] for directory in status):
+            lines.append(summary('latents', totals['latents'], totals['files']))
+        if any(directory['text_cached'] for directory in status):
+            for k in range(text_encoders):
+                lines.append(summary(f'text embeddings, text encoder {k + 1}', totals['text'][k], totals['files'],
+                                     totals['partial'][k]))
     return lines
 
 
