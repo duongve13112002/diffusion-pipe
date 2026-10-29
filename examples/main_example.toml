@@ -132,6 +132,14 @@ save_dtype = 'bfloat16'
 # With cache_text_embeddings = false it is also how many captions are encoded together per step, for
 # models without their own on-the-fly encoder (README "Text embeddings: cached or on the fly").
 caching_batch_size = 1
+# While caching, results are written to disk by a thread of their own. This is how many MB of them
+# may wait for it before the caching process stops to let the disk catch up (default 512). Raise it
+# if a network volume writes in bursts (the progress bar shows long "saving" stretches), lower it
+# if RAM is short. It changes only when rows are written, never what is cached.
+#caching_write_queue_mb = 512
+# Seconds between the lines each GPU rank prints while caching, which say what its time went to:
+# waiting for work, encoding, remembering rows, moving results (default 60; 0 turns them off).
+#caching_report_seconds = 60
 
 # Number of parallel processes to use in map() calls when caching the dataset. Defaults to min(8, num_cpu_cores) if unset.
 # If you have a lot of cores and multiple GPUs, raising this can increase throughput of caching, but it may use more memory,
