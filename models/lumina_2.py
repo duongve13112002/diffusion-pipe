@@ -15,9 +15,28 @@ from accelerate import init_empty_weights
 from accelerate.utils import set_module_tensor_to_device
 
 from models.base import BasePipeline, make_contiguous
+from utils import attention as attention_util
 from utils.common import AUTOCAST_DTYPE, load_state_dict
 
+from Lumina_2.models import model as lumina_2_model
 from Lumina_2.models.model import NextDiT_2B_GQA_patch2_Adaln_Refiner
+
+_flash_attn_2_varlen = lumina_2_model.flash_attn_varlen_func
+
+
+def _varlen_attention(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, dropout_p=0.0,
+                      causal=False, softmax_scale=None):
+    """Lumina 2's flash-attn 2 varlen call (every bf16 / fp16 attention of its DiT), run by
+    FlashAttention-3 / -4 with [model] attention = 'flash3' / 'flash4'."""
+    if attention_util.flash_enabled() and not dropout_p:
+        return attention_util.flash_varlen(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k,
+                                           softmax_scale=softmax_scale, causal=causal)
+    return _flash_attn_2_varlen(q, k, v, cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=cu_seqlens_k,
+                                max_seqlen_q=max_seqlen_q, max_seqlen_k=max_seqlen_k, dropout_p=dropout_p,
+                                causal=causal, softmax_scale=softmax_scale)
+
+
+lumina_2_model.flash_attn_varlen_func = _varlen_attention
 
 
 def get_lin_function(

@@ -21,6 +21,7 @@ import multiprocess as mp
 import numpy as np
 
 from utils import dataset as dataset_util
+from utils import attention as attention_util
 from utils import common
 from utils.common import is_main_process, get_rank, DTYPE_MAP, empty_cuda_cache, all_ok
 import utils.saver
@@ -179,6 +180,8 @@ def set_config_defaults(config):
     config.setdefault('eval_every_n_examples', None)
     config.setdefault('eval_before_first_step', True)
     config.setdefault('compile', False)
+    # [model] attention: 'sdpa', 'flash3' or 'flash4' (FlashAttention-3 / -4); checked before anything loads.
+    attention_util.attention_setting(config)
     config.setdefault('x_axis_examples', False)
 
 
@@ -353,6 +356,9 @@ if __name__ == '__main__':
     deepspeed.init_distributed()
     # After init_distributed, which sets LOCAL_RANK itself when it discovers an MPI launch.
     torch.cuda.set_device(common.resolve_local_rank(args.local_rank))
+    if not (args.cache_only or args.cache_status or args.metadata_only):
+        # Fails before caching when FlashAttention cannot run here; runs that only cache need none.
+        attention_util.configure(config)
 
     resume_from_checkpoint = (
         args.resume_from_checkpoint if args.resume_from_checkpoint is not None
@@ -628,6 +634,8 @@ if __name__ == '__main__':
     dataset_manager.cache()
     if args.cache_only:
         quit()
+    # After caching, so the VAE and text encoders cache with PyTorch's own attention.
+    attention_util.install()
 
     # Free up as much RAM as we can.
     del dataset_manager
@@ -1102,6 +1110,7 @@ if __name__ == '__main__':
     if config['eval_before_first_step'] and not resume_from_checkpoint:
         evaluate(model, model_engine, eval_dataloaders, tb_writer, 0, config['eval_gradient_accumulation_steps'], disable_block_swap_for_eval)
 
+    attention_reported = False
     empty_cuda_cache()
     while True:
         model_engine.reset_activation_shape()
@@ -1111,6 +1120,9 @@ if __name__ == '__main__':
         logged_step = step % config['logging_steps'] == 0 or step % steps_per_print == 0
         step_stats.before_step(logged_step)
         loss = model_engine.train_batch(iterator).item()
+        if not attention_reported:
+            attention_util.report()
+            attention_reported = True
         if nan_check is not None:
             nan_check.after_step(step, loss)
         loss_average.add(loss)
@@ -1192,6 +1204,7 @@ if __name__ == '__main__':
         saver.save_model(final_model_name)
     if not checkpointed:
         saver.save_checkpoint(step, examples)
+    attention_util.report()
 
     if is_main_process():
         print('TRAINING COMPLETE!')

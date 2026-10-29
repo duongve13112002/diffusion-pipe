@@ -7,13 +7,31 @@ from typing import Optional, Tuple
 import torch
 import torch.nn as nn
 
-from hyimage.models.hunyuan.modules.flash_attn_no_pad import flash_attn_no_pad
+from hyimage.models.hunyuan.modules.flash_attn_no_pad import flash_attn_no_pad as _flash_attn_2_no_pad
+from hyimage.models.hunyuan.modules import models as hyimage_models, token_refiner as hyimage_token_refiner
+from utils import attention as attention_util
 
 from hyimage.models.hunyuan.modules.activation_layers import get_activation_layer
 from hyimage.models.hunyuan.modules.mlp_layers import MLP, LinearWarpforSingle
 from hyimage.models.hunyuan.modules.modulate_layers import ModulateDiT, apply_gate, modulate
 from hyimage.models.hunyuan.modules.norm_layers import get_norm_layer
 from hyimage.models.hunyuan.modules.posemb_layers import apply_rotary_emb
+
+
+def flash_attn_no_pad(qkv, key_padding_mask, causal=False, dropout_p=0.0, softmax_scale=None, deterministic=False):
+    """HunyuanImage's flash-attn 2 call on packed (B, S, 3, H, D) qkv, run by FlashAttention-3 / -4
+    with [model] attention = 'flash3' / 'flash4' (flash-attn 2 still for attention dropout, which they lack)."""
+    if attention_util.flash_enabled() and not dropout_p:
+        q, k, v = qkv.unbind(2)
+        return attention_util.flash_unpadded(q, k, v, key_padding_mask, softmax_scale=softmax_scale, causal=causal,
+                                           deterministic=deterministic or None)
+    return _flash_attn_2_no_pad(qkv, key_padding_mask, causal=causal, dropout_p=dropout_p,
+                                softmax_scale=softmax_scale, deterministic=deterministic)
+
+
+# The token refiner (and the submodule's own blocks) look the function up in their module.
+hyimage_token_refiner.flash_attn_no_pad = flash_attn_no_pad
+hyimage_models.flash_attn_no_pad = flash_attn_no_pad
 
 
 @torch.compiler.disable

@@ -15,6 +15,7 @@ Models supported: SDXL, Flux, LTX-Video, HunyuanVideo (t2v), Cosmos, Lumina Imag
 
 ## Recent changes
 - 2026-10-29
+  - FlashAttention-3 and -4 for every model: `[model] attention = 'flash3'` or `'flash4'` (default `'sdpa'`, which changes nothing). PyTorch's `scaled_dot_product_attention` is routed through FlashAttention, and the models that call flash-attn themselves (Wan, HiDream, HunyuanVideo, HunyuanImage-2.1, OmniGen2, Lumina 2) use it too; Iris maps the key onto its `attn_backend`. Calls FlashAttention cannot take run PyTorch SDPA and are counted, never dropped silently. See [FlashAttention](#flashattention). Changed: Wan and HiDream no longer pick FlashAttention-3 by themselves when it is installed; with `'sdpa'` they use flash-attn 2 if installed, else PyTorch SDPA (a line at startup says so). Fixed: Wan without flash-attn 2 ran SDPA without the text padding mask, so its cross-attention attended to the padding tokens.
   - `--cache_status`: prints how many files of each dataset directory (and of each bucket) have their latents and their text embeddings cached, counted in files, not captions, then exits. It reads what is cached, also from a run that was interrupted or is still caching, and encodes, clears and writes nothing. See [pre-caching](#pre-caching).
   - The progress bar of caching now shows the files done (`latents: 41%|... 4120/10000 [..., 4120/10000 files]`, `text_embeddings_1: ... 880/3000 files`), also for text embeddings, whose bar counts a file's captions one by one.
   - Caching shows where its time goes. The bar ends with `saving 12%, waiting 88%`: the share of the time the process that collects the results spent writing them to the cache, and waiting for the encoders and workers to send more. Each GPU rank prints a line every minute, `[CACHE] rank 0, last 60 s, 18 tasks: waiting for work 4%, encoding 71%, remembering rows 9%, moving results 16%`, which says what the GPU waited for. The results are now written by a thread of their own (at most `caching_write_queue_mb`, default 512, queued, then the process waits for the disk), and the workers run at most `2 * map_num_proc` batches ahead of what has been collected, so a slow disk can no longer pile finished batches up in memory. Two new top-level keys, next to `caching_batch_size`: `caching_write_queue_mb` (a number above 0, default `512`) and `caching_report_seconds` (0 or more, default `60`; `0` turns the per-rank lines off).
@@ -290,6 +291,29 @@ Every `logging_steps` steps Tensorboard (and wandb) get, besides `train/loss`, t
   dtype. Measuring it keeps a copy of the trained weights through the step: `log_update_norm` is on by default
   when training an adapter and off for a full fine-tune, where the copy is as large as the model.
 - `train/lr`: the first parameter group's learning rate.
+
+## FlashAttention
+`[model] attention` picks the attention kernel for training, for every model:
+```
+[model]
+attention = 'flash3'   # 'sdpa' (default), 'flash3' or 'flash4'
+```
+- `'sdpa'`: PyTorch's `scaled_dot_product_attention`, which picks flash-attn 2, cuDNN or memory-efficient attention by itself. Models that call flash-attn directly use flash-attn 2 when it is installed.
+- `'flash3'`: FlashAttention-3, the `flash_attn_3` package built from the `hopper/` directory of [flash-attention](https://github.com/Dao-AILab/flash-attention) (`cd flash-attention/hopper && python setup.py install`; the build takes a long time). Hopper GPUs (H100, H200); Ampere / Ada only if the build has those kernels, and there it is no faster than flash-attn 2.
+- `'flash4'`: FlashAttention-4, `pip install flash-attn-4` (`flash_attn.cute`, written in CuTe DSL). Hopper and Blackwell. It compiles its kernels the first time each shape configuration runs, so the first steps are slow.
+
+How it works: after caching, `torch.nn.functional.scaled_dot_product_attention` is replaced by a function that sends each call FlashAttention can take to FlashAttention and the rest to PyTorch SDPA. FlashAttention takes float16 / bfloat16 inputs (float32 under autocast is cast as SDPA would), head_dim a multiple of 8 up to 256 (FA4 on Blackwell: up to 128, or 256 on B200 / B300), grouped-query attention, `is_causal` when queries and keys have the same length, and a key-padding mask (a bool mask, or a float mask of 0 and -inf / very negative values, that only says which keys of each batch item count), which runs as variable-length attention. Anything else (an arbitrary mask or bias, dropout, float32 without autocast, VAE attention with head_dim 512, ...) runs PyTorch SDPA. The first call of each kind is printed (`[attention] PyTorch SDPA runs a call FlashAttention-3 cannot take: a float mask with bias values ...`), and the counts of both, summed over all GPUs, are printed after the first step and at the end of training.
+
+- Refused: `compile = true` with `'flash3'` / `'flash4'`, and Cosmos (Transformer Engine attention). Iris Turbo distillation refuses the key.
+- Iris: `attention = 'flash3'` is `attn_backend = 'fa3'`, `'flash4'` is `'fa4'`; setting both to different kernels is an error.
+- HiDream's code needs flash-attn 2 or FlashAttention-3 installed to import at all, and HunyuanImage-2.1's needs flash-attn 2, whichever `attention` is set.
+- Deterministic training (`torch.use_deterministic_algorithms`) is passed on to FlashAttention. FA4 has no deterministic backward on RTX Blackwell (compute capability 12): there the SDPA calls run SDPA, and the models that call flash-attn directly stop with an error.
+- FlashAttention starts after caching: the VAE, text encoders and image encoders cache with the attention they use with `'sdpa'`. `--cache_only`, `--cache_status` and `--metadata_only` do not need FlashAttention installed.
+- Iris runs its own fa3 / fa4 kernels, which take fewer setups: fa3 needs Hopper and the `flash_attn_3` package (`flash_attn_3.flash_attn_interface`), fa4 Hopper or datacenter Blackwell (10.x). Others are refused when the model loads.
+- With xformers or SageAttention installed, ComfyUI runs the models built on it with those instead of PyTorch SDPA, so FlashAttention does not reach them; a warning at the start of training says so.
+- `--nan_check` replays a non-finite layer with the default (FlashAttention where it can) and then with each PyTorch SDPA kernel, so it shows whether a NaN comes from FlashAttention.
+
+To check a GPU and an install before training, run `python tools/check_flash_attention.py` in the training environment (no weights needed, 5-15 minutes, longer with FA4 while it compiles its kernels; `--quick` for shorter benchmarks). It checks FA3 and FA4, whichever import, against a float32 reference, on the mask kinds above, the helpers the flash-attn models use, a short training run, determinism and each model's own attention call (Wan, HiDream, HunyuanVideo, HunyuanImage-2.1, OmniGen2, Lumina 2, Iris), then times forward + backward against PyTorch SDPA on the shapes of the models here. It writes `flash_attention_check_<host>_<time>.txt` (and a `.json`) in the current directory as it goes.
 
 ## Reducing VRAM requirements
 The [wan_14b_min_vram.toml](./examples/wan_14b_min_vram.toml) example file has all of these settings enabled.

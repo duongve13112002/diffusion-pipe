@@ -20,6 +20,8 @@ from .model import (
     WanModel, sinusoidal_embedding_1d
 )
 from .clip import CLIPModel
+from .attention import FLASH_ATTN_2_AVAILABLE
+from utils import attention as attention_util
 from . import configs as wan_configs
 
 KEEP_IN_HIGH_PRECISION = ['norm', 'bias', 'patch_embedding', 'text_embedding', 'time_embedding', 'time_projection', 'head', 'modulation']
@@ -78,6 +80,7 @@ class WanPipeline(BasePipeline):
         self.offloader = ModelOffloader('dummy', [], 0, 0, True, torch.device('cuda'), False, debug=False)
         self.cache_text_embeddings = self.model_config.get('cache_text_embeddings', True)
         self.t_dist = get_t_distribution(self.model_config).to('cuda')
+        attention_util.note_if_unused('Wan', 'flash-attn 2' if FLASH_ATTN_2_AVAILABLE else 'PyTorch SDPA')
 
         # The official Wan top-level checkpoint folder. Must exist.
         ckpt_dir = Path(self.model_config['ckpt_path'])

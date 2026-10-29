@@ -12,7 +12,7 @@ kernel and for every sample alone. That says whether the NaN is reproducible, wh
 on the attention kernel, and which samples cause it.
 """
 
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from functools import partial
 from pathlib import Path
 
@@ -51,17 +51,29 @@ def _in_backward():
         return False
 
 
+@contextmanager
+def _sdpa_only(backend):
+    # With [model] attention = 'flash3' / 'flash4', the SDPA replacement would ignore sdpa_kernel
+    # and run FlashAttention again; bypass it so each replay runs the PyTorch kernel it names.
+    from torch.nn.attention import sdpa_kernel
+    from utils import attention
+    with attention.bypass(), sdpa_kernel(backend):
+        yield
+
+
 def _attention_kernels():
     """(name, context) for each SDPA kernel to replay with: the default choice first."""
-    kernels = [('default kernel', nullcontext)]
+    from utils import attention
+    default = f'default kernel ({attention.label()} where it can)' if attention.flash_enabled() else 'default kernel'
+    kernels = [(default, nullcontext)]
     try:
-        from torch.nn.attention import SDPBackend, sdpa_kernel
+        from torch.nn.attention import SDPBackend
     except ImportError:
         return kernels
     for name in ('FLASH_ATTENTION', 'CUDNN_ATTENTION', 'EFFICIENT_ATTENTION', 'MATH'):
         if hasattr(SDPBackend, name):
-            kernels.append((name.lower().replace('_attention', '') + ' kernel',
-                            partial(sdpa_kernel, getattr(SDPBackend, name))))
+            kernels.append(('PyTorch SDPA ' + name.lower().replace('_attention', '') + ' kernel',
+                            partial(_sdpa_only, getattr(SDPBackend, name))))
     return kernels
 
 

@@ -190,6 +190,12 @@ llm_path = '/data2/imagegen_models/hunyuan_video_comfyui/llava-llama-3-8b-text-e
 clip_path = '/data2/imagegen_models/hunyuan_video_comfyui/clip-vit-large-patch14'
 # Base dtype used for all models.
 dtype = 'bfloat16'
+# Any model: the attention kernel. 'sdpa' (default) is PyTorch's scaled_dot_product_attention;
+# 'flash3' is FlashAttention-3 (the flash_attn_3 package, Hopper), 'flash4' FlashAttention-4
+# (pip install flash-attn-4, Hopper / Blackwell). Calls FlashAttention cannot take (arbitrary masks,
+# float32, head_dim > 256, ...) run SDPA and are counted in the log. Not with compile = true.
+# See README "FlashAttention"; tools/check_flash_attention.py tests a GPU and install.
+#attention = 'flash3'
 # Hunyuan Video supports fp8 for the transformer when training LoRA.
 transformer_dtype = 'float8'
 # How to sample timesteps to train on. Can be logit_normal or uniform.

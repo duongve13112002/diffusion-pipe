@@ -16,6 +16,27 @@ from utils.common import AUTOCAST_DTYPE
 from omnigen2.pipelines.omnigen2.pipeline_omnigen2 import OmniGen2Pipeline as OriginalOmniGen2Pipeline
 from omnigen2.models.transformers.transformer_omnigen2 import OmniGen2Transformer2DModel
 from omnigen2.models.transformers.transformer_omnigen2 import OmniGen2RotaryPosEmbed
+from omnigen2.models import attention_processor as omnigen2_attention_processor
+from utils import attention as attention_util
+
+_flash_attn_2_varlen = getattr(omnigen2_attention_processor, 'flash_attn_varlen_func', None)
+
+
+def _varlen_attention(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, dropout_p=0.0,
+                      causal=False, softmax_scale=None):
+    """OmniGen2's flash-attn 2 varlen call (its processor when flash-attn is installed), run by
+    FlashAttention-3 / -4 with [model] attention = 'flash3' / 'flash4'. Without flash-attn it uses its SDPA
+    processor, which the SDPA replacement covers."""
+    if attention_util.flash_enabled() and not dropout_p:
+        return attention_util.flash_varlen(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k,
+                                         softmax_scale=softmax_scale, causal=causal)
+    return _flash_attn_2_varlen(q, k, v, cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=cu_seqlens_k,
+                                max_seqlen_q=max_seqlen_q, max_seqlen_k=max_seqlen_k, dropout_p=dropout_p,
+                                causal=causal, softmax_scale=softmax_scale)
+
+
+if _flash_attn_2_varlen is not None:
+    omnigen2_attention_processor.flash_attn_varlen_func = _varlen_attention
 
 
 def get_lin_function(

@@ -372,6 +372,53 @@ def pixels_to_uint8(tensor):
     return (tensor.float() * 255).round_().clamp_(0, 255).to(torch.uint8)
 
 
+# Iris's attn_backend values that [model] attention = 'sdpa' allows (fa3 and fa4 are not SDPA), and
+# the backend each FlashAttention choice maps to.
+SDPA_BACKENDS = ('sdpa', 'torch_flash', 'torch_cudnn')
+FLASH_BACKENDS = {'flash3': 'fa3', 'flash4': 'fa4'}
+
+
+def iris_attn_backend(model_config):
+    """The attn_backend to run Iris with, None for the checkpoint's own. [model] attention, the key
+    every model shares, maps onto it: 'flash3' is attn_backend = 'fa3', 'flash4' is 'fa4'. Setting
+    both is fine when they agree and an error when they do not."""
+    attention = model_config.get('attention')
+    attn_backend = model_config.get('attn_backend')
+    if attention in FLASH_BACKENDS:
+        wanted = FLASH_BACKENDS[attention]
+        if attn_backend not in (None, wanted):
+            raise ValueError(f"[model] attention = {attention!r} runs Iris with attn_backend = {wanted!r}, but "
+                             f"attn_backend = {attn_backend!r} is set; remove one of them")
+        return wanted
+    if attention == 'sdpa' and attn_backend is not None and attn_backend not in SDPA_BACKENDS:
+        raise ValueError(f"[model] attention = 'sdpa' conflicts with attn_backend = {attn_backend!r}; use attention = "
+                         "'flash3' / 'flash4' for FlashAttention, or remove attention to let attn_backend decide")
+    return attn_backend
+
+
+# The GPUs (compute capability major) Iris's own fa3 / fa4 kernels accept: fewer than
+# [model] attention = 'flash3' / 'flash4' allows for the other models.
+IRIS_FLASH_GPUS = {'fa3': (9,), 'fa4': (9, 10)}
+
+
+def check_iris_flash_backend(backend):
+    """Refuses an fa3 / fa4 attn_backend that Iris would only refuse at the first forward, after
+    caching: its kernel's module must import (Iris imports FA3 as flash_attn_3.flash_attn_interface
+    only) and the GPU must be one Iris runs it on."""
+    if backend not in IRIS_FLASH_GPUS or not torch.cuda.is_available():
+        return
+    from iris3b.nn import attention as iris_attention
+    try:
+        iris_attention._external_attention_func(backend)
+    except RuntimeError as error:
+        raise RuntimeError(f'Iris attn_backend = {backend!r}: {error}') from error
+    major, minor = torch.cuda.get_device_capability()
+    if major not in IRIS_FLASH_GPUS[backend]:
+        raise RuntimeError(f"Iris attn_backend = {backend!r} does not run on {torch.cuda.get_device_name()} "
+                           f"(compute capability {major}.{minor}): Iris runs fa3 on Hopper (9.x) and fa4 on "
+                           "Hopper / Blackwell (9.x, 10.x) only. Use attention = 'sdpa' (attn_backend 'sdpa')")
+
+
 class IrisPipeline(BasePipeline):
     encodes_text_on_the_fly = True
     name = 'iris'
@@ -412,8 +459,9 @@ class IrisPipeline(BasePipeline):
         # What save_model writes back: a training-time attention backend (fa3, say) must not
         # end up in the exported config, where it would bind inference to that GPU.
         self._checkpoint_attn_backend = model_cfg.attn_backend
-        if attn_backend := self.model_config.get('attn_backend', None):
+        if attn_backend := iris_attn_backend(self.model_config):
             model_cfg.attn_backend = attn_backend
+        check_iris_flash_backend(model_cfg.attn_backend)
         if (model_cfg.attn_backend != 'torch_cudnn' and not self.model_config.get('allow_cudnn_attention', False)
                 and hasattr(torch.backends.cuda, 'enable_cudnn_sdp')):
             # PyTorch picks cuDNN for this attention on Hopper, and its backward returns NaN for

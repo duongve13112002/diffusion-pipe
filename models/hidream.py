@@ -19,6 +19,33 @@ from utils.offloading import ModelOffloader
 from hi_diffusers import HiDreamImagePipeline, HiDreamImageTransformer2DModel
 from hi_diffusers.schedulers.fm_solvers_unipc import FlowUniPCMultistepScheduler
 from hi_diffusers.models.moe import MoEGate
+from hi_diffusers.models import attention_processor as hidream_attention_processor
+from utils import attention as attention_util
+
+try:
+    import flash_attn as flash_attn_2
+except ImportError:
+    flash_attn_2 = None
+if not hasattr(flash_attn_2, 'flash_attn_func'):
+    # flash-attn-4 alone installs flash_attn/cute, which makes `import flash_attn` work without flash-attn 2.
+    flash_attn_2 = None
+
+
+def _hidream_attention(query, key, value):
+    """HiDream's attention (it picks FA3 whenever it is installed), with [model] attention deciding:
+    'flash3' / 'flash4' run FlashAttention-3 / -4; 'sdpa' runs flash-attn 2, or PyTorch SDPA without it."""
+    if attention_util.flash_enabled():
+        hidden_states = attention_util.flash_dense(query, key, value)
+    elif flash_attn_2 is not None:
+        hidden_states = flash_attn_2.flash_attn_func(query, key, value, dropout_p=0., causal=False)
+    else:
+        hidden_states = F.scaled_dot_product_attention(
+            query.transpose(1, 2), key.transpose(1, 2), value.transpose(1, 2)).transpose(1, 2)
+    hidden_states = hidden_states.flatten(-2)
+    return hidden_states.to(query.dtype)
+
+
+hidream_attention_processor.attention = _hidream_attention
 
 
 KEEP_IN_HIGH_PRECISION = ['norm', 'bias', 't_embedder', 'p_embedder', 'x_embedder', 'final_layer', 'gate']
@@ -50,6 +77,7 @@ class HiDreamPipeline(BasePipeline):
         self.model_config = self.config['model']
         self.offloader_double = ModelOffloader('dummy', [], 0, 0, True, torch.device('cuda'), False, debug=False)
         self.offloader_single = ModelOffloader('dummy', [], 0, 0, True, torch.device('cuda'), False, debug=False)
+        attention_util.note_if_unused('HiDream', 'flash-attn 2' if flash_attn_2 is not None else 'PyTorch SDPA')
 
         dtype = self.model_config['dtype']
         scheduler = FlowUniPCMultistepScheduler(num_train_timesteps=1000, shift=1, use_dynamic_shifting=False)

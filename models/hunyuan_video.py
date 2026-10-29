@@ -26,6 +26,24 @@ from hyvideo.modules.posemb_layers import get_nd_rotary_pos_embed
 from hyvideo.diffusion.schedulers import FlowMatchDiscreteScheduler
 from hyvideo.diffusion.pipelines import HunyuanVideoPipeline as OriginalHunyuanVideoPipeline
 from hyvideo.vae.autoencoder_kl_causal_3d import AutoencoderKLCausal3D
+from hyvideo.modules import attenion as hunyuan_attention
+from utils import attention as attention_util
+
+_flash_attn_2_varlen = hunyuan_attention.flash_attn_varlen_func
+
+
+def _varlen_attention(q, k, v, cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seqlen_kv):
+    """HunyuanVideo's flash-attn 2 varlen call, run by FlashAttention-3 / -4 with [model] attention =
+    'flash3' / 'flash4'."""
+    if attention_util.flash_enabled():
+        return attention_util.flash_varlen(q, k, v, cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seqlen_kv)
+    if _flash_attn_2_varlen is None:
+        raise ImportError("HunyuanVideo needs flash-attn 2, or [model] attention = 'flash3' / 'flash4' with "
+                          "FlashAttention-3 / -4")
+    return _flash_attn_2_varlen(q, k, v, cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seqlen_kv)
+
+
+hunyuan_attention.flash_attn_varlen_func = _varlen_attention
 
 
 # In diffusion-pipe, we already converted the dtype to an object. But Hunyuan scripts want the string version in a lot of places.
