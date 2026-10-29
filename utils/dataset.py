@@ -1,7 +1,7 @@
 from pathlib import Path
 import os.path
 import random
-from collections import OrderedDict, defaultdict
+from collections import OrderedDict, defaultdict, deque
 import math
 import os
 import hashlib
@@ -332,6 +332,91 @@ def _open_cached_prefix(dataset, cache_dir, cache_file_prefix='', new_fingerprin
         content_digest=(lambda: _content_digest(dataset, content_column)) if content_column else None)
 
 
+def _item_bytes(item):
+    if torch.is_tensor(item):
+        return item.numel() * item.element_size()
+    if isinstance(item, dict):
+        return sum(_item_bytes(value) for value in item.values())
+    if isinstance(item, (list, tuple)):
+        return sum(_item_bytes(value) for value in item)
+    if isinstance(item, np.ndarray):
+        return item.nbytes
+    if isinstance(item, (bytes, bytearray)):
+        return len(item)
+    return 0
+
+
+class _BackgroundWriter:
+    """Writes the rows of a Cache on a thread of its own, in the order they were given, so the
+    process that receives the encoded rows goes on receiving while the disk is written. put()
+    waits while limit_bytes of rows are queued. The rows of a Cache are a prefix of its inputs:
+    rows still queued when the process dies are missing from the end, which is what any
+    interrupted write leaves. Nothing else may use the cache until close() or abort()."""
+
+    def __init__(self, cache, limit_bytes=512 << 20):
+        self.cache = cache
+        self.limit_bytes = limit_bytes
+        self.pending = deque()
+        self.queued = 0
+        self.closed = False
+        self.error = None
+        self.condition = threading.Condition()
+        self.thread = threading.Thread(target=self._run, daemon=True, name='cache-writer')
+        self.thread.start()
+
+    def _run(self):
+        while True:
+            with self.condition:
+                while not self.pending and not self.closed:
+                    self.condition.wait()
+                if not self.pending:
+                    return
+                item, size = self.pending.popleft()
+            try:
+                self.cache.add(item)
+            except BaseException as error:
+                with self.condition:
+                    self.error = error
+                    self.pending.clear()
+                    self.queued = 0
+                    self.condition.notify_all()
+                return
+            with self.condition:
+                self.queued -= size
+                self.condition.notify_all()
+
+    def _raise_error(self):
+        if self.error is not None:
+            raise RuntimeError(f'Writing the cache failed: {type(self.error).__name__}: {self.error}') from self.error
+
+    def put(self, item):
+        size = max(_item_bytes(item), 1)
+        with self.condition:
+            while self.queued >= self.limit_bytes and self.error is None:
+                self.condition.wait()
+            self._raise_error()
+            self.pending.append((item, size))
+            self.queued += size
+            self.condition.notify_all()
+
+    def close(self):
+        """Wait until every row is written. Raises what the writing failed with."""
+        with self.condition:
+            self.closed = True
+            self.condition.notify_all()
+        self.thread.join()
+        self._raise_error()
+
+    def abort(self):
+        """Drop the rows not yet written and stop; the row being written is finished."""
+        with self.condition:
+            self.pending.clear()
+            self.queued = 0
+            self.closed = True
+            self.condition.notify_all()
+        self.thread.join()
+
+
 def _file_ends(dataset):
     """The row counts at which each file's rows end: one row per file for latents, a file's
     captions in a row each for text embeddings. None for a dataset that has no image_spec."""
@@ -478,18 +563,57 @@ def _map_and_cache(dataset, map_fn, cache_dir, cache_file_prefix='', new_fingerp
     completed_batches = cache_size // caching_batch_size
     total_batches = dataset_size // caching_batch_size
 
-    map_iter = (pool.imap(wrapper, dataset.iter(batch_size=caching_batch_size)) if pool
-                else map(wrapper, dataset.iter(batch_size=caching_batch_size)))
+    batches = dataset.iter(batch_size=caching_batch_size)
+    window = None
+    stop = threading.Event()
+    if pool:
+        # The workers keep taking batches however far this process is behind writing the rows
+        # they return, and the rows wait in memory: bound how many batches are out at once.
+        window = threading.Semaphore(2 * NUM_PROC)
+
+        def limited():
+            for batch in batches:
+                # The pool feeds its workers from a thread of its own, which the pool's shutdown
+                # joins: after a failure here nothing releases the window, so it must give up.
+                while not window.acquire(timeout=0.5):
+                    if stop.is_set():
+                        return
+                yield batch
+        map_iter = pool.imap(wrapper, limited())
+    else:
+        map_iter = map(wrapper, batches)
     # Counted in files, which is what a user asks about: a file's captions are rows of their own.
     progress = tqdm(map_iter, initial=completed_batches, total=total_batches,
                     desc=cache_file_prefix.strip('_') or None)
     if file_ends is not None:
         progress.set_postfix_str(f'{_files_done(file_ends, cache_size)}/{len(file_ends)} files')
-    for batch in progress:
-        for example in unbatch_iter(batch):
-            cache.add(example)
-        if file_ends is not None:
-            progress.set_postfix_str(f'{_files_done(file_ends, len(cache))}/{len(file_ends)} files')
+    # Where the time goes tells what limits the speed: waiting for results means the encoder (or
+    # the workers feeding it) is the limit, saving means the disk is (rows are queued for a
+    # thread that writes them, and this process stops only when that queue is full).
+    writer = _BackgroundWriter(cache)
+    started = time.monotonic()
+    saving = 0.0
+    received = cache_size
+    try:
+        for batch in progress:
+            if window is not None:
+                window.release()
+            got = time.monotonic()
+            for example in unbatch_iter(batch):
+                writer.put(example)
+                received += 1
+            now = time.monotonic()
+            saving += now - got
+            # Rows handed to the writer count as done: it is at most a few hundred MB behind.
+            files = f'{_files_done(file_ends, received)}/{len(file_ends)} files' if file_ends is not None else ''
+            elapsed = max(now - started, 1e-9)
+            timing = f'saving {100 * saving / elapsed:.0f}%, waiting {100 * (1 - saving / elapsed):.0f}%'
+            progress.set_postfix_str(f'{files}, {timing}' if files else timing)
+        writer.close()
+    except BaseException:
+        stop.set()
+        writer.abort()
+        raise
 
     if pool is not None:
         pool.close()
@@ -3605,6 +3729,41 @@ def _wait_in_store(keys, liveness):
         time.sleep(CACHING_POLL_SECONDS)
 
 
+class _RankTiming:
+    """Where a GPU rank's time goes while caching, to tell why its GPU is not busy: waiting for
+    work (the workers that feed it are the limit), encoding (the GPU is), remembering rows (see
+    _RecentTextEncodings) and moving results (copying them out and sending them to the workers).
+    Printed every INTERVAL seconds and when the round ends."""
+
+    INTERVAL = 60
+    NAMES = ('waiting for work', 'encoding', 'remembering rows', 'moving results')
+
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self.seconds = defaultdict(float)
+        self.tasks = 0
+        self.since = time.monotonic()
+
+    def add(self, name, seconds):
+        self.seconds[name] += seconds
+
+    def line(self, now):
+        elapsed = max(now - self.since, 1e-9)
+        parts = [f'{name} {100 * self.seconds[name] / elapsed:.0f}%' for name in self.NAMES if self.seconds[name] > 0]
+        return f'[CACHE] rank {dist.get_rank()}, last {elapsed:.0f} s, {self.tasks} tasks: ' + ', '.join(parts)
+
+    def report(self, force=False):
+        now = time.monotonic()
+        if self.tasks and (force or now - self.since >= self.INTERVAL):
+            print(self.line(now))
+            self.reset()
+
+
+_RANK_TIMING = _RankTiming()
+
+
 def _work_on_queue(queue, handle_task, process, round_, liveness):
     """Take caching tasks until the caching process is done. `process` is that process on global
     rank 0, None elsewhere.
@@ -3613,24 +3772,31 @@ def _work_on_queue(queue, handle_task, process, round_, liveness):
     caching process may be waiting forever for that rank's result, and would never end the queue.
     """
     store = torch.distributed.distributed_c10d._get_default_store()
+    _RANK_TIMING.reset()
     try:
         while True:
             if store.check([_abort_key(round_)]):
                 raise RuntimeError('Dataset caching failed on another rank: see its log')
+            asked = time.monotonic()
             try:
                 task = queue.get(timeout=CACHING_POLL_SECONDS)
             except Empty:
+                _RANK_TIMING.add('waiting for work', time.monotonic() - asked)
                 if process is not None and not process.is_alive():
                     raise RuntimeError(f'The dataset caching process ended with exit code {process.exitcode} '
                                        'before finishing: see its log')
                 liveness.check()
                 continue
+            _RANK_TIMING.add('waiting for work', time.monotonic() - asked)
             if task is None:
                 # Propagate None so all worker processes break out of this loop.
                 # This is safe because it's a FIFO queue. The first None always comes after all work items.
                 queue.put(None)
+                _RANK_TIMING.report(force=True)
                 break
             handle_task(task)
+            _RANK_TIMING.tasks += 1
+            _RANK_TIMING.report()
         if process is not None:
             process.join()
             if process.exitcode != 0:
@@ -4133,6 +4299,8 @@ class DatasetManager:
         else:
             # ComfyUI model in a wrapper class that delays loading until the model is needed.
             self.submodels[id].load_model_if_needed()
+        started = time.monotonic()
+        remembered = self.recent_text_encodings.remembering
         if id == 0:
             tensor, control_tensor, audio_list, pipe = task[1:]
             kwargs = {}
@@ -4154,6 +4322,13 @@ class DatasetManager:
                 results = encode_results(results, self.text_embedding_dtype)
         else:
             raise RuntimeError()
+        if torch.cuda.is_available():
+            # The GPU runs ahead of this process: wait for it, so that the time up to here is its.
+            torch.cuda.synchronize()
+        computed = time.monotonic()
+        remembered = self.recent_text_encodings.remembering - remembered
+        _RANK_TIMING.add('encoding', computed - started - remembered)
+        _RANK_TIMING.add('remembering rows', remembered)
         # Need to move to CPU here. If we don't, we get this error:
         # RuntimeError: Cannot re-initialize CUDA in forked subprocess. To use CUDA with multiprocessing, you must use the 'spawn' start method
         # I think this is because HF Datasets uses the multiprocess library (different from Python multiprocessing!) so it will always use fork.
@@ -4164,6 +4339,7 @@ class DatasetManager:
             else:
                 cpu_results[k] = v.to('cpu')
         pipe.send(cpu_results)
+        _RANK_TIMING.add('moving results', time.monotonic() - computed)
 
 
 class _RecentTextEncodings:
@@ -4183,6 +4359,15 @@ class _RecentTextEncodings:
         self.limit_bytes = limit_bytes
         self.rows = OrderedDict()
         self.size = 0
+        # Seconds spent copying rows to remember them (a rank's timing, see _RankTiming).
+        self.remembering = 0.0
+
+    @staticmethod
+    def _wait_for_gpu():
+        """Copying a row waits for the GPU to produce it; that wait is the encoder's, not the copy's."""
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        return time.monotonic()
 
     @staticmethod
     def _per_row(results, count):
@@ -4226,18 +4411,22 @@ class _RecentTextEncodings:
                 missing.append(i)
         if len(missing) == count:
             results = encode(*columns)
+            began = self._wait_for_gpu()
             rows = self._per_row(results, count)
             for key, row in zip(keys, rows or []):
                 self._remember(key, row)
+            self.remembering += time.monotonic() - began
             return results
         if missing:
             results = encode(*[None if c is None else [c[i] for i in missing] for c in columns])
+            began = self._wait_for_gpu()
             rows = self._per_row(results, len(missing))
             if rows is None:
                 return encode(*columns)
             for i, row in zip(missing, rows):
                 found[keys[i]] = row
                 self._remember(keys[i], row)
+            self.remembering += time.monotonic() - began
         names = found[keys[0]].keys()
         return {name: [found[key][name] for key in keys] for name in names}
 

@@ -1,9 +1,17 @@
 """--cache_status: how many files have their latents and text embeddings cached, read without
 encoding, clearing or writing anything; and the same count shown while caching."""
 
+import multiprocessing
+import queue
+import threading
+import time
+import types
+
 import datasets
 import numpy as np
 import pytest
+import torch
+from deepspeed import comm as dist
 
 import utils.dataset as dataset_util
 from test.test_cached_only import CountingModel, full_caches, truncate
@@ -146,9 +154,242 @@ def test_caching_shows_the_files_done(tmp_path, monkeypatch):
     config = dataset_config(images, multiline_captions=True, reuse_metadata_cache=False)
     model = CountingModel()
     run_caching(model, dataset_util.Dataset(config, model), config)
-    latents = [text for desc, text in shown if desc == 'latents']
-    embeddings = [text for desc, text in shown if desc == 'text_embeddings_1']
+    latents = [text.split(',')[0] for desc, text in shown if desc == 'latents']
+    embeddings = [text.split(',')[0] for desc, text in shown if desc == 'text_embeddings_1']
     assert latents[0] == '0/3 files' and latents[-1] == '3/3 files'
     # Six captions, two to a file: the count moves a file at a time.
     assert embeddings[0] == '0/3 files' and embeddings[-1] == '3/3 files'
     assert '1/3 files' in embeddings and '2/3 files' in embeddings
+
+
+def timing_of(shown, description):
+    """(saving %, waiting %) of the last progress update of one cache."""
+    text = [t for d, t in shown if d == description][-1]
+    saving, waiting = (int(part.split()[1].rstrip('%')) for part in text.split(', ')[-2:])
+    return saving, waiting
+
+
+def test_caching_shows_where_the_time_goes(tmp_path, monkeypatch):
+    from utils.cache import Cache
+
+    shown = []
+
+    class Progress:
+        def __init__(self, iterable, **kwargs):
+            self.iterable = iterable
+            self.description = kwargs.get('desc')
+
+        def set_postfix_str(self, text):
+            shown.append((self.description, text))
+
+        def __iter__(self):
+            return iter(self.iterable)
+
+    monkeypatch.setattr(dataset_util, 'tqdm', Progress)
+    add = Cache.add
+
+    def slow_add(self, item):
+        time.sleep(0.1)
+        return add(self, item)
+
+    monkeypatch.setattr(Cache, 'add', slow_add)
+    # A writer that queues one row at most, so that its slowness holds the caching process up.
+    writer = dataset_util._BackgroundWriter
+    monkeypatch.setattr(dataset_util, '_BackgroundWriter', lambda cache: writer(cache, limit_bytes=1))
+    images = make_images(tmp_path / 'images', CAPTIONS)
+    config = dataset_config(images, reuse_metadata_cache=False)
+    model = CountingModel()
+    run_caching(model, dataset_util.Dataset(config, model), config)
+    # Writing a row takes 0.1 s here and encoding one almost nothing: the writer is the limit.
+    for description in ('latents', 'text_embeddings_1', 'text_embeddings_2'):
+        saving, waiting = timing_of(shown, description)
+        assert saving >= 80 and saving + waiting in (99, 100, 101), (description, saving, waiting)
+    assert [t for d, t in shown if d == 'latents'][-1].startswith('6/6 files, saving ')
+
+
+class SlowCache:
+    def __init__(self, delay=0.0, fail_at=None):
+        self.rows = []
+        self.delay = delay
+        self.fail_at = fail_at
+
+    def add(self, item):
+        time.sleep(self.delay)
+        if self.fail_at is not None and len(self.rows) == self.fail_at:
+            raise OSError('disk full')
+        self.rows.append(item)
+
+
+def test_the_writer_writes_every_row_in_order():
+    cache = SlowCache()
+    writer = dataset_util._BackgroundWriter(cache)
+    for i in range(50):
+        writer.put({'x': torch.tensor([i])})
+    writer.close()
+    assert [row['x'].item() for row in cache.rows] == list(range(50))
+
+
+def test_the_writer_stops_the_caller_at_its_limit():
+    cache = SlowCache(delay=0.05)
+    writer = dataset_util._BackgroundWriter(cache, limit_bytes=3 * 8)
+    row = {'x': torch.zeros(1, dtype=torch.int64)}
+    started = time.monotonic()
+    for _ in range(8):
+        writer.put({k: v.clone() for k, v in row.items()})
+        assert writer.queued <= 3 * 8 + 8
+    # With room for three rows the caller must have waited for the disk for most of the rest.
+    assert time.monotonic() - started >= 0.05 * 3
+    writer.close()
+    assert len(cache.rows) == 8
+
+
+def test_a_failed_write_reaches_the_caller():
+    cache = SlowCache(fail_at=2)
+    writer = dataset_util._BackgroundWriter(cache)
+    with pytest.raises(RuntimeError, match='Writing the cache failed: OSError: disk full'):
+        for i in range(100):
+            writer.put({'x': torch.tensor([i])})
+            time.sleep(0.01)
+        writer.close()
+    assert [row['x'].item() for row in cache.rows] == [0, 1]
+    writer.abort()
+
+
+def test_aborting_drops_the_rows_not_yet_written_and_keeps_a_prefix():
+    cache = SlowCache(delay=0.05)
+    writer = dataset_util._BackgroundWriter(cache)
+    for i in range(20):
+        writer.put({'x': torch.tensor([i])})
+    while not cache.rows:
+        time.sleep(0.01)
+    writer.abort()
+    written = [row['x'].item() for row in cache.rows]
+    assert 0 < len(written) < 20 and written == list(range(len(written)))
+
+
+class StreamingPool:
+    """multiprocessing.Pool.imap takes its tasks from the iterable on a thread of its own."""
+
+    feeders = []
+
+    def __init__(self, count, initializer, args):
+        from concurrent.futures import ThreadPoolExecutor
+        self.executor = ThreadPoolExecutor(count, initializer=initializer, initargs=args)
+
+    def imap(self, function, iterable):
+        futures = queue.Queue()
+
+        def feed():
+            for item in iterable:
+                futures.put(self.executor.submit(function, item))
+            futures.put(None)
+
+        feeder = threading.Thread(target=feed, daemon=True)
+        feeder.start()
+        self.feeders.append(feeder)
+
+        def results():
+            while (future := futures.get()) is not None:
+                yield future.result()
+        return results()
+
+    def close(self):
+        self.executor.shutdown(wait=True)
+
+    def join(self):
+        pass
+
+
+def test_workers_do_not_run_far_ahead_of_the_cache(tmp_path, monkeypatch):
+    """The rows the workers return wait in memory until they are written: how many batches are out
+    at once is bounded, whatever the disk does."""
+    monkeypatch.setattr(dataset_util, 'NUM_PROC', 2)
+    monkeypatch.setattr(dataset_util.mp, 'Pool', StreamingPool)
+    monkeypatch.setattr(dataset_util.mp, 'Manager', lambda: types.SimpleNamespace(
+        Queue=queue.Queue, shutdown=lambda: None))
+    started = consumed = highest = 0
+    lock = threading.Lock()
+
+    def map_fn(batch, rank):
+        nonlocal started
+        with lock:
+            started += 1
+        return {'x': [torch.zeros(1) for _ in batch['image_spec']]}
+
+    class Progress:
+        def __init__(self, iterable, **kwargs):
+            self.iterable = iterable
+
+        def set_postfix_str(self, text):
+            pass
+
+        def __iter__(self):
+            nonlocal consumed, highest
+            for item in self.iterable:
+                time.sleep(0.02)
+                with lock:
+                    consumed += 1
+                    highest = max(highest, started - consumed)
+                yield item
+
+    monkeypatch.setattr(dataset_util, 'tqdm', Progress)
+    rows = datasets.Dataset.from_dict({'image_spec': [[None, f'{i}.png'] for i in range(60)]})
+    cache = dataset_util._map_and_cache(rows, map_fn, tmp_path / 'cache', caching_batch_size=1)
+    assert len(cache) == 60 and consumed == 60
+    # The window is 2 * NUM_PROC batches; a batch counts as started a moment before it is returned.
+    assert highest <= 2 * 2 + 1, highest
+
+
+def test_a_gpu_rank_reports_where_its_time_goes(capsys, monkeypatch):
+    monkeypatch.setattr(dist, 'get_rank', lambda: 3)
+    timing = dataset_util._RankTiming()
+    timing.add('waiting for work', 1.0)
+    timing.add('encoding', 6.0)
+    timing.add('moving results', 3.0)
+    timing.tasks = 5
+    timing.since = time.monotonic() - 10.0
+    timing.report()
+    assert capsys.readouterr().out == ''
+    timing.INTERVAL = 5
+    timing.report()
+    line = capsys.readouterr().out.strip()
+    assert line.startswith('[CACHE] rank 3, last 10 s, 5 tasks: waiting for work 10%, encoding 60%, moving results 30%')
+    assert 'remembering' not in line and timing.tasks == 0
+
+
+def test_handling_a_task_adds_its_time_to_the_rank(tmp_path):
+    model = CountingModel()
+    manager = dataset_util.DatasetManager(model)
+    dataset_util._RANK_TIMING.reset()
+    pipe_parent, pipe_child = multiprocessing.Pipe(duplex=False)
+    manager._handle_task((1, ['a red bus', 'two dogs'], [False, False], None, pipe_child))
+    pipe_parent.recv()
+    seconds = dataset_util._RANK_TIMING.seconds
+    assert seconds['encoding'] > 0 and seconds['moving results'] > 0 and seconds['remembering rows'] > 0
+
+
+def test_a_failing_worker_does_not_leave_the_pool_hanging(tmp_path, monkeypatch):
+    """The pool's shutdown joins the thread that feeds its workers; that thread must not stay
+    blocked on the window of batches in flight once the caching loop has failed."""
+    monkeypatch.setattr(dataset_util, 'NUM_PROC', 2)
+    monkeypatch.setattr(dataset_util.mp, 'Pool', StreamingPool)
+    monkeypatch.setattr(dataset_util.mp, 'Manager', lambda: types.SimpleNamespace(
+        Queue=queue.Queue, shutdown=lambda: None))
+    StreamingPool.feeders = []
+
+    def map_fn(batch, rank):
+        if batch['image_spec'][0][1] == '3.png':
+            raise ValueError('worker failed')
+        return {'x': [torch.zeros(1) for _ in batch['image_spec']]}
+
+    rows = datasets.Dataset.from_dict({'image_spec': [[None, f'{i}.png'] for i in range(60)]})
+    with pytest.raises(ValueError, match='worker failed'):
+        dataset_util._map_and_cache(rows, map_fn, tmp_path / 'cache', caching_batch_size=1)
+    (feeder,) = StreamingPool.feeders
+    feeder.join(5)
+    assert not feeder.is_alive()
+
+
+def test_rows_of_arrays_and_bytes_count_toward_the_writers_limit():
+    row = {'a': np.zeros(10, dtype=np.float32), 'b': b'12345', 'c': [torch.zeros(2)]}
+    assert dataset_util._item_bytes(row) == 40 + 5 + 8

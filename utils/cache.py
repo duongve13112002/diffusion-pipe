@@ -71,7 +71,8 @@ class Cache:
         self.reused_after_fingerprint_change = False
         print('[CACHE] Initializing')
         # create database
-        self.con = sqlite3.connect(self.metadata_db, autocommit=False)
+        # One thread uses it at a time: the caching process hands the rows to a writer thread and waits for it.
+        self.con = sqlite3.connect(self.metadata_db, autocommit=False, check_same_thread=False)
 
         # check fingerprint, clear cache if different
         self.con.execute('CREATE TABLE IF NOT EXISTS fingerprint(value)')
