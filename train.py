@@ -307,7 +307,6 @@ if __name__ == '__main__':
             ('--metadata_only', args.metadata_only), ('--cache_only', args.cache_only),
             ('--dump_dataset', args.dump_dataset is not None), ('--test_sample', args.test_sample),
             ('--regenerate_cache', args.regenerate_cache),
-            ('--resume_from_checkpoint', args.resume_from_checkpoint is not None),
             ('a [turbo] config', 'turbo' in config)) if given]
         if conflicting:
             raise SystemExit(f'--cache_status only reads the caches; it does not go with {", ".join(conflicting)}')

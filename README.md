@@ -406,7 +406,8 @@ count can be up to that far behind; when another run is caching the same dataset
 `--trust_cache` so that this one does not rescan the sources (with `reuse_metadata_cache = true`
 nothing is rescanned anyway). Launch it like training (`deepspeed train.py --deepspeed --config ... --cache_status`);
 it refuses `--metadata_only`, `--cache_only`, `--regenerate_cache`, `--dump_dataset`,
-`--test_sample`, `--resume_from_checkpoint` and Turbo configs.
+`--test_sample` and Turbo configs. `--resume_from_checkpoint` may stay in the command: it exits
+before any checkpoint is loaded, so it does nothing here.
 
 While caching, the progress bar shows the same count for the cache it is filling:
 `latents: 41%|████ | 4120/10000 [...]` ends with `4120/10000 files`, and
