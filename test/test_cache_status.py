@@ -195,7 +195,7 @@ def test_caching_shows_where_the_time_goes(tmp_path, monkeypatch):
     monkeypatch.setattr(Cache, 'add', slow_add)
     # A writer that queues one row at most, so that its slowness holds the caching process up.
     writer = dataset_util._BackgroundWriter
-    monkeypatch.setattr(dataset_util, '_BackgroundWriter', lambda cache: writer(cache, limit_bytes=1))
+    monkeypatch.setattr(dataset_util, '_BackgroundWriter', lambda cache, limit: writer(cache, limit_bytes=1))
     images = make_images(tmp_path / 'images', CAPTIONS)
     config = dataset_config(images, reuse_metadata_cache=False)
     model = CountingModel()
@@ -393,3 +393,67 @@ def test_a_failing_worker_does_not_leave_the_pool_hanging(tmp_path, monkeypatch)
 def test_rows_of_arrays_and_bytes_count_toward_the_writers_limit():
     row = {'a': np.zeros(10, dtype=np.float32), 'b': b'12345', 'c': [torch.zeros(2)]}
     assert dataset_util._item_bytes(row) == 40 + 5 + 8
+
+
+@pytest.mark.parametrize('config, expected', [
+    ({}, (512, 60)),
+    ({'caching_write_queue_mb': 2048, 'caching_report_seconds': 0}, (2048, 0)),
+    ({'caching_write_queue_mb': 0.5, 'caching_report_seconds': 2.5}, (0.5, 2.5)),
+])
+def test_caching_progress_settings(config, expected):
+    assert dataset_util.caching_progress_settings(config) == expected
+
+
+@pytest.mark.parametrize('key, value', [
+    ('caching_write_queue_mb', 0), ('caching_write_queue_mb', -5), ('caching_write_queue_mb', 'big'),
+    ('caching_write_queue_mb', True), ('caching_write_queue_mb', float('nan')),
+    ('caching_report_seconds', -1), ('caching_report_seconds', '60'), ('caching_report_seconds', False),
+])
+def test_caching_progress_settings_are_checked(key, value):
+    with pytest.raises(ValueError, match=key):
+        dataset_util.caching_progress_settings({key: value})
+
+
+def test_the_settings_reach_the_caching_process_and_the_ranks(monkeypatch):
+    started = []
+
+    class Process:
+        def __init__(self, **kwargs):
+            started.append(kwargs)
+
+        def start(self):
+            pass
+
+    monkeypatch.setattr(dataset_util.mp, 'Process', Process, raising=False)
+    monkeypatch.setattr(dataset_util._RANK_TIMING, 'INTERVAL', 60, raising=False)
+    manager = dataset_util.DatasetManager(CountingModel(), write_queue_mb=7, report_seconds=0)
+    assert dataset_util._RANK_TIMING.INTERVAL == 0
+    manager._start_caching_process(queue.Queue(), stage='latents')
+    assert started[0]['kwargs'] == {'stage': 'latents', 'write_queue_mb': 7}
+    monkeypatch.setattr(dataset_util, '_write_queue_bytes', 0)
+    monkeypatch.setattr(dataset_util, '_cache_datasets', lambda *args, **kwargs: None)
+    dataset_util._cache_fn([], queue.Queue(), None, 0, False, False, 1, write_queue_mb=3)
+    assert dataset_util._write_queue_bytes == 3 << 20
+
+
+def test_the_writer_gets_the_configured_limit(tmp_path, monkeypatch):
+    limits = []
+    writer = dataset_util._BackgroundWriter
+    monkeypatch.setattr(dataset_util, '_BackgroundWriter', lambda cache, limit: limits.append(limit) or writer(cache, limit))
+    monkeypatch.setattr(dataset_util, '_write_queue_bytes', 12345)
+    rows = datasets.Dataset.from_dict({'image_spec': [[None, f'{i}.png'] for i in range(3)]})
+    dataset_util._map_and_cache(rows, lambda batch, rank: {'x': [torch.zeros(1) for _ in batch['image_spec']]},
+                                tmp_path / 'cache', caching_batch_size=1)
+    assert limits == [12345]
+
+
+def test_a_rank_with_the_report_off_prints_nothing(capsys, monkeypatch):
+    monkeypatch.setattr(dist, 'get_rank', lambda: 0)
+    timing = dataset_util._RankTiming()
+    timing.INTERVAL = 0
+    timing.add('encoding', 1.0)
+    timing.tasks = 4
+    timing.since = time.monotonic() - 1000
+    timing.report()
+    timing.report(force=True)
+    assert capsys.readouterr().out == ''

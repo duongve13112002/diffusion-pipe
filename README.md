@@ -17,7 +17,7 @@ Models supported: SDXL, Flux, LTX-Video, HunyuanVideo (t2v), Cosmos, Lumina Imag
 - 2026-10-29
   - `--cache_status`: prints how many files of each dataset directory (and of each bucket) have their latents and their text embeddings cached, counted in files, not captions, then exits. It reads what is cached, also from a run that was interrupted or is still caching, and encodes, clears and writes nothing. See [pre-caching](#pre-caching).
   - The progress bar of caching now shows the files done (`latents: 41%|... 4120/10000 [..., 4120/10000 files]`, `text_embeddings_1: ... 880/3000 files`), also for text embeddings, whose bar counts a file's captions one by one.
-  - Caching shows where its time goes. The bar ends with `saving 12%, waiting 88%`: the share of the time the process that collects the results spent writing them to the cache, and waiting for the encoders and workers to send more. Each GPU rank prints a line every minute, `[CACHE] rank 0, last 60 s, 18 tasks: waiting for work 4%, encoding 71%, remembering rows 9%, moving results 16%`, which says what the GPU waited for. The results are now written by a thread of their own (at most 512 MB queued, then the process waits for the disk), and the workers run at most `2 * map_num_proc` batches ahead of what has been collected, so a slow disk can no longer pile finished batches up in memory.
+  - Caching shows where its time goes. The bar ends with `saving 12%, waiting 88%`: the share of the time the process that collects the results spent writing them to the cache, and waiting for the encoders and workers to send more. Each GPU rank prints a line every minute, `[CACHE] rank 0, last 60 s, 18 tasks: waiting for work 4%, encoding 71%, remembering rows 9%, moving results 16%`, which says what the GPU waited for. The results are now written by a thread of their own (at most `caching_write_queue_mb`, default 512, queued, then the process waits for the disk), and the workers run at most `2 * map_num_proc` batches ahead of what has been collected, so a slow disk can no longer pile finished batches up in memory. Two new top-level keys, next to `caching_batch_size`: `caching_write_queue_mb` (a number above 0, default `512`) and `caching_report_seconds` (0 or more, default `60`; `0` turns the per-rank lines off).
 - 2026-10-28
   - `use_cached_latents_only` and `use_cached_embeddings_only` (top level or per `[[directory]]`, default `false`) train on what an unfinished caching run left, without encoding more. With the latents option, only images whose latents are cached are trained; with the embeddings option, only captions whose embeddings (for every text encoder) are cached; with both, only samples that have both. The option left off still caches as usual, and with `cache_text_embeddings = false` the captions are encoded during training as ever, so the latents option alone is what limits the data. The startup log says how many samples are used (`training on the cached latents only: 41200 of 90000 samples`). The empty caption's embedding is still encoded when it is missing (one caption). A cache made for other inputs (images, captions or a setting changed since) or by another VAE or text encoder is refused, never cleared; `--regenerate_cache` is refused with these options. Data parallel ranks train on the samples every one of them can read. The cache now commits what it has written every 5 minutes, so an interrupted run keeps (and a resumed run skips) nearly everything it encoded; before, nothing was kept until a 10 GB shard was full.
   - A cache records the VAE or text encoder that fills it from its first row, not only once complete: a run resumed with another one rebuilds the cache instead of appending its rows to the other encoder's.
@@ -422,6 +422,19 @@ moving results 16%` once a minute: `waiting for work` high means too few CPU wor
 image decoding) are feeding the GPU, `encoding` is the GPU itself, `remembering rows` is the copy
 that lets repeated captions be encoded once, and `moving results` is copying results to the CPU and
 sending them to the caching process. Raising `caching_batch_size` only helps the `encoding` share.
+
+Two top-level keys, next to `caching_batch_size`, set this (both optional; a value that is not a
+number in range is refused, naming the key):
+
+```toml
+caching_write_queue_mb = 512   # MB of results queued for the writing thread; default 512
+caching_report_seconds = 60    # seconds between the per-rank lines; 0 turns them off; default 60
+```
+
+`caching_write_queue_mb` is how far the caching process may run ahead of the disk: raise it when a
+network volume writes in bursts (the bar shows long `saving` stretches although the average is
+low), lower it when RAM is short. It changes only when rows are written, never what is cached. A
+`[turbo]` config refuses both keys, as it refuses every key it does not use.
 
 ### Text embeddings: cached or on the fly
 

@@ -114,6 +114,8 @@ def test_unused_settings_are_noted():
 @pytest.mark.parametrize('name, edit, message', [
     ('lora', lambda c: c.update(epochs=10), 'not used by Turbo distillation: epochs'),
     ('lora', lambda c: c.update(warmup_steps=100, eval_every_n_epochs=1), 'eval_every_n_epochs, warmup_steps'),
+    ('lora', lambda c: c.update(caching_write_queue_mb=256, caching_report_seconds=0),
+     'caching_report_seconds, caching_write_queue_mb'),
     ('stage1', lambda c: c.update(gradient_accumulation_steps=4), 'no gradient accumulation'),
     ('stage1', lambda c: c.update(pipeline_stages=2), 'pipeline_stages must be 1'),
     ('lora', lambda c: c['model'].update(type='flux'), "type must be 'iris'"),

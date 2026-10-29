@@ -169,6 +169,9 @@ def set_config_defaults(config):
     config.setdefault('multi_node_caching', True)
     if not isinstance(config['multi_node_caching'], bool):
         raise ValueError(f"multi_node_caching must be true or false, got {config['multi_node_caching']!r}")
+    # Caching: MB of results queued for the thread that writes them, and how often (seconds) each
+    # GPU rank prints where its time went; checked here so a typo fails before any model loads.
+    config['caching_write_queue_mb'], config['caching_report_seconds'] = dataset_util.caching_progress_settings(config)
     config.setdefault('eval_datasets', [])
     config.setdefault('eval_gradient_accumulation_steps', 1)
     config.setdefault('eval_every_n_steps', None)
@@ -491,7 +494,8 @@ if __name__ == '__main__':
     }
     caching_batch_size = config.get('caching_batch_size', 1)
     dataset_manager = dataset_util.DatasetManager(model, regenerate_cache=regenerate_cache, trust_cache=args.trust_cache, caching_batch_size=caching_batch_size, keep_models_loaded=args.test_sample,
-                                                  multi_node=config['multi_node_caching'])
+                                                  multi_node=config['multi_node_caching'], write_queue_mb=config['caching_write_queue_mb'],
+                                                  report_seconds=config['caching_report_seconds'])
     # cache_text_embeddings = false on a model that does not encode its captions itself: its text
     # encoders encode each batch's captions in the training process instead of filling a cache.
     text_encoding = (TextEncodingOnTheFly(model, caching_batch_size=caching_batch_size)

@@ -332,6 +332,26 @@ def _open_cached_prefix(dataset, cache_dir, cache_file_prefix='', new_fingerprin
         content_digest=(lambda: _content_digest(dataset, content_column)) if content_column else None)
 
 
+DEFAULT_WRITE_QUEUE_MB = 512
+DEFAULT_REPORT_SECONDS = 60
+_write_queue_bytes = DEFAULT_WRITE_QUEUE_MB << 20
+
+
+def caching_progress_settings(config):
+    """(caching_write_queue_mb, caching_report_seconds) of a training config: how many MB of
+    results the caching process queues for the thread that writes them before it waits for the
+    disk, and how often each GPU rank prints where its time went (0: never)."""
+    values = []
+    for key, default, ok, needs in (
+            ('caching_write_queue_mb', DEFAULT_WRITE_QUEUE_MB, lambda v: v > 0, 'greater than 0'),
+            ('caching_report_seconds', DEFAULT_REPORT_SECONDS, lambda v: v >= 0, '0 or more')):
+        value = config.get(key, default)
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not ok(value):
+            raise ValueError(f'{key} must be a number {needs}, got {value!r}')
+        values.append(value)
+    return tuple(values)
+
+
 def _item_bytes(item):
     if torch.is_tensor(item):
         return item.numel() * item.element_size()
@@ -590,7 +610,7 @@ def _map_and_cache(dataset, map_fn, cache_dir, cache_file_prefix='', new_fingerp
     # Where the time goes tells what limits the speed: waiting for results means the encoder (or
     # the workers feeding it) is the limit, saving means the disk is (rows are queued for a
     # thread that writes them, and this process stops only when that queue is full).
-    writer = _BackgroundWriter(cache)
+    writer = _BackgroundWriter(cache, _write_queue_bytes)
     started = time.monotonic()
     saving = 0.0
     received = cache_size
@@ -3351,7 +3371,9 @@ class Dataset:
 
 
 def _cache_fn(datasets, queue, preprocess_media_file_fn, num_text_encoders, regenerate_cache, trust_cache, caching_batch_size,
-              stage='all', node=0, text_encoder=None):
+              stage='all', node=0, text_encoder=None, write_queue_mb=DEFAULT_WRITE_QUEUE_MB):
+    global _write_queue_bytes
+    _write_queue_bytes = int(write_queue_mb * (1 << 20))
     # Dataset map() starts a bunch of processes. Make sure torch uses a limited number of threads
     # to avoid CPU contention.
     # TODO: if we ever change Datasets map to use spawn instead of fork, this might not work.
@@ -3733,7 +3755,7 @@ class _RankTiming:
     """Where a GPU rank's time goes while caching, to tell why its GPU is not busy: waiting for
     work (the workers that feed it are the limit), encoding (the GPU is), remembering rows (see
     _RecentTextEncodings) and moving results (copying them out and sending them to the workers).
-    Printed every INTERVAL seconds and when the round ends."""
+    Printed every INTERVAL seconds (0: never) and when the round ends."""
 
     INTERVAL = 60
     NAMES = ('waiting for work', 'encoding', 'remembering rows', 'moving results')
@@ -3756,7 +3778,7 @@ class _RankTiming:
 
     def report(self, force=False):
         now = time.monotonic()
-        if self.tasks and (force or now - self.since >= self.INTERVAL):
+        if self.INTERVAL and self.tasks and (force or now - self.since >= self.INTERVAL):
             print(self.line(now))
             self.reset()
 
@@ -4130,8 +4152,10 @@ def describe_cache_status(status, text_encoders):
 # models to GPU as few times as needed.
 class DatasetManager:
     def __init__(self, model, regenerate_cache=False, trust_cache=False, caching_batch_size=1, keep_models_loaded=False,
-                 multi_node=True):
+                 multi_node=True, write_queue_mb=DEFAULT_WRITE_QUEUE_MB, report_seconds=DEFAULT_REPORT_SECONDS):
         self.model = model
+        self.write_queue_mb = write_queue_mb
+        _RANK_TIMING.INTERVAL = report_seconds
         # With several nodes, each caches its share of the buckets on its own GPUs. Off, global
         # rank 0's node caches everything while the others wait.
         self.multi_node = multi_node
@@ -4251,7 +4275,7 @@ class DatasetManager:
                 self.trust_cache,
                 self.caching_batch_size,
             ),
-            kwargs=stage,
+            kwargs=dict(stage, write_queue_mb=self.write_queue_mb),
         )
         process.start()
         return process
