@@ -37,3 +37,45 @@ def test_native_model_builds_with_training_blocks(gate_compress):
     output.square().mean().backward()
     assert torch.isfinite(x.grad).all()
     assert torch.isfinite(block.attn.qkv_proj.weight.grad).all()
+
+
+def build_block():
+    block = DiTBlock(8, 2, 4, 16, 8, 1e-6, 1e-6, dtype=torch.float32, device='cpu', operations=disable_weight_init)
+    with torch.no_grad():
+        for parameter in block.parameters():
+            parameter.fill_(0.05)
+    return block
+
+
+def test_block_uses_an_attention_passed_by_comfyui():
+    """ComfyUI hands a block its own (patched) attention as `attention=`, as in its block-replace path."""
+    from comfy.ldm.modules.attention import ComfyAttention
+    block = build_block()
+    assert isinstance(block.attn.comfy_attention, ComfyAttention)
+    x, t_emb = torch.randn(2, 3, 8), torch.randn(2, 1, 8)
+    calls = []
+
+    def patched(h, rope_freqs=None, transformer_options=None, attention_mask=None):
+        calls.append(h.shape)
+        return torch.zeros_like(h)
+
+    patched_out = block(x, t_emb, [(0, 3, 0)], None, transformer_options={}, attention=patched)
+    assert calls == [x.shape]
+    # No attention: the block's own attention runs, so the two outputs differ.
+    assert not torch.allclose(patched_out, block(x, t_emb, [(0, 3, 0)], None))
+
+
+def test_attention_hands_comfyui_its_own_attention_object(monkeypatch):
+    import models.minimax_h3 as minimax_h3
+    from comfy.ldm.modules.attention import AttentionTensorContainer
+    attention = Attention(8, 2, 4, 1e-6, dtype=torch.float32, device='cpu', operations=disable_weight_init)
+    seen = {}
+
+    def spy(q, k, v, heads, **kwargs):
+        seen.update(kwargs, containers=[type(t) for t in (q, k, v)])
+        return torch.zeros(q.peek().shape[0], q.peek().shape[2], 8)
+
+    monkeypatch.setattr(minimax_h3, 'optimized_attention', spy)
+    attention(torch.randn(2, 3, 8))
+    assert seen['preferred_attention'] is attention.comfy_attention
+    assert seen['containers'] == [AttentionTensorContainer] * 3
