@@ -309,7 +309,7 @@ How it works: after caching, `torch.nn.functional.scaled_dot_product_attention` 
 - HiDream's code needs flash-attn 2 or FlashAttention-3 installed to import at all, and HunyuanImage-2.1's needs flash-attn 2, whichever `attention` is set.
 - Deterministic training (`torch.use_deterministic_algorithms`) is passed on to FlashAttention. FA4 has no deterministic backward on RTX Blackwell (compute capability 12): there the SDPA calls run SDPA, and the models that call flash-attn directly stop with an error.
 - FlashAttention starts after caching: the VAE, text encoders and image encoders cache with the attention they use with `'sdpa'`. `--cache_only`, `--cache_status` and `--metadata_only` do not need FlashAttention installed.
-- Iris runs its own fa3 / fa4 kernels, which take fewer setups: fa3 needs Hopper and the `flash_attn_3` package (`flash_attn_3.flash_attn_interface`), fa4 Hopper or datacenter Blackwell (10.x). Others are refused when the model loads.
+- Iris runs its own fa3 / fa4 kernels, which take fewer setups: fa3 needs Hopper and the `flash_attn_3` package (`flash_attn_3.flash_attn_interface`), fa4 Hopper or datacenter Blackwell (10.x). Others are refused when the model loads, except in the runs that only cache.
 - With xformers or SageAttention installed, ComfyUI runs the models built on it with those instead of PyTorch SDPA, so FlashAttention does not reach them; a warning at the start of training says so.
 - `--nan_check` replays a non-finite layer with the default (FlashAttention where it can) and then with each PyTorch SDPA kernel, so it shows whether a NaN comes from FlashAttention.
 

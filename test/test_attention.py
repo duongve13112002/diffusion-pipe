@@ -554,6 +554,10 @@ def test_iris_flash_backend_checked_before_caching(monkeypatch, backend, capabil
     else:
         with pytest.raises(RuntimeError, match=error):
             iris.check_iris_flash_backend(backend)
+    # --cache_only / --cache_status / --metadata_only never run the transformer: no check.
+    monkeypatch.setattr(attention, '_model_runs', True)
+    attention.skip_kernel_checks()
+    iris.check_iris_flash_backend(backend)
 
 
 def test_nan_check_replays_bypass_the_replacement(fa3):

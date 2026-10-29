@@ -38,6 +38,7 @@ from accelerate import init_empty_weights
 from accelerate.utils import set_module_tensor_to_device
 
 from models.base import BasePipeline, PreprocessMediaFile, make_contiguous
+from utils import attention as attention_util
 from utils.common import AUTOCAST_DTYPE, is_main_process, iterate_safetensors, zero_first
 from utils.offloading import ModelOffloader
 
@@ -404,8 +405,9 @@ IRIS_FLASH_GPUS = {'fa3': (9,), 'fa4': (9, 10)}
 def check_iris_flash_backend(backend):
     """Refuses an fa3 / fa4 attn_backend that Iris would only refuse at the first forward, after
     caching: its kernel's module must import (Iris imports FA3 as flash_attn_3.flash_attn_interface
-    only) and the GPU must be one Iris runs it on."""
-    if backend not in IRIS_FLASH_GPUS or not torch.cuda.is_available():
+    only) and the GPU must be one Iris runs it on. Not in runs that only cache (--cache_only, ...),
+    which never run the transformer."""
+    if backend not in IRIS_FLASH_GPUS or not torch.cuda.is_available() or not attention_util.kernel_checks():
         return
     from iris3b.nn import attention as iris_attention
     try:

@@ -46,6 +46,9 @@ _reported_reasons = set()
 _mask_cache = {}
 # Inside bypass(): the replacement hands every call to PyTorch SDPA, uncounted.
 _bypass = 0
+# False in runs that never run the model (--cache_only, --cache_status, --metadata_only): nothing
+# then checks that a FlashAttention kernel can run here.
+_model_runs = True
 
 FLASH_CALL = 'flash'
 FLASH_PADDED = 'flash with key padding'
@@ -133,6 +136,17 @@ def configure(config):
         _arch, _module = major, module
     _backend = value
     return value
+
+
+def skip_kernel_checks():
+    """For runs that only cache or read the caches: they need no FlashAttention installed."""
+    global _model_runs
+    _model_runs = False
+
+
+def kernel_checks():
+    """Whether to check, when a model loads, that the attention kernel it was asked for runs here."""
+    return _model_runs
 
 
 def flash_enabled():

@@ -356,8 +356,11 @@ if __name__ == '__main__':
     deepspeed.init_distributed()
     # After init_distributed, which sets LOCAL_RANK itself when it discovers an MPI launch.
     torch.cuda.set_device(common.resolve_local_rank(args.local_rank))
-    if not (args.cache_only or args.cache_status or args.metadata_only):
-        # Fails before caching when FlashAttention cannot run here; runs that only cache need none.
+    if args.cache_only or args.cache_status or args.metadata_only:
+        # Runs that only cache never run the model, so they need no FlashAttention installed.
+        attention_util.skip_kernel_checks()
+    else:
+        # Fails before caching when FlashAttention cannot run here.
         attention_util.configure(config)
 
     resume_from_checkpoint = (
