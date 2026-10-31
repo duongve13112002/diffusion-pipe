@@ -454,6 +454,8 @@ if __name__ == '__main__':
         model = moss_image.MossImagePipeline(config)
     else:
         raise NotImplementedError(f'Model type {model_type} is not implemented')
+    # vae_dtype / latent_cache_dtype: a wrong value, or a model they do not apply to, stops here.
+    model.vae_dtypes
 
     # import sys, PIL
     # test_image = sys.argv[1]

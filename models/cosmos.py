@@ -151,7 +151,7 @@ class CosmosPipeline(BasePipeline):
             config_file='submodules/Cosmos/cosmos1/models/diffusion/config/config.py',
         )
 
-        self.vae = load_custom_video_vae(self.model_config['vae_path'])
+        self.vae = self.load_vae(self.vae_dtypes.encode)
 
         self.tokenizer = T5TokenizerFast(
             vocab_file='configs/t5_old/spiece.model',
@@ -206,6 +206,10 @@ class CosmosPipeline(BasePipeline):
             framerate=self.framerate,
             round_frames=8,
         )
+
+    def load_vae(self, dtype):
+        vae = load_custom_video_vae(self.model_config['vae_path'])
+        return vae if dtype is None else vae.to(dtype)
 
     def get_call_vae_fn(self, vae):
         def fn(tensor):

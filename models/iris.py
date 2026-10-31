@@ -422,6 +422,7 @@ def check_iris_flash_backend(backend):
 
 
 class IrisPipeline(BasePipeline):
+    vae_dtype_refusal = 'Iris caches pixels, not VAE latents'
     encodes_text_on_the_fly = True
     name = 'iris'
     framerate = None

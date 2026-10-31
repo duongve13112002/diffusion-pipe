@@ -1077,6 +1077,10 @@ class SizeBucketDataset:
             raise ValueError(f'num_repeats must be >0, was {self.num_repeats}')
 
     @property
+    def vae_identity_required(self):
+        return getattr(self.directory_dataset, 'vae_identity_required', False)
+
+    @property
     def vae_identity(self):
         # Reached through the directory dataset so the two SizeBucketDataset construction sites
         # do not both have to grow an argument. Absent in tests that build one standalone.
@@ -1119,7 +1123,7 @@ class SizeBucketDataset:
                 self.metadata_dataset, self.cache_dir, cache_file_prefix='latents_',
                 fingerprint_columns=latent_columns,
                 keep_on_fingerprint_change=self.directory_config.get('keep_latent_cache', False),
-                identity=self.vae_identity,
+                identity=self.vae_identity, require_identity=self.vae_identity_required,
                 content_column=('image_spec' if self.directory_config.get('require_non_latin_caption') is not None
                                 else None))
         else:
@@ -1128,7 +1132,7 @@ class SizeBucketDataset:
                 regenerate_cache=regenerate_cache, caching_batch_size=caching_batch_size,
                 fingerprint_columns=latent_columns,
                 keep_on_fingerprint_change=self.directory_config.get('keep_latent_cache', False),
-                identity=self.vae_identity,
+                identity=self.vae_identity, require_identity=self.vae_identity_required,
                 content_column=('image_spec' if self.directory_config.get('require_non_latin_caption') is not None
                                 else None))
         assert len(self.latent_dataset) == len(self.metadata_dataset), (len(self.latent_dataset), len(self.metadata_dataset))
@@ -1900,7 +1904,7 @@ def directory_setting(directory_config, dataset_config, key, why):
 class DirectoryDataset:
     def __init__(self, directory_config, dataset_config, model_name, framerate=None,
                  round_to_multiple=32, skip_dataset_validation=False,
-                 caches_text_embeddings=True, vae_identity='', on_the_fly_media=None,
+                 caches_text_embeddings=True, vae_identity='', vae_identity_required=False, on_the_fly_media=None,
                  layout_caption_format=None, encode_text_in_loader=False):
         self._set_defaults(directory_config, dataset_config)
         self.directory_config = directory_config
@@ -1959,6 +1963,8 @@ class DirectoryDataset:
         # Recorded in the cache manifests, not in the fingerprints, so adding them invalidates
         # nothing. Empty means the model declares no identity and every cache stays valid.
         self.vae_identity = vae_identity
+        # A latent cache that records no VAE is not reused (vae_dtype / latent_cache_dtype are set).
+        self.vae_identity_required = vae_identity_required
         self.text_embedding_identity = ''
         self.keep_text_embedding_cache = directory_config.get(
             'keep_text_embedding_cache', dataset_config.get('keep_text_embedding_cache', False))
@@ -3148,6 +3154,7 @@ class Dataset:
                 # What produced the latents. Declared per model via vae_config_keys; empty for
                 # a model that has not declared one, which keeps its caches exactly as before.
                 vae_identity=model.vae_cache_key(),
+                vae_identity_required=model.vae_identity_required(),
                 on_the_fly_media=on_the_fly_media,
                 layout_caption_format=getattr(model, 'layout_caption_format', None),
             )
@@ -4163,7 +4170,7 @@ class DatasetManager:
         # Nothing to cache for text encoders that encode each batch during training instead.
         self.text_encoders = [] if encodes_text_in_loader(model) else self.model.get_text_encoders()
         self.submodels = [self.vae] + list(self.text_encoders)
-        self.call_vae_fn = self.model.get_call_vae_fn(self.vae)
+        self.call_vae_fn = self.model.get_cached_vae_fn(self.vae)
         self.vae_supports_audio = 'audio' in signature(self.call_vae_fn).parameters
         self.call_text_encoder_fns = [self.model.get_call_text_encoder_fn(text_encoder) for text_encoder in self.text_encoders]
         # Cached only when there is an encoder to cache for: a model that encodes on the fly

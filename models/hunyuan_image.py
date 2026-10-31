@@ -59,12 +59,7 @@ class HunyuanImagePipeline(BasePipeline):
         self.offloader_single = ModelOffloader('dummy', [], 0, 0, True, torch.device('cuda'), False, debug=False)
         dtype = self.model_config['dtype']
 
-        config = HunyuanVAE2D.load_config('configs/hunyuan_image/vae_config.json')
-        with init_empty_weights():
-            vae = HunyuanVAE2D.from_config(config)
-        for key, tensor in iterate_safetensors(self.model_config['vae_path']):
-            set_module_tensor_to_device(vae, key, device='cpu', dtype=dtype, value=tensor)
-        self.vae = vae
+        self.vae = self.load_vae(self.vae_dtypes.encode)
 
         self.tokenizer = transformers.Qwen2Tokenizer.from_pretrained('configs/qwen_image/tokenizer', local_files_only=True)
 
@@ -155,6 +150,14 @@ class HunyuanImagePipeline(BasePipeline):
             return k
 
         self.load_adapter_weights_into(self.transformer, adapter_path, rename_key=rename_key)
+
+    def load_vae(self, dtype):
+        config = HunyuanVAE2D.load_config('configs/hunyuan_image/vae_config.json')
+        with init_empty_weights():
+            vae = HunyuanVAE2D.from_config(config)
+        for key, tensor in iterate_safetensors(self.model_config['vae_path']):
+            set_module_tensor_to_device(vae, key, device='cpu', dtype=dtype or self.model_config['dtype'], value=tensor)
+        return vae
 
     def get_call_vae_fn(self, vae):
         def fn(image):

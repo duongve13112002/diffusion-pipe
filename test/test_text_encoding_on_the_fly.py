@@ -71,6 +71,12 @@ class Model:
     def vae_cache_key(self):
         return ''
 
+    def vae_identity_required(self):
+        return False
+
+    def get_cached_vae_fn(self, vae):
+        return self.get_call_vae_fn(vae)
+
     def get_vae(self):
         return self.vae
 

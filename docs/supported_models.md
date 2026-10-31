@@ -865,26 +865,20 @@ rather than loaded with layers' weights in their neighbours.
   likeness dataset; with many more than about 55 images it suggests coming down from 60 sooner.
   Eval losses are computed at the last point's share in every epoch, so they stay comparable.
 - `vae_dtype` is the precision the VAE encodes the training images (and decodes samples) in:
-  `'float16'` (default), `'bfloat16'` or `'float32'` (what the reference pipeline uses). Latents
-  are stored in float32 either way. On six photos from Wikimedia Commons at about 1 MP (a shop
-  sign with text, people, animals, a landscape, buildings, flowers), bfloat16 latents differed
-  from float32 ones by 0.8-3.1% (relative L2, cosine similarity above 0.9995), and float16 ones
-  by 0.1-0.8%. Decoded by the same float32 VAE, a bfloat16 latent's image differed from the
-  float32 latent's by 58-62 dB PSNR (float16: 77-80 dB), while the VAE's own reconstruction of
-  the photos is at 27-41 dB, which bfloat16 moved by at most 0.05 dB. Encoding in bfloat16 took
-  about half the time of float32 (CPU); on a GPU float16 and bfloat16 run at the same speed.
-  float16 is the default for its three extra mantissa bits, as ComfyUI also runs this VAE in
-  float16 on NVIDIA GPUs. Its range ends at 65504 where bfloat16's is float32's: none of the six
-  photos overflowed. An image whose latents come out non-finite anyway is encoded again in
-  bfloat16, and if they still are, in float32, with a warning each time (the rest of its batch is
-  kept); those VAEs are loaded from the weights when first needed. Only latents non-finite in
-  float32 too (an image with non-finite pixels) stop the caching with an error. If the warning
-  comes up often, `vae_dtype = 'bfloat16'` saves encoding those images twice. The latent cache records `vae_dtype`, so
-  changing it re-encodes the cache. Caches written before this option were encoded in float32:
+  `'float16'` (default), `'bfloat16'` or `'float32'` (what the reference pipeline uses), and
+  `latent_cache_dtype` the precision the latents are cached in (default: `vae_dtype`). Both are
+  described, with the checks on non-finite latents, in the README's
+  [VAE precision and latent cache dtype](../README.md#vae-precision-and-latent-cache-dtype); they work for
+  every model. On six photos from Wikimedia Commons at about 1 MP (a shop sign with text, people,
+  animals, a landscape, buildings, flowers), bfloat16 latents differed from float32 ones by
+  0.8-3.1% (relative L2, cosine similarity above 0.9995), and float16 ones by 0.1-0.8%. Decoded by
+  the same float32 VAE, a bfloat16 latent's image differed from the float32 latent's by 58-62 dB
+  PSNR (float16: 77-80 dB), while the VAE's own reconstruction of the photos is at 27-41 dB, which
+  bfloat16 moved by at most 0.05 dB. Encoding in bfloat16 took about half the time of float32
+  (CPU); on a GPU float16 and bfloat16 run at the same speed. float16 is the default for its three
+  extra mantissa bits, as ComfyUI also runs this VAE in float16 on NVIDIA GPUs; none of the six
+  photos overflowed it. Caches written before the option were encoded in float32:
   `vae_dtype = 'float32'` keeps them, any other value re-encodes them.
-  The latents are cached in `vae_dtype` too (half the disk of float32 for float16 and bfloat16);
-  a batch whose latents do not fit in float16 is cached in float32, with a warning. Rows cached in
-  float32 before this change stay valid: training reads latents in float32 either way.
 - Captions are encoded with MOSS-Image's chat template, which trims the caption, and cut at
   4096 tokens (`on_caption_overflow = 'warn' | 'silent' | 'error'`).
 - Checkpoints with each block's q, k and v fused into `proj.qkv` load too: the

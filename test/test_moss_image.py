@@ -22,6 +22,7 @@ import comfy.ops
 from comfy.ldm.moss_image.model import MOSSImage
 
 from models import moss_image as mi
+from utils import vae_dtype as vd
 
 TEXT_DIM = 48
 TINY = dict(dim=64, ffn_dim=96, num_heads=2, num_layers=3, text_dim=TEXT_DIM, latent_channels=128)
@@ -100,7 +101,6 @@ def bare_pipeline(model_config=None, config=None):
     pipe.clean_end_schedule = None
     pipe.clean_end_samplers = {}
     pipe.training_epoch = 1
-    pipe.fallback_vaes = {}
     return pipe
 
 
@@ -1613,7 +1613,7 @@ def test_vae_dtype_reaches_the_vae(value, dtype, tmp_path, monkeypatch):
     monkeypatch.setattr(mi, 'read_component', lambda path, stem: ({}, {}))
     pipe = make_pipeline({'diffusers_path': str(diffusers_dir(tmp_path)),
                           **({} if value is None else {'vae_dtype': value})})
-    assert pipe.vae_dtype == dtype
+    assert pipe.vae_dtypes.encode == dtype
     pipe.vae.load_model_if_needed()
     assert built == [dtype]
 
@@ -1621,12 +1621,25 @@ def test_vae_dtype_reaches_the_vae(value, dtype, tmp_path, monkeypatch):
 def test_vae_dtype_is_part_of_the_latent_cache_identity(tmp_path):
     root = diffusers_dir(tmp_path)
     # float32 keeps the identity caches were written with before vae_dtype existed (they were
-    # all encoded in float32), so they stay valid; another vae_dtype rebuilds them.
+    # all encoded in float32), so they stay valid; another vae_dtype rebuilds them. A config that
+    # sets neither key (the default float16) has the identity it had before latent_cache_dtype.
     before = f'{root}||torch.bfloat16'
     assert make_pipeline({'diffusers_path': str(root), 'vae_dtype': 'float32'}).vae_cache_key() == before
     assert make_pipeline({'diffusers_path': str(root)}).vae_cache_key() == before + '|vae_dtype=float16'
     assert make_pipeline({'diffusers_path': str(root), 'vae_dtype': 'bf16'}).vae_cache_key() \
         == before + '|vae_dtype=bfloat16'
+    assert make_pipeline({'diffusers_path': str(root), 'vae_dtype': 'float16'}).vae_cache_key() \
+        == before + '|vae_dtype=float16'
+
+
+def test_latent_cache_dtype_is_part_of_the_latent_cache_identity(tmp_path):
+    root = diffusers_dir(tmp_path)
+    before = f'{root}||torch.bfloat16'
+    for model, suffix in [({'vae_dtype': 'float32', 'latent_cache_dtype': 'float16'}, '|latent_cache_dtype=float16'),
+                          ({'latent_cache_dtype': 'bfloat16'}, '|vae_dtype=float16|latent_cache_dtype=bfloat16'),
+                          ({'vae_dtype': 'float16', 'latent_cache_dtype': 'float16'}, '|vae_dtype=float16'),
+                          ({'vae_dtype': 'float32', 'latent_cache_dtype': 'float32'}, '')]:
+        assert make_pipeline({'diffusers_path': str(root), **model}).vae_cache_key() == before + suffix
 
 
 class FallbackRecorder:
@@ -1635,10 +1648,12 @@ class FallbackRecorder:
 
     def __init__(self, pipe, fails):
         self.fails, self.calls = fails, []
-        pipe.vae_encode = lambda pixels: self.encode(pixels, pipe.vae_dtype)
-        pipe.fallback_vae_encode = self.encode
+        pipe.vae_encode = lambda pixels, vae: self.encode(pixels, vae.dtype)
+        pipe.load_vae = lambda dtype: types.SimpleNamespace(dtype=dtype)
+        self.vae = types.SimpleNamespace(dtype=pipe.vae_dtypes.encode)
 
     def encode(self, pixels, dtype):
+        pixels = pixels.as_subclass(torch.Tensor)
         self.calls.append((dtype, pixels.mean((1, 2, 3)).tolist()))
         latents = pixels.mean((1, 2, 3), keepdim=True).expand(-1, 4, 2, 2).clone()
         for i, value in enumerate(pixels.mean((1, 2, 3)).tolist()):
@@ -1647,16 +1662,27 @@ class FallbackRecorder:
         return latents
 
 
+class CpuPixels(torch.Tensor):
+    """Pixels whose .to('cuda', ...) stays where they are, as the tests have no GPU."""
+
+    def to(self, *args, **kwargs):
+        return self
+
+
 def fallback_batch(*values):
-    pixels = torch.stack([torch.full((3, 16, 16), v) for v in values])
-    return types.SimpleNamespace(to=lambda *args: pixels)
+    return torch.stack([torch.full((3, 16, 16), v) for v in values]).as_subclass(CpuPixels)
+
+
+def encoding_pipeline(fails=None, **model_config):
+    pipe = bare_pipeline()
+    pipe.model_config = model_config
+    vaes = FallbackRecorder(pipe, fails or {})
+    return pipe.get_cached_vae_fn(vaes.vae), vaes
 
 
 def test_overflowed_images_are_encoded_again_in_a_wider_dtype(capsys):
-    pipe = bare_pipeline()
-    pipe.vae_dtype = torch.float16
-    vaes = FallbackRecorder(pipe, {torch.float16: (0.5, 0.75), torch.bfloat16: (0.75,)})
-    latents = pipe.get_call_vae_fn(None)(fallback_batch(0.25, 0.5, 0.75))['latents']
+    fn, vaes = encoding_pipeline({torch.float16: (0.5, 0.75), torch.bfloat16: (0.75,)})
+    latents = fn(fallback_batch(0.25, 0.5, 0.75))['latents']
     # Only the images that failed are encoded again, each in the next dtype, and kept in place.
     assert vaes.calls == [(torch.float16, [0.25, 0.5, 0.75]), (torch.bfloat16, [0.5, 0.75]), (torch.float32, [0.75])]
     assert latents[:, 0, 0, 0].tolist() == [0.25, 0.5, 0.75]
@@ -1666,29 +1692,32 @@ def test_overflowed_images_are_encoded_again_in_a_wider_dtype(capsys):
 
 
 def test_a_finite_batch_is_encoded_once(capsys):
-    pipe = bare_pipeline()
-    pipe.vae_dtype = torch.float16
-    vaes = FallbackRecorder(pipe, {})
-    pipe.get_call_vae_fn(None)(fallback_batch(0.25, 0.5))
+    fn, vaes = encoding_pipeline()
+    fn(fallback_batch(0.25, 0.5))
     assert vaes.calls == [(torch.float16, [0.25, 0.5])]
     assert 'WARNING' not in capsys.readouterr().out
 
 
 @pytest.mark.parametrize('dtype', [torch.float16, torch.bfloat16, torch.float32])
 def test_latents_are_cached_in_vae_dtype(dtype):
-    pipe = bare_pipeline()
-    pipe.vae_dtype = dtype
-    FallbackRecorder(pipe, {})
-    latents = pipe.get_call_vae_fn(None)(fallback_batch(0.25, 0.5))['latents']
+    fn, _ = encoding_pipeline(vae_dtype=vd.NAMES[dtype])
+    latents = fn(fallback_batch(0.25, 0.5))['latents']
     assert latents.dtype == dtype
     assert latents[:, 0, 0, 0].tolist() == [0.25, 0.5]
 
 
+@pytest.mark.parametrize('encode, store', [('float32', torch.float16), ('float16', torch.bfloat16),
+                                           ('bfloat16', torch.float32)])
+def test_latent_cache_dtype_sets_what_is_stored_apart_from_vae_dtype(encode, store):
+    fn, vaes = encoding_pipeline(vae_dtype=encode, latent_cache_dtype=vd.NAMES[store])
+    latents = fn(fallback_batch(0.25, 0.5))['latents']
+    assert latents.dtype == store
+    assert vaes.calls[0][0] == vd.DTYPES[encode]
+
+
 def test_latents_too_large_for_float16_are_cached_in_float32(capsys):
-    pipe = bare_pipeline()
-    pipe.vae_dtype = torch.float16
-    FallbackRecorder(pipe, {})
-    latents = pipe.get_call_vae_fn(None)(fallback_batch(0.25, 1e5))['latents']
+    fn, _ = encoding_pipeline()
+    latents = fn(fallback_batch(0.25, 1e5))['latents']
     assert latents.dtype == torch.float32
     assert latents[:, 0, 0, 0].tolist() == [0.25, 1e5]
     assert 'caching this batch of 2 images in float32' in capsys.readouterr().out
@@ -1697,12 +1726,11 @@ def test_latents_too_large_for_float16_are_cached_in_float32(capsys):
 @pytest.mark.parametrize('dtype, tried', [(torch.float16, 'float32'), (torch.bfloat16, 'float32'),
                                           (torch.float32, 'float32')])
 def test_latents_non_finite_in_float32_too_are_not_cached(dtype, tried):
-    pipe = bare_pipeline()
-    pipe.vae_dtype = dtype
-    vaes = FallbackRecorder(pipe, {d: (0.5,) for d in (torch.float16, torch.bfloat16, torch.float32)})
-    with pytest.raises(RuntimeError, match=f'non-finite latents even in {tried}: an image in this batch'):
-        pipe.get_call_vae_fn(None)(fallback_batch(0.25, 0.5))
-    assert [d for d, _ in vaes.calls] == [dtype, *mi.VAE_FALLBACKS[dtype]]
+    fn, vaes = encoding_pipeline({d: (0.5,) for d in (torch.float16, torch.bfloat16, torch.float32)},
+                                 vae_dtype=vd.NAMES[dtype])
+    with pytest.raises(RuntimeError, match=f'non-finite latents even in {tried}'):
+        fn(fallback_batch(0.25, 0.5))
+    assert [d for d, _ in vaes.calls] == [dtype, *vd.FALLBACKS[dtype]]
 
 
 def test_a_fallback_vae_is_loaded_from_the_weights_once(monkeypatch):
@@ -1722,11 +1750,11 @@ def test_a_fallback_vae_is_loaded_from_the_weights_once(monkeypatch):
     monkeypatch.setattr(mi.comfy.sd, 'VAE', FakeVAE)
     monkeypatch.setattr(mi, 'read_component', lambda path, stem: ({}, {}))
     pipe = bare_pipeline()
-    pipe.vae_path, pipe.fallback_vaes, pipe.vae_dtype = 'vae', {}, torch.float16
+    pipe.vae_path = 'vae'
     pipe.latent_format = types.SimpleNamespace(process_in=lambda latents: latents)
     for _ in range(2):
-        pipe.fallback_vae_encode(torch.zeros(1, 3, 16, 16), torch.float32)
-    pipe.fallback_vae_encode(torch.zeros(1, 3, 16, 16), torch.bfloat16)
+        pipe.fallback_call_vae_fn(torch.float32)
+    pipe.fallback_call_vae_fn(torch.bfloat16)
     assert built == [torch.float32, torch.bfloat16]
 
 

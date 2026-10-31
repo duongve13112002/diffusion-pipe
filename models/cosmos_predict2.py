@@ -11,6 +11,7 @@
 # limitations under the License.
 
 import math
+import types
 import os.path
 import re
 from pathlib import Path
@@ -402,18 +403,7 @@ class CosmosPredict2Pipeline(BasePipeline):
             self.oplora_exclude_names = ('context_refiner',)
 
         # This isn't a nn.Module.
-        self.vae = WanVAE(
-            vae_pth=self.model_config['vae_path'],
-            device='cpu',
-            dtype=dtype,
-        )
-        # These need to be on the device the VAE will be moved to during caching. Guarded so a
-        # CPU-only box can still construct the pipeline (tools/sample_anima_refiner.py offers
-        # --device cpu); on a GPU box this is unchanged.
-        if torch.cuda.is_available():
-            self.vae.mean = self.vae.mean.to('cuda')
-            self.vae.std = self.vae.std.to('cuda')
-        self.vae.scale = [self.vae.mean, 1.0 / self.vae.std]
+        self.vae = self.load_wan_vae(self.vae_dtypes.encode or dtype)
 
         self.is_generic_llm = False
         self.t5_tokenizer = T5TokenizerFast(
@@ -1050,11 +1040,35 @@ class CosmosPredict2Pipeline(BasePipeline):
             framerate=self.framerate,
         )
 
+    def load_wan_vae(self, dtype):
+        vae = WanVAE(
+            vae_pth=self.model_config['vae_path'],
+            device='cpu',
+            dtype=dtype,
+        )
+        if self.vae_dtypes.encode is not None:
+            vae.model.to(dtype)
+        # These need to be on the device the VAE will be moved to during caching. Guarded so a
+        # CPU-only box can still construct the pipeline (tools/sample_anima_refiner.py offers
+        # --device cpu); on a GPU box this is unchanged.
+        if torch.cuda.is_available():
+            vae.mean = vae.mean.to('cuda')
+            vae.std = vae.std.to('cuda')
+        vae.scale = [vae.mean, 1.0 / vae.std]
+        return vae
+
+    def load_vae(self, dtype):
+        wan_vae = self.load_wan_vae(dtype or self.model_config['dtype'])
+        wan_vae.model.to(dtype or self.model_config['dtype'])
+        wan_vae.model.scale = wan_vae.scale
+        return wan_vae.model
+
     def get_call_vae_fn(self, vae):
         def fn(tensor):
             p = next(vae.parameters())
             tensor = tensor.to(p.device, p.dtype)
-            latents = vae_encode(tensor, self.vae)
+            # The scale of a VAE loaded for the fallback travels with it.
+            latents = vae_encode(tensor, types.SimpleNamespace(model=vae, scale=getattr(vae, 'scale', self.vae.scale)))
             return {'latents': latents}
         return fn
 

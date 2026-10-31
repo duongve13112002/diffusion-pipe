@@ -81,6 +81,8 @@ class Flux2Pipeline(ComfyPipeline):
         else:
             super().load_diffusion_model()
 
+    vae_latent_keys = ('latents', 'control_latents')
+
     def get_call_vae_fn(self, vae):
         """
         Returns a function to encode images with the VAE, supporting optional control images.

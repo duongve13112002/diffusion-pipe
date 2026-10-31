@@ -240,26 +240,7 @@ class HunyuanVideoPipeline(BasePipeline):
             crop_start = PROMPT_TEMPLATE[self.args.prompt_template].get("crop_start", 0)
             self.max_text_length_image = self.args.text_len + crop_start
 
-        if vae_path := self.model_config.get('vae_path', None):
-            with open('configs/hy_vae_config.json') as f:
-                vae_config = json.load(f)
-            vae_sd = load_safetensors(vae_path)
-            vae = AutoencoderKLCausal3D.from_config(vae_config)
-            vae.load_state_dict(vae_sd)
-            del vae_sd
-            vae.requires_grad_(False)
-            vae.eval()
-            vae.to(dtype=dtype)
-        else:
-            vae, _, _, _ = load_vae(
-                self.args.vae,
-                TYPE_TO_PRECISION[dtype],
-                vae_path=os.path.join(self.args.model_base, 'hunyuan-video-t2v-720p/vae'),
-                logger=logger,
-                device='cpu',
-            )
-        # Enabled by default in inference scripts, so we should probably train with it.
-        vae.enable_tiling()
+        vae = self.load_vae(self.vae_dtypes.encode)
 
         # Text encoder
         prompt_template = (
@@ -374,6 +355,30 @@ class HunyuanVideoPipeline(BasePipeline):
             support_video=True,
             framerate=self.framerate,
         )
+
+    def load_vae(self, dtype):
+        dtype = dtype or self.model_config['dtype']
+        if vae_path := self.model_config.get('vae_path', None):
+            with open('configs/hy_vae_config.json') as f:
+                vae_config = json.load(f)
+            vae_sd = load_safetensors(vae_path)
+            vae = AutoencoderKLCausal3D.from_config(vae_config)
+            vae.load_state_dict(vae_sd)
+            del vae_sd
+            vae.requires_grad_(False)
+            vae.eval()
+            vae.to(dtype=dtype)
+        else:
+            vae, _, _, _ = load_vae(
+                self.args.vae,
+                TYPE_TO_PRECISION[dtype],
+                vae_path=os.path.join(self.args.model_base, 'hunyuan-video-t2v-720p/vae'),
+                logger=logger,
+                device='cpu',
+            )
+        # Enabled by default in inference scripts, so we should probably train with it.
+        vae.enable_tiling()
+        return vae
 
     def get_call_vae_fn(self, vae):
         def fn(tensor):

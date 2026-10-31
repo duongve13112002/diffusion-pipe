@@ -29,12 +29,7 @@ class AuraFlowPipeline(BasePipeline):
         self.max_sequence_length = self.model_config['max_sequence_length']
         dtype = self.model_config['dtype']
 
-        with open('configs/auraflow/vae_config.json') as f:
-            vae_config = json.load(f)
-        with init_empty_weights():
-            vae = diffusers.AutoencoderKL.from_config(vae_config)
-        for key, tensor in iterate_safetensors(self.model_config['vae_path']):
-            set_module_tensor_to_device(vae, key, device='cpu', dtype=dtype, value=tensor)
+        vae = self.load_vae(self.vae_dtypes.encode)
 
         tokenizer = transformers.AutoTokenizer.from_pretrained('configs/auraflow/tokenizer', local_files_only=True)
 
@@ -92,6 +87,15 @@ class AuraFlowPipeline(BasePipeline):
 
     def save_adapter(self, save_dir, peft_state_dict):
         self.save_lora_weights(save_dir, transformer_lora_layers=peft_state_dict)
+
+    def load_vae(self, dtype):
+        with open('configs/auraflow/vae_config.json') as f:
+            vae_config = json.load(f)
+        with init_empty_weights():
+            vae = diffusers.AutoencoderKL.from_config(vae_config)
+        for key, tensor in iterate_safetensors(self.model_config['vae_path']):
+            set_module_tensor_to_device(vae, key, device='cpu', dtype=dtype or self.model_config['dtype'], value=tensor)
+        return vae
 
     def get_call_vae_fn(self, vae):
         def fn(image):

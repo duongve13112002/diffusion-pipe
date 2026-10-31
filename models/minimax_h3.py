@@ -228,39 +228,39 @@ class MinimaxH3Pipeline(ComfyPipeline):
             # Because uncond branch is no_grad() but tensors passed between pipeline parallel layers must require grad.
             assert self.config['pipeline_stages'] == 1, 'CFG training requires pipeline_stages=1'
 
+        self.vae = ModelWrapper(lambda: self.load_vae(self.vae_dtypes.encode))
+
+    def load_vae(self, dtype):
         # combined video and (optional) audio VAE in one object
-        def load_fn():
-            sd = comfy.utils.load_torch_file(self.model_config['vae'])
-            vae = comfy.sd.VAE(sd=sd)
-            vae.throw_exception_if_invalid()
+        sd = comfy.utils.load_torch_file(self.model_config['vae'])
+        vae = comfy.sd.VAE(sd=sd, dtype=dtype)
+        vae.throw_exception_if_invalid()
 
-            def vae_encode_crop_pixels(self, pixels):
-                if not self.crop_input:
-                    return pixels
-
-                downscale_ratio = self.spacial_compression_encode()
-
-                dims = pixels.shape[-3:-1]
-                for d in range(len(dims)):
-                    x = (dims[d] // downscale_ratio) * downscale_ratio
-                    x_offset = (dims[d] % downscale_ratio) // 2
-                    if x != dims[d]:
-                        pixels = pixels.narrow(d + 1, x_offset, x)
+        def vae_encode_crop_pixels(self, pixels):
+            if not self.crop_input:
                 return pixels
 
-            # patch this to handle 5D video tensor (original code expects 4D even for video)
-            vae.vae_encode_crop_pixels = types.MethodType(vae_encode_crop_pixels, vae)
-            vae_list = [vae]
+            downscale_ratio = self.spacial_compression_encode()
 
-            # audio VAE
-            sd = comfy.utils.load_torch_file(self.model_config['audio_vae'])
-            vae = comfy.sd.VAE(sd=sd)
-            vae.throw_exception_if_invalid()
-            vae_list.append(vae)
+            dims = pixels.shape[-3:-1]
+            for d in range(len(dims)):
+                x = (dims[d] // downscale_ratio) * downscale_ratio
+                x_offset = (dims[d] % downscale_ratio) // 2
+                if x != dims[d]:
+                    pixels = pixels.narrow(d + 1, x_offset, x)
+            return pixels
 
-            return vae_list
+        # patch this to handle 5D video tensor (original code expects 4D even for video)
+        vae.vae_encode_crop_pixels = types.MethodType(vae_encode_crop_pixels, vae)
+        vae_list = [vae]
 
-        self.vae = ModelWrapper(load_fn)
+        # audio VAE
+        sd = comfy.utils.load_torch_file(self.model_config['audio_vae'])
+        vae = comfy.sd.VAE(sd=sd, dtype=dtype)
+        vae.throw_exception_if_invalid()
+        vae_list.append(vae)
+
+        return vae_list
 
     def unsupported_checkpoint(self, shapes, metadata):
         pdd_steps = checkpoint_transformer_config(metadata).get('pdd_steps', 1)
@@ -291,8 +291,9 @@ class MinimaxH3Pipeline(ComfyPipeline):
     def get_preprocess_media_file_fn(self):
         return PreprocessMediaFileMinimax(self.config)
 
-    def vae_encode(self, img: torch.Tensor, audio: list):
-        video_vae, audio_vae = self.vae._model
+    def vae_encode(self, img: torch.Tensor, audio: list, vae=None):
+        vae = self.vae if vae is None else vae
+        video_vae, audio_vae = vae._model if isinstance(vae, ModelWrapper) else vae
         # move channel dim to end
         # works for both images (b c h w) and video (b c f h w)
         img = img.movedim(1, -1)
@@ -312,6 +313,8 @@ class MinimaxH3Pipeline(ComfyPipeline):
 
         return latents, audio_latents
 
+    vae_latent_keys = ('latents', 'audio_latents')
+
     def get_call_vae_fn(self, vae):
         def fn(images: torch.Tensor, audio: list):
             if images.shape[2] > 1:
@@ -319,8 +322,8 @@ class MinimaxH3Pipeline(ComfyPipeline):
                 missing_audio = sum(1 if a is None else 0 for a in audio)
                 if missing_audio > 0:
                     print(f'WARNING: this batch had {missing_audio} videos without audio. The videos could have no audio track, or it could be a bug in the code.')
-            images = images.to('cuda', self.dtype)
-            latents, audio_latents = self.vae_encode(images, audio)
+            images = images.to('cuda', self.comfy_vae_pixel_dtype)
+            latents, audio_latents = self.vae_encode(images, audio, vae)
             return {'latents': latents, 'audio_latents': audio_latents}
         return fn
 
@@ -368,7 +371,8 @@ class MinimaxH3Pipeline(ComfyPipeline):
             if a is not None:
                 if audio_shape is None:
                     audio_shape = a.shape
-                    audio_latents = torch.empty((bs, *audio_shape[1:]), dtype=a.dtype, device=device)
+                    # float32 whatever the cache holds (latent_cache_dtype): the noise is added to these.
+                    audio_latents = torch.empty((bs, *audio_shape[1:]), dtype=torch.float32, device=device)
                 assert a.shape == audio_shape
                 audio_latents[i, ...] = a
                 valid_audio.append(True)

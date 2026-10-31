@@ -214,6 +214,17 @@ timestep_sample_method = 'logit_normal'
 #   'float32'  twice the size of bfloat16, no loss.
 #text_embedding_dtype = 'float8'
 
+# Any model that caches latents (not Iris): the precision the VAE encodes the images in, and the
+# precision the latents are stored in. 'float32', 'bfloat16' or 'float16' for both. Left out, a
+# model encodes and caches as it always did (MOSS-Image: float16). vae_dtype alone stores in
+# vae_dtype; latent_cache_dtype alone stores the usual encoding, rounded. For example, encoding in
+# float32 and storing in float16 keeps the cache half the size of float32:
+#vae_dtype = 'float32'
+#latent_cache_dtype = 'float16'
+# An image whose latents are non-finite is encoded again in a wider dtype, and a batch that does
+# not fit in the storage dtype is cached in float32, each with a warning. A cache made with other
+# values is rebuilt.
+
 # For models that support full fine tuning, simply delete or comment out the [adapter] table to FFT.
 [adapter]
 type = 'lora'

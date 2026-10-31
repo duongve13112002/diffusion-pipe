@@ -22,6 +22,7 @@ sys.path.insert(0, os.path.join(os.path.abspath(os.path.dirname(__file__)), '../
 import peft
 from utils.dora import DORA_SCALE, check_dora_matches_model, saved_key
 import torch
+from utils import vae_dtype as vae_dtype_lib
 # torchaudio is required, and not only for the one resample call further down. The vendored
 # ComfyUI imports it at module scope in several places -- comfy.sd pulls in
 # comfy.ldm.lightricks.vae.audio_vae, which does -- so the `import comfy.sd` below needs it
@@ -276,11 +277,66 @@ class CommonPipeline:
         without this a run pointed at a different VAE silently reuses latents that belong to
         the old one. Recorded rather than fingerprinted, so adding it invalidates nothing.
         """
+        suffix = self.vae_dtypes.cache_key(self.vae_float32_is_default)
         if not self.vae_config_keys:
-            return ''
+            return suffix
         parts = [str(self.model_config.get(key, '')) for key in self.vae_config_keys]
         parts.append(str(self.model_config.get('dtype', '')))
-        return '|'.join(parts)
+        return '|'.join(parts) + suffix
+
+    # vae_dtype / latent_cache_dtype in [model] (see utils/vae_dtype.py). A model whose VAE caches
+    # in float32 whatever the settings were before them sets this, so that float32 adds nothing
+    # to its caches' identity and the caches made before the keys stay valid.
+    vae_float32_is_default = False
+    # What the model's VAE encodes by default when vae_dtype is left out (a name), None for the
+    # model's own dtype.
+    default_vae_dtype = None
+    # The entries of call_vae_fn's result that the VAE produced (the rest are not rounded).
+    vae_latent_keys = ('latents',)
+    # Why the model cannot take vae_dtype / latent_cache_dtype (it has no latents to cache).
+    vae_dtype_refusal = None
+
+    @property
+    def vae_dtypes(self):
+        if '_vae_dtypes' not in self.__dict__:
+            if self.vae_dtype_refusal:
+                vae_dtype_lib.refuse(self.model_config, type(self).__name__, self.vae_dtype_refusal)
+            self.__dict__['_vae_dtypes'] = vae_dtype_lib.LatentDtypes(self.model_config, self.default_vae_dtype)
+        return self.__dict__['_vae_dtypes']
+
+    @property
+    def comfy_vae_pixel_dtype(self):
+        """The dtype the pixels reach a ComfyUI VAE in. With vae_dtype set they stay float32:
+        ComfyUI maps them to -1..1 before casting to the VAE's dtype, so a float32 VAE rounds
+        nothing, as in the reference pipelines."""
+        return torch.float32 if self.vae_dtypes.encode is not None else self.dtype
+
+    def vae_identity_required(self):
+        """Whether a latent cache that records no VAE may not be reused. Only when the config sets
+        one of the dtypes: nothing else changes the caches of a config that does not."""
+        return any(key in self.model_config for key in vae_dtype_lib.KEYS)
+
+    def load_vae(self, dtype):
+        """The VAE as get_call_vae_fn takes it, loaded from its weights in dtype (None: the model's
+        own). Called again for a wider dtype when an image's latents overflow."""
+        raise NotImplementedError(f'{type(self).__name__} cannot load its VAE in another dtype')
+
+    def get_cached_vae_fn(self, vae):
+        """get_call_vae_fn for the latent cache, with vae_dtype and latent_cache_dtype applied."""
+        fn = self.get_call_vae_fn(vae)
+        if not self.vae_dtypes.active:
+            return fn
+        return vae_dtype_lib.wrap_call_vae_fn(fn, self.vae_dtypes, self.vae_latent_keys, self.fallback_call_vae_fn)
+
+    def fallback_call_vae_fn(self, dtype):
+        fns = self.__dict__.setdefault('_fallback_vae_fns', {})
+        if dtype not in fns:
+            # Kept once loaded, as one overflow is seldom the last.
+            vae = self.load_vae(dtype)
+            if isinstance(vae, nn.Module):
+                vae.to('cuda')
+            fns[dtype] = self.get_call_vae_fn(vae)
+        return fns[dtype]
 
     def text_encoder_cache_key(self, i):
         """Identity of text encoder `i`, recorded in that encoder's cache manifest.
@@ -351,8 +407,8 @@ class CommonPipeline:
 
     def get_call_vae_fn(self, vae):
         def fn(images):
-            images = images.to('cuda', self.dtype)
-            latents = self.vae_encode(images)
+            images = images.to('cuda', self.comfy_vae_pixel_dtype)
+            latents = self.vae_encode(images, vae)
             return {'latents': latents}
         return fn
 
@@ -728,41 +784,7 @@ class ComfyPipeline(CommonPipeline):
         self.latent_format = None
 
         # VAE
-        def load_fn():
-            sd = comfy.utils.load_torch_file(self.model_config['vae'])
-            vae = comfy.sd.VAE(sd=sd)
-            vae.throw_exception_if_invalid()
-
-            def vae_encode_crop_pixels(self, pixels):
-                if self.crop_input:
-                    downscale_ratio = self.spacial_compression_encode()
-
-                    dims = pixels.shape[-3:-1]  # only change from source
-                    for d in range(len(dims)):
-                        x = (dims[d] // downscale_ratio) * downscale_ratio
-                        x_offset = (dims[d] % downscale_ratio) // 2
-                        if x != dims[d]:
-                            pixels = pixels.narrow(d + 1, x_offset, x)
-
-                if pixels.shape[-1] > self.output_channels:
-                    pixels = pixels[..., :self.output_channels]
-                elif pixels.shape[-1] < self.output_channels:
-                    if self.pad_channel_value is not None:
-                        if isinstance(self.pad_channel_value, str):
-                            mode = self.pad_channel_value
-                            value = None
-                        else:
-                            mode = "constant"
-                            value = self.pad_channel_value
-
-                        pixels = torch.nn.functional.pad(pixels, (0, self.output_channels - pixels.shape[-1]), mode=mode, value=value)
-                return pixels
-
-            # patch this to handle 5D video tensor (original code expects 4D even for video)
-            vae.vae_encode_crop_pixels = types.MethodType(vae_encode_crop_pixels, self.vae)
-            return vae
-
-        self.vae = ModelWrapper(load_fn)
+        self.vae = ModelWrapper(lambda: self.load_vae(self.vae_dtypes.encode))
 
         # Text encoders
         self.text_encoders = []
@@ -867,6 +889,40 @@ class ComfyPipeline(CommonPipeline):
         if patched_something:
             assert 'adapter' in self.config, 'You are trying to full finetune a quantized model which will not work'
 
+    def load_vae(self, dtype):
+        sd = comfy.utils.load_torch_file(self.model_config['vae'])
+        vae = comfy.sd.VAE(sd=sd, dtype=dtype)
+        vae.throw_exception_if_invalid()
+
+        def vae_encode_crop_pixels(self, pixels):
+            if self.crop_input:
+                downscale_ratio = self.spacial_compression_encode()
+
+                dims = pixels.shape[-3:-1]  # only change from source
+                for d in range(len(dims)):
+                    x = (dims[d] // downscale_ratio) * downscale_ratio
+                    x_offset = (dims[d] % downscale_ratio) // 2
+                    if x != dims[d]:
+                        pixels = pixels.narrow(d + 1, x_offset, x)
+
+            if pixels.shape[-1] > self.output_channels:
+                pixels = pixels[..., :self.output_channels]
+            elif pixels.shape[-1] < self.output_channels:
+                if self.pad_channel_value is not None:
+                    if isinstance(self.pad_channel_value, str):
+                        mode = self.pad_channel_value
+                        value = None
+                    else:
+                        mode = "constant"
+                        value = self.pad_channel_value
+
+                    pixels = torch.nn.functional.pad(pixels, (0, self.output_channels - pixels.shape[-1]), mode=mode, value=value)
+            return pixels
+
+        # patch this to handle 5D video tensor (original code expects 4D even for video)
+        vae.vae_encode_crop_pixels = types.MethodType(vae_encode_crop_pixels, vae)
+        return vae
+
     def get_vae(self):
         return self.vae
 
@@ -878,11 +934,11 @@ class ComfyPipeline(CommonPipeline):
         del self.text_encoders
         empty_cuda_cache()
 
-    def vae_encode(self, img):
+    def vae_encode(self, img, vae=None):
         # move channel dim to end
         # works for both images (b c h w) and video (b c f h w)
         img = img.movedim(1, -1)
-        latents = self.vae.encode(img)
+        latents = (self.vae if vae is None else vae).encode(img)
         latents = self.latent_format.process_in(latents)
         return latents
 

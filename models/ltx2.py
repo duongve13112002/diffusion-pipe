@@ -204,36 +204,7 @@ class LTX2Pipeline(ComfyPipeline):
         self.refuse_unsupported_checkpoint()
 
         # VAE
-        def load_fn():
-            vae_sd = {}
-            with safetensors.safe_open(self.model_config['diffusion_model'], framework='pt', device='cpu') as f:
-                metadata = f.metadata()
-                for key in f.keys():
-                    if m := re.fullmatch(r'vae\.(.+)', key):
-                        vae_sd[m.group(1)] = f.get_tensor(key)
-            assert len(vae_sd) > 0
-
-            vae = comfy.sd.VAE(sd=vae_sd, metadata=metadata)
-            vae.throw_exception_if_invalid()
-
-            def vae_encode_crop_pixels(self, pixels):
-                if not self.crop_input:
-                    return pixels
-
-                downscale_ratio = self.spacial_compression_encode()
-
-                dims = pixels.shape[-3:-1]
-                for d in range(len(dims)):
-                    x = (dims[d] // downscale_ratio) * downscale_ratio
-                    x_offset = (dims[d] % downscale_ratio) // 2
-                    if x != dims[d]:
-                        pixels = pixels.narrow(d + 1, x_offset, x)
-                return pixels
-
-            # patch this to handle 5D video tensor (original code expects 4D even for video)
-            vae.vae_encode_crop_pixels = types.MethodType(vae_encode_crop_pixels, self.vae)
-            return vae
-        self.vae = ModelWrapper(load_fn)
+        self.vae = ModelWrapper(lambda: self.load_vae(self.vae_dtypes.encode))
 
         # Text encoder
         def load_fn():
@@ -241,6 +212,36 @@ class LTX2Pipeline(ComfyPipeline):
         self.text_encoders = [ModelWrapper(load_fn)]
 
         self.offloader = ModelOffloader('dummy', [], 0, 0, True, torch.device('cuda'), False, debug=False)
+
+    def load_vae(self, dtype):
+        vae_sd = {}
+        with safetensors.safe_open(self.model_config['diffusion_model'], framework='pt', device='cpu') as f:
+            metadata = f.metadata()
+            for key in f.keys():
+                if m := re.fullmatch(r'vae\.(.+)', key):
+                    vae_sd[m.group(1)] = f.get_tensor(key)
+        assert len(vae_sd) > 0
+
+        vae = comfy.sd.VAE(sd=vae_sd, metadata=metadata, dtype=dtype)
+        vae.throw_exception_if_invalid()
+
+        def vae_encode_crop_pixels(self, pixels):
+            if not self.crop_input:
+                return pixels
+
+            downscale_ratio = self.spacial_compression_encode()
+
+            dims = pixels.shape[-3:-1]
+            for d in range(len(dims)):
+                x = (dims[d] // downscale_ratio) * downscale_ratio
+                x_offset = (dims[d] % downscale_ratio) // 2
+                if x != dims[d]:
+                    pixels = pixels.narrow(d + 1, x_offset, x)
+            return pixels
+
+        # patch this to handle 5D video tensor (original code expects 4D even for video)
+        vae.vae_encode_crop_pixels = types.MethodType(vae_encode_crop_pixels, vae)
+        return vae
 
     def unsupported_checkpoint(self, shapes, metadata):
         # Each block of a model with cross-attention adaLN has a prompt_scale_shift_table.

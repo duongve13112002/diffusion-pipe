@@ -1,5 +1,6 @@
 import json
 import re
+import types
 import os.path
 from pathlib import Path
 
@@ -196,16 +197,10 @@ class WanPipeline(BasePipeline):
                     p.data = p.data.to(torch.float8_e4m3fn)
         self.text_encoder.model.requires_grad_(False)
 
-        vae_class = Wan2_2_VAE if model_type == 'ti2v' else Wan2_1_VAE
+        self.vae_class = Wan2_2_VAE if model_type == 'ti2v' else Wan2_1_VAE
+        self.vae_path = ckpt_dir / wan_config.vae_checkpoint
         # Same here, this isn't a nn.Module.
-        self.vae = vae_class(
-            vae_pth=ckpt_dir / wan_config.vae_checkpoint,
-            device='cpu',
-            dtype=dtype,
-        )
-        self.vae.model.to(dtype)
-        # These tensors need to be on the device the VAE will be moved to during caching.
-        self.vae.scale = [entry.to('cuda') for entry in self.vae.scale]
+        self.vae = self.load_wan_vae(self.vae_dtypes.encode or dtype)
 
         if model_type in ('i2v', 'flf2v'):
             self.clip = CLIPModel(
@@ -248,6 +243,24 @@ class WanPipeline(BasePipeline):
     def __getattr__(self, name):
         return getattr(self.diffusers_pipeline, name)
 
+    def load_wan_vae(self, dtype):
+        vae = self.vae_class(
+            vae_pth=self.vae_path,
+            device='cpu',
+            dtype=dtype,
+        )
+        vae.model.to(dtype)
+        # These tensors need to be on the device the VAE will be moved to during caching.
+        vae.scale = [entry.to('cuda') for entry in vae.scale]
+        return vae
+
+    def load_vae(self, dtype):
+        wan_vae = self.load_wan_vae(dtype or self.model_config['dtype'])
+        wan_vae.model.scale = wan_vae.scale
+        return VaeAndClip(wan_vae.model, self.clip.model if self.model_type in ('i2v', 'flf2v') else None)
+
+    vae_latent_keys = ('latents', 'y')
+
     def get_vae(self):
         vae = self.vae.model
         clip = self.clip.model if self.model_type in ('i2v', 'flf2v') else None
@@ -287,9 +300,11 @@ class WanPipeline(BasePipeline):
         def fn(tensor):
             vae = vae_and_clip.vae
             p = next(vae.parameters())
+            # The scale of a VAE loaded for the fallback travels with it.
+            wan_vae = types.SimpleNamespace(model=vae, scale=getattr(vae, 'scale', self.vae.scale))
             tensor = tensor.to(p.device, p.dtype)
             tensor = tensor*2 - 1
-            latents = vae_encode(tensor, self.vae)
+            latents = vae_encode(tensor, wan_vae)
             ret = {'latents': latents}
 
             if is_i2v:
@@ -306,7 +321,7 @@ class WanPipeline(BasePipeline):
                 # NOTE: encoding 0s with the VAE doesn't give you 0s in the latents, I tested this. So we need to
                 # encode the whole thing here, we can't just extract the first frame from the latents later and make
                 # the rest 0. But what happens if you do that? Probably things get fried, but might be worth testing.
-                y = vae_encode(tensor, self.vae)
+                y = vae_encode(tensor, wan_vae)
                 ret['y'] = y
 
             clip = vae_and_clip.clip

@@ -214,17 +214,7 @@ class QwenImagePipeline(BasePipeline):
                 key = 'lm_head.weight'
             set_module_tensor_to_device(text_encoder, key, device='cpu', dtype=dtype, value=tensor)
 
-        # TODO: make this work with ComfyUI VAE weights, which have completely different key names.
-        if 'vae_path' in self.model_config:
-            vae_path = self.model_config['vae_path']
-        else:
-            vae_path = Path(self.model_config['diffusers_path']) / 'vae'
-        with open('configs/qwen_image/vae/config.json') as f:
-            vae_config = json.load(f)
-        with init_empty_weights():
-            vae = diffusers.AutoencoderKLQwenImage.from_config(vae_config)
-        for key, tensor in iterate_safetensors(vae_path):
-            set_module_tensor_to_device(vae, key, device='cpu', dtype=dtype, value=tensor)
+        vae = self.load_vae(self.vae_dtypes.encode)
 
         self.diffusers_pipeline = diffusers.QwenImagePipeline(
             scheduler=None,
@@ -235,15 +225,6 @@ class QwenImagePipeline(BasePipeline):
         )
 
         self.diffusers_pipeline.processor = processor
-
-        latents_mean = (
-            torch.tensor(self.vae.config.latents_mean)
-            .view(1, self.vae.config.z_dim, 1, 1, 1)
-            .to(dtype)
-        )
-        latents_std = torch.tensor(self.vae.config.latents_std).view(1, self.vae.config.z_dim, 1, 1, 1).to(dtype)
-        self.vae.register_buffer('latents_mean_tensor', latents_mean)
-        self.vae.register_buffer('latents_std_tensor', latents_std)
 
     def load_diffusion_model(self):
         dtype = self.model_config['dtype']
@@ -293,6 +274,28 @@ class QwenImagePipeline(BasePipeline):
 
     def get_preprocess_media_file_fn(self):
         return self.preprocess_media_file_fn
+
+    def load_vae(self, dtype):
+        dtype = dtype or self.model_config['dtype']
+        # TODO: make this work with ComfyUI VAE weights, which have completely different key names.
+        if 'vae_path' in self.model_config:
+            vae_path = self.model_config['vae_path']
+        else:
+            vae_path = Path(self.model_config['diffusers_path']) / 'vae'
+        with open('configs/qwen_image/vae/config.json') as f:
+            vae_config = json.load(f)
+        with init_empty_weights():
+            vae = diffusers.AutoencoderKLQwenImage.from_config(vae_config)
+        for key, tensor in iterate_safetensors(vae_path):
+            set_module_tensor_to_device(vae, key, device='cpu', dtype=dtype, value=tensor)
+
+        latents_mean = torch.tensor(vae.config.latents_mean).view(1, vae.config.z_dim, 1, 1, 1).to(dtype)
+        latents_std = torch.tensor(vae.config.latents_std).view(1, vae.config.z_dim, 1, 1, 1).to(dtype)
+        vae.register_buffer('latents_mean_tensor', latents_mean)
+        vae.register_buffer('latents_std_tensor', latents_std)
+        return vae
+
+    vae_latent_keys = ('latents', 'control_latents')
 
     def get_call_vae_fn(self, vae):
         def fn(*args):

@@ -14,6 +14,10 @@ Models supported: SDXL, Flux, LTX-Video, HunyuanVideo (t2v), Cosmos, Lumina Imag
 - Optional OPLoRA (orthogonal projection LoRA) to reduce catastrophic forgetting when training LoRAs
 
 ## Recent changes
+- 2026-10-31
+  - `vae_dtype` and `latent_cache_dtype` in `[model]`, for every model that caches latents (`vae_dtype` was MOSS-Image's). `vae_dtype` is the precision the VAE encodes the images in; `latent_cache_dtype` is the precision the latents are stored in: `'float32'`, `'bfloat16'` or `'float16'` for both. Encode in float32 and store in float16 to halve the cache, or set only `vae_dtype` and the cache is stored in it. Left out, a model encodes and caches exactly as before, and its caches are kept; MOSS-Image keeps its default `vae_dtype = 'float16'` and its caches too. An image whose latents come out non-finite is encoded again in a wider dtype (bfloat16, then float32) with a warning, and a batch whose latents do not fit in the storage dtype is cached in float32 with a warning. A cache made with other values is rebuilt. Iris refuses both keys (it caches pixels). See [VAE precision and latent cache dtype](#vae-precision-and-latent-cache-dtype).
+  - ComfyUI submodule updated to master 7c4390a6f.
+  - `tools/check_flash_attention.py` lists the warnings raised while it ran. FlashAttention 4's `aux_data ... cannot be converted to a JitArgument` message comes from the CuTe DSL compiling a kernel; the checks above it say whether the results are right.
 - 2026-10-29
   - FlashAttention-3 and -4 for every model: `[model] attention = 'flash3'` or `'flash4'` (default `'sdpa'`, which changes nothing). PyTorch's `scaled_dot_product_attention` is routed through FlashAttention, and the models that call flash-attn themselves (Wan, HiDream, HunyuanVideo, HunyuanImage-2.1, OmniGen2, Lumina 2) use it too; Iris maps the key onto its `attn_backend`. Calls FlashAttention cannot take run PyTorch SDPA and are counted, never dropped silently. See [FlashAttention](#flashattention). Changed: Wan and HiDream no longer pick FlashAttention-3 by themselves when it is installed; with `'sdpa'` they use flash-attn 2 if installed, else PyTorch SDPA (a line at startup says so). Fixed: Wan without flash-attn 2 ran SDPA without the text padding mask, so its cross-attention attended to the padding tokens.
   - `--cache_status`: prints how many files of each dataset directory (and of each bucket) have their latents and their text embeddings cached, counted in files, not captions, then exits. It reads what is cached, also from a run that was interrupted or is still caching, and encodes, clears and writes nothing. See [pre-caching](#pre-caching).
@@ -522,6 +526,33 @@ training batch instead of the caption files' order. So:
 With `pipeline_stages` above 1, the first and last stages both load the text encoders.
 Switching between `true` and `false` keeps the latent caches; the text embedding cache is only
 written and read with `true`.
+
+### VAE precision and latent cache dtype
+
+Two keys in `[model]`, for every model that caches latents:
+
+- `vae_dtype`: the precision the VAE encodes the images in (and, for MOSS-Image, decodes samples in).
+- `latent_cache_dtype`: the precision the latents are stored in on disk.
+
+Both take `'float32'`, `'bfloat16'` or `'float16'`. Training reads the latents back in float32 either way.
+
+| set | the VAE encodes in | the cache stores |
+| --- | --- | --- |
+| neither | what the model always did | what it always did |
+| `vae_dtype` | `vae_dtype` | `vae_dtype` |
+| `latent_cache_dtype` | what the model always did | `latent_cache_dtype` (the latents are rounded to it) |
+| both | `vae_dtype` | `latent_cache_dtype` |
+
+For example `vae_dtype = 'float32'` with `latent_cache_dtype = 'float16'` encodes with the full precision VAE and keeps the cache half the size of float32. float16 keeps three more mantissa bits than bfloat16, but stops at 65504 where bfloat16 reaches float32's range.
+
+Setting `vae_dtype` loads the VAE from its weights in that dtype (a float32 VAE is not a bfloat16 VAE cast up), and the pixels reach a ComfyUI VAE in float32. Two things are checked for every batch, as MOSS-Image always did:
+
+- An image whose latents come out non-finite is encoded again in bfloat16, then in float32 (from float16; from bfloat16 only float32), with a warning each time; the rest of its batch is kept. Those VAEs are loaded from the weights when first needed. Latents that are non-finite in float32 too (an image with non-finite pixels) stop the caching with an error. If the warning comes up often, set `vae_dtype` to the dtype it names.
+- A batch whose latents do not fit in the storage dtype (float16 overflows at 65504) is cached in float32, with a warning.
+
+A latent cache records both keys, so a cache made with other values is rebuilt, and going back finds the old cache again with `reuse_metadata_cache = true`. A config that sets neither is unaffected: the cache identity, the metadata and the caches stay as they were.
+
+Defaults: MOSS-Image encodes in float16 (`vae_dtype = 'float16'`); its caches written in float32 before the option (`vae_dtype = 'float32'`) stay valid. Every other model keeps its own precision when the keys are left out. SDXL always runs its VAE in float32 unless `vae_dtype` is set. Iris caches pixels, not latents, and refuses both keys. MiniMax-H3 applies `vae_dtype` to its audio VAE too, and `latent_cache_dtype` to the audio latents.
 
 ### Aspect ratio buckets from the images
 

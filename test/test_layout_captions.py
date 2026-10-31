@@ -1096,6 +1096,12 @@ class TestModelsDeclareTheirFormat:
             def vae_cache_key(self):
                 return ''
 
+            def vae_identity_required(self):
+                return False
+
+            def get_cached_vae_fn(self, vae):
+                return vae
+
         monkeypatch.setattr(dataset_module, 'DirectoryDataset', Recorder)
         config = {'directory': [{'path': 'a'}, {'path': 'b'}]}
         dataset_module.Dataset(config, Model(), skip_dataset_validation=True)

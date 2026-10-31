@@ -142,6 +142,12 @@ class ChromaPipeline(BasePipeline):
 
         dtype = self.model_config['dtype']
         self.diffusers_pipeline = diffusers.FluxPipeline.from_pretrained(self.model_config['diffusers_path'], torch_dtype=dtype, transformer=None)
+        if self.vae_dtypes.encode is not None:
+            self.diffusers_pipeline.vae = self.load_vae(self.vae_dtypes.encode)
+
+    def load_vae(self, dtype):
+        return diffusers.AutoencoderKL.from_pretrained(
+            self.model_config['diffusers_path'], subfolder='vae', torch_dtype=dtype or self.model_config['dtype'])
 
     def __getattr__(self, name):
         return getattr(self.diffusers_pipeline, name)

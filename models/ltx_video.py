@@ -40,7 +40,7 @@ class LTXVideoPipeline(BasePipeline):
         # The VAE could be different for each model version, so we have to make sure to use different cache directories.
         self.name = single_file_path.stem
 
-        vae = CausalVideoAutoencoder.from_pretrained(single_file_path)
+        vae = self.load_vae(self.vae_dtypes.encode)
         self.diffusers_pipeline = OriginalLTXVideoPipeline.from_pretrained(
             diffusers_path,
             transformer=None,
@@ -95,6 +95,10 @@ class LTXVideoPipeline(BasePipeline):
             round_width=32,
             round_frames=8,
         )
+
+    def load_vae(self, dtype):
+        vae = CausalVideoAutoencoder.from_pretrained(Path(self.model_config['single_file_path']))
+        return vae if dtype is None else vae.to(dtype)
 
     def get_call_vae_fn(self, vae):
         def fn(tensor):

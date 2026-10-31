@@ -113,20 +113,6 @@ DTYPE_NAMES = {
 }
 
 
-# The VAE only encodes the training images (and decodes samples). The reference pipeline runs it
-# in float32. In float16 the latents of real photos differ from float32 ones by 0.1-0.8% (relative
-# L2; bfloat16, with three fewer mantissa bits: 1-3%), and their decodes by about 78 dB PSNR, far
-# below the VAE's own reconstruction error. float16 can overflow where bfloat16 cannot; ComfyUI
-# runs this VAE in float16 on NVIDIA GPUs too (see vae_dtype in the docs).
-VAE_DTYPES = {
-    'bfloat16': torch.bfloat16, 'bf16': torch.bfloat16, 'float32': torch.float32, 'fp32': torch.float32,
-    'float16': torch.float16, 'fp16': torch.float16,
-}
-VAE_DTYPE_NAMES = {torch.bfloat16: 'bfloat16', torch.float32: 'float32', torch.float16: 'float16'}
-# Images whose latents come out non-finite are encoded again in these, in order.
-VAE_FALLBACKS = {torch.float16: (torch.bfloat16, torch.float32), torch.bfloat16: (torch.float32,), torch.float32: ()}
-
-
 def _dtype(value, key):
     if isinstance(value, torch.dtype):
         return value
@@ -994,6 +980,10 @@ class MossImagePipeline(ComfyPipeline):
     channels = LATENT_CHANNELS
     pixels_round_to_multiple = 16
     vae_config_keys = ('diffusers_path', 'vae_path')
+    # Encoded in float16 unless vae_dtype says otherwise (see vae_dtype in the docs); caches made
+    # before the option were float32, so float32 adds nothing to the cache identity.
+    default_vae_dtype = 'float16'
+    vae_float32_is_default = True
     # JSON layout captions in MOSS-Image's prompt schema get their boxes rewritten per bucket:
     # see utils/layout_captions.py.
     layout_caption_format = 'moss_image'
@@ -1017,11 +1007,7 @@ class MossImagePipeline(ComfyPipeline):
                              'and block_lr_scale would do nothing: remove them, or force_constant_lr')
         self.latent_format = comfy.latent_formats.Flux2()
         self.text_dim = TEXT_DIM
-        vae_dtype = self.model_config.get('vae_dtype', 'float16')
-        if not isinstance(vae_dtype, str) or vae_dtype not in VAE_DTYPES:
-            raise ValueError(f'vae_dtype must be one of {", ".join(sorted(VAE_DTYPES))}, got {vae_dtype!r}')
-        self.vae_dtype = VAE_DTYPES[vae_dtype]
-        self.fallback_vaes = {}
+        self.vae_dtypes
 
         self.transformer_path = self._component('transformer_path', 'transformer')
         self.vae_path = self._component('vae_path', 'vae')
@@ -1064,7 +1050,7 @@ class MossImagePipeline(ComfyPipeline):
             else:
                 print(f'MOSS-Image: {share:.1f}% of training steps below sigma {CLEAN_END_SIGMA}')
 
-        self.vae = ModelWrapper(lambda: self.load_vae(self.vae_dtype))
+        self.vae = ModelWrapper(lambda: self.load_vae(self.vae_dtypes.encode))
         self.text_encoders = [ModelWrapper(lambda: load_text_encoder(self.text_encoder_path))]
         self.offloader = ModelOffloader('dummy', [], 0, 0, True, torch.device('cuda'), False, debug=False)
         self.diffusion_model = None
@@ -1162,21 +1148,6 @@ class MossImagePipeline(ComfyPipeline):
         vae.throw_exception_if_invalid()
         return vae
 
-    def fallback_vae_encode(self, pixels, dtype):
-        # Loaded from the weights again, not cast from the VAE in vae_dtype: float16 weights cast
-        # up are still rounded to float16. Kept once loaded, as one overflow is seldom the last.
-        if dtype not in self.fallback_vaes:
-            self.fallback_vaes[dtype] = self.load_vae(dtype)
-        return self.latent_format.process_in(self.fallback_vaes[dtype].encode(pixels.movedim(1, -1)))
-
-    def vae_cache_key(self):
-        # A latent cache encoded at another vae_dtype is rebuilt. float32 keeps the identity of
-        # caches written before vae_dtype existed, which were all encoded in float32.
-        key = super().vae_cache_key()
-        if self.vae_dtype != torch.float32:
-            key += f'|vae_dtype={VAE_DTYPE_NAMES[self.vae_dtype]}'
-        return key
-
     def text_encoder_cache_key(self, i):
         return f'moss_image|{self.text_encoder_path}|qwen35_9b|last|{MAX_TEXT_TOKENS}|trimmed-v1|prompt-strip-v1'
 
@@ -1238,34 +1209,10 @@ class MossImagePipeline(ComfyPipeline):
 
     def get_call_vae_fn(self, vae):
         def fn(images):
-            # fp32 pixels: ComfyUI maps them to -1..1 before casting to vae_dtype, so with a float32
-            # VAE nothing is rounded, as in the reference.
+            # fp32 pixels: ComfyUI maps them to -1..1 before casting to the VAE's dtype, so with a
+            # float32 VAE nothing is rounded, as in the reference.
             pixels = images.to('cuda', torch.float32)
-            latents = self.vae_encode(pixels)
-            # float16 can overflow, and a non-finite latent would be cached and trained on: such
-            # images are encoded again in a wider dtype.
-            tried = self.vae_dtype
-            for dtype in VAE_FALLBACKS[self.vae_dtype]:
-                bad = ~torch.isfinite(latents.flatten(1)).all(1)
-                if not bad.any():
-                    break
-                print(f'WARNING: the VAE in {VAE_DTYPE_NAMES[tried]} gave non-finite latents for {int(bad.sum())} of '
-                      f'{len(bad)} images; encoding them again in {VAE_DTYPE_NAMES[dtype]}. If this happens often, '
-                      f"set vae_dtype = '{VAE_DTYPE_NAMES[dtype]}' in [model].")
-                latents[bad] = self.fallback_vae_encode(pixels[bad], dtype).to(latents.dtype)
-                tried = dtype
-            if not torch.isfinite(latents).all():
-                raise RuntimeError(f'The VAE gave non-finite latents even in {VAE_DTYPE_NAMES[tried]}: '
-                                   'an image in this batch has non-finite pixels')
-            # ComfyUI returns float32 whatever the VAE ran in; the cache keeps vae_dtype. Every row
-            # is saved on its own and training reads latents with .float(), so rows cached in
-            # float32 before this (or kept below) mix with these.
-            stored = latents.to(self.vae_dtype)
-            if not torch.isfinite(stored).all():
-                print(f'WARNING: latents do not fit in {VAE_DTYPE_NAMES[self.vae_dtype]}; '
-                      f'caching this batch of {len(latents)} images in float32.')
-                stored = latents
-            return {'latents': stored}
+            return {'latents': self.vae_encode(pixels, vae)}
         return fn
 
     def get_text_encoders(self):

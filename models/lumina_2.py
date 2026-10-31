@@ -60,12 +60,17 @@ class Lumina2Pipeline(BasePipeline):
     # layers, since they also use this class.
     adapter_target_modules = ['JointTransformerBlock']
 
+    def load_vae(self, dtype):
+        # float32 unless vae_dtype says otherwise, as it always was.
+        kwargs = {} if dtype is None else {'torch_dtype': dtype}
+        return diffusers.AutoencoderKL.from_single_file(self.model_config['vae_path'], config='configs/flux_vae', **kwargs)
+
     def __init__(self, config):
         self.config = config
         self.model_config = self.config['model']
         dtype = self.model_config['dtype']
 
-        self.vae = diffusers.AutoencoderKL.from_single_file(self.model_config['vae_path'], config='configs/flux_vae')
+        self.vae = self.load_vae(self.vae_dtypes.encode)
 
         self.tokenizer = transformers.AutoTokenizer.from_pretrained('configs/gemma_2_2b')
         self.tokenizer.padding_side = 'right'

@@ -8,6 +8,7 @@ import torch.nn.functional as F
 from deepspeed.utils.logging import logger
 import peft
 import safetensors
+from accelerate import init_empty_weights
 from safetensors.torch import save_file
 
 from models.base import BasePipeline, make_contiguous
@@ -404,8 +405,11 @@ class SDXLPipeline(BasePipeline):
         if self.v_pred:
             fix_noise_scheduler_betas_for_zero_terminal_snr(self.scheduler)
 
-        # Probably good to always do this for SDXL.
-        self.diffusers_pipeline.upcast_vae()
+        if self.vae_dtypes.encode is None:
+            # Probably good to always do this for SDXL.
+            self.diffusers_pipeline.upcast_vae()
+        else:
+            self.diffusers_pipeline.vae = self.load_vae(self.vae_dtypes.encode)
         self.unet.train()
         self.text_encoder.train()
         self.text_encoder_2.train()
@@ -413,6 +417,24 @@ class SDXLPipeline(BasePipeline):
 
     def __getattr__(self, name):
         return getattr(self.diffusers_pipeline, name)
+
+    def load_vae(self, dtype):
+        """The checkpoint's VAE, converted from the original (ldm) key names in dtype from the
+        file's own precision. The VAE's config is the one the pipeline was built with."""
+        from diffusers.loaders.single_file_utils import convert_ldm_vae_checkpoint
+        path = str(self.model_config['checkpoint_path'])
+        if path.endswith('.safetensors'):
+            with safetensors.safe_open(path, framework='pt', device='cpu') as f:
+                state = {k: f.get_tensor(k) for k in f.keys() if k.startswith('first_stage_model.')}
+        else:
+            loaded = torch.load(path, weights_only=True, map_location='cpu')
+            loaded = loaded.get('state_dict', loaded)
+            state = {k: v for k, v in loaded.items() if k.startswith('first_stage_model.')}
+        state = convert_ldm_vae_checkpoint(state, self.diffusers_pipeline.vae.config)
+        with init_empty_weights():
+            vae = diffusers.AutoencoderKL.from_config(self.diffusers_pipeline.vae.config)
+        vae.load_state_dict({k: v.to(dtype) for k, v in state.items()}, assign=True)
+        return vae.eval().requires_grad_(False)
 
     def _set_param_original_name(self):
         for state_dict_key_prefix, module in (

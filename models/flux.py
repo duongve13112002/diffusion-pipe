@@ -155,6 +155,7 @@ class FluxPipeline(BasePipeline):
     # Unique name, used to make the cache_dir path.
     name = 'flux'
     vae_config_keys = ('diffusers_path',)
+    vae_latent_keys = ('latents', 'control_latents')
 
     # layers that will participate in activation checkpointing
     checkpointable_layers = [
@@ -194,6 +195,8 @@ class FluxPipeline(BasePipeline):
             bypass_flux_guidance(transformer)
 
         self.diffusers_pipeline = diffusers.FluxPipeline.from_pretrained(self.model_config['diffusers_path'], torch_dtype=dtype, transformer=transformer)
+        if self.vae_dtypes.encode is not None:
+            self.diffusers_pipeline.vae = self.load_vae(self.vae_dtypes.encode)
 
         if 'adapter' in self.config:
             if fuse_adapters := self.config['adapter'].get('fuse_adapters', None):
@@ -213,6 +216,10 @@ class FluxPipeline(BasePipeline):
         # so store it in an attribute here. Same thing below if we're training a lora and creating lora weights.
         for name, p in self.transformer.named_parameters():
             p.original_name = name
+
+    def load_vae(self, dtype):
+        return diffusers.AutoencoderKL.from_pretrained(
+            self.model_config['diffusers_path'], subfolder='vae', torch_dtype=dtype or self.model_config['dtype'])
 
     def __getattr__(self, name):
         return getattr(self.diffusers_pipeline, name)
