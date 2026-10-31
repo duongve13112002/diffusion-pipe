@@ -41,6 +41,7 @@ import subprocess
 import sys
 import time
 import traceback
+import warnings
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 sys.path.insert(0, ROOT)
@@ -84,6 +85,19 @@ class Report:
         self.current.append(entry)
         if ok is False:
             self.failures.append(entry)
+
+    def watch_warnings(self):
+        """Remembers each distinct warning the run raises (FA4's JIT, say), still printing it as usual."""
+        self.warnings = {}
+        shown = warnings.showwarning
+
+        def record(message, category, filename, lineno, file=None, line=None):
+            key = f'{category.__name__}: {str(message)[:400]}'
+            self.warnings[key] = True
+            shown(message, category, filename, lineno, file, line)
+
+        warnings.showwarning = record
+        warnings.simplefilter('default')
 
     def close(self):
         with open(self.json_path, 'w') as f:
@@ -737,6 +751,7 @@ def main(argv=None):
 
     os.makedirs(args.out_dir, exist_ok=True)
     report = Report(args.out_dir)
+    report.watch_warnings()
     report.line(f'FlashAttention check, {datetime.datetime.now().isoformat(timespec="seconds")}; report: '
                 f'{report.txt_path}')
     try:
@@ -789,6 +804,12 @@ def main(argv=None):
             str(f.get('case') or f.get('check') or f.get('section')) + f' ({f.get("backend", "")})'
             for f in report.failures) if failed else ''))
         report.results['failures'] = report.failures
+        if report.warnings:
+            report.line(f'  {len(report.warnings)} distinct warning(s) were raised; the checks above say whether they '
+                        'matter (a result is a PASS only when output and gradients match the reference):')
+            for text in report.warnings:
+                report.line(f'    {text}')
+            report.results['warnings'] = report.warnings
         report.line(f'  Send back: {report.txt_path}')
         return 1 if failed else 0
     finally:
