@@ -38,6 +38,23 @@ warmup_steps = 100
 # Only used by 'cosine_with_restarts': how many cosine cycles to run over the whole training.
 # 1 is a plain cosine decay; higher values add that many warm restarts. Defaults to 1.
 #lr_scheduler_num_cycles = 4
+# Only for 'cosine' and 'linear': end the schedule at this fraction (0 to <1) of each parameter group's own
+# learning rate instead of at 1e-6 (cosine) or 0 (linear). KohakuMoss's recipes use 0.1.
+#lr_scheduler_min_ratio = 0.1
+
+# Skip an optimizer step whose gradient has a NaN or inf, instead of letting it poison the weights (or the
+# adapter and the optimizer's moments). The weights, optimizer state and LR schedule stay as they were; the
+# skipped steps are counted in train/nonfinite_skipped. The run stops after nonfinite_patience skipped steps
+# in a row (0: never). Any model, any training type; not with gradient_release. See docs/training-options.md.
+#skip_nonfinite_steps = true
+#nonfinite_patience = 8
+
+# Full fine-tune only. Weight decay pulls each weight toward 0 by default; 'start' pulls it toward the weight
+# it had when the run began, so decay stops eroding the pretrained model. Needs weight decay in [optimizer]
+# (adamw, adamw_optimi, stableadamw, adamw8bit or genericoptim). weight_decay_to_one: regex over parameter
+# names that decay toward 1 instead (norm gains); the tensors must be 1D (no decay from the optimizer).
+#weight_decay_target = 'start'
+#weight_decay_to_one = '^layers\.41\.(q_norm|k_norm)\.weight$'
 
 # Block swapping is supported for Wan, HunyuanVideo, Flux, and Chroma. This value controls the number
 # of blocks kept offloaded to RAM. Increasing it lowers VRAM use, but has a performance penalty. The
@@ -241,6 +258,9 @@ dtype = 'bfloat16'
 #fuse_adapters = [
 #    {path = '/data2/imagegen_models/loras/some_lora.safetensors', weight = 1.0}
 #]
+# LoRA+: the lora_B factors learn this many times faster than lora_A (the paper uses 2 to 16). 1 is plain
+# LoRA. LoRA, OPLoRA and DoRA; not LoKr. See docs/training-options.md.
+#lora_plus_ratio = 16
 # DoRA: learn a per-output magnitude beside the LoRA direction. LoRA only. Not with oplora.
 # Costs extra VRAM and step time. Saved as <module>.dora_scale.
 #use_dora = true

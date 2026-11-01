@@ -105,7 +105,7 @@ def train(args):
     with tempfile.TemporaryDirectory() as directory:
         config['output_dir'] = directory
         config['max_steps'] = args.steps
-        config['pipeline_stages'] = args.gpus
+        config['pipeline_stages'] = args.stages or args.gpus
         config['steps_per_print'] = 1
         config['logging_steps'] = 1
         config.setdefault('save_every_n_steps', 10**9)
@@ -149,6 +149,7 @@ def main():
     run = sub.add_parser('train')
     run.add_argument('--config', required=True)
     run.add_argument('--gpus', type=int, default=1)
+    run.add_argument('--stages', type=int, default=0, help='pipeline stages; default: one per GPU')
     run.add_argument('--steps', type=int, default=8)
     run.add_argument('--full', action='store_true')
     args = parser.parse_args()

@@ -1,5 +1,7 @@
 """Tests for utils/lr_schedule.py. CPU only, no DeepSpeed."""
 
+import math
+
 import pytest
 import torch
 from torch import nn
@@ -104,3 +106,52 @@ def test_invalid_num_cycles_raises(bad):
     opt = _make_optimizer()
     with pytest.raises(ValueError, match='lr_scheduler_num_cycles'):
         create_lr_scheduler(opt, 'cosine_with_restarts', total_steps=10, num_cycles=bad)
+
+
+def test_min_ratio_ends_cosine_at_a_fraction_of_each_groups_own_rate():
+    model = nn.Linear(2, 2)
+    opt = torch.optim.SGD([{'params': [model.weight], 'lr': 1.0}, {'params': [model.bias], 'lr': 0.01}])
+    scheduler = create_lr_scheduler(opt, 'cosine', total_steps=20, warmup_steps=5, min_ratio=0.1)
+    seen = []
+    for _ in range(40):
+        seen.append([g['lr'] for g in opt.param_groups])
+        opt.step()
+        scheduler.step()
+    assert seen[0][0] == pytest.approx(1 / 5) and seen[5][0] == pytest.approx(1.0)
+    assert seen[-1][0] == pytest.approx(0.1) and seen[-1][1] == pytest.approx(0.001)
+    # The decay spans the 15 steps after the warmup: the rate after the 20th step of the run is the floor.
+    assert seen[20][0] == pytest.approx(0.1) and seen[19][0] > 0.1
+    cosine = [row[0] for row in seen[5:21]]
+    assert all(b <= a + 1e-9 for a, b in zip(cosine, cosine[1:]))
+    assert seen[5 + 7][0] == pytest.approx(0.1 + 0.9 * 0.5 * (1 + math.cos(math.pi * 7 / 15)))
+
+
+@pytest.mark.parametrize('kind', ['cosine', 'linear'])
+def test_min_ratio_is_reached_on_the_last_step_of_a_run_with_warmup(kind):
+    opt = _make_optimizer(lr=1.0)
+    scheduler = create_lr_scheduler(opt, kind, total_steps=100, warmup_steps=20, min_ratio=0.1)
+    lrs = _collect_lrs(scheduler, opt, 101)
+    assert lrs[-1] == pytest.approx(0.1) and min(lrs[20:]) == pytest.approx(0.1)
+
+
+def test_without_min_ratio_a_warmup_still_shifts_the_schedule_as_before():
+    opt = _make_optimizer(lr=1.0)
+    scheduler = create_lr_scheduler(opt, 'linear', total_steps=100, warmup_steps=20)
+    assert _collect_lrs(scheduler, opt, 101)[-1] == pytest.approx(0.2)
+
+
+def test_min_ratio_linear_and_default_unchanged():
+    opt = _make_optimizer(lr=1.0)
+    scheduler = create_lr_scheduler(opt, 'linear', total_steps=10, min_ratio=0.25)
+    assert _collect_lrs(scheduler, opt, 11)[-1] == pytest.approx(0.25)
+    opt = _make_optimizer(lr=1.0)
+    scheduler = create_lr_scheduler(opt, 'cosine', total_steps=10, min_ratio=None)
+    assert _collect_lrs(scheduler, opt, 11)[-1] == pytest.approx(1e-6, abs=1e-5)
+
+
+@pytest.mark.parametrize('kind, ratio', [('constant', 0.1), ('cosine_with_restarts', 0.1), ('cosine', 1.0),
+                                         ('cosine', -0.1), ('cosine', True), ('cosine', '0.1')])
+def test_min_ratio_refusals(kind, ratio):
+    with pytest.raises(ValueError, match='lr_scheduler_min_ratio'):
+        create_lr_scheduler(_make_optimizer(), kind, total_steps=10, min_ratio=ratio)
+

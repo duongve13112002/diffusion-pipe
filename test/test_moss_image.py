@@ -1979,6 +1979,12 @@ def test_learning_rates_below_the_cosine_floor_are_warned_about(tmp_path, caplog
     with caplog.at_level(logging.WARNING):
         pipe.get_param_groups(trainable(pipe))
     assert 'below' not in caplog.text
+    # A floor relative to each group's own rate replaces the absolute one, so nothing rises towards it.
+    pipe.config['lr_scheduler'] = 'cosine'
+    pipe.config['lr_scheduler_min_ratio'] = 0.1
+    with caplog.at_level(logging.WARNING):
+        pipe.get_param_groups(trainable(pipe))
+    assert 'below' not in caplog.text
 
 
 @pytest.mark.parametrize('key', ['mlp_lr', 'self_attn_lr', 'refiner_lr', 'text_encoder_lr', 'atn_lr', 'block_lr_scales'])

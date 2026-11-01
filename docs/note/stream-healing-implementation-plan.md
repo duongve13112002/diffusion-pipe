@@ -145,7 +145,7 @@ new `model.set_training_step(step)` call before `train_batch`, next to the exist
 
 `MossImagePipeline.get_extra_log_scalars` (called on every rank every step, `train.py` line 1181)
 all-reduces sums and a count recorded by the last stage's loss function, the Iris pattern:
-`train/loss_flow`, `train/stream_penalty`, and per term the unweighted value, the two write shares,
+`train/flow_loss`, `train/stream_penalty`, and per term the unweighted value, the two write shares,
 the write target and the stream RMS. `train/loss` stays the total the optimizer minimised.
 
 ### Refused combinations

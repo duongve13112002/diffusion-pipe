@@ -34,8 +34,12 @@ from utils.pipeline import ManualPipelineModule
 from utils.dora import apply_dora_config_defaults, check_model_dtypes as check_dora_model_dtypes
 from utils.oplora import OPLoRAProjector, apply_oplora_config_defaults
 from utils.outlier_decay import OutlierDecay, apply_outlier_decay_config_defaults
-from utils.lr_schedule import create_lr_scheduler
+from utils.step_guard import NonFiniteGuard, apply_step_guard_config_defaults
+from utils.weight_decay_target import (WeightDecayTarget, apply_weight_decay_target_config_defaults,
+                                       restore_optimizer_decay, weight_decay_target_active)
+from utils.lr_schedule import create_lr_scheduler, validate_min_ratio
 from utils.checkpoint_layout import check_checkpoint_files, check_checkpoint_layers, shift_checkpoint_layers
+from utils.lora_plus import NAME as LORA_PLUS, apply_lora_plus_config_defaults, lora_plus_active, split_lora_plus_groups
 from utils.param_groups import check_resumed_param_groups, group_names, split_2d_param_groups
 from utils.ema import ParameterEMA, apply_ema_config_defaults, load_ema_checkpoint, load_ema_weights
 from utils.optimizer_factory import resolve_optimizer_class
@@ -136,6 +140,7 @@ def set_config_defaults(config):
 
         apply_dora_config_defaults(adapter_config)
         check_dora_model_dtypes(adapter_config, model_config)
+        apply_lora_plus_config_defaults(config)
         # per-adapter defaults
         if adapter_config['type'] == 'lora':
             adapter_config.setdefault('dropout', 0.0)
@@ -158,6 +163,15 @@ def set_config_defaults(config):
     # Outlier decay of the base weights of a full fine-tune (utils/outlier_decay.py); refused
     # next to an [adapter].
     apply_outlier_decay_config_defaults(config)
+
+    # Skipping optimizer steps whose gradient is NaN or inf (utils/step_guard.py); off by default.
+    apply_step_guard_config_defaults(config)
+
+    # Weight decay toward the launch weights, or toward 1 for named tensors (utils/weight_decay_target.py).
+    apply_weight_decay_target_config_defaults(config)
+
+    # Fail before any model is loaded, not when the scheduler is built.
+    validate_min_ratio(config.get('lr_scheduler_min_ratio'), config.get('lr_scheduler', 'constant'))
 
     config.setdefault('logging_steps', 1)
     # The size of each step's change to the weights (utils/step_stats.py): on by default for an
@@ -820,6 +834,14 @@ if __name__ == '__main__':
     # parallelism has always relied on "Torch-style" backward(), so I think this is an oversight by Deepspeed devs and it's safe
     # to force this to True to get it to work.
     model_engine._support_torch_style_backward = True
+    # Read by the engine step in utils/patches.py.
+    nonfinite_guard = None
+    if config['skip_nonfinite_steps']:
+        nonfinite_guard = NonFiniteGuard(config['nonfinite_patience'])
+        model_engine.nonfinite_guard = nonfinite_guard
+        if is_main_process():
+            print(f'Non-finite step guard on: a step with a NaN or inf gradient is skipped; the run stops after '
+                  f'{config["nonfinite_patience"] or "no limit of"} in a row')
     startup_timing.mark('pipeline layers and DeepSpeed engine')
     global_batch_size = model_engine.train_micro_batch_size_per_gpu() * model_engine.gradient_accumulation_steps() * model_engine.grid.get_data_parallel_world_size()
     print(f'Global batch size = {global_batch_size}')
@@ -838,6 +860,13 @@ if __name__ == '__main__':
     if eval_every_n_examples := config.pop('eval_every_n_examples', None):
         config['eval_every_n_steps'] = eval_every_n_examples // global_batch_size
         print(f"Computed eval_every_n_steps = {config['eval_every_n_steps']}")
+
+    def lora_plus_groups(param_groups, optimizer_kwargs):
+        # LoRA+ ([adapter] lora_plus_ratio): the lora_B tensors get their own groups at ratio x the lr.
+        adapter_config = config.get('adapter')
+        if not lora_plus_active(adapter_config):
+            return param_groups
+        return split_lora_plus_groups(param_groups, adapter_config[LORA_PLUS], optimizer_kwargs['lr'])
 
     def get_optimizer(model_parameters):
         optim_config = config['optimizer']
@@ -922,9 +951,10 @@ if __name__ == '__main__':
         elif optim_type_lower == 'genericoptim':
             kwargs['compile'] = config['compile']
             kwargs['mpu'] = pipeline_model.mpu()
-            param_groups = split_2d_param_groups(model.get_param_groups(model_parameters), kwargs)
+            param_groups = split_2d_param_groups(
+                lora_plus_groups(model.get_param_groups(model_parameters), kwargs), kwargs)
         else:
-            param_groups = model.get_param_groups(model_parameters)
+            param_groups = lora_plus_groups(model.get_param_groups(model_parameters), kwargs)
 
         if not param_groups:
             # get_param_groups legitimately returns [] when every learning rate that applies to
@@ -1027,6 +1057,7 @@ if __name__ == '__main__':
         total_steps=config['epochs'] * steps_per_epoch,
         warmup_steps=config['warmup_steps'],
         num_cycles=config.get('lr_scheduler_num_cycles', 1),
+        min_ratio=config.get('lr_scheduler_min_ratio'),
     )
     model_engine.lr_scheduler = lr_scheduler
 
@@ -1040,6 +1071,15 @@ if __name__ == '__main__':
         )
         if model_engine.grid.get_data_parallel_rank() == 0:
             print(f'stage {model_engine.grid.get_pipe_parallel_rank()}: {outlier_decay.describe()}')
+        outlier_decay.require_match()
+
+    # Also before a resume: the launch weights are the anchors the decay pulls toward.
+    weight_decay_target = None
+    if weight_decay_target_active(config):
+        weight_decay_target = WeightDecayTarget.build(pipeline_model.named_parameters(), optimizer, config)
+        if model_engine.grid.get_data_parallel_rank() == 0:
+            print(f'stage {model_engine.grid.get_pipe_parallel_rank()}: {weight_decay_target.describe()}')
+        weight_decay_target.require_match()
 
     step = 1
     examples = global_batch_size
@@ -1093,6 +1133,13 @@ if __name__ == '__main__':
         model_engine.lr_scheduler = torch.optim.lr_scheduler.ConstantLR(optimizer, factor=1.0)
         for pg in optimizer.param_groups:
             pg['lr'] = config['force_constant_lr']
+
+    if weight_decay_target is not None:
+        # Restoring the optimizer state brought back the decay the checkpoint was saved with.
+        weight_decay_target.claim_groups()
+    elif resume_from_checkpoint and restore_optimizer_decay(optimizer):
+        if is_main_process():
+            print('The checkpoint was saved with weight_decay_target on; the weight decay of those groups is back on.')
 
     eval_dataloaders = {
         name: dataset_util.PipelineDataLoader(eval_data, model_engine, config['eval_gradient_accumulation_steps'], model,
@@ -1172,24 +1219,39 @@ if __name__ == '__main__':
         if outlier_decay is not None:
             # DeepSpeed advances the scheduler inside train_batch, so the lr is read before it.
             outlier_decay.before_step()
+        if weight_decay_target is not None:
+            weight_decay_target.before_step()
         loss = model_engine.train_batch(iterator).item()
         if not attention_reported:
             attention_util.report()
             attention_reported = True
         if nan_check is not None:
             nan_check.after_step(step, loss)
-        loss_average.add(loss)
-        if oplora_projector is not None:
+        # A step the guard dropped changed nothing, so what follows a step (the projections and
+        # decays that act on its result, the EMA, the loss average) is left out for it.
+        step_skipped = nonfinite_guard is not None and nonfinite_guard.step_skipped
+        if step_skipped:
+            if is_main_process():
+                print(f'step {step}: skipped, the gradient is not finite (loss {loss:.4g}); '
+                      f'{nonfinite_guard.consecutive} in a row, {nonfinite_guard.skipped} in all')
+            if outlier_decay is not None:
+                outlier_decay.reset_metrics()
+            nonfinite_guard.check_patience()
+        else:
+            loss_average.add(loss)
+        if oplora_projector is not None and not step_skipped:
             oplora_projector.project()
-        if outlier_decay is not None:
+        if outlier_decay is not None and not step_skipped:
             outlier_decay.apply(step)
+        if weight_decay_target is not None and not step_skipped:
+            weight_decay_target.apply(step)
         # After the projection and the decay, which are part of what the step changes.
         stats = step_stats.after_step() if logged_step else {}
         if stats and optimizer.param_groups:
             stats['train/lr'] = optimizer.param_groups[0]['lr']
         if logged_step:
             stats = {'train/loss_avg': loss_average.average(), **stats}
-        if ema is not None:
+        if ema is not None and not step_skipped:
             ema.update(step)
         train_dataloader.sync_epoch()
 
@@ -1204,6 +1266,8 @@ if __name__ == '__main__':
         # Models may expose extra per-step scalars. Reached through getattr so a model that
         # defines nothing logs nothing and is untouched by this.
         extra_scalars = getattr(model, 'get_extra_log_scalars', lambda: {})()
+        if nonfinite_guard is not None:
+            extra_scalars = {**extra_scalars, **nonfinite_guard.log_scalars()}
         if outlier_decay is not None and logged_step:
             # A collective: every rank reaches it on the same steps.
             extra_scalars = {**extra_scalars, **outlier_decay.log_scalars()}

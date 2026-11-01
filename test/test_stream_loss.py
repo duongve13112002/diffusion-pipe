@@ -27,7 +27,7 @@ def spec_of(**terms):
     return parse_stream_loss({'stream_loss': {name: dict(fields) for name, fields in (terms or ALL).items()}})
 
 
-# ---- configuration -------------------------------------------------------------------------------
+# configuration
 
 def test_defaults_and_active_terms():
     assert parse_stream_loss({}) is None
@@ -84,7 +84,7 @@ def test_compile_is_refused():
     assert set(mi.MossImagePipeline(config).stream_spec) == {'rms'}
 
 
-# ---- the terms -----------------------------------------------------------------------------------
+# the terms
 
 def test_top_shares_and_dilute():
     energy = torch.tensor([[4.0, 1.0, 3.0, 2.0], [1.0, 1.0, 1.0, 1.0]], requires_grad=True)
@@ -109,7 +109,7 @@ def test_write_target_schedule():
     assert write_target({'start': 0, 'anneal': 0, 'target': 0.2}, 1) == pytest.approx(0.2)
 
 
-# ---- the numbers the layers carry, against ComfyUI's own forward ---------------------------------
+# the numbers the layers carry, against ComfyUI's own forward
 
 class Recorder:
     """The block outputs and the sublayer writes of ComfyUI's forward, summed over its calls."""
@@ -237,7 +237,7 @@ def test_write_hinge_is_zero_at_or_below_the_target_share():
     assert float(parts['write_target']) == 1.0 and float(total) == 0.0
 
 
-# ---- the loss function ---------------------------------------------------------------------------
+# the loss function
 
 def label_for(prediction):
     torch.manual_seed(5)
@@ -316,7 +316,7 @@ def test_without_stream_loss_nothing_changes():
     assert pipe.get_loss_fn() is not None
 
 
-# ---- gradients -----------------------------------------------------------------------------------
+# gradients
 
 def penalty_loss(pipe, inputs):
     output = pipe.pipeline_model(inputs)
@@ -403,8 +403,11 @@ def test_stages_pass_the_vector_across_the_cut(cut):
     for i, t in enumerate(received):
         if torch.is_floating_point(t):
             assert t.grad is not None, f'stage-2 input {i} got no gradient'
-    torch.autograd.backward([t for t in first if t.requires_grad],
-                            [r.grad for r, t in zip(received, first) if t.requires_grad])
+    # DeepSpeed backpropagates every floating output of a stage, so each one must have a graph.
+    floating = [i for i, t in enumerate(first) if torch.is_floating_point(t)]
+    for i in floating:
+        assert first[i].requires_grad, f'stage-1 output {i} has no graph: DeepSpeed would fail on it'
+    torch.autograd.backward([first[i] for i in floating], [received[i].grad for i in floating])
     got = grads_of(pipe)
     for name in expected:
         torch.testing.assert_close(got[name], expected[name], rtol=1e-4, atol=1e-5 * float(expected[name].abs().max()))
@@ -418,7 +421,7 @@ def test_skipped_layers_leave_the_vector_alone_in_training_too():
     assert float(v[:, 1].abs().sum()) == 0 and float(v[:, 0].abs().sum()) > 0
 
 
-# ---- metrics -------------------------------------------------------------------------------------
+# metrics
 
 def test_stream_metrics_average_the_micro_batches():
     metrics = StreamMetrics(['a', 'b'])

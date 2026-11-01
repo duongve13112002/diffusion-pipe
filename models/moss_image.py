@@ -25,6 +25,7 @@ ComfyUI or diffusers layout), or a mix: a component path overrides the same comp
 diffusers_path.
 """
 
+import copy
 import hashlib
 import json
 import logging
@@ -33,6 +34,7 @@ import os
 import re
 import sys
 from collections import OrderedDict
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 
 sys.path.insert(0, os.path.join(os.path.abspath(os.path.dirname(__file__)), '../submodules/ComfyUI'))
@@ -46,6 +48,7 @@ from tqdm import tqdm
 
 from models.base import ComfyPipeline, ModelWrapper, PreprocessMediaFile, make_contiguous
 from utils.common import is_main_process
+from utils.distillation import distill_loss, distill_warnings, parse_distill_config
 from utils.offloading import ModelOffloader
 from utils.stream_loss import StreamLayout, StreamMetrics, channel_energy, check_width, parse_stream_loss
 import comfy.latent_formats
@@ -992,6 +995,8 @@ class MossImagePipeline(ComfyPipeline):
     # JSON layout captions in MOSS-Image's prompt schema get their boxes rewritten per bucket:
     # see utils/layout_captions.py.
     layout_caption_format = 'moss_image'
+    # utils.distillation.DistillConfig when [teacher] has a loss_weight, else None.
+    distill = None
 
     def __init__(self, config):
         # ComfyPipeline.__init__ is not called: it expects `vae` and `text_encoders` entries, and
@@ -1010,6 +1015,10 @@ class MossImagePipeline(ComfyPipeline):
                              'blocks with forward hooks and carries its numbers through the pipeline layers. '
                              'Set compile = false, or remove stream_loss.')
         self.stream_metrics = None
+        self.distill = parse_distill_config(config)
+        if self.distill is not None and is_main_process():
+            for message in distill_warnings(self.distill, config):
+                print(f'WARNING: {message}')
         self.training_step = 1
         self.cache_text_embeddings = self.model_config['cache_text_embeddings']
         self.tokenizer = None
@@ -1213,7 +1222,12 @@ class MossImagePipeline(ComfyPipeline):
         if self.stream_spec is not None:
             check_width(self.stream_spec, self.diffusion_model.layers[0].norm1.weight.shape[0])
             self.layer_state.stream = StreamLayout(self.stream_spec, len(self.diffusion_model.layers))
-            self.stream_metrics = StreamMetrics(self.layer_state.stream.metric_names())
+        if self.stream_spec is not None or self.distill is not None:
+            # Every rank builds it: the reduction in get_extra_log_scalars is a collective.
+            names = self.layer_state.stream.metric_names() if self.stream_spec is not None else ['flow_loss']
+            if self.distill is not None:
+                names += ['distill_loss', 'distill_lambda']
+            self.stream_metrics = StreamMetrics(names)
         if not self.cache_text_embeddings and self.on_first_stage():
             # Read now, before DeepSpeed starts, by the ranks whose first layer encodes: in the
             # first step the other stages would wait on the read, and a failed read would leave
@@ -1337,24 +1351,56 @@ class MossImagePipeline(ComfyPipeline):
         noisy = (1 - s) * latents + s * noise
         target = noise - latents
         # ComfyUI's MOSS-Image takes sigma itself; its timestep embedding scales it by 1000.
+        if self.distill is not None:
+            # The loss weights the teacher term by the noise level. Like the target it comes from the
+            # first stage's draw, so it sits among the tensors the dataloader broadcasts (the mask is last).
+            return (noisy, sigma, text, text_mask), (target, sigma, mask)
         return (noisy, sigma, text, text_mask), (target, mask)
 
     def get_loss_fn(self):
         flow_loss = super().get_loss_fn()
 
         def loss_fn(output, label):
-            stream = None
-            if isinstance(output, (tuple, list)):
-                output, stream = output
-            loss = flow_loss(output, label)
+            # (target, mask), or (target, sigma, mask) when [teacher] is on.
+            target, *rest, mask = label
+            sigma = rest[0] if rest else None
             layout = self.layer_state.stream if self.layer_state is not None else None
-            if stream is None or layout is None:
+            stream = teacher = None
+            if isinstance(output, (tuple, list)):
+                # What FinalLayer carried to the loss in training: the stream vector when stream_loss
+                # is on, then the teacher velocity when [teacher] is.
+                output, *carried = output
+                if layout is not None and carried:
+                    stream = carried.pop(0)
+                if carried:
+                    teacher = carried.pop(0)
+            if sigma is not None and teacher is None and self.distill is not None and torch.is_grad_enabled():
+                raise RuntimeError('[teacher] is on and this is a training batch, but no teacher velocity reached the '
+                                   'loss; distillation would silently be off. This is a bug in the layer tuple.')
+            loss = flow_loss(output, (target, mask))
+            if stream is None and teacher is None:
                 return loss
-            penalty, terms, parts = layout.penalty(stream, self.training_step)
-            self.stream_metrics.record({
-                'flow_loss': loss, 'stream_penalty': penalty,
-                **{f'penalty_{name}': value for name, value in terms.items()}, **parts})
-            return loss + penalty
+            values = {'flow_loss': loss}
+            total = loss
+            if stream is not None and layout is not None:
+                penalty, terms, parts = layout.penalty(stream, self.training_step)
+                values.update({'stream_penalty': penalty, **{f'penalty_{name}': value for name, value in terms.items()},
+                               **parts})
+                total = total + penalty
+            if teacher is not None:
+                if self.distill is None or sigma is None:
+                    raise RuntimeError('The teacher velocity reached the loss, but [teacher] is off or the label has '
+                                       'no noise level')
+                term, mean_lambda = distill_loss(output, teacher, sigma, mask, self.training_step, self.distill,
+                                                 self.config)
+                # A zero-weight link to the teacher tensor: the stage that receives it from an earlier one
+                # sends a gradient back for every floating input, and the loss otherwise only reads a
+                # detached copy.
+                total = total + term + teacher.reshape(-1)[:1].sum().to(term.dtype) * 0
+                values.update({'distill_loss': term, 'distill_lambda': mean_lambda})
+            if self.stream_metrics is not None:
+                self.stream_metrics.record(values)
+            return total
         return loss_fn
 
     def get_extra_log_scalars(self):
@@ -1387,9 +1433,11 @@ class MossImagePipeline(ComfyPipeline):
             raise ValueError(f'The learning rate settings freeze every parameter of this pipeline stage{where}: '
                              'block_lr_scale or a <part>_lr of 0 covers all it holds. Use fewer pipeline_stages, '
                              'or let some of its blocks train.')
-        # The cosine schedules end at an absolute eta_min (utils/lr_schedule.py).
+        # The cosine schedules end at an absolute eta_min (utils/lr_schedule.py), unless lr_scheduler_min_ratio
+        # sets a floor relative to each group's own rate.
         low = sorted({g['lr'] for g in groups if g['lr'] < COSINE_ETA_MIN})
-        if low and str(self.config.get('lr_scheduler', '')).startswith('cosine') and report:
+        absolute_floor = self.config.get('lr_scheduler_min_ratio') is None
+        if low and absolute_floor and str(self.config.get('lr_scheduler', '')).startswith('cosine') and report:
             logging.warning(f'Learning rates{where} {", ".join(f"{lr:g}" for lr in low)} are below the cosine '
                             f'schedule\'s floor of {COSINE_ETA_MIN:g}: those groups rise towards it rather than decay.')
         for p in parameters:
@@ -1403,11 +1451,36 @@ class MossImagePipeline(ComfyPipeline):
         # The text encoder layer is there either way (see TextEncoderLayer), a pass-through when
         # embeddings are cached.
         text_encoder = None if self.cache_text_embeddings else self.text_encoders[0]
-        layers = [TextEncoderLayer(text_encoder, self.dtype, self.text_dim), InitialLayer(model, state)]
+        layers = [TextEncoderLayer(text_encoder, self.dtype, self.text_dim, state, self.build_teacher()),
+                  InitialLayer(model, state)]
         for i, block in enumerate(model.layers):
             layers.append(TransformerLayer(block, i, self.offloader, state, len(model.layers)))
         layers.append(FinalLayer(model, state))
         return layers
+
+    def build_teacher(self):
+        """The frozen starting model for [teacher] (TeacherForward), on the ranks that run the first
+        pipeline stage; None when [teacher] is off or on the other stages.
+
+        An adapter: the model's own blocks with the adapter switched off, nothing to copy (parse_distill_config
+        keeps this to one pipeline stage, which holds them all). A full fine-tune: a copy of the model as
+        loaded, frozen, on the GPU of every rank of stage 0; the rest of the stages never run it.
+        """
+        if self.distill is None or not self.on_first_stage():
+            return None
+        model = self.diffusion_model
+        # Its own state: no stream vector and never sampling, so the layers it builds are the plain forward.
+        state = LayerState(model.rope, self.dtype)
+        if 'adapter' in self.config:
+            return TeacherForward(model, state, lambda: adapter_switched_off(self.lora_model))
+        copy_of_model = copy.deepcopy(model).requires_grad_(False).eval()
+        copy_of_model.to(comfy.model_management.get_torch_device())
+        state.rope_fn = copy_of_model.rope
+        if is_main_process():
+            size = sum(p.numel() * p.element_size() for p in copy_of_model.parameters()) / 2**30
+            print(f'MOSS-Image: [teacher] keeps a frozen copy of the starting model ({size:.1f} GiB) on the GPU '
+                  'of every rank of the first pipeline stage')
+        return TeacherForward(copy_of_model, state)
 
     def enable_block_swap(self, blocks_to_swap):
         model = self.diffusion_model
@@ -1593,11 +1666,20 @@ class TextEncoderLayer(nn.Module):
     The encoder is ComfyUI's, frozen, held in a list so it is not this layer's submodule: it
     stays out of DeepSpeed's checkpoints and parameter counts, and ComfyUI moves it to the GPU.
     Not checkpointable: recomputing a 9B forward to save its output would be a bad trade.
+
+    It also runs the teacher of [teacher] (TeacherForward): the frozen starting model's velocity for the
+    batch, which rides the pipeline after the embeddings to the loss. Here, and not in InitialLayer,
+    because this layer is never activation-checkpointed: the teacher forward runs once per
+    micro-batch instead of again in backward. Training batches only; eval and sampling leave it out.
     """
 
-    def __init__(self, text_encoder, dtype, text_dim=TEXT_DIM):
+    def __init__(self, text_encoder, dtype, text_dim=TEXT_DIM, state=None, teacher=None):
         super().__init__()
         self.text_encoder = [] if text_encoder is None else [text_encoder]
+        # Held in a list, like the encoder: its weights are not this layer's parameters, so they stay out
+        # of DeepSpeed's checkpoints, parameter counts and the optimizer.
+        self.teacher = [] if teacher is None else [teacher]
+        self.state = state
         self.dtype = dtype
         self.text_dim = text_dim
         self.eval_cache = {}
@@ -1644,6 +1726,8 @@ class TextEncoderLayer(nn.Module):
                 text[i, :e.shape[0]] = e
                 mask[i, :e.shape[0]] = True
         outputs = make_contiguous(x, sigma, text, mask)
+        if self.teacher and self.training and torch.is_grad_enabled() and not self.state.sampling:
+            outputs = make_contiguous(*outputs, self.teacher[0].velocity(x, sigma, text, mask))
         # Marked here, in a layer that is never checkpointed, as Iris does: a stage that ends with
         # this layer sends them to the next one and runs backward on them, and reentrant
         # checkpointing decides from its inputs whether the next layer's parameters get gradients.
@@ -1653,6 +1737,55 @@ class TextEncoderLayer(nn.Module):
                 if torch.is_floating_point(tensor) and not tensor.requires_grad:
                     tensor.requires_grad_(True)
         return outputs
+
+
+@contextmanager
+def adapter_switched_off(lora_model):
+    """PEFT's disable_adapter() with the trainable flags put back afterwards.
+
+    Switching adapters off clears requires_grad on the adapter weights and switching them on sets it
+    on every one of them again, which would also thaw a weight train.py froze (a zero learning rate)
+    and leave it without a slot in the optimizer. The flags are restored on the way out.
+    """
+    flags = [(p, p.requires_grad) for p in lora_model.parameters()]
+    try:
+        with lora_model.disable_adapter():
+            yield
+    finally:
+        for p, flag in flags:
+            if p.requires_grad != flag:
+                p.requires_grad_(flag)
+
+
+class TeacherForward:
+    """The velocity of the model the run started from, for [teacher]: the same layers as the student
+    (InitialLayer, the blocks, FinalLayer), run under no_grad on the student's noisy latent, noise
+    level and text, with a state of their own (no stream vector, never sampling).
+
+    `adapter_off` is a context manager factory that switches the student's adapter off (PEFT's
+    disable_adapter) when the student shares the blocks; it is None for a full fine-tune, whose
+    teacher is a separate frozen copy. Not an nn.Module: nothing in it is the student's.
+    """
+
+    def __init__(self, model, state, adapter_off=None):
+        self.adapter_off = adapter_off
+        self.state = state
+        offloader = ModelOffloader('dummy', [], 0, 0, True, torch.device('cuda' if torch.cuda.is_available() else 'cpu'),
+                                   False, debug=False)
+        count = len(model.layers)
+        self.layers = [InitialLayer(model, state)]
+        self.layers += [TransformerLayer(block, i, offloader, state, count) for i, block in enumerate(model.layers)]
+        self.layers.append(FinalLayer(model, state))
+
+    @torch.no_grad()
+    def velocity(self, x, sigma, text, mask):
+        """The prediction for the batch, in float32. The inputs are detached first: InitialLayer marks
+        its floating inputs as requiring grad, which must not reach the student's tensors."""
+        inputs = tuple(t.detach() for t in (x, sigma, text, mask))
+        with (self.adapter_off() if self.adapter_off is not None else nullcontext()):
+            for layer in self.layers:
+                inputs = layer(inputs)
+        return inputs.detach().float()
 
 
 def _length_groups(lengths):
@@ -1703,7 +1836,7 @@ class InitialLayer(nn.Module):
         for item in inputs:
             if torch.is_floating_point(item):
                 item.requires_grad_(True)
-        x, sigma, text, text_mask = inputs
+        x, sigma, text, text_mask, *teacher = inputs
         batch, channels, height, width = x.shape
         if channels != self.latent_channels:
             raise ValueError(f'Expected {self.latent_channels} latent channels, got {channels}')
@@ -1734,9 +1867,14 @@ class InitialLayer(nn.Module):
             pieces.append((indices, torch.cat((video[indices], refined), 1)))
         hidden = _assemble(pieces, batch, hw + max(lengths_list))
         sizes = torch.tensor([height, width], device=device)
-        # The stream penalties' numbers ride the layers to the loss (utils/stream_loss.py).
-        stream = [] if self.state.stream is None else [self.state.stream.new(hidden)]
-        return make_contiguous(hidden, mod, head, lengths, sizes, *stream)
+        # The stream penalties' numbers ride the layers to the loss (utils/stream_loss.py). Tied to
+        # hidden: with a stage cut right after this layer the vector is an output of its stage, and
+        # DeepSpeed backpropagates every floating output, so it needs a graph.
+        stream = [] if self.state.stream is None else [_tie(self.state.stream.new(hidden), hidden)]
+        # The teacher velocity (training batches with [teacher] only) goes on to the loss, tied to
+        # the stream like the stream vector: a floating tensor this stage outputs needs a graph.
+        teacher = [_tie(t, hidden) for t in teacher]
+        return make_contiguous(hidden, mod, head, lengths, sizes, *stream, *teacher)
 
 
 class TransformerLayer(nn.Module):
@@ -1768,7 +1906,8 @@ class TransformerLayer(nn.Module):
     def forward(self, inputs):
         hidden, mod, head, lengths, sizes, *extra = inputs
         layout = self.state.stream
-        if layout is not None and len(extra) != 1:
+        # What follows the stream vector (when there is one) is the teacher velocity, passed on untouched.
+        if layout is not None and not extra:
             raise RuntimeError('stream_loss is on but the stream vector did not reach this layer')
         self.offloader.wait_for_block(self.block_idx)
         if self.block_idx not in self.state.skip_layers:
@@ -1799,8 +1938,11 @@ class TransformerLayer(nn.Module):
                 hidden = _assemble(pieces, batch, total)
             if penalized:
                 values = layout.block_values(self.block_idx, hidden, lengths + hw, writes)
-                extra = [layout.add(extra[0], self.block_idx, values)]
+                extra = [layout.add(extra[0], self.block_idx, values), *extra[1:]]
         self.offloader.submit_move_blocks_forward(self.block_idx)
+        kept = 0 if layout is None else 1
+        # Tied to this layer's output so the tensor has a graph through it, as the stream vector has.
+        extra = [*extra[:kept], *[_tie(t, hidden) for t in extra[kept:]]]
         return make_contiguous(hidden, mod, head, lengths, sizes, *extra)
 
 
@@ -1820,7 +1962,7 @@ class FinalLayer(nn.Module):
         out = x.transpose(1, 2).reshape(x.shape[0], -1, height, width)
         out = _tie(out, mod)
         if extra and self.training and not self.state.sampling:
-            # The training loss function adds the penalty formed from the vector; eval and
-            # sampling return the plain prediction.
-            return out, extra[0]
+            # The training loss function adds the penalty formed from the stream vector and the term
+            # formed from the teacher velocity; eval and sampling return the plain prediction.
+            return (out, *extra)
         return out

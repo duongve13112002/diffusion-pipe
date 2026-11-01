@@ -914,6 +914,8 @@ rather than loaded with layers' weights in their neighbours.
   `force_constant_lr` with any of these, and ranges past the last block. Each pipeline stage
   prints its groups and rates. The warmup, constant and linear schedules keep the ratios between
   the rates; the cosine ones end at an absolute 1e-6, so a rate below that is warned about.
+  `lr_scheduler_min_ratio` (cosine and linear) ends every group at a fraction of its own rate
+  instead, and then keeps the ratios too.
   A resumed run keeps the rates its optimizer saved. `--reset_optimizer_params` takes new values
   for the same groups, but also restarts the LR schedule (warmup included). Settings that change
   the groups are refused on resume unless `--reset_optimizer` starts the optimizer state afresh.
@@ -964,7 +966,10 @@ rather than loaded with layers' weights in their neighbours.
   flow loss. They need `compile = false` and `k` no larger than the model width. The step logs
   `train/flow_loss`, `train/stream_penalty` (`train/loss` is their sum), each term's value, the
   write shares (`train/write_share_attn`, `train/write_share_ffn`) with their target, and
-  `train/stream_rms`.
+  `train/stream_rms`. With a penalty on, `train/loss` (and the epoch loss) includes it while the
+  evaluation loss is the flow loss alone, so compare `train/flow_loss` with the evaluation loss.
+  The penalty adds a per-block write tap that keeps a block-sized tensor per sublayer when
+  `activation_checkpointing` is off; leave checkpointing on for a full fine-tune.
 
   `outlier_decay` shrinks each targeted weight after the optimizer step by
   `lr * rate * sign(w) * relu(|w| - cap * r0)`, with `r0` the tensor's RMS in the weights the run
@@ -973,6 +978,30 @@ rather than loaded with layers' weights in their neighbours.
   in fp32; an element the decay does not touch stays bit-identical), seeded by `seed` and the step
   so that data-parallel replicas stay identical. It logs `train/outlier_over` (elements above the
   cap) and `train/outlier_max` (the largest `|w| / (cap * r0)`).
+  It needs an optimizer that steps at its group's learning rate (`adamw`, `adamw8bit`, `adamw_optimi`,
+  `stableadamw`, `sgd`, `adamw8bitkahan`, or `genericoptim` without `automagic`), refuses a step with
+  `lr * rate` above 1, and stops at startup if `targets` / `exclude` match no trained parameter on any stage.
+- Settings from KohakuMossTrainer's recipes. `examples/moss_image/moss_image_lora_kohakumoss.toml` and
+  `moss_image_full_kohakumoss.toml` write its base LoRA (rank 32, AdamW 1e-4, cosine to 10%) and full
+  fine-tune (Muon + Adam 5e-5, cosine to 10%, EMA 0.9999, the last block's q/k norm decaying toward 1)
+  recipes as diffusion-pipe configs, each line saying which number is KohakuMoss's and what differs
+  (the batch, the weight-decay exemptions, Muon's details, and for the full fine-tune the engine). The generic options they use are in
+  [training-options.md](training-options.md): the non-finite step guard, weight decay toward the starting
+  weights, the cosine floor and LoRA+. MOSS-Image also has:
+
+  ```toml
+  [teacher]                          # distillation toward the model the run started from
+  loss_weight = 0.5                  # 0 or absent: off. loss = data loss + lambda * loss(v, v_starting_model)
+  shape = 'constant'                 # or 'sigmoid' (t_mid, width): weight the noisy end more
+  decay = 'none'                     # or 'linear' / 'cosine' with decay_steps
+  ```
+
+  An adapter's teacher is the same blocks with the adapter switched off (needs `pipeline_stages = 1`; one
+  extra forward per micro-batch). A full fine-tune keeps a frozen copy of the starting model on the GPU of
+  every rank of the first pipeline stage (about 10 GB in bf16) and runs it once per micro-batch there. It
+  runs in the text-encoder layer so activation checkpointing does not repeat it, for training batches only;
+  refused with `compile`, `blocks_to_swap` and unknown keys. The step log gets `train/distill_loss` and
+  `train/distill_lambda`. No image-quality benefit has been measured.
 - `merge_adapters` also takes ai-toolkit's MOSS-Image LoRAs, which adapt the fused `proj.qkv`
   (ComfyUI, diffusers `transformer.` and kohya `lora_unet_` names): each of q, k and v gets the
   LoRA's A and its third of B, which is exact. Fused LoKr/LoHa/DoRA cannot be split and are

@@ -227,7 +227,7 @@ def counts_in_norm(p, mpu):
     return mpu.get_model_parallel_rank() == 0
 
 
-def clip_grad_norm_(parameters, max_norm, norm_type=2, mpu=None):
+def clip_grad_norm_(parameters, max_norm, norm_type=2, mpu=None, total_norm=None):
     """Clips gradient norm of an iterable of parameters.
 
     This has been adapted from Nvidia megatron. We add norm averaging
@@ -244,6 +244,8 @@ def clip_grad_norm_(parameters, max_norm, norm_type=2, mpu=None):
         max_norm (float or int): max norm of the gradients
         norm_type (float or int): type of the used p-norm. Can be ``'inf'`` for
             infinity norm.
+        total_norm: the norm of these gradients when the caller already has it (grad_norm below,
+            same parameters), so it is not computed a second time.
 
     Returns:
         Total norm of the parameters (viewed as a single vector).
@@ -251,7 +253,8 @@ def clip_grad_norm_(parameters, max_norm, norm_type=2, mpu=None):
     if isinstance(parameters, torch.Tensor):
         parameters = [parameters]
     parameters = list(filter(lambda p: p.grad is not None, parameters))
-    total_norm = grad_norm(parameters, norm_type, mpu)
+    if total_norm is None:
+        total_norm = grad_norm(parameters, norm_type, mpu)
     max_norm = torch.tensor([float(max_norm)], device=total_norm.device)
     clip_coef = max_norm / (total_norm + 1e-6)
     tmp_tensor = torch.tensor([1.0], device=clip_coef.device)
@@ -303,8 +306,11 @@ def grad_norm(parameters, norm_type=2, mpu=None):
 
 
 def _clip_fp32_gradients(self):
-    # Kept for the training log (utils/step_stats.py).
-    self.last_grad_norm = clip_grad_norm_(parameters=self.module.parameters(), max_norm=self.gradient_clipping(), mpu=self.mpu)
+    # Kept for the training log (utils/step_stats.py). The non-finite step guard has already computed
+    # the norm of this step (see _take_model_step_measured): it is not computed again.
+    known = self.__dict__.pop('_known_grad_norm', None)
+    self.last_grad_norm = clip_grad_norm_(parameters=self.module.parameters(), max_norm=self.gradient_clipping(),
+                                          mpu=self.mpu, total_norm=known)
 
 
 _take_model_step = deepspeed.runtime.engine.DeepSpeedEngine._take_model_step
@@ -313,9 +319,21 @@ _take_model_step = deepspeed.runtime.engine.DeepSpeedEngine._take_model_step
 def _take_model_step_measured(self, *args, **kwargs):
     # Without clipping nothing measures the gradient norm; utils/step_stats.py asks for it on the
     # steps it logs. Every rank asks on the same steps: the norm is summed over ranks.
-    if self.gradient_clipping() <= 0.0 and getattr(self, 'measure_grad_norm', False):
-        self.last_grad_norm = grad_norm([p for p in self.module.parameters() if p.grad is not None], mpu=self.mpu)
-    return _take_model_step(self, *args, **kwargs)
+    # With the non-finite step guard (utils/step_guard.py, set on the engine by train.py) the norm
+    # is needed on every step; it is kept for the clipping that follows, which would repeat it.
+    guard = getattr(self, 'nonfinite_guard', None)
+    measure = self.gradient_clipping() <= 0.0 and getattr(self, 'measure_grad_norm', False)
+    norm = None
+    if guard is not None or measure:
+        norm = grad_norm([p for p in self.module.parameters() if p.grad is not None], mpu=self.mpu)
+        self.last_grad_norm = norm
+    if guard is None:
+        return _take_model_step(self, *args, **kwargs)
+    self._known_grad_norm = norm
+    try:
+        return guard.run_step(self.optimizer, norm, lambda: _take_model_step(self, *args, **kwargs))
+    finally:
+        self.__dict__.pop('_known_grad_norm', None)
 
 
 def copy_args_to_cpu_if_needed(self, *args, **kwargs):

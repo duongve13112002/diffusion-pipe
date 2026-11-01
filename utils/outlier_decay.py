@@ -52,6 +52,11 @@ DEFAULTS = {
     'seed': 0,
 }
 SUPPORTED_DTYPES = (torch.float32, torch.bfloat16)
+# Optimizers that step the weights in place at the learning rate of their parameter group, which is
+# what the decay's lr * rate assumes. Left out: Prodigy and the pytorch_optimizer family (they step
+# with d * lr or other internal scales), Automagic (a learning rate per parameter), GenericOptim
+# with automagic on, and the torchao offload optimizer (not checked to leave an in-place edit alone).
+STEP_LR_OPTIMIZERS = ('adamw', 'adamw8bit', 'adamw_optimi', 'stableadamw', 'sgd', 'adamw8bitkahan', 'genericoptim')
 
 
 def _number(table, name, low, strict=False):
@@ -102,6 +107,13 @@ def apply_outlier_decay_config_defaults(config):
     if 'adapter' in config and table['rate'] > 0:
         raise ValueError(f'{KEY} decays the base weights, which an adapter run does not train: '
                          'remove the [adapter] table for a full fine-tune, or remove [outlier_decay]')
+    optimizer = config.get('optimizer')
+    if table['rate'] > 0 and isinstance(optimizer, dict) and optimizer.get('type'):
+        kind = str(optimizer['type']).lower()
+        if kind not in STEP_LR_OPTIMIZERS or (kind == 'genericoptim' and optimizer.get('automagic', False)):
+            raise ValueError(f"{KEY} needs an optimizer that steps at its group's learning rate; "
+                             f"{optimizer['type']!r} {'with automagic ' if kind == 'genericoptim' else ''}is not one. "
+                             f'Supported: {", ".join(STEP_LR_OPTIMIZERS)} (genericoptim without automagic)')
     config[KEY] = table
 
 
@@ -189,6 +201,26 @@ class OutlierDecay:
     def __len__(self):
         return len(self.params)
 
+    def require_match(self):
+        """Raise unless some process holds a parameter the decay acts on. A regex that matches
+        nothing would otherwise leave a run that logs outlier_over = 0 for ever. Every rank must
+        call it: it is a collective when torch.distributed is up."""
+        total = len(self)
+        too_strong = int(self.peak_pull() > 1.0)
+        if dist.is_available() and dist.is_initialized():
+            device = torch.device('cuda', torch.cuda.current_device()) if torch.cuda.is_available() else 'cpu'
+            count = torch.tensor([total, too_strong], dtype=torch.int64, device=device)
+            dist.all_reduce(count)
+            total, too_strong = int(count[0]), int(count[1])
+        if too_strong:
+            raise ValueError(f'{KEY}: lr * rate is above 1 for some tensor at the highest learning rate of the '
+                             'schedule; the update would pass the cap. Lower rate or the learning rate (checked at '
+                             'startup on every rank so that no stage is left waiting).')
+        if total == 0:
+            raise ValueError(f"{KEY}: no trained parameter of any pipeline stage matches targets "
+                             f"{self.spec['targets']!r} / exclude {self.spec['exclude']!r} "
+                             f"(include_1d = {self.spec['include_1d']})")
+
     def describe(self):
         spec = self.spec
         if not self.params:
@@ -197,6 +229,17 @@ class OutlierDecay:
         return (f'{KEY}: {len(self.params)} tensors ({elements / 1e6:.1f}M elements), rate {spec["rate"]:g}, '
                 f'cap {spec["cap_start"] or spec["cap"]:g} -> {spec["cap"]:g} over {spec["cap_anneal"]} steps, '
                 f'warmup {spec["warmup"]} steps')
+
+    def peak_pull(self):
+        """The largest lr * rate over the parameters, at the highest learning rate the schedule reaches."""
+        peak = {id(p): max(float(group.get('initial_lr', group['lr'])), float(group['lr']))
+                for group in self.optimizer.param_groups for p in group['params']}
+        return max((peak.get(id(p), 0.0) for p in self.params), default=0.0) * float(self.spec['rate'])
+
+    def reset_metrics(self):
+        """Forget the last step's numbers: after a step that was dropped there are none, and the logged
+        ones would repeat the step before."""
+        self._over, self._largest = None, 1.0
 
     def before_step(self):
         """Record each parameter's learning rate for the step about to run: DeepSpeed advances the
@@ -221,6 +264,10 @@ class OutlierDecay:
         active = [i for i, lr in enumerate(self._lrs) if lr * rate > 0]
         if not active:
             return
+        strongest = max(self._lrs[i] for i in active) * rate
+        if strongest > 1.0:
+            raise ValueError(f'{KEY}: lr * rate is {strongest:g} at step {step}; above 1 the update passes '
+                             'the cap and flips the sign of the weights it acts on. Lower rate.')
         extremes = torch.stack([torch.stack(torch.aminmax(self.params[i].detach())) for i in active])
         largest = extremes.float().abs().amax(1).tolist()
         counts = []

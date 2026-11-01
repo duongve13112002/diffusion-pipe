@@ -14,6 +14,14 @@ Models supported: SDXL, Flux, LTX-Video, HunyuanVideo (t2v), Cosmos, Lumina Imag
 - Optional OPLoRA (orthogonal projection LoRA) to reduce catastrophic forgetting when training LoRAs
 
 ## Recent changes
+- 2026-11-02
+  - Five opt-in training settings ported from KohakuMossTrainer, all off by default (a config that does not mention them trains as before). See [docs/training-options.md](docs/training-options.md).
+    - `skip_nonfinite_steps = true` (every model, every training type): an optimizer step whose gradient has a NaN or inf is dropped, leaving the weights, optimizer state and LR schedule as they were, and counted in `train/nonfinite_skipped`; `nonfinite_patience` (default 8) stops the run after that many in a row.
+    - `weight_decay_target = 'start'` and `weight_decay_to_one = '<regex>'` (full fine-tune, every model): weight decay pulls each weight toward the weights the run started from instead of toward 0, and the named tensors toward 1.
+    - `lora_plus_ratio` in `[adapter]` (LoRA, OPLoRA, DoRA): LoRA+, the `lora_B` factors learn that many times faster than `lora_A`.
+    - `lr_scheduler_min_ratio` (`cosine` and `linear`): the schedule ends at that fraction of each group's learning rate instead of at 1e-6 (cosine) or 0 (linear).
+    - `[teacher] loss_weight` (MOSS-Image, LoRA and full fine-tune): distillation toward the starting model.
+  - `examples/moss_image/moss_image_lora_kohakumoss.toml` and `moss_image_full_kohakumoss.toml`: the LoRA and full fine-tune settings of KohakuMossTrainer's base recipes written as diffusion-pipe configs (batch, engine and Muon details differ; each file says where). `genericoptim` (Muon) is accepted by `weight_decay_target`.
 - 2026-11-01
   - Fixed: with `[model] attention = 'sdpa'` and activation checkpointing, models built on ComfyUI (MOSS-Image, Flux 2, Z-Image, Qwen-Image 2.1, ...) could stop in the first backward with `CheckpointError: Recomputed values for the following tensors have different metadata than during the forward pass` on Hopper / Blackwell with PyTorch 2.9+, when the caches were complete. PyTorch's SDPA kernel order is now settled at startup and printed; `[model] sdpa_prefer_cudnn` (default `false`) chooses which order. `tools/check_sdpa_priority.py` checks it on a GPU. See [PyTorch SDPA kernel order](#pytorch-sdpa-kernel-order).
   - `--resume_from_checkpoint` is checked before the model loads and the datasets are scanned: a wrong run directory, a missing `latest` or checkpoint, a save that did not finish (empty files) and another `pipeline_stages` than the checkpoint's (unless `--reset_optimizer`) stop the run at once. The layer layout check runs as soon as the layers are built, before DeepSpeed and the optimizer.

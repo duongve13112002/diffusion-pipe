@@ -83,10 +83,11 @@ class LossAverage:
         self.epoch_steps += 1
 
     def average(self):
-        return sum(self.recent) / len(self.recent)
+        # Empty when every step so far was skipped by the non-finite step guard.
+        return sum(self.recent) / len(self.recent) if self.recent else float('nan')
 
     def end_epoch(self):
-        average = self.epoch_sum / self.epoch_steps
+        average = self.epoch_sum / self.epoch_steps if self.epoch_steps else float('nan')
         self.epoch_sum = 0.0
         self.epoch_steps = 0
         return average

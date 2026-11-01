@@ -221,14 +221,18 @@ def test_bf16_update_moves_by_the_expected_amount_though_smaller_than_one_step()
 
 def test_same_seed_and_step_give_identical_weights_on_every_replica():
     outcomes = []
-    for _ in range(2):
+    for run in range(2):
         torch.manual_seed(0)
         module = Stub().to(torch.bfloat16)
         optimizer = optimizer_for(module, lr=1e-3)
         decay = OutlierDecay.build(module.named_parameters(), optimizer, make_spec(cap=1.0, seed=5))
         with torch.no_grad():
             module.a.weight[:, :4] *= 40
+        # A replica's global generator is in a state of its own (data, noise, dropout draw from it):
+        # the decay must not depend on it.
+        torch.manual_seed(100 + run)
         for step in range(1, 6):
+            torch.rand(7 + run)
             decay.before_step()
             decay.apply(step)
         outcomes.append(module.a.weight.detach().clone())
@@ -244,3 +248,61 @@ def test_r0_is_taken_at_build_time():
         for p in module.parameters():
             p.mul_(3.0)
     assert decay.r0 == r0
+
+
+@pytest.mark.parametrize('optimizer, ok', [
+    ({'type': 'adamw'}, True), ({'type': 'AdamW_Optimi'}, True), ({'type': 'genericoptim'}, True),
+    ({'type': 'genericoptim', 'automagic': True}, False), ({'type': 'prodigy'}, False),
+    ({'type': 'automagic'}, False), ({'type': 'offload'}, False), ({'type': 'Lion'}, False),
+])
+def test_only_optimizers_that_step_at_the_group_lr_are_accepted(optimizer, ok):
+    config = {'outlier_decay': {'rate': 6.0}, 'optimizer': optimizer}
+    if ok:
+        apply_outlier_decay_config_defaults(config)
+    else:
+        with pytest.raises(ValueError, match='steps at its group'):
+            apply_outlier_decay_config_defaults(config)
+    # Rate 0 is off: no optimizer is refused.
+    apply_outlier_decay_config_defaults({'outlier_decay': {'rate': 0}, 'optimizer': optimizer})
+
+
+def test_lr_times_rate_above_one_is_refused():
+    module = Stub()
+    decay = OutlierDecay.build(module.named_parameters(), optimizer_for(module, lr=0.5), make_spec(rate=6.0))
+    with torch.no_grad():
+        module.a.weight[0, 0] = 1000.0 * decay.r0[0]
+    decay.before_step()
+    with pytest.raises(ValueError, match='flips the sign'):
+        decay.apply(1)
+
+
+def test_a_rate_that_would_pass_the_cap_is_caught_at_startup_on_every_rank():
+    module = Stub()
+    decay = OutlierDecay.build(module.named_parameters(), optimizer_for(module, lr=0.5), make_spec(rate=6.0))
+    assert decay.peak_pull() == pytest.approx(3.0)
+    with pytest.raises(ValueError, match='above 1 for some tensor'):
+        decay.require_match()
+    OutlierDecay.build(module.named_parameters(), optimizer_for(module, lr=1e-3), make_spec(rate=6.0)).require_match()
+
+
+def test_reset_metrics_forgets_the_last_steps_numbers():
+    module = Stub()
+    decay = OutlierDecay.build(module.named_parameters(), optimizer_for(module, lr=1e-3), make_spec(rate=6.0))
+    with torch.no_grad():
+        module.a.weight[0, 0] = 1000.0 * decay.r0[0]
+    decay.before_step()
+    decay.apply(1)
+    assert decay.log_scalars()['train/outlier_max'] > 1.0
+    decay.reset_metrics()
+    assert decay.log_scalars() == {'train/outlier_over': 0.0, 'train/outlier_max': 1.0}
+
+
+def test_require_match_raises_when_nothing_is_targeted():
+    module = Stub()
+    optimizer = optimizer_for(module)
+    OutlierDecay.build(module.named_parameters(), optimizer, make_spec()).require_match()
+    nothing = OutlierDecay.build(module.named_parameters(), optimizer, make_spec(targets='no_such_name'))
+    assert len(nothing) == 0
+    with pytest.raises(ValueError, match='no trained parameter of any pipeline stage'):
+        nothing.require_match()
+

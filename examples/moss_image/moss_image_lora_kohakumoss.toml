@@ -1,0 +1,160 @@
+# MOSS-Image LoRA with the settings of KohakuMossTrainer's LoRA recipe (configs/moss/_base/base_lora.py),
+# written for diffusion-pipe. See docs/supported_models.md#moss-image and
+# docs/note/kohakumoss-port-plan-and-recommended-configs.md for where each number comes from.
+#   deepspeed --num_gpus=1 train.py --deepspeed --config examples/moss_image/moss_image_lora_kohakumoss.toml
+#
+# What is KohakuMoss's here: rank 32 with alpha = rank, AdamW at 1e-4 with weight decay 0.01 and betas (0.9, 0.95),
+# cosine to 10% of the lr after 100 warmup steps, gradient clipping 1.0, the report's noise distribution (the defaults
+# below), caption dropout 0.1 (the dataset file), about 1 megapixel images, 4000 optimizer steps.
+# What is not: the batch. KohakuMoss's base_lora.py steps on up to 12288 tokens (MAX_TOKENS, GRAD_ACC 1) and
+# its 5090 recipes on 64 images; this file keeps the small batch of the other example (2 x 2 x 1 = 4 images
+# per step) because that suits one GPU. Raise gradient_accumulation_steps to step on more images; how the
+# learning rate should change with the batch is not documented, so judge it from your samples.
+output_dir = '/data/diffusion_pipe_training_runs/moss_image_lora_kohakumoss'
+dataset = 'examples/moss_image/moss_image_dataset.toml'
+
+# The scheduler runs for epochs * steps per epoch (max_steps only stops early and leaves the cosine
+# unfinished), so choose epochs for about 4000 optimizer steps: images * epochs / images per step.
+epochs = 50
+micro_batch_size_per_gpu = 2
+pipeline_stages = 1
+gradient_accumulation_steps = 2
+gradient_clipping = 1.0
+warmup_steps = 100
+lr_scheduler = 'cosine'
+# End the cosine at 10% of each group's own lr (after the warmup, on the last step) instead of the default
+# floor of 1e-6.
+lr_scheduler_min_ratio = 0.1
+
+# Drop an optimizer step whose gradient has a NaN or inf instead of letting it poison the adapter and
+# the optimizer's moments; the run stops after nonfinite_patience skipped steps in a row.
+skip_nonfinite_steps = true
+#nonfinite_patience = 8
+
+eval_every_n_epochs = 1
+eval_before_first_step = true
+eval_micro_batch_size_per_gpu = 1
+eval_gradient_accumulation_steps = 1
+
+save_every_n_epochs = 2
+checkpoint_every_n_minutes = 120
+activation_checkpointing = true
+partition_method = 'parameters'
+save_dtype = 'bfloat16'
+caching_batch_size = 4
+steps_per_print = 1
+# On a smaller GPU, swap blocks to the CPU (LoRA/LoKr only; MOSS-Image has 42). The on-the-fly
+# text encoder stays on the GPU (~18 GB); cache_text_embeddings = true frees it before training.
+#blocks_to_swap = 16
+
+[model]
+type = 'moss_image'
+# A MOSS-Image diffusers directory (OpenMOSS-Team/MOSS-Image-Base or MOSS-Image-SFT): its
+# transformer/, text_encoder/ (+ tokenizer/) and vae/ are all loaded from it.
+diffusers_path = '/data/models/MOSS-Image-Base'
+# Any component can come from elsewhere instead: a diffusers component directory, or a single
+# .safetensors file in ComfyUI or diffusers layout (fp8 scaled / comfy-quant files included).
+#transformer_path = '/data/comfyui/models/diffusion_models/moss_image_base_fp8_scaled.safetensors'
+#text_encoder_path = '/data/comfyui/models/text_encoders/qwen35_9b.safetensors'
+#vae_path = '/data/comfyui/models/vae/flux2-vae.safetensors'
+dtype = 'bfloat16'
+# Precision the VAE encodes the training images in: 'float16' (default), 'bfloat16' (cannot
+# overflow, a little less exact) or 'float32' (the reference pipeline's). An image that overflows
+# float16 is encoded again in bfloat16, then float32, with a warning. Changing it re-encodes the
+# latent cache; caches from before this option were encoded in float32 and are kept with 'float32'.
+# See docs/supported_models.md#moss-image.
+#vae_dtype = 'float16'
+# Captions are encoded on the fly by default: only latents are cached and the Qwen3.5-9B text
+# encoder stays on the GPU. true caches the embeddings once (~8 KB per token) instead.
+#cache_text_embeddings = false
+# With cache_text_embeddings = true: the dtype the embeddings are cached in. 'float8' (e4m3, a scale
+# per token) halves the ~8 KB per token of bfloat16, each value off by ~2%; 'bfloat16', 'float16' or
+# 'float32' work too. Read back in the encoder's own dtype. Changing it rebuilds that cache only.
+#text_embedding_dtype = 'float8'
+# Layout (JSON) captions with boxes normalized to 0..1000 (the technical report's form): 'as_written'
+# keeps them in 0..1000 per bucket; 'abs_centralized' converts them to centred pixel boxes, the form
+# the USERGUIDE recommends. Centred captions are left as they are either way.
+#layout_bbox_space = 'as_written'
+# The LoRA's learning rate per part and per block (default: [optimizer] lr). A LoRA on the blocks
+# has attn and ffn parameters only; norm_lr, text_refiner_lr, modulation_lr and embed_head_lr
+# are refused for it. See docs/supported_models.md#moss-image.
+#attn_lr = 1e-4
+#ffn_lr = 5e-5
+#block_lr_scale = [{blocks = '0-9', scale = 0.5}]
+# Keep the 42 blocks in fp8 to save memory (LoRA/LoKr only); everything else stays in dtype.
+#diffusion_model_dtype = 'float8'
+# Adapters merged into the weights before training (for example a LoRA trained on Base).
+#merge_adapters = ['/data/loras/moss_style.safetensors']
+
+# Noise levels: the technical report's final pretraining distribution (logit-normal over
+# sigma, mean -1.09, std 0.95, capped at 0.95, plus 1% uniform). All of these are optional.
+timestep_sample_method = 'logit_normal'
+#logit_mean = -1.09
+#logit_std = 0.95
+#sigma_cutoff = 0.95
+#uniform_fraction = 0.01
+#shift = 1.0
+# Percent of training steps below sigma 0.5, where faces and fine detail are refined; sets
+# logit_mean to give it (so leave logit_mean out). The reference puts about 11% there. Fizgig
+# found likeness LoRAs converge much sooner with more: 30 is about where Krea 2 sits.
+#clean_end_share = 30
+# Or by epoch: 60% up to epoch 7, down to 30% by epoch 15, then every 2nd epoch at 60% again
+# (Fizgig's default for small likeness datasets).
+#clean_end_share = [[7, 60], [15, 30]]
+#clean_end_share_refresh_every = 2
+# Captions longer than the text encoder's 4096 tokens are cut: 'warn' (default), 'silent' or 'error'.
+#on_caption_overflow = 'warn'
+
+# --test_sample settings; the defaults are the reference pipeline's.
+#sample_steps = 50
+#sample_cfg = 3.0
+#sample_shift = 5.0
+#sample_negative_prompt = ''
+#sample_uncond_skip_layers = [22]
+#sample_slg_layers = []
+#sample_slg_scale = 0.0
+
+# Residual-stream penalty (off by default; see docs/supported_models.md#moss-image). Untuned: the value
+# is KohakuMossTrainer's for a full fine-tune, a LoRA at a higher lr may want another.
+#[model.stream_loss.write]
+#weight = 5e-3
+#target = 0.5
+#anneal = 2000
+
+# Distillation toward the model the run started from (off by default; not in KohakuMoss's recipe):
+# loss = data loss + lambda * loss(prediction, the base model's prediction), where the base model is this
+# LoRA's blocks with the adapter switched off. One extra forward per micro-batch. LoRA needs
+# pipeline_stages = 1. decay = 'none' holds the model near its start for the whole run.
+#[teacher]
+#loss_weight = 0.5
+#decay = 'linear'
+#decay_steps = 3000
+
+[adapter]
+type = 'lora'
+rank = 32
+dtype = 'bfloat16'
+# LoRA+: the up-projection (lora_B) learns this many times faster than lora_A (the paper uses 2 to 16).
+# 1 is plain LoRA. Not in KohakuMoss's recipe, so off here.
+#lora_plus_ratio = 16
+# OPLoRA (orthogonal-projection LoRA):
+#oplora = true
+#oplora_rank = 16
+
+# LoKr instead of LoRA:
+#[adapter]
+#type = 'lokr'
+#rank = 16
+#decompose_factor = 8
+#dtype = 'bfloat16'
+
+# KohakuMoss: AdamW, lr 1e-4, weight decay 0.01, betas (0.9, 0.95) (scripts/train/moss.py).
+[optimizer]
+type = 'adamw_optimi'
+lr = 1e-4
+betas = [0.9, 0.95]
+weight_decay = 0.01
+eps = 1e-8
+
+[monitoring]
+enable_wandb = false

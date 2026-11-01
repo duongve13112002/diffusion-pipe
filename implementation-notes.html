@@ -33,6 +33,125 @@
 <p class="meta">A running log of decisions taken outside the spec, forced changes, tradeoffs, and
 anything else the maintainer needs to know. Newest entry first.</p>
 
+<h2>2026-11-02 &mdash; Step guard, weight decay toward the start, LoRA+, cosine floor and distillation</h2>
+
+<p><strong>Request.</strong> Port the KohakuMossTrainer features chosen in
+<code>docs/note/kohakumoss-port-plan-and-recommended-configs.md</code>: a non-finite step guard for every model and
+every training type, weight decay toward the launch weights (with decay-to-one for chosen tensors), LoRA+, a floor for
+the cosine schedule, and distillation toward a frozen teacher for MOSS-Image (LoRA and full fine-tune); two example
+configs with KohakuMoss's best LoRA and full fine-tune settings; single GPU, several GPUs and several nodes. User
+documentation is <code>docs/training-options.md</code>. Everything is off unless the config turns it on.</p>
+
+<h3>What was added</h3>
+<ul>
+  <li><code>utils/step_guard.py</code>, <code>skip_nonfinite_steps</code> / <code>nonfinite_patience</code>. The gradient norm
+    is computed once in the engine step patch (<code>utils/patches.py</code>), reused by gradient clipping, and a
+    non-finite one makes DeepSpeed's own overflow protocol skip the step (the optimizer's <code>step</code> is a no-op for
+    that call and <code>optimizer.overflow</code> is set, both put back after): weights, moments and the LR schedule are
+    untouched and the engine counts a skipped step. The norm is summed over the pipeline and averaged over the
+    data-parallel ranks, so every rank takes the same branch with no extra collective.</li>
+  <li><code>utils/weight_decay_target.py</code>, <code>weight_decay_target = 'start'</code> and
+    <code>weight_decay_to_one = '&lt;regex&gt;'</code>: after the optimizer step, <code>p -= lr * wd * (p - a)</code>, with
+    <code>a</code> a copy of the launch weights (or 1). The optimizer's own decay is switched off for those tensors.
+    Stochastic rounding for bf16, seeded by the step so replicas and nodes agree. Optimizers: adamw, adamw_optimi,
+    stableadamw, adamw8bit, genericoptim.</li>
+  <li><code>utils/lora_plus.py</code>, <code>[adapter] lora_plus_ratio</code>: the <code>lora_B</code> tensors get their own
+    parameter groups at <code>ratio</code> times the group's learning rate, before the weight-decay split.</li>
+  <li><code>lr_scheduler_min_ratio</code> (<code>utils/lr_schedule.py</code>): cosine and linear end at a fraction of each
+    group's own rate.</li>
+  <li><code>utils/distillation.py</code> and <code>models/moss_image.py</code>, <code>[teacher] loss_weight</code>:
+    <code>loss = L(v, target) + lambda * L(v, v_teacher)</code>. The anima refiner's <code>shape_at</code>,
+    <code>decay_at</code> and <code>lambda_at</code> are reused.</li>
+  <li>Examples <code>moss_image_lora_kohakumoss.toml</code> and <code>moss_image_full_kohakumoss.toml</code>; tests
+    <code>test_step_guard.py</code> (including a real DeepSpeed engine on CPU), <code>test_weight_decay_target.py</code>,
+    <code>test_lora_plus.py</code>, <code>test_distillation.py</code>, additions to <code>test_lr_schedule.py</code> and
+    <code>test_outlier_decay.py</code>; GPU scripts <code>tools/test_nonfinite_guard_gpu.py</code> (with
+    <code>tools/nonfinite_poison_launcher.py</code>) and <code>tools/test_distillation_gpu.py</code>.</li>
+</ul>
+
+<h3>Decisions made that were not in the request</h3>
+<ul>
+  <li><strong>The teacher runs in <code>TextEncoderLayer</code>, not <code>InitialLayer</code> as the plan said.</strong> The
+    plan believed <code>InitialLayer</code> is not activation-checkpointed; it is
+    (<code>checkpointable_layers</code>), so a teacher forward there would have run again in backward.
+    <code>TextEncoderLayer</code> is never checkpointed. The teacher velocity travels in the layer tuple after the stream
+    vector, tied to each layer's output so that every floating tensor a stage outputs has a graph and every one it
+    receives gets a gradient (DeepSpeed asserts both). Training batches only.</li>
+  <li><strong>The label is <code>(target, sigma, mask)</code> with <code>[teacher]</code> on</strong>, so the dataloader's
+    existing broadcast of everything before the mask from the first stage to the last carries sigma too.</li>
+  <li><strong>The teacher is always the model as the run loaded it.</strong> No <code>transformer_path</code> or
+    <code>dtype</code> key: an adapter's teacher is its own blocks with the adapter off (PEFT's
+    <code>disable_adapter()</code>, wrapped so <code>requires_grad</code> is restored: PEFT's re-enable would otherwise thaw
+    a weight frozen by a zero learning rate); a full fine-tune's is a frozen deep copy on the GPU of every rank of
+    stage 0. A resumed run distills toward the model file's weights, not toward the checkpoint.</li>
+  <li><strong>LoRA+ is applied to the optimizer groups in <code>train.py</code></strong>, not where the adapter is built,
+    because the learning rate lives in the groups. Refused with LoKr, <code>gradient_release</code> and
+    <code>force_constant_lr</code>.</li>
+  <li><strong>The guard is not available with <code>gradient_release</code></strong> (the gradients are freed during
+    backward). The default is off, as asked.</li>
+  <li><strong>genericoptim is accepted by the weight-decay target</strong> after checking against the real optimizer that
+    its decay is exactly <code>lr * wd * p</code> with the group's rate, Muon groups included; a test keeps it so.</li>
+  <li>While wiring the guard, <code>outlier_decay</code> got three holes closed: an optimizer allowlist (a decay applied at
+    the wrong rate is worse than none), a refusal when <code>lr * rate</code> exceeds 1, and a startup check that the
+    <code>targets</code> regex matches something on some stage. <code>LossAverage</code> returns NaN, not an error, when a
+    whole epoch was skipped. The stream vector of <code>InitialLayer</code> had no graph when a pipeline cut came right
+    after it; it is now tied to the hidden state.</li>
+</ul>
+
+<h3>What independent review found</h3>
+<p>Three agents that had not seen the work checked it: one the research notes, docs and example configs against
+KohakuMossTrainer's source, one the step guard and weight decay target (including a real two-stage, four-rank
+DeepSpeed run on CPU), one the distillation and LoRA+ (including real pipeline engines with one and two stages).
+Fixed:</p>
+<ul>
+  <li><strong>Guard removed a wrapped <code>optimizer.step</code>.</strong> After a skipped step the guard deleted
+    the instance-level <code>step</code> instead of restoring it. Torch LR schedulers and the Prodigy pipeline sync
+    both put one there, so with Prodigy on several stages the sync was lost and the next step hung. It is restored now
+    (test: <code>test_an_instance_level_step_survives_a_skipped_step</code>).</li>
+  <li><strong>StableAdamW is not plain decoupled decay.</strong> optimi divides its decay by the update's RMS, so
+    <code>weight_decay_target</code> refuses <code>stableadamw</code>, and <code>decouple_lr = true</code> for the
+    others. <code>blocks_to_swap</code> is refused (the launch-weight copy would sit on another device than the
+    swapped weight). A <code>weight_decay_to_one</code> regex that matches nothing is now caught also with target
+    <code>'start'</code>, with one startup <code>all_reduce</code> over the stages.</li>
+  <li><strong><code>lr_scheduler_min_ratio</code> did not reach the floor with a warmup.</strong> The post-warmup
+    schedule was sized by the whole run, so it ended <code>warmup_steps</code> late. With the key set it now spans the
+    steps after the warmup and ends exactly at the floor. Without the key the schedules are unchanged on purpose
+    (existing runs train as before), though they share the same lag.</li>
+  <li><strong>Spurious warning.</strong> The MOSS-Image warning that low rates "rise towards the cosine floor" fired
+    when <code>lr_scheduler_min_ratio</code> replaced that floor.</li>
+  <li><strong>LoRA+ with Prodigy or automagic</strong> did nothing without saying so, and a missing
+    <code>[optimizer] lr</code> gave a bare <code>KeyError</code>; both are clear errors now.</li>
+  <li><strong>Distillation silently off.</strong> If a training batch carried the noise levels but no teacher velocity,
+    the loss fell back to the plain flow loss. It now raises.</li>
+  <li><strong>Docs.</strong> KohakuMoss's Adam betas are (0.9, 0.95), not the other examples' (0.9, 0.99); the 64-image
+    batch belongs to the 5090 LoRA recipes only; the "best recipe" wording became "base recipe" (the runnable full
+    recipes use AdamW without EMA); Muon differs in detail (Nesterov, split fused projection, which tensors use
+    it); KohakuMoss also exempts the 2D video_embedder, text_embedder.proj and time_embedding weights from decay;
+    stale rows of the plan were corrected; the single-GPU, multi-GPU and multi-node claims now say what was and was
+    not run.</li>
+</ul>
+<p>Also fixed after the first round: the <code>lr * wd</code> (and outlier decay <code>lr * rate</code>) above 1 check
+is now made at startup, on every rank in the same collective as <code>require_match</code>, from each group's
+<code>initial_lr</code>, so one stage cannot raise alone and leave the others waiting (the per-step check stays as a
+backstop); the outlier numbers are cleared on a skipped step instead of repeating the step before; a checkpoint saved
+with the weight decay target keeps the optimizer decay it replaced (<code>weight_decay_before_target</code> in the
+group) and a resume with the feature off puts it back. The GenericOptim <code>_grad_norm</code> fallback that the
+review flagged is only read with <code>gradient_release</code>, which the guard refuses, so it cannot be stale.</p>
+<p>Left as it is: with the plain <code>cosine</code> the LoRA+ ratio fades to 1 at the very end, because its floor is
+an absolute <code>1e-6</code> (<code>lr_scheduler_min_ratio</code> avoids it), and without
+<code>lr_scheduler_min_ratio</code> a warmup still shifts the schedule, as it always has, so that existing runs do not
+change.</p>
+
+<h3>Not verified</h3>
+<div class="flag">
+  <p>Everything above ran on CPU with tiny random models and a one-process DeepSpeed engine. No GPU was available: the
+  real 5B model, DeepSpeed pipeline stages with the extra tuple element, bf16 on CUDA, multi-node, and the memory and
+  step time of a full fine-tune teacher on a two-stage pipeline (an estimate: the copy is about the size of the model,
+  and stage 0 runs one more forward per micro-batch) are untested. <code>tools/test_nonfinite_guard_gpu.py</code> and
+  <code>tools/test_distillation_gpu.py</code> are the scripts for that. None of the features is tuned and no image-quality
+  benefit has been measured; KohakuMoss does not enable any of them in its default recipes.</p>
+</div>
+
 <h2>2026-11-01 &mdash; Residual-stream penalties and outlier decay for MOSS-Image</h2>
 
 <p><strong>Request.</strong> KohakuMossTrainer's <code>stream-healing.md</code> describes massive
