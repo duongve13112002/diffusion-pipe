@@ -33,6 +33,79 @@
 <p class="meta">A running log of decisions taken outside the spec, forced changes, tradeoffs, and
 anything else the maintainer needs to know. Newest entry first.</p>
 
+<h2>2026-11-01 &mdash; SDPA kernel order under checkpointing, early resume checks, warm launch cost</h2>
+
+<p><strong>Request.</strong> Find and fix why MOSS-Image with <code>attention = 'sdpa'</code> stopped
+in the first backward with a <code>CheckpointError</code> while <code>'flash4'</code> trained; check
+<code>--resume_from_checkpoint</code> before the metadata is built (the failure seen was a wrong
+run directory); make launches with complete caches faster (about 10M images in about 100
+directories, <code>reuse_metadata_cache = false</code>, <code>--trust_cache</code>).</p>
+
+<h3>Decisions made that were not in the request</h3>
+<ul>
+<li><code>[model] sdpa_prefer_cudnn</code>, default <code>false</code>: after settling, PyTorch's
+pre-change order (flash first) is written back, because it is what every call after the first already
+ran with, so training numerics do not move; <code>true</code> keeps PyTorch's cuDNN-first order. A
+key rather than a fixed choice, because which kernel is faster or safer depends on the GPU and
+cuDNN, and cuDNN's backward gave NaN on Iris (H200).</li>
+<li>The fix is in <code>train.py</code> for every model, not in MOSS-Image: every ComfyUI-based
+model, and the SDPA fallbacks of <code>flash3</code> / <code>flash4</code>, can hit it. The Iris
+approach (<code>enable_cudnn_sdp(False)</code>) was rejected: ComfyUI's
+<code>sdpa_kernel</code> enables cuDNN again inside its context.</li>
+<li>The training tools other than <code>train.py</code> (<code>tools/distill_refiner.py</code>,
+the Iris Turbo tools) do not settle the order. Iris does not run through ComfyUI's context, and the
+Iris tools disable cuDNN SDPA by default.</li>
+<li>Resume: the run directory and checkpoint are resolved, and their files checked, right after the
+distributed setup. A new run's directory name (its start time) is therefore taken before the model
+loads rather than after caching; the directory is still created where it was.</li>
+<li>Startup timing lines were added (<code>utils/startup_timing.py</code>) so the next slow
+launch shows its phases; they cost one <code>all_gather_object</code> before the first step.</li>
+</ul>
+
+<h3>Tradeoffs weighed</h3>
+<ul>
+<li>The settled order uses <code>torch._C._get_sdp_priority_order</code> /
+<code>_set_sdp_priority_order</code>, private functions that <code>torch.nn.attention.sdpa_kernel</code>
+itself uses. The function does nothing where they are missing. The environment variable
+alternative was rejected: its name changed between PyTorch 2.9 and 2.10.</li>
+<li>The cache fingerprints could not be made cheaper by hashing differently: a new value re-encodes
+every existing cache. They are read faster (same values, checked against the old code in
+<code>test/test_digest_memo.py</code>) and remembered next to the metadata files, keyed by file
+size and modification time. A file rewritten in place with the same size within the same
+nanosecond would be served an old digest; regrouping writes new files.</li>
+<li>The memo is written into the metadata's dataset directories (<code>diffusion_pipe_digests.json</code>).
+<code>datasets.load_from_disk</code> ignores extra files there; a read-only volume just computes.</li>
+</ul>
+
+<h3>What an independent review found (fixed)</h3>
+<ul>
+<li>The memo key had no dataset fingerprint: two contiguous <code>select(range(a, b))</code> slices
+of one file with the same length, or a column replaced in memory with <code>add_column</code>,
+shared a key and would have been served another view's digest. No caller did either yet. The
+fingerprint is now part of the key; tests cover both.</li>
+<li><code>_column_values</code> returned plain lists for a dataset with a numpy / torch format set,
+where the old read returned arrays: another hash. It now leaves formatted datasets to the
+<code>datasets</code> library.</li>
+<li>The early resume check refused another <code>pipeline_stages</code> even with
+<code>--reset_optimizer</code>, which DeepSpeed loads (layer files have global indices, the EMA
+allows another split). It now only refuses when the optimizer state is loaded.</li>
+<li><code>tools/check_sdpa_priority.py</code>: a worker that exited without a result, or hung, left
+the scheduler waiting forever, and a late result could free another task's GPU. Each worker now
+has its own pipe, and <code>--timeout</code> (default 600 s) stops a hung scenario.</li>
+<li>The memo's temporary file name had no host name: ranks of several nodes with the same pid
+could write one file. Harmless (a torn file reads as empty) but fixed.</li>
+</ul>
+
+<h3>Not verified</h3>
+<ul>
+<li>No GPU here: the SDPA fix is verified on CPU by a stand-in for PyTorch's selection state driven
+through the real <code>sdpa_kernel</code>, and by reading PyTorch's source (v2.8 to v2.15 and
+<code>main</code>). <code>tools/check_sdpa_priority.py</code> is the GPU check and has not been run.</li>
+<li>The launch timings are from a synthetic 100k-image directory on local disk, scaled linearly; a
+network volume and 100 directories were not measured. The <code>[startup]</code> lines of a real
+launch will show the actual split.</li>
+</ul>
+
 <h2>2026-09-30 &mdash; Per-access caption dropout and in-memory non-Latin line filtering</h2>
 
 <p><strong>Request.</strong> Add <code>caption_dropout_rate</code> and

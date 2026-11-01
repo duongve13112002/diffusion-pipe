@@ -14,6 +14,7 @@ from pathlib import Path
 import pytest
 import torch
 import torch.nn.functional as F
+from torch.nn.attention import SDPBackend
 
 from utils import attention
 
@@ -663,3 +664,119 @@ def test_install_warns_when_comfyui_bypasses_sdpa(monkeypatch, capsys, name, war
     attention.install()
     attention.uninstall()
     assert ('does not reach the models built on ComfyUI' in capsys.readouterr().out) == warned
+
+
+class FakeSdpaSelection:
+    """PyTorch's SDPA kernel selection, reduced to what settle_sdpa_priority depends on.
+
+    The enabled flags and the priority order live in torch._C, which torch.nn.attention.sdpa_kernel
+    reads and writes; these tests swap those functions for this object's so the real sdpa_kernel
+    runs against it. The first call that picks a kernel puts cuDNN first, once, as PyTorch 2.9+
+    does on Hopper / Blackwell with a recent cuDNN (priority_order() in sdp_utils.cpp); the getter
+    does not trigger that, as THPModule_sDPPriorityOrder does not. Each call records the kernel
+    it picked: the first enabled one in the current order.
+    """
+
+    NAMES = {'flash': SDPBackend.FLASH_ATTENTION, 'mem_efficient': SDPBackend.EFFICIENT_ATTENTION,
+             'math': SDPBackend.MATH, 'cudnn': SDPBackend.CUDNN_ATTENTION,
+             'overrideable': SDPBackend.OVERRIDEABLE}
+    DEFAULT = [SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH,
+               SDPBackend.CUDNN_ATTENTION, SDPBackend.OVERRIDEABLE]
+
+    def __init__(self, monkeypatch, prefers_cudnn=True):
+        self.order = [int(b) for b in self.DEFAULT]
+        self.enabled = {name: name != 'overrideable' for name in self.NAMES}
+        self.prefers_cudnn = prefers_cudnn
+        self.initialised = False
+        self.picked = []
+        monkeypatch.setattr(torch._C, '_get_sdp_priority_order', lambda: list(self.order))
+        monkeypatch.setattr(torch._C, '_set_sdp_priority_order', self.set_order)
+        for name in self.NAMES:
+            monkeypatch.setattr(torch._C, f'_get_{name}_sdp_enabled', lambda name=name: self.enabled[name])
+            monkeypatch.setattr(torch._C, f'_set_sdp_use_{name}',
+                                lambda value, name=name: self.enabled.__setitem__(name, value))
+        monkeypatch.setattr(F, 'scaled_dot_product_attention', self.sdpa)
+        monkeypatch.setattr(torch.cuda, 'is_available', lambda: True)
+        monkeypatch.setattr(attention, '_settled', None)
+
+    def set_order(self, order):
+        self.order = [int(b) for b in order]
+
+    def sdpa(self, q, k, v, *args, **kwargs):
+        if not self.initialised:
+            self.initialised = True
+            if self.prefers_cudnn:
+                self.order = [int(b) for b in (SDPBackend.CUDNN_ATTENTION, SDPBackend.FLASH_ATTENTION,
+                                               SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH)]
+        enabled = {int(backend) for name, backend in self.NAMES.items() if self.enabled[name]}
+        self.picked.append(SDPBackend(next(b for b in self.order if b in enabled)))
+        return q
+
+    def comfy_call(self):
+        """comfy.ops.scaled_dot_product_attention for inputs of 128K elements or more."""
+        from torch.nn.attention import sdpa_kernel
+        priority = [SDPBackend.FLASH_ATTENTION, SDPBackend.CUDNN_ATTENTION, SDPBackend.EFFICIENT_ATTENTION,
+                    SDPBackend.MATH]
+        with sdpa_kernel(priority, set_priority=True):
+            F.scaled_dot_product_attention(torch.zeros(1), torch.zeros(1), torch.zeros(1))
+
+
+def test_first_comfy_call_and_its_recomputation_pick_different_kernels_unsettled(monkeypatch):
+    # The failure settle_sdpa_priority exists for: the forward and its recomputation disagree.
+    fake = FakeSdpaSelection(monkeypatch)
+    fake.comfy_call()
+    fake.comfy_call()
+    assert fake.picked == [SDPBackend.CUDNN_ATTENTION, SDPBackend.FLASH_ATTENTION]
+
+
+@pytest.mark.parametrize('prefer_cudnn', [False, True])
+def test_settled_priority_picks_one_kernel_per_call(monkeypatch, prefer_cudnn, capsys):
+    fake = FakeSdpaSelection(monkeypatch)
+    before, chosen, final = attention.settle_sdpa_priority(prefer_cudnn, device='cpu')
+    assert fake.picked == [SDPBackend.CUDNN_ATTENTION]  # the settling call itself
+    assert before == [int(b) for b in fake.DEFAULT]
+    assert chosen[0] == int(SDPBackend.CUDNN_ATTENTION)
+    assert final == (chosen if prefer_cudnn else before) == fake.order
+    del fake.picked[:]
+    # ComfyUI's context: its own order, the same kernel for the forward and its recomputation.
+    fake.comfy_call()
+    fake.comfy_call()
+    assert fake.picked == [SDPBackend.FLASH_ATTENTION] * 2
+    # A plain call: the settled order.
+    F.scaled_dot_product_attention(torch.zeros(1), torch.zeros(1), torch.zeros(1))
+    assert fake.picked[-1] == (SDPBackend.CUDNN_ATTENTION if prefer_cudnn else SDPBackend.FLASH_ATTENTION)
+    assert fake.enabled == {name: name != 'overrideable' for name in fake.NAMES}
+    out = capsys.readouterr().out
+    assert out.count('[attention] PyTorch SDPA kernel order:') == 1
+    assert ('sdpa_prefer_cudnn = true)' in out) == prefer_cudnn
+
+
+def test_settle_runs_once_per_process(monkeypatch):
+    fake = FakeSdpaSelection(monkeypatch)
+    first = attention.settle_sdpa_priority(False, device='cpu')
+    assert attention.settle_sdpa_priority(True, device='cpu') is first
+    assert len(fake.picked) == 1
+
+
+def test_settle_leaves_an_order_pytorch_does_not_change(monkeypatch, capsys):
+    fake = FakeSdpaSelection(monkeypatch, prefers_cudnn=False)
+    before, chosen, final = attention.settle_sdpa_priority(False, device='cpu')
+    assert before == chosen == final == [int(b) for b in fake.DEFAULT]
+    assert 'would put' not in capsys.readouterr().out
+
+
+def test_settle_without_cuda_does_nothing(monkeypatch):
+    monkeypatch.setattr(attention, '_settled', None)
+    monkeypatch.setattr(torch.cuda, 'is_available', lambda: False)
+    called = []
+    monkeypatch.setattr(F, 'scaled_dot_product_attention', lambda *a, **k: called.append(a))
+    assert attention.settle_sdpa_priority(False) is None
+    assert called == [] and attention._settled is None
+
+
+def test_sdpa_prefer_cudnn_setting():
+    assert attention.sdpa_prefer_cudnn_setting(model_config()) is False
+    assert attention.sdpa_prefer_cudnn_setting(model_config(sdpa_prefer_cudnn=True)) is True
+    for bad in ('true', 1, None):
+        with pytest.raises(ValueError, match='sdpa_prefer_cudnn must be true or false'):
+            attention.attention_setting(model_config(sdpa_prefer_cudnn=bad))

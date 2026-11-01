@@ -196,6 +196,10 @@ dtype = 'bfloat16'
 # float32, head_dim > 256, ...) run SDPA and are counted in the log. Not with compile = true.
 # See README "FlashAttention"; tools/check_flash_attention.py tests a GPU and install.
 #attention = 'flash3'
+# Any model: PyTorch SDPA's kernel order, settled at startup (README "PyTorch SDPA kernel order").
+# false (default) keeps PyTorch's default order, flash first; true keeps the order PyTorch picks for
+# the GPU, cuDNN first on Hopper / Blackwell with a recent cuDNN.
+#sdpa_prefer_cudnn = true
 # Hunyuan Video supports fp8 for the transformer when training LoRA.
 transformer_dtype = 'float8'
 # How to sample timesteps to train on. Can be logit_normal or uniform.

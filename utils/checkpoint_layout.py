@@ -5,6 +5,39 @@ import re
 from pathlib import Path
 
 LAYER_FILE = re.compile(r'layer_(\d+)-.*model_states\.pt$')
+# One per pipeline stage: DeepSpeed's model-parallel rank is the stage of a PipelineModule. The
+# optimizer state sits in it (or, with ZeRO, in zero_pp_rank_<dp>_mp_rank_<stage>_* files).
+STAGE_FILE = re.compile(r'(?:zero_pp_rank_\d+_)?mp_rank_(\d+)_model_states\.pt$')
+
+
+def check_checkpoint_files(run_dir, tag, pipeline_stages, loads_optimizer=True):
+    """Refuse, before anything is loaded or cached, a checkpoint this run cannot resume from by its
+    files alone: none of its layer files, an empty file (a save that did not finish writing), or
+    other pipeline stages than `pipeline_stages`. DeepSpeed would otherwise get as far as
+    load_checkpoint, after caching and loading the model, and fail there on a missing
+    mp_rank_<stage> file or an optimizer state of other parameters. What needs the model's layers
+    (check_checkpoint_layers) or the optimizer is checked when those exist. loads_optimizer
+    False (--reset_optimizer) leaves another number of stages to DeepSpeed, as before: the
+    optimizer state is what each stage's file holds that the other layout cannot use.
+    """
+    directory = Path(run_dir) / tag
+    files = [path for path in directory.iterdir() if path.is_file()]
+    if not any(LAYER_FILE.match(path.name) for path in files):
+        raise RuntimeError(f'The checkpoint {directory} has no layer files (layer_<index>-*model_states.pt): '
+                           'its save did not finish, or it is not a diffusion-pipe training checkpoint')
+    if empty := sorted(path.name for path in files if path.name.endswith('.pt') and path.stat().st_size == 0):
+        raise RuntimeError(f'The checkpoint {directory} has empty files, so its save did not finish: '
+                           f'{", ".join(empty[:5])}{" ..." if len(empty) > 5 else ""}. Resume from an earlier '
+                           'checkpoint (--resume_from_checkpoint <run>, after pointing its `latest` at one)')
+    stages = {int(match.group(1)) for path in files if (match := STAGE_FILE.match(path.name))}
+    if loads_optimizer and stages != set(range(pipeline_stages)):
+        saved = f'{max(stages) + 1} pipeline stage(s)' if stages == set(range(len(stages))) and stages \
+            else f'stage files {describe(stages)}'
+        raise RuntimeError(f'The checkpoint {directory} was saved with {saved}; this run has pipeline_stages = '
+                           f'{pipeline_stages}. Each stage keeps its own optimizer state, so a checkpoint resumes '
+                           'only with the pipeline_stages it was saved with. Set it back, resume with '
+                           '--reset_optimizer (a fresh optimizer state), or start a new run from its saved '
+                           'model (transformer_path, or [adapter] init_from_existing).')
 
 
 def check_checkpoint_layers(run_dir, layers, added_in_front=0, tag=None):

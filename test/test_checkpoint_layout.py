@@ -7,7 +7,7 @@ from deepspeed.runtime.checkpoint_engine import TorchCheckpointEngine
 from deepspeed.runtime.pipe import LayerSpec
 from deepspeed.runtime.pipe.module import PipelineModule, TiedLayerSpec
 
-from utils.checkpoint_layout import check_checkpoint_layers, shift_checkpoint_layers
+from utils.checkpoint_layout import check_checkpoint_files, check_checkpoint_layers, shift_checkpoint_layers
 
 
 def checkpoint(tmp_path, indices, tag='global_step7', ranks=('model_00',)):
@@ -115,3 +115,52 @@ def test_the_checkpoint_latest_names_is_the_one_checked(tmp_path):
 
 def test_a_run_without_a_checkpoint_is_left_to_deepspeed(tmp_path):
     check_checkpoint_layers(tmp_path, layers(4))
+
+
+def saved(tmp_path, stages=1, layers_per_stage=3, zero=False, tag='global_step7'):
+    """The files a pipeline save writes: each layer's, and one per stage (ZeRO: per stage and rank)."""
+    (tmp_path / tag).mkdir(parents=True)
+    for i in range(stages * layers_per_stage):
+        torch.save({}, tmp_path / tag / f'layer_{i:02d}-model_00-model_states.pt')
+    for stage in range(stages):
+        name = f'zero_pp_rank_0_mp_rank_{stage:02d}_model_states.pt' if zero else f'mp_rank_{stage:02d}_model_states.pt'
+        torch.save({}, tmp_path / tag / name)
+    return tmp_path, tag
+
+
+@pytest.mark.parametrize('zero', [False, True])
+@pytest.mark.parametrize('stages', [1, 4])
+def test_a_complete_checkpoint_resumes_with_its_stages(tmp_path, stages, zero):
+    check_checkpoint_files(*saved(tmp_path, stages=stages, zero=zero), stages)
+
+
+@pytest.mark.parametrize('saved_stages, stages', [(1, 2), (4, 2), (2, 1)])
+def test_other_pipeline_stages_are_refused(tmp_path, saved_stages, stages):
+    with pytest.raises(RuntimeError, match=rf'saved with {saved_stages} pipeline stage\(s\); this run has '
+                                           rf'pipeline_stages = {stages}'):
+        check_checkpoint_files(*saved(tmp_path, stages=saved_stages), stages)
+
+
+def test_a_missing_stage_file_is_named(tmp_path):
+    run, tag = saved(tmp_path, stages=3)
+    (run / tag / 'mp_rank_01_model_states.pt').unlink()
+    with pytest.raises(RuntimeError, match='stage files 0, 2'):
+        check_checkpoint_files(run, tag, 3)
+
+
+def test_an_unfinished_save_is_refused(tmp_path):
+    run, tag = saved(tmp_path)
+    (run / tag / 'layer_01-model_00-model_states.pt').write_bytes(b'')
+    with pytest.raises(RuntimeError, match='empty files, so its save did not finish: layer_01'):
+        check_checkpoint_files(run, tag, 1)
+
+
+def test_a_directory_without_layer_files_is_refused(tmp_path):
+    (tmp_path / 'global_step7').mkdir()
+    torch.save({}, tmp_path / 'global_step7' / 'mp_rank_00_model_states.pt')
+    with pytest.raises(RuntimeError, match='has no layer files'):
+        check_checkpoint_files(tmp_path, 'global_step7', 1)
+
+
+def test_a_reset_optimizer_resume_leaves_other_stages_to_deepspeed(tmp_path):
+    check_checkpoint_files(*saved(tmp_path, stages=4), 2, loads_optimizer=False)

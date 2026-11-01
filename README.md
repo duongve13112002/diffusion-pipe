@@ -14,6 +14,11 @@ Models supported: SDXL, Flux, LTX-Video, HunyuanVideo (t2v), Cosmos, Lumina Imag
 - Optional OPLoRA (orthogonal projection LoRA) to reduce catastrophic forgetting when training LoRAs
 
 ## Recent changes
+- 2026-11-01
+  - Fixed: with `[model] attention = 'sdpa'` and activation checkpointing, models built on ComfyUI (MOSS-Image, Flux 2, Z-Image, Qwen-Image 2.1, ...) could stop in the first backward with `CheckpointError: Recomputed values for the following tensors have different metadata than during the forward pass` on Hopper / Blackwell with PyTorch 2.9+, when the caches were complete. PyTorch's SDPA kernel order is now settled at startup and printed; `[model] sdpa_prefer_cudnn` (default `false`) chooses which order. `tools/check_sdpa_priority.py` checks it on a GPU. See [PyTorch SDPA kernel order](#pytorch-sdpa-kernel-order).
+  - `--resume_from_checkpoint` is checked before the model loads and the datasets are scanned: a wrong run directory, a missing `latest` or checkpoint, a save that did not finish (empty files) and another `pipeline_stages` than the checkpoint's (unless `--reset_optimizer`) stop the run at once. The layer layout check runs as soon as the layers are built, before DeepSpeed and the optimizer.
+  - Faster launches with complete caches and `reuse_metadata_cache = false`: the fingerprints that check the latent and text embedding caches against the metadata are read as Arrow columns and remembered next to the metadata files (`diffusion_pipe_digests.json`), instead of every rank hashing every row at every launch (about 1.5 h per process for 10M images before, a few minutes after; the first launch after updating hashes once more). Fingerprints keep their values, so no cache is re-encoded. Layout-caption models no longer read every caption at every launch on every rank. See [docs/note/warm-startup-cost.md](docs/note/warm-startup-cost.md).
+  - Startup timing: `[startup] <phase>: <seconds>` lines as each phase ends, and a summary with the slowest rank per phase before the first step.
 - 2026-10-31
   - `vae_dtype` and `latent_cache_dtype` in `[model]`, for every model that caches latents (`vae_dtype` was MOSS-Image's). `vae_dtype` is the precision the VAE encodes the images in; `latent_cache_dtype` is the precision the latents are stored in: `'float32'`, `'bfloat16'` or `'float16'` for both. Encode in float32 and store in float16 to halve the cache, or set only `vae_dtype` and the cache is stored in it. Left out, a model encodes and caches exactly as before, and its caches are kept; MOSS-Image keeps its default `vae_dtype = 'float16'` and its caches too. An image whose latents come out non-finite is encoded again in a wider dtype (bfloat16, then float32) with a warning, and a batch whose latents do not fit in the storage dtype is cached in float32 with a warning. A cache made with other values is rebuilt. Iris refuses both keys (it caches pixels). See [VAE precision and latent cache dtype](#vae-precision-and-latent-cache-dtype).
   - ComfyUI submodule updated to master 7c4390a6f.
@@ -318,6 +323,42 @@ How it works: after caching, `torch.nn.functional.scaled_dot_product_attention` 
 - `--nan_check` replays a non-finite layer with the default (FlashAttention where it can) and then with each PyTorch SDPA kernel, so it shows whether a NaN comes from FlashAttention.
 
 To check a GPU and an install before training, run `python tools/check_flash_attention.py` in the training environment (no weights needed, 5-15 minutes, longer with FA4 while it compiles its kernels; `--quick` for shorter benchmarks). It checks FA3 and FA4, whichever import, against a float32 reference, on the mask kinds above, the helpers the flash-attn models use, a short training run, determinism and each model's own attention call (Wan, HiDream, HunyuanVideo, HunyuanImage-2.1, OmniGen2, Lumina 2, Iris), then times forward + backward against PyTorch SDPA on the shapes of the models here. It writes `flash_attention_check_<host>_<time>.txt` (and a `.json`) in the current directory as it goes.
+
+### PyTorch SDPA kernel order
+With `'sdpa'`, PyTorch picks among its own kernels (flash, cuDNN, memory-efficient, math) in a priority order. PyTorch 2.9 and later change that order the first time SDPA runs in a process (cuDNN first on Hopper / Blackwell with a recent cuDNN), and ComfyUI's attention wrapper undoes the change when the first call happens inside it. Before this was handled, the first attention call of a run used cuDNN and its recomputation under activation checkpointing used flash, and the first backward stopped with `CheckpointError: Recomputed values for the following tensors have different metadata than during the forward pass`. It hit the ComfyUI-based models (MOSS-Image, Flux 2, Z-Image, Qwen-Image 2.1, ...) when the caches were complete, so nothing ran SDPA before training.
+
+`train.py` now settles the order at startup, before caching and before the model loads, and prints it (`[attention] PyTorch SDPA kernel order: ...`). One key chooses which order:
+```
+[model]
+sdpa_prefer_cudnn = false   # default
+```
+- `false`: PyTorch's default order (flash, efficient, math, cuDNN), what every call after the first already ran with.
+- `true`: the order PyTorch picks for the GPU (cuDNN first where PyTorch prefers it). Calls inside ComfyUI's own wrapper keep its order (flash first) either way.
+
+`python tools/check_sdpa_priority.py` checks it on a GPU (no weights; a minute or two): it runs a checkpointed attention layer through ComfyUI's wrapper in fresh processes, without the fix and with both settings, and prints the kernels each forward and recomputation ran. See [docs/note/sdpa-priority-checkpoint-mismatch.md](docs/note/sdpa-priority-checkpoint-mismatch.md) for the details.
+
+### PyTorch SDPA backends and their settings
+With `attention = 'sdpa'` (and for the calls FlashAttention-3 / -4 cannot take), `torch.nn.functional.scaled_dot_product_attention` runs the first backend in its priority order that accepts the call. From PyTorch's own checks (`aten/src/ATen/native/transformers/cuda/sdp_utils.cpp`):
+
+| Backend | Takes | GPUs |
+| --- | --- | --- |
+| `flash` (flash-attn 2, built into PyTorch) | float16 / bfloat16, no `attn_mask` (`is_causal` only with equal query and key lengths), head_dim up to 256 (with gradients on sm86 / sm89 / sm120 / sm121: up to 192, or above 224 without dropout) | sm80 to sm121 |
+| `cudnn` | float16 / bfloat16, masks, grouped-query attention; refused while `torch.use_deterministic_algorithms(True)` is on | sm80 to sm121 |
+| `efficient` (memory-efficient) | float32 too, arbitrary masks; head_dim aligned to 8 (half) or 4 (float32) | sm50 to sm121 |
+| `math` | anything; slowest, materialises the attention matrix | any |
+
+What decides which one runs:
+- The order. Default: flash, efficient, math, cuDNN. PyTorch 2.9 and later move cuDNN first at the first call on Hopper / Blackwell (2.9: cuDNN 9.9+, sm 9.0 / 10.0; 2.10+: cuDNN newer than 9.15, sm 9.x / 10.x). Environment variables turn that off: `TORCH_CUDNN_SDPA_PREFERRED=0` on 2.9, `TORCH_CUDNN_SDPA_DEPRIORITIZED=1` on 2.10 and later. Here `train.py` settles the order at startup instead: `[model] sdpa_prefer_cudnn` above.
+- Global switches: `torch.backends.cuda.enable_flash_sdp`, `enable_mem_efficient_sdp`, `enable_math_sdp`, `enable_cudnn_sdp` (and `*_sdp_enabled()` to read them); `torch.backends.cuda.allow_fp16_bf16_reduction_math_sdp` lets the math backend reduce in half precision.
+- `torch.nn.attention.sdpa_kernel(backends, set_priority=False)`: only those backends inside the block, in that order with `set_priority=True`. ComfyUI runs every call of 128K query elements or more inside `sdpa_kernel([flash, cuDNN, efficient, math], set_priority=True)`, so the models built on ComfyUI use flash for those whatever the global order; smaller calls follow the global order.
+- `torch.backends.cuda.can_use_flash_attention(params, debug=True)` (and `can_use_cudnn_attention`, `torch.nn.attention.can_use_efficient_attention`) say why a backend refuses a call.
+- PyTorch 2.10 and later also have a prototype that routes the flash backend to FlashAttention-4 (2.11 and later: FlashAttention-3 too): `torch.nn.attention.activate_flash_attention_impl('FA4')`. This repo does not use it; `[model] attention = 'flash3'` / `'flash4'` replace SDPA themselves, with the routing and counting described above.
+
+Keys in this repo that pick among them:
+- `[model] attention`: `'sdpa'` (default), `'flash3'`, `'flash4'`.
+- `[model] sdpa_prefer_cudnn`: `false` (default) or `true`; the startup line `[attention] PyTorch SDPA kernel order: ...` shows the result.
+- Iris only: `[model] attn_backend` (`sdpa`, `torch_flash`, `torch_cudnn`, `fa3`, `fa4`) forces one kernel, and `allow_cudnn_attention` (default `false`) keeps cuDNN switched off for it (see [supported models](docs/supported_models.md)).
+- Tools: `tools/check_sdpa_priority.py` (the kernel order under checkpointing), `tools/sdpa_probe.py` (every kernel on Iris's shapes), `tools/check_flash_attention.py` (FlashAttention-3 / -4), `train.py --nan_check` (replays a non-finite layer with each kernel).
 
 ## Reducing VRAM requirements
 The [wan_14b_min_vram.toml](./examples/wan_14b_min_vram.toml) example file has all of these settings enabled.

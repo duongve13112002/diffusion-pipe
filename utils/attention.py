@@ -16,6 +16,13 @@ DSL): Hopper and Blackwell, compiling its kernels the first time each configurat
 Models that call flash-attn directly (Wan, HiDream, HunyuanVideo, HunyuanImage, OmniGen2, Lumina 2) use
 flash_dense / flash_varlen / flash_unpadded below when flash_enabled(); Iris maps the key onto its
 own attn_backend. 'sdpa' (the default) changes nothing for SDPA models.
+
+settle_sdpa_priority fixes PyTorch's SDPA kernel order before the model runs, for every
+`attention` value: PyTorch (2.9 on) changes that order the first time SDPA picks a kernel, and
+when that first time falls inside ComfyUI's sdpa_kernel(..., set_priority=True), the change is
+undone again when the context exits. The first attention call of a run then uses another kernel
+than its recomputation under activation checkpointing, which saves other tensors and fails the
+backward. See docs/note/sdpa-priority-checkpoint-mismatch.md.
 """
 
 import collections
@@ -25,6 +32,7 @@ import weakref
 
 import torch
 import torch.nn.functional as F
+from torch.nn.attention import SDPBackend
 
 CHOICES = ('sdpa', 'flash3', 'flash4')
 LABELS = {'flash3': 'FlashAttention-3', 'flash4': 'FlashAttention-4'}
@@ -49,6 +57,8 @@ _bypass = 0
 # False in runs that never run the model (--cache_only, --cache_status, --metadata_only): nothing
 # then checks that a FlashAttention kernel can run here.
 _model_runs = True
+# settle_sdpa_priority's result once it has run in this process: (before, chosen, final) orders.
+_settled = None
 
 FLASH_CALL = 'flash'
 FLASH_PADDED = 'flash with key padding'
@@ -67,7 +77,79 @@ def attention_setting(config):
         if model['type'] == 'cosmos':
             raise ValueError(f"[model] attention = {value!r} does not apply to cosmos: Cosmos runs its attention "
                              "through Transformer Engine, not PyTorch SDPA or flash-attn")
+    sdpa_prefer_cudnn_setting(config)
     return value
+
+
+def sdpa_prefer_cudnn_setting(config):
+    """The checked `[model] sdpa_prefer_cudnn` value (default False): whether PyTorch SDPA keeps
+    the kernel order PyTorch picks for this GPU (cuDNN attention first on Hopper / Blackwell with a
+    recent cuDNN) or its default order (flash, efficient, math, cuDNN)."""
+    value = config['model'].get('sdpa_prefer_cudnn', False)
+    if not isinstance(value, bool):
+        raise ValueError(f'[model] sdpa_prefer_cudnn must be true or false, got {value!r}')
+    return value
+
+
+def _backend_names(order):
+    names = []
+    for value in order:
+        try:
+            names.append(SDPBackend(value).name.lower())
+        except ValueError:
+            names.append(str(value))
+    return ', '.join(names)
+
+
+def settle_sdpa_priority(prefer_cudnn, device='cuda'):
+    """Settles PyTorch SDPA's kernel order in this process before anything else calls SDPA;
+    returns the orders (before, as PyTorch chose it, as left), or None where there is nothing to
+    settle (no CUDA, or a PyTorch without priority orders). Runs once per process.
+
+    PyTorch 2.9 and later set the order lazily: the first call that picks a kernel puts cuDNN
+    attention first on Hopper / Blackwell with a recent cuDNN (unless an environment variable
+    says otherwise; its name changed between releases). ComfyUI runs SDPA inside
+    sdpa_kernel(..., set_priority=True), which reads the order on entry and writes it back on
+    exit. If the first call of a process happens there, PyTorch's change lands inside the context
+    and the exit undoes it: that one call runs cuDNN and every later call flash. Under activation
+    checkpointing the first call is recomputed in the backward with the other kernel, whose saved
+    tensors differ, and torch.utils.checkpoint stops the run (CheckpointError). With caches
+    complete (a resumed run, --trust_cache) nothing calls SDPA before the first training step, so
+    the first call is a model's own.
+
+    One small SDPA call here, outside any context, makes PyTorch's one-time change happen now.
+    prefer_cudnn False then restores the order from before it, the order every call after the
+    first ran with until now; True keeps PyTorch's. Either way the order is settled before the
+    model runs, so a call and its recomputation pick the same kernel. Calls inside ComfyUI's
+    context still use ComfyUI's own order.
+    """
+    global _settled
+    if _settled is not None:
+        return _settled
+    get_order = getattr(torch._C, '_get_sdp_priority_order', None)
+    set_order = getattr(torch._C, '_set_sdp_priority_order', None)
+    if not torch.cuda.is_available() or get_order is None or set_order is None:
+        return None
+    before = list(get_order())
+    # float16: every CUDA GPU takes it; PyTorch decides the order when it picks the kernel, before
+    # it runs one.
+    q = torch.zeros((1, 1, 8, 64), device=device, dtype=torch.float16)
+    with torch.no_grad():
+        (_original_sdpa or F.scaled_dot_product_attention)(q, q, q)
+    chosen = list(get_order())
+    if not prefer_cudnn and chosen != before:
+        set_order(before)
+    _settled = (before, chosen, list(get_order()))
+    if _is_main():
+        if chosen == before:
+            print(f'[attention] PyTorch SDPA kernel order: {_backend_names(_settled[2])}')
+        elif prefer_cudnn:
+            print(f'[attention] PyTorch SDPA kernel order: {_backend_names(chosen)} (PyTorch\'s choice for this GPU, '
+                  'kept by [model] sdpa_prefer_cudnn = true)')
+        else:
+            print(f'[attention] PyTorch SDPA kernel order: {_backend_names(_settled[2])}. PyTorch would put '
+                  f'{_backend_names(chosen[:1])} first on this GPU; set [model] sdpa_prefer_cudnn = true for that')
+    return _settled
 
 
 def import_module(backend):

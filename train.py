@@ -22,6 +22,7 @@ import numpy as np
 
 from utils import dataset as dataset_util
 from utils import attention as attention_util
+from utils import startup_timing
 from utils import common
 from utils.common import is_main_process, get_rank, DTYPE_MAP, empty_cuda_cache, all_ok
 import utils.saver
@@ -33,7 +34,7 @@ from utils.pipeline import ManualPipelineModule
 from utils.dora import apply_dora_config_defaults, check_model_dtypes as check_dora_model_dtypes
 from utils.oplora import OPLoRAProjector, apply_oplora_config_defaults
 from utils.lr_schedule import create_lr_scheduler
-from utils.checkpoint_layout import check_checkpoint_layers, shift_checkpoint_layers
+from utils.checkpoint_layout import check_checkpoint_files, check_checkpoint_layers, shift_checkpoint_layers
 from utils.param_groups import check_resumed_param_groups, group_names, split_2d_param_groups
 from utils.ema import ParameterEMA, apply_ema_config_defaults, load_ema_checkpoint, load_ema_weights
 from utils.optimizer_factory import resolve_optimizer_class
@@ -299,6 +300,7 @@ def _get_automagic_lrs(optimizer):
 
 
 if __name__ == '__main__':
+    startup_timing.begin()
     # With multiple GPUs / large batch sizes, the dataloader can trigger "too many open files" errors unless we do this.
     torch.multiprocessing.set_sharing_strategy('file_system')
     deepspeed.utils.set_log_level_from_string('info')
@@ -362,6 +364,10 @@ if __name__ == '__main__':
     else:
         # Fails before caching when FlashAttention cannot run here.
         attention_util.configure(config)
+        # Before anything calls SDPA (caching, the model): a first call inside ComfyUI's priority
+        # context would leave PyTorch's kernel order changed after it, and checkpointing's
+        # recomputation of that call would pick another kernel than the forward did.
+        attention_util.settle_sdpa_priority(attention_util.sdpa_prefer_cudnn_setting(config))
 
     resume_from_checkpoint = (
         args.resume_from_checkpoint if args.resume_from_checkpoint is not None
@@ -371,6 +377,31 @@ if __name__ == '__main__':
         args.regenerate_cache if args.regenerate_cache is not None
         else config.get('regenerate_cache', False)
     )
+
+    # Determine run_dir (and the checkpoint to resume) on rank 0 and broadcast it, or its error.
+    # Before the model loads and the datasets are scanned and cached, which can take hours: a
+    # resume that cannot work (no checkpoint, an unfinished save, other pipeline stages) stops now.
+    # The runs that only cache or inspect the data never resume, so they skip it.
+    run_dir = resume_tag = None
+    if not (args.cache_only or args.cache_status or args.metadata_only or args.dump_dataset):
+        run_dir_container = [None]
+        if is_main_process():
+            try:
+                if resume_from_checkpoint:
+                    run_dir, resume_tag = common.resume_run_dir(config['output_dir'], resume_from_checkpoint)
+                    check_checkpoint_files(run_dir, resume_tag, config['pipeline_stages'],
+                                           loads_optimizer=not args.reset_optimizer)
+                else:
+                    run_dir = os.path.join(config['output_dir'], datetime.now(timezone.utc).strftime('%Y%m%d_%H-%M-%S'))
+                run_dir_container[0] = (run_dir, resume_tag, None)
+            except Exception as e:
+                run_dir_container[0] = (None, None, f'{type(e).__name__}: {e}')
+
+        torch.distributed.broadcast_object_list(run_dir_container, src=0, group=dist.get_world_group())
+        run_dir, resume_tag, error = run_dir_container[0]
+        if error is not None:
+            raise RuntimeError(error)
+    startup_timing.mark('distributed setup, attention and resume checks')
 
     model_type = config['model']['type']
 
@@ -456,6 +487,7 @@ if __name__ == '__main__':
         raise NotImplementedError(f'Model type {model_type} is not implemented')
     # vae_dtype / latent_cache_dtype: a wrong value, or a model they do not apply to, stops here.
     model.vae_dtypes
+    startup_timing.mark('model setup')
 
     # import sys, PIL
     # test_image = sys.argv[1]
@@ -661,23 +693,7 @@ if __name__ == '__main__':
             model.load_adapter_weights(init_from_existing)
     else:
         is_adapter = False
-
-    # Determine run_dir (and the checkpoint to resume) on rank 0 and broadcast it, or its error
-    run_dir_container = [None]
-    if is_main_process():
-        try:
-            if resume_from_checkpoint:
-                run_dir_container[0] = (*common.resume_run_dir(config['output_dir'], resume_from_checkpoint), None)
-            else:
-                run_dir = os.path.join(config['output_dir'], datetime.now(timezone.utc).strftime('%Y%m%d_%H-%M-%S'))
-                run_dir_container[0] = (run_dir, None, None)
-        except Exception as e:
-            run_dir_container[0] = (None, None, f'{type(e).__name__}: {e}')
-
-    torch.distributed.broadcast_object_list(run_dir_container, src=0, group=dist.get_world_group())
-    run_dir, resume_tag, error = run_dir_container[0]
-    if error is not None:
-        raise RuntimeError(error)
+    startup_timing.mark('loading the diffusion model')
 
     error = None
     if not resume_from_checkpoint and is_main_process():
@@ -736,6 +752,17 @@ if __name__ == '__main__':
         model.enable_block_swap(blocks_to_swap)
 
     layers = model.to_layers()
+    layer_shift = None
+    if resume_from_checkpoint:
+        # As soon as the layers exist, before DeepSpeed builds the engine and the optimizer. Every
+        # rank reads the checkpoint's file list; one failing (a volume error) stops all.
+        error = None
+        try:
+            layer_shift = check_checkpoint_layers(
+                run_dir, layers, getattr(model, 'checkpoint_layers_added_in_front', 0), tag=resume_tag)
+        except Exception as e:
+            error = e
+        all_ok(error)
     additional_pipeline_module_kwargs = {}
     activation_checkpointing = config['activation_checkpointing']
     if activation_checkpointing:
@@ -788,6 +815,7 @@ if __name__ == '__main__':
     # parallelism has always relied on "Torch-style" backward(), so I think this is an oversight by Deepspeed devs and it's safe
     # to force this to True to get it to work.
     model_engine._support_torch_style_backward = True
+    startup_timing.mark('pipeline layers and DeepSpeed engine')
     global_batch_size = model_engine.train_micro_batch_size_per_gpu() * model_engine.gradient_accumulation_steps() * model_engine.grid.get_data_parallel_world_size()
     print(f'Global batch size = {global_batch_size}')
 
@@ -953,6 +981,7 @@ if __name__ == '__main__':
                                  config['optimizer'].get('gradient_release', False), config['pipeline_stages'])
 
     model.model_engine = model_engine
+    startup_timing.mark('optimizer')
 
     train_data.post_init(
         model_engine.grid.get_data_parallel_rank(),
@@ -984,6 +1013,7 @@ if __name__ == '__main__':
         text_encoding=text_encoding,
     )
     steps_per_epoch = len(train_dataloader) // model_engine.gradient_accumulation_steps()
+    startup_timing.mark('batching (post_init) and dataloader')
 
     scheduler_type = config.get('lr_scheduler', 'constant')
     lr_scheduler = create_lr_scheduler(
@@ -1001,14 +1031,6 @@ if __name__ == '__main__':
     # make sure to do this before calling model_engine.set_dataloader(), as that method creates an iterator
     # which starts creating dataloader internal state
     if resume_from_checkpoint:
-        # Every rank reads the checkpoint's file list; one failing (a volume error) stops all.
-        error = layer_shift = None
-        try:
-            layer_shift = check_checkpoint_layers(
-                run_dir, layers, getattr(model, 'checkpoint_layers_added_in_front', 0), tag=resume_tag)
-        except Exception as e:
-            error = e
-        all_ok(error)
         restore = None
         if layer_shift:
             if is_main_process():
@@ -1049,6 +1071,7 @@ if __name__ == '__main__':
         del client_state
         if is_main_process():
             print(f'Resuming training from checkpoint. Resuming at epoch: {train_dataloader.epoch}, step: {step}')
+        startup_timing.mark('loading the checkpoint')
 
     if 'force_constant_lr' in config:
         model_engine.lr_scheduler = torch.optim.lr_scheduler.ConstantLR(optimizer, factor=1.0)
@@ -1115,6 +1138,8 @@ if __name__ == '__main__':
     if config['eval_before_first_step'] and not resume_from_checkpoint:
         evaluate(model, model_engine, eval_dataloaders, tb_writer, 0, config['eval_gradient_accumulation_steps'], disable_block_swap_for_eval)
 
+    startup_timing.mark('EMA, saver and the rest')
+    startup_timing.report()
     attention_reported = False
     empty_cuda_cache()
     while True:

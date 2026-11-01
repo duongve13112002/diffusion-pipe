@@ -34,6 +34,7 @@ import multiprocess as mp
 from tqdm import tqdm
 from comfy_api.latest import InputImpl
 
+from utils import startup_timing
 from utils.common import all_ok, fsync_dir, is_main_process, VIDEO_EXTENSIONS, round_to_nearest_multiple
 from utils.cache import Cache
 from utils.embedding_dtype import check_text_embedding_dtype, encode_results
@@ -287,14 +288,120 @@ def resolve_batch_fill_config(dataset_config, defaults=None, overrides=None):
     return resolved
 
 
-def _content_digest(dataset, column, upto=None):
-    """Hash of the first `upto` values of `column`, or all of them when upto is None.
+def _column_values(dataset, column):
+    """list(dataset[column]): the same Python values, read as one Arrow column. Iterating the
+    lazy Column that dataset[column] returns formats the rows one at a time, 20-40 times slower,
+    which a dataset of millions of rows paid on every rank at every launch. A feature that needs
+    decoding (an image, say), or a dataset with an output format set (numpy, torch, ...), whose
+    values are not the plain Python ones, is left to the datasets library."""
+    if (dataset.format['type'] is not None
+            or datasets.features.features.require_decoding(dataset.features[column])):
+        return list(dataset[column])
+    return dataset.select_columns([column]).with_format('arrow')[:].column(0).to_pylist()
 
-    list(), not dataset[column], for the same reason the fingerprint code below spells it out:
-    indexing returns a lazy Column holding a reference to its parent dataset.
-    """
-    values = list(dataset[column])
-    return Hasher.hash(values if upto is None else values[:upto])
+
+# The digests of a dataset's columns, kept next to its Arrow files (see _memoized_digest).
+DIGEST_MEMO_FILE = 'diffusion_pipe_digests.json'
+DIGEST_MEMO_ENTRIES = 64
+
+
+def _dataset_identity(dataset):
+    """What a dataset's rows are made of, cheaply: its Arrow files (path, size, modification
+    time), its row selection (indices mapping), its length and its fingerprint. The fingerprint
+    tells apart views the rest cannot: select() of a contiguous range slices the table without
+    an indices mapping, so two ranges of one file with the same length look alike otherwise. A
+    dataset whose fingerprint is random (a transform the datasets library cannot hash) misses
+    every time, which only costs the computation. None for a dataset held in memory,
+    unless it records with _digest_origin the file-backed dataset it was derived from and how
+    (a deterministic transform, named so the name changes when the transform does)."""
+    origin = getattr(dataset, '_digest_origin', None)
+    if origin is not None:
+        base, transform = origin
+        identity = _dataset_identity(base)
+        return None if identity is None else Hasher.hash([identity, transform, dataset._fingerprint, len(dataset)])
+    files = sorted({entry['filename'] for entry in dataset.cache_files})
+    if not files:
+        return None
+    stats = []
+    for name in files:
+        stat = os.stat(name)
+        stats.append((os.path.abspath(name), stat.st_size, stat.st_mtime_ns))
+    indices = None
+    if dataset._indices is not None:
+        indices = hashlib.blake2b(np.ascontiguousarray(dataset._indices.column(0).to_numpy()).tobytes(),
+                                  digest_size=16).hexdigest()
+    return Hasher.hash([stats, indices, len(dataset), dataset._fingerprint])
+
+
+def _memo_path(dataset):
+    """Where a dataset's digests are kept: beside its saved data files (save_to_disk's data-*),
+    not an indices file the datasets library put in its own cache."""
+    origin = getattr(dataset, '_digest_origin', None)
+    if origin is not None:
+        return _memo_path(origin[0])
+    files = sorted(entry['filename'] for entry in dataset.cache_files)
+    data = [name for name in files if os.path.basename(name).startswith('data-')]
+    return Path((data or files)[0]).parent / DIGEST_MEMO_FILE
+
+
+def _memoized_digest(dataset, what, compute):
+    """compute(), a digest of the dataset's contents, remembered next to its Arrow files under
+    the dataset's identity and `what`. The fingerprints and content digests of the tensor caches
+    hash whole columns, a few minutes per million rows, and every rank recomputed them at every
+    launch from files that had not changed. A file rewritten since has another size or
+    modification time and misses; a dataset in memory, or a volume that cannot be written, just
+    computes."""
+    try:
+        identity = _dataset_identity(dataset)
+    except OSError:
+        identity = None
+    if identity is None:
+        return compute()
+    path = _memo_path(dataset)
+    key = Hasher.hash([identity, what])
+    try:
+        memo = json.loads(path.read_text(encoding='utf-8'))
+        if not isinstance(memo, dict):
+            memo = {}
+    except (OSError, ValueError):
+        memo = {}
+    if isinstance(memo.get(key), str):
+        return memo[key]
+    value = compute()
+    memo.pop(key, None)
+    memo[key] = value
+    memo = dict(list(memo.items())[-DIGEST_MEMO_ENTRIES:])
+    # Ranks of several nodes can share a pid and thread id; the host tells their files apart.
+    temporary = path.with_name(f'{path.name}.{socket.gethostname()}.{os.getpid()}.{threading.get_ident()}.tmp')
+    try:
+        temporary.write_text(json.dumps(memo), encoding='utf-8')
+        os.replace(temporary, path)
+    except OSError:
+        # Read-only or full: the next launch computes it again.
+        with contextlib.suppress(OSError):
+            temporary.unlink()
+    return value
+
+
+def _layout_caption_counts(metadata_dataset):
+    """(images, images with a JSON layout caption) of a bucket's metadata. Every rank asked this
+    at every launch of a layout-caption model (MOSS-Image, Ideogram 4), reading every caption;
+    the answer is remembered with the metadata's files (see _memoized_digest)."""
+    def compute():
+        images = layout = 0
+        for captions in _column_values(metadata_dataset, 'caption'):
+            images += 1
+            layout += any(is_layout_caption(caption) for caption in captions)
+        return json.dumps([images, layout])
+    return tuple(json.loads(_memoized_digest(metadata_dataset, ['layout_caption_counts', 1], compute)))
+
+
+def _content_digest(dataset, column, upto=None):
+    """Hash of the first `upto` values of `column`, or all of them when upto is None."""
+    def compute():
+        values = _column_values(dataset, column)
+        return Hasher.hash(values if upto is None else values[:upto])
+    return _memoized_digest(dataset, ['content_digest', column, upto], compute)
 
 
 def _cache_fingerprint(dataset, new_fingerprint_args, fingerprint_columns):
@@ -306,14 +413,19 @@ def _cache_fingerprint(dataset, new_fingerprint_args, fingerprint_columns):
         # own fingerprint covers every column, captions included, so anything that rewrites the
         # caption text -- a prefix, tag dropout, a different shuffle count -- moved the latent
         # fingerprint too and re-encoded the entire dataset through a VAE that had not changed.
-        hasher = Hasher()
-        for column in sorted(fingerprint_columns):
-            hasher.update(column)
-            # list(), not dataset[column]: indexing returns a lazy Column that holds a reference
-            # to its parent dataset, so hashing it drags the whole dataset -- captions included
-            # -- back into the digest and defeats the entire point of selecting columns.
-            hasher.update(list(dataset[column]))
-        new_fingerprint_args.append(hasher.hexdigest())
+        columns = sorted(fingerprint_columns)
+
+        def columns_digest():
+            hasher = Hasher()
+            for column in columns:
+                hasher.update(column)
+                # A list of the values, not dataset[column]: indexing returns a lazy Column that
+                # holds a reference to its parent dataset, so hashing it drags the whole dataset
+                # -- captions included -- back into the digest and defeats the entire point of
+                # selecting columns.
+                hasher.update(_column_values(dataset, column))
+            return hasher.hexdigest()
+        new_fingerprint_args.append(_memoized_digest(dataset, ['fingerprint_columns', columns], columns_digest))
     return Hasher.hash(new_fingerprint_args)
 
 
@@ -653,7 +765,8 @@ class TextEmbeddingDataset:
         self.image_spec_to_te_idx = defaultdict(list)
         # TODO: maybe make this use Dataset object like the latents. But, you won't be caching text embeddings
         # when training on very large datasets, so perhaps it doesn't really matter.
-        for i, image_spec in enumerate(flattened_captions['image_spec']):
+        # One Arrow column, not the rows one at a time (see _column_values).
+        for i, image_spec in enumerate(_column_values(flattened_captions, 'image_spec')):
             self.image_spec_to_te_idx[tuple(image_spec)].append(i)
 
     def get_text_embeddings(self, image_spec, caption_number):
@@ -819,6 +932,9 @@ def _cache_text_embeddings(metadata_dataset, map_fn, i, cache_dir, regenerate_ca
             te_dataset, flattened_captions, cache_dir / f'caption_index_{metadata_dataset._fingerprint}.sqlite')
     if layout_rewriter is None:
         flattened_captions = metadata_dataset.map(flatten_captions, batched=True, keep_in_memory=True, remove_columns=metadata_dataset.column_names)
+        # Held in memory, but a pure function of the metadata's rows: its digests are remembered
+        # under the metadata's files (see _memoized_digest).
+        flattened_captions._digest_origin = (metadata_dataset, 'flatten_captions')
     else:
         rewrite_tag = Hasher.hash([layout_rewriter.cache_tag, layout_rewriter.caption_prefix])
         flattened_captions = _flattened_captions(
@@ -1149,7 +1265,7 @@ class SizeBucketDataset:
             print('Building iteration order')
             image_spec_to_latents_idx = {
                 tuple(image_spec): i
-                for i, image_spec in enumerate(self.metadata_dataset['image_spec'])
+                for i, image_spec in enumerate(_column_values(self.metadata_dataset, 'image_spec'))
             }
 
             equal_num_captions = True
@@ -1799,7 +1915,7 @@ class ARBucketDataset:
                               text_encoder_key='', keep_text_embedding_cache=False,
                               identity=None, require_identity=False):
         if (getattr(self.directory_dataset, 'layout_rewriter', None) is not None
-                and any(is_layout_caption(c) for captions in self.metadata_dataset['caption'] for c in captions)):
+                and _layout_caption_counts(self.metadata_dataset)[1]):
             # A layout caption is a different text at each resolution (its boxes follow the
             # crop), so each size bucket of this aspect ratio caches its own embeddings.
             for size_bucket_dataset in self.size_buckets:
@@ -2514,14 +2630,15 @@ class DirectoryDataset:
             self._report_layout_captions()
 
     def _report_layout_captions(self):
-        buckets = self.bucket_datasets()
+        if not is_main_process():
+            return
         # Counted per image: cache_shuffle_num repeats each caption, which is not the user's count.
         total = layout = 0
-        for bucket in buckets:
-            for captions in bucket.metadata_dataset['caption']:
-                total += 1
-                layout += any(is_layout_caption(c) for c in captions)
-        if layout and is_main_process():
+        for bucket in self.bucket_datasets():
+            bucket_total, bucket_layout = _layout_caption_counts(bucket.metadata_dataset)
+            total += bucket_total
+            layout += bucket_layout
+        if layout:
             field = {'moss_image': 'summary.caption (gen_brief in the scene/element schema)',
                      'moss_image_centered': 'summary.caption (gen_brief in the scene/element schema)',
                      'ideogram4': 'high_level_description'}[self.layout_caption_format]
@@ -4214,6 +4331,7 @@ class DatasetManager:
                 for text_encoder in range(len(self.text_encoders)):
                     self._cache_on_every_node('text', node, nodes, leader, text_encoder=text_encoder)
 
+        startup_timing.mark('caching round: metadata, latents and text embeddings checked or encoded')
         if metadata_only:
             # No model was used. Every rank reads the metadata back, so one that cannot (a node
             # that does not see the volume rank 0 wrote to) fails the run here and not at training.
@@ -4268,6 +4386,7 @@ class DatasetManager:
         except Exception as e:
             error = e
         all_ok(error)
+        startup_timing.mark('every rank loading the cached datasets')
 
     def _start_caching_process(self, queue, **stage):
         # start up a process to run through the dataset caching flow
