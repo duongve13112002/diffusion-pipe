@@ -101,6 +101,9 @@ def bare_pipeline(model_config=None, config=None):
     pipe.clean_end_schedule = None
     pipe.clean_end_samplers = {}
     pipe.training_epoch = 1
+    pipe.stream_spec = None
+    pipe.stream_metrics = None
+    pipe.training_step = 1
     return pipe
 
 

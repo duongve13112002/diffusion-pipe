@@ -33,6 +33,7 @@ from utils.unsloth_utils import unsloth_checkpoint
 from utils.pipeline import ManualPipelineModule
 from utils.dora import apply_dora_config_defaults, check_model_dtypes as check_dora_model_dtypes
 from utils.oplora import OPLoRAProjector, apply_oplora_config_defaults
+from utils.outlier_decay import OutlierDecay, apply_outlier_decay_config_defaults
 from utils.lr_schedule import create_lr_scheduler
 from utils.checkpoint_layout import check_checkpoint_files, check_checkpoint_layers, shift_checkpoint_layers
 from utils.param_groups import check_resumed_param_groups, group_names, split_2d_param_groups
@@ -153,6 +154,10 @@ def set_config_defaults(config):
     # EMA of the trained weights (utils/ema.py): validated here so a typo fails before any
     # model is loaded.
     apply_ema_config_defaults(config)
+
+    # Outlier decay of the base weights of a full fine-tune (utils/outlier_decay.py); refused
+    # next to an [adapter].
+    apply_outlier_decay_config_defaults(config)
 
     config.setdefault('logging_steps', 1)
     # The size of each step's change to the weights (utils/step_stats.py): on by default for an
@@ -1025,6 +1030,17 @@ if __name__ == '__main__':
     )
     model_engine.lr_scheduler = lr_scheduler
 
+    # Before a resume replaces the weights: each tensor's reference RMS is the one it had at launch.
+    # Only data-parallel rank 0 of each stage reports the metrics, the replicas hold the same weights.
+    outlier_decay = None
+    if 'outlier_decay' in config and config['outlier_decay']['rate'] > 0:
+        outlier_decay = OutlierDecay.build(
+            pipeline_model.named_parameters(), optimizer, config['outlier_decay'],
+            contributes=model_engine.grid.get_data_parallel_rank() == 0,
+        )
+        if model_engine.grid.get_data_parallel_rank() == 0:
+            print(f'stage {model_engine.grid.get_pipe_parallel_rank()}: {outlier_decay.describe()}')
+
     step = 1
     examples = global_batch_size
     loss_average = LossAverage(config['loss_average_steps'])
@@ -1149,6 +1165,13 @@ if __name__ == '__main__':
             nan_check.before_step(step)
         logged_step = step % config['logging_steps'] == 0 or step % steps_per_print == 0
         step_stats.before_step(logged_step)
+        # Models whose loss changes with the step (MOSS-Image's stream penalty schedule); every
+        # rank, as each pipeline stage's layers may read it.
+        if hasattr(model, 'set_training_step'):
+            model.set_training_step(step)
+        if outlier_decay is not None:
+            # DeepSpeed advances the scheduler inside train_batch, so the lr is read before it.
+            outlier_decay.before_step()
         loss = model_engine.train_batch(iterator).item()
         if not attention_reported:
             attention_util.report()
@@ -1158,7 +1181,9 @@ if __name__ == '__main__':
         loss_average.add(loss)
         if oplora_projector is not None:
             oplora_projector.project()
-        # After the projection, which is part of what the step changes.
+        if outlier_decay is not None:
+            outlier_decay.apply(step)
+        # After the projection and the decay, which are part of what the step changes.
         stats = step_stats.after_step() if logged_step else {}
         if stats and optimizer.param_groups:
             stats['train/lr'] = optimizer.param_groups[0]['lr']
@@ -1179,6 +1204,9 @@ if __name__ == '__main__':
         # Models may expose extra per-step scalars. Reached through getattr so a model that
         # defines nothing logs nothing and is untouched by this.
         extra_scalars = getattr(model, 'get_extra_log_scalars', lambda: {})()
+        if outlier_decay is not None and logged_step:
+            # A collective: every rank reaches it on the same steps.
+            extra_scalars = {**extra_scalars, **outlier_decay.log_scalars()}
         # .get, because steps_per_print is read straight into the DeepSpeed config dict and is
         # never setdefault-ed onto config itself.
         if is_main_process() and (extra_scalars or stats) and step % steps_per_print == 0:

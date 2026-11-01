@@ -917,6 +917,62 @@ rather than loaded with layers' weights in their neighbours.
   A resumed run keeps the rates its optimizer saved. `--reset_optimizer_params` takes new values
   for the same groups, but also restarts the LR schedule (warmup included). Settings that change
   the groups are refused on resume unless `--reset_optimizer` starts the optimizer state afresh.
+- Residual-stream penalties and outlier decay (both off by default, opt in with the tables below).
+  A MOSS-Image fine-tune can pile the energy of its residual stream into a few "massive"
+  channels and grow a few sparse weight outliers
+  ([KohakuMossTrainer's stream-healing notes](https://github.com/KohakuBlueleaf/KohakuMossTrainer/blob/main/docs/concepts/stream-healing.md)
+  describe it); these port its remedies. Nothing here has been tuned or shown to improve images:
+  the weights below are KohakuMoss's for a 10k-step full fine-tune at lr 2e-5, and a LoRA at a
+  higher lr may want other values. [Notes](note/stream-healing-implementation-plan.md).
+
+  ```toml
+  [model.stream_loss.write]          # the main term
+  weight = 5e-3                      # 0 turns a term off
+  target = 0.5                       # required: the top-k share the hinge settles on
+  anneal = 2000                      # steps the share takes to fall from 1 to target
+  start = 0
+  k = 32                             # channels counted as "the top"
+  parts = 'both'                     # 'attn', 'ffn' or 'both'
+  dilute = false                     # false: only the top channels are shrunk
+
+  [model.stream_loss.rms]
+  weight = 5e-5
+  target = 1.0                       # per-sample RMS of the stream, pulled to this from both sides
+
+  [model.stream_loss.concentration]
+  weight = 1e-2
+  k = 32
+  dilute = true
+
+  [outlier_decay]                    # full fine-tune only: refused next to [adapter]
+  rate = 6.0                         # lambda; 0 turns it off
+  cap = 16.0                         # threshold, in units of each tensor's RMS when the run started
+  cap_start = 64.0                   # 0 = cap; else the cap falls geometrically to `cap` ...
+  cap_anneal = 10000                 # ... over this many steps
+  warmup = 1000                      # steps over which rate ramps linearly from 0
+  targets = ''                       # regex over parameter names; empty = every 2-D trained weight
+  exclude = ''
+  include_1d = false
+  ```
+
+  The stream terms work for LoRA and full fine-tunes alike. Per block, the top-`k` share is the
+  fraction of the channel energy held by the `k` largest channels, taken over the micro-batch:
+  `concentration` penalises it for each block's output, `write` for what each attention and FFN
+  sublayer adds to the stream (its projection output times its gate, adapter included) with a
+  hinge `relu(share - tau)^2` whose `tau` falls from 1 to `target`, and `rms` pulls each sample's
+  stream RMS to `target`. Training batches only; eval losses and `--test_sample` are the plain
+  flow loss. They need `compile = false` and `k` no larger than the model width. The step logs
+  `train/flow_loss`, `train/stream_penalty` (`train/loss` is their sum), each term's value, the
+  write shares (`train/write_share_attn`, `train/write_share_ffn`) with their target, and
+  `train/stream_rms`.
+
+  `outlier_decay` shrinks each targeted weight after the optimizer step by
+  `lr * rate * sign(w) * relu(|w| - cap * r0)`, with `r0` the tensor's RMS in the weights the run
+  started from (a resumed run takes it from `transformer_path` again, so keep that path). The
+  decay is far below one bf16 step, so bf16 weights are updated with stochastic rounding (computed
+  in fp32; an element the decay does not touch stays bit-identical), seeded by `seed` and the step
+  so that data-parallel replicas stay identical. It logs `train/outlier_over` (elements above the
+  cap) and `train/outlier_max` (the largest `|w| / (cap * r0)`).
 - `merge_adapters` also takes ai-toolkit's MOSS-Image LoRAs, which adapt the fused `proj.qkv`
   (ComfyUI, diffusers `transformer.` and kohya `lora_unet_` names): each of q, k and v gets the
   LoRA's A and its third of B, which is exact. Fused LoKr/LoHa/DoRA cannot be split and are

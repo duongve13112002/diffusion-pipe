@@ -33,6 +33,61 @@
 <p class="meta">A running log of decisions taken outside the spec, forced changes, tradeoffs, and
 anything else the maintainer needs to know. Newest entry first.</p>
 
+<h2>2026-11-01 &mdash; Residual-stream penalties and outlier decay for MOSS-Image</h2>
+
+<p><strong>Request.</strong> KohakuMossTrainer's <code>stream-healing.md</code> describes massive
+residual-stream channels and sparse weight outliers in MOSS-Image fine-tunes, and its trainer has
+<code>STREAM_LOSS</code> and <code>OUTLIER_DECAY</code> against them. diffusion-pipe had nothing of the
+kind. Port both, for LoRA and full fine-tunes. The comparison and the plan are in
+<code>docs/note/kohakumoss-vs-diffusion-pipe-moss-training.md</code> and
+<code>docs/note/stream-healing-implementation-plan.md</code>.</p>
+
+<h3>What was added</h3>
+<ul>
+  <li><code>utils/stream_loss.py</code>, <code>[model.stream_loss.&lt;term&gt;]</code>: <code>concentration</code>,
+    <code>rms</code> and <code>write</code> (KohakuMoss's <code>peak</code> guards fp16 headroom and does not apply to
+    bf16/fp32 training, so it is refused by name). Off unless a term has a weight. Wired through
+    <code>models/moss_image.py</code> (layers, <code>get_loss_fn</code>, <code>get_extra_log_scalars</code>,
+    <code>set_training_step</code>) and <code>train.py</code>.</li>
+  <li><code>utils/outlier_decay.py</code>, <code>[outlier_decay]</code>: full fine-tune only (refused next to
+    <code>[adapter]</code>, whose base weights never change). Applied after <code>train_batch</code>, before the
+    step statistics and the EMA, so both see the decayed weights.</li>
+  <li>Tests: <code>test/test_stream_loss.py</code> (config, the terms, the carried numbers against ComfyUI's own
+    forward, LoRA and full gradients, checkpointing, a pipeline cut, eval and sampling) and
+    <code>test/test_outlier_decay.py</code>. GPU script: <code>tools/test_stream_healing_gpu.py</code>.</li>
+</ul>
+
+<h3>Decisions made that were not in the request</h3>
+<ul>
+  <li><strong>No change to the ComfyUI submodule.</strong> A sublayer's write is its projection's output times
+    its gate (<code>gated_residual</code> is <code>addcmul(x, y, gate)</code>), so forward hooks on
+    <code>proj.o</code> and <code>proj.ffn_down</code>, times the gates the layer already builds, give it. The
+    hooks are on the modules an adapter has wrapped, so a LoRA's part is included.</li>
+  <li><strong>The penalty rides the pipeline layers.</strong> Each block adds its numbers (top-k shares, the RMS
+    term) to one float32 vector that travels with the activations, as Iris's REPA loss does, and the loss function
+    forms the penalty on the last stage. Carrying shares rather than a finished penalty lets the hinge's schedule
+    depend on the step without the layers knowing it. With no stream term the tuples keep their old shape.</li>
+  <li><strong>Training batches only.</strong> Eval and <code>--test_sample</code> return the plain prediction, so
+    eval losses stay the flow loss.</li>
+  <li><strong>bf16 weights are decayed with stochastic rounding.</strong> The decay per step is far below one bf16
+    step, so rounding to nearest would never move a weight. The noise is seeded by <code>seed</code> and the step,
+    the same on every data-parallel replica, so the replicas stay identical. The optimizer's Kahan buffer is not
+    adjusted.</li>
+  <li><code>r0</code> (each tensor's reference RMS) is taken from the weights as loaded at launch, before a resume.</li>
+  <li>Refused: <code>compile = true</code> with a stream term, <code>k</code> above the model width, an
+    <code>[outlier_decay]</code> with an <code>[adapter]</code>, unknown terms and fields.</li>
+</ul>
+
+<h3>Not verified</h3>
+<div class="flag">
+  <p>Everything above was run on CPU with tiny random models. No GPU was available: the real 5B model, DeepSpeed
+  pipeline stages, bf16 on CUDA, block swap and a resumed run were not exercised
+  (<code>tools/test_stream_healing_gpu.py</code> is for that). Nothing is tuned and nothing shows the penalties
+  improve images: KohakuMoss measured <code>concentration</code> + <code>rms</code> on a fine-tune and lists the
+  full <code>write</code> + <code>OUTLIER_DECAY</code> run as pending, and its weights are for a 10k-step full
+  fine-tune at lr 2e-5.</p>
+</div>
+
 <h2>2026-11-01 &mdash; SDPA kernel order under checkpointing, early resume checks, warm launch cost</h2>
 
 <p><strong>Request.</strong> Find and fix why MOSS-Image with <code>attention = 'sdpa'</code> stopped

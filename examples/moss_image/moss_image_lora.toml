@@ -95,6 +95,13 @@ timestep_sample_method = 'logit_normal'
 #sample_slg_layers = []
 #sample_slg_scale = 0.0
 
+# Residual-stream penalty (off by default; see docs/supported_models.md#moss-image). Untuned: the value
+# is KohakuMossTrainer's for a full fine-tune, a LoRA at a higher lr may want another.
+#[model.stream_loss.write]
+#weight = 5e-3
+#target = 0.5
+#anneal = 2000
+
 [adapter]
 type = 'lora'
 rank = 32

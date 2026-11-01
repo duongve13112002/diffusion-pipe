@@ -80,6 +80,15 @@ timestep_sample_method = 'logit_normal'
 # ...and per block, multiplying its part's rate (ranges are inclusive and may not overlap):
 #block_lr_scale = [{blocks = '0-9', scale = 0.5}, {blocks = '35-41', scale = 1.5}]
 
+# Residual-stream penalties and outlier decay (off by default; see docs/supported_models.md#moss-image).
+# Untuned: these are KohakuMossTrainer's values for a 10k-step full fine-tune.
+#[model.stream_loss.write]
+#weight = 5e-3
+#target = 0.5
+#anneal = 2000
+#[model.stream_loss.rms]
+#weight = 5e-5
+
 [optimizer]
 type = 'adamw_optimi'
 lr = 1e-5
@@ -99,3 +108,11 @@ eps = 1e-8
 
 [monitoring]
 enable_wandb = false
+
+# Pulls weight outliers back towards each tensor's starting RMS after every step (full fine-tune only).
+#[outlier_decay]
+#rate = 6.0
+#cap = 16.0
+#cap_start = 64.0
+#cap_anneal = 10000
+#warmup = 1000

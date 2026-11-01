@@ -47,6 +47,7 @@ from tqdm import tqdm
 from models.base import ComfyPipeline, ModelWrapper, PreprocessMediaFile, make_contiguous
 from utils.common import is_main_process
 from utils.offloading import ModelOffloader
+from utils.stream_loss import StreamLayout, StreamMetrics, channel_energy, check_width, parse_stream_loss
 import comfy.latent_formats
 import comfy.lora
 import comfy.model_base
@@ -951,6 +952,10 @@ class LayerState:
         self.rope_fn = rope
         self.compute_dtype = compute_dtype
         self.skip_layers = frozenset()
+        # True while sample() runs: the stream penalties are for training batches only.
+        self.sampling = False
+        # utils.stream_loss.StreamLayout when [model.stream_loss] has an active term, else None.
+        self.stream = None
         self._rope = OrderedDict()
 
     def rope(self, height, width, text_length, device):
@@ -998,6 +1003,14 @@ class MossImagePipeline(ComfyPipeline):
             raise ValueError('MOSS-Image runs in bfloat16 or float32; set dtype to one of them')
         self.model_config['dtype'] = self.dtype
         self._check_keys()
+        # Residual-stream penalties (utils/stream_loss.py): None unless a term has a weight.
+        self.stream_spec = parse_stream_loss(self.model_config)
+        if self.stream_spec is not None and config.get('compile'):
+            raise ValueError('[model.stream_loss] does not work with compile = true: the penalty taps the '
+                             'blocks with forward hooks and carries its numbers through the pipeline layers. '
+                             'Set compile = false, or remove stream_loss.')
+        self.stream_metrics = None
+        self.training_step = 1
         self.cache_text_embeddings = self.model_config['cache_text_embeddings']
         self.tokenizer = None
         self.overflow_warned = set()
@@ -1076,6 +1089,11 @@ class MossImagePipeline(ComfyPipeline):
             if round(before, 6) != round(after, 6):
                 print(f'MOSS-Image: epoch {epoch}, {after:.1f}% of training steps below sigma {CLEAN_END_SIGMA}')
         self.training_epoch = epoch
+
+    def set_training_step(self, step):
+        """Called by train.py on every rank before each optimizer step (1-based); the write term's
+        hinge share depends on it."""
+        self.training_step = step
 
     def training_noise_sampler(self):
         if self.clean_end_schedule is None:
@@ -1192,6 +1210,10 @@ class MossImagePipeline(ComfyPipeline):
                              'a quantized model, which will not work. Train an [adapter], or load an unquantized checkpoint.')
         self.learning_rates.check_blocks(len(self.diffusion_model.layers))
         self.layer_state = LayerState(self.diffusion_model.rope, self.dtype)
+        if self.stream_spec is not None:
+            check_width(self.stream_spec, self.diffusion_model.layers[0].norm1.weight.shape[0])
+            self.layer_state.stream = StreamLayout(self.stream_spec, len(self.diffusion_model.layers))
+            self.stream_metrics = StreamMetrics(self.layer_state.stream.metric_names())
         if not self.cache_text_embeddings and self.on_first_stage():
             # Read now, before DeepSpeed starts, by the ranks whose first layer encodes: in the
             # first step the other stages would wait on the read, and a failed read would leave
@@ -1317,6 +1339,33 @@ class MossImagePipeline(ComfyPipeline):
         # ComfyUI's MOSS-Image takes sigma itself; its timestep embedding scales it by 1000.
         return (noisy, sigma, text, text_mask), (target, mask)
 
+    def get_loss_fn(self):
+        flow_loss = super().get_loss_fn()
+
+        def loss_fn(output, label):
+            stream = None
+            if isinstance(output, (tuple, list)):
+                output, stream = output
+            loss = flow_loss(output, label)
+            layout = self.layer_state.stream if self.layer_state is not None else None
+            if stream is None or layout is None:
+                return loss
+            penalty, terms, parts = layout.penalty(stream, self.training_step)
+            self.stream_metrics.record({
+                'flow_loss': loss, 'stream_penalty': penalty,
+                **{f'penalty_{name}': value for name, value in terms.items()}, **parts})
+            return loss + penalty
+        return loss_fn
+
+    def get_extra_log_scalars(self):
+        """The stream penalty numbers of the step (utils/stream_loss.py): train/flow_loss and
+        train/stream_penalty (train/loss is their sum), each term unweighted, the write shares and
+        target, the stream RMS. train.py calls this on every rank each step; the reduction inside is
+        a collective every rank joins."""
+        if self.stream_metrics is None:
+            return {}
+        return self.stream_metrics.reduce()
+
     def get_param_groups(self, parameters):
         rates = self.learning_rates
         if not rates.active:
@@ -1357,7 +1406,7 @@ class MossImagePipeline(ComfyPipeline):
         layers = [TextEncoderLayer(text_encoder, self.dtype, self.text_dim), InitialLayer(model, state)]
         for i, block in enumerate(model.layers):
             layers.append(TransformerLayer(block, i, self.offloader, state, len(model.layers)))
-        layers.append(FinalLayer(model))
+        layers.append(FinalLayer(model, state))
         return layers
 
     def enable_block_swap(self, blocks_to_swap):
@@ -1416,10 +1465,12 @@ class MossImagePipeline(ComfyPipeline):
 
     def _predict(self, x, t, conds, skip=frozenset()):
         self.layer_state.skip_layers = skip
+        self.layer_state.sampling = True
         try:
             return self.pipeline_model((x, t, *conds)).float()
         finally:
             self.layer_state.skip_layers = frozenset()
+            self.layer_state.sampling = False
 
     @torch.no_grad()
     def sample(self, w=1024, h=1024, steps=None, seed=None, noise=None, decode=True):
@@ -1683,7 +1734,9 @@ class InitialLayer(nn.Module):
             pieces.append((indices, torch.cat((video[indices], refined), 1)))
         hidden = _assemble(pieces, batch, hw + max(lengths_list))
         sizes = torch.tensor([height, width], device=device)
-        return make_contiguous(hidden, mod, head, lengths, sizes)
+        # The stream penalties' numbers ride the layers to the loss (utils/stream_loss.py).
+        stream = [] if self.state.stream is None else [self.state.stream.new(hidden)]
+        return make_contiguous(hidden, mod, head, lengths, sizes, *stream)
 
 
 class TransformerLayer(nn.Module):
@@ -1694,43 +1747,80 @@ class TransformerLayer(nn.Module):
         self.offloader = offloader
         self.state = state
         self.transformer_options = {'total_blocks': num_blocks, 'block_type': 'single', 'block_index': block_idx}
+        self._writes = None
+        self._gates = None
+        if state.stream is not None and state.stream.write_parts:
+            # What a sublayer adds to the stream is its projection's output times its gate (ComfyUI's
+            # Block.forward: gated_residual = addcmul(x, y, gate)). The projections are the modules
+            # an adapter has wrapped by now, so the write includes the adapter's part.
+            for part, name, gate in (('attn', 'o', 2), ('ffn', 'ffn_down', 5)):
+                if part in state.stream.write_parts:
+                    block.proj[name].register_forward_hook(self._write_tap(part, gate))
+
+    def _write_tap(self, part, gate):
+        def tap(module, inputs, output):
+            if self._writes is None:
+                return
+            energy = channel_energy(output * self._gates[gate])
+            self._writes[part] = self._writes[part] + energy if part in self._writes else energy
+        return tap
 
     def forward(self, inputs):
-        hidden, mod, head, lengths, sizes = inputs
+        hidden, mod, head, lengths, sizes, *extra = inputs
+        layout = self.state.stream
+        if layout is not None and len(extra) != 1:
+            raise RuntimeError('stream_loss is on but the stream vector did not reach this layer')
         self.offloader.wait_for_block(self.block_idx)
         if self.block_idx not in self.state.skip_layers:
+            # Training batches only: eval and sampling leave the vector as it is.
+            penalized = layout is not None and self.training and not self.state.sampling
             height, width = sizes.tolist()
             hw = height * width
             lengths_list = lengths.tolist()
             batch, total = hidden.shape[:2]
             groups = _length_groups(lengths_list)
             pieces = []
-            for n, indices in groups.items():
-                pe = self.state.rope(height, width, n, hidden.device)
-                rows = hidden[:, :hw + n] if len(indices) == batch else hidden[indices, :hw + n]
-                rows_mod = mod if len(indices) == batch else mod[indices]
-                # MOSSImage._forward's mod: six (batch, 1, dim) tensors.
-                out = self.block(rows, rows_mod.unsqueeze(2).unbind(1), pe, self.transformer_options)
-                pieces.append((indices, out))
+            self._writes = {} if penalized else None
+            try:
+                for n, indices in groups.items():
+                    pe = self.state.rope(height, width, n, hidden.device)
+                    rows = hidden[:, :hw + n] if len(indices) == batch else hidden[indices, :hw + n]
+                    rows_mod = mod if len(indices) == batch else mod[indices]
+                    # MOSSImage._forward's mod: six (batch, 1, dim) tensors.
+                    self._gates = rows_mod.unsqueeze(2).unbind(1)
+                    out = self.block(rows, self._gates, pe, self.transformer_options)
+                    pieces.append((indices, out))
+                writes = self._writes
+            finally:
+                self._writes = self._gates = None
             if len(groups) == 1 and hw + lengths_list[0] == total:
                 hidden = pieces[0][1]
             else:
                 hidden = _assemble(pieces, batch, total)
+            if penalized:
+                values = layout.block_values(self.block_idx, hidden, lengths + hw, writes)
+                extra = [layout.add(extra[0], self.block_idx, values)]
         self.offloader.submit_move_blocks_forward(self.block_idx)
-        return make_contiguous(hidden, mod, head, lengths, sizes)
+        return make_contiguous(hidden, mod, head, lengths, sizes, *extra)
 
 
 class FinalLayer(nn.Module):
-    def __init__(self, model):
+    def __init__(self, model, state=None):
         super().__init__()
         self.final_norm_video = model.final_norm_video
         self.final_linear_video = model.final_linear_video
+        self.state = state
 
     def forward(self, inputs):
-        hidden, mod, head, lengths, sizes = inputs
+        hidden, mod, head, lengths, sizes, *extra = inputs
         height, width = sizes.tolist()
         shift, scale = head.unsqueeze(2).unbind(1)
         x = modulated_rms_norm(hidden[:, :height * width], self.final_norm_video, scale, shift)
         x = self.final_linear_video(x)
         out = x.transpose(1, 2).reshape(x.shape[0], -1, height, width)
-        return _tie(out, mod)
+        out = _tie(out, mod)
+        if extra and self.training and not self.state.sampling:
+            # The training loss function adds the penalty formed from the vector; eval and
+            # sampling return the plain prediction.
+            return out, extra[0]
+        return out
