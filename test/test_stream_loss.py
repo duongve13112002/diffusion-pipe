@@ -441,3 +441,11 @@ def test_hooks_are_registered_once_and_only_for_the_tapped_parts():
     spec = spec_of(rms=ALL['rms'])
     pipe, layout, _ = stream_pipeline(spec)
     assert len(pipe.diffusion_model.layers[0].proj['o']._forward_hooks) == 0
+
+
+def test_stream_loss_is_refused_off_moss_image():
+    from utils.stream_loss import refuse_stream_loss_off_moss
+    refuse_stream_loss_off_moss({'type': 'moss_image', 'stream_loss': {}})
+    refuse_stream_loss_off_moss({'type': 'flux'})
+    with pytest.raises(ValueError, match='stream_loss'):
+        refuse_stream_loss_off_moss({'type': 'flux', 'stream_loss': {'write': {'weight': 1}}})

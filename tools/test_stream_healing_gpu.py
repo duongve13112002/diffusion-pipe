@@ -53,7 +53,9 @@ def selftest():
         raise SystemExit('No CUDA device available. Run this on a GPU machine.')
     device = 'cuda'
     for dtype in (torch.float32, torch.bfloat16):
-        config = {'outlier_decay': {'rate': 6.0, 'cap': 1.0, 'seed': 7}}
+        # cap 4 x r0: a default-initialised layer's largest element is sqrt(3) x r0, so only the 16 x r0 columns exceed it
+        cap = 4.0
+        config = {'outlier_decay': {'rate': 6.0, 'cap': cap, 'seed': 7}}
         apply_outlier_decay_config_defaults(config)
 
         def make():
@@ -73,7 +75,7 @@ def selftest():
             decay.before_step()
             decay.apply(step)
         moved = (start - module.weight.float())[:, :8].mean().item()
-        wanted = (16 * r0 - r0) * (1 - (1 - 1e-3 * 6.0) ** steps)
+        wanted = (16 - cap) * r0 * (1 - (1 - 1e-3 * 6.0) ** steps)
         check(abs(moved - wanted) < 0.15 * wanted, f'{dtype}: outliers moved {moved:.4g}, expected {wanted:.4g}')
         check(torch.equal(module.weight.float()[:, 8:], start[:, 8:]), f'{dtype}: elements below the cap are bit-identical')
         again, decay2 = make()

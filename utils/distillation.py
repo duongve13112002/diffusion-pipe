@@ -105,6 +105,11 @@ def parse_distill_config(config):
     if config.get('blocks_to_swap', 0):
         raise ValueError(f'[{KEY}] cannot be combined with blocks_to_swap: block swapping already moves the '
                          'blocks between CPU and GPU every step, and the teacher is a second full forward.')
+    if isinstance(config.get('adapter'), dict) and config['adapter'].get('init_from_existing'):
+        raise ValueError(f'[{KEY}] cannot be combined with [adapter] init_from_existing: the teacher is the model with '
+                         'the adapter switched off, which is the base model, not the base plus the adapter the run '
+                         'starts from, so the term would pull the first steps away from the starting adapter. '
+                         'Remove one of them.')
     if 'adapter' in config and int(config.get('pipeline_stages', 1)) != 1:
         raise ValueError(f'[{KEY}] with an [adapter] needs pipeline_stages = 1: the teacher is the same blocks '
                          'with the adapter switched off, which only a stage that holds the whole model can run. '

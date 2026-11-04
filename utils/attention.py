@@ -119,7 +119,9 @@ def settle_sdpa_priority(prefer_cudnn, device='cuda'):
 
     One small SDPA call here, outside any context, makes PyTorch's one-time change happen now.
     prefer_cudnn False then restores the order from before it, the order every call after the
-    first ran with until now; True keeps PyTorch's. Either way the order is settled before the
+    first ran with until now when that first call ran inside ComfyUI's context (a process whose
+    first call ran outside any context had cuDNN first from then on: it now runs flash first);
+    True keeps PyTorch's. Either way the order is settled before the
     model runs, so a call and its recomputation pick the same kernel. Calls inside ComfyUI's
     context still use ComfyUI's own order.
     """

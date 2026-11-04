@@ -97,6 +97,10 @@ def apply_outlier_decay_config_defaults(config):
         raise ValueError(f"{KEY}.cap_start must be 0 (= cap) or >= cap, got {table['cap_start']!r}")
     for name in ('cap_anneal', 'warmup', 'seed'):
         _whole(table, name)
+    if (table['cap_start'] > 0) != (table['cap_anneal'] > 0):
+        raise ValueError(f"{KEY}.cap_start and {KEY}.cap_anneal go together: the cap falls from cap_start to cap over "
+                         f"cap_anneal steps, so setting only one changes nothing (got cap_start={table['cap_start']!r}, "
+                         f"cap_anneal={table['cap_anneal']!r})")
     for name in ('targets', 'exclude'):
         try:
             re.compile(table[name])

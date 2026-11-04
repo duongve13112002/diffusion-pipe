@@ -88,7 +88,13 @@ outside any context, so PyTorch's one-time change happens there, then:
 
 - `[model] sdpa_prefer_cudnn = false` (default): writes back the order from before the change
   (flash, efficient, math, cuDNN). That is the order every call after the first already ran with,
-  so training is unchanged apart from the first call no longer differing.
+  so training is unchanged apart from the first call no longer differing, for a run whose first
+  SDPA call ran inside ComfyUI's priority context. Where it did not (a model that calls
+  `F.scaled_dot_product_attention` itself, the flash3/flash4 fallback calls, or a ComfyUI model
+  whose first call was a small one), PyTorch's change had already made cuDNN first for the rest of
+  the process on PyTorch 2.9+ with a recent cuDNN on Hopper/Blackwell. Those runs now use flash
+  first by default: a speed and last-bit numerics change, and the safer order (cuDNN's backward
+  has returned NaN). Set `sdpa_prefer_cudnn = true` to keep the old behaviour.
 - `[model] sdpa_prefer_cudnn = true`: keeps PyTorch's order (cuDNN first where PyTorch prefers it).
   Calls outside ComfyUI's context (smaller inputs, non-ComfyUI models) then run cuDNN.
 

@@ -78,6 +78,13 @@ def _whole(term, name, where, low):
         raise _bad(where, name, value, f'a whole number >= {low}')
 
 
+def refuse_stream_loss_off_moss(model_config):
+    """[model.stream_loss] is read by MOSS-Image only; on another model it would be ignored."""
+    if KEY in model_config and model_config.get('type') != 'moss_image':
+        raise ValueError(f"[model.{KEY}] only applies to model type 'moss_image', not {model_config.get('type')!r}: "
+                         "the penalty taps MOSS-Image's residual stream. Remove it.")
+
+
 def parse_stream_loss(model_config):
     """The active terms of model_config['stream_loss'] with their defaults filled in
     ({term: fields}), or None when no term has a weight above zero.

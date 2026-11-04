@@ -38,6 +38,7 @@ from utils.step_guard import NonFiniteGuard, apply_step_guard_config_defaults
 from utils.weight_decay_target import (WeightDecayTarget, apply_weight_decay_target_config_defaults,
                                        restore_optimizer_decay, weight_decay_target_active)
 from utils.lr_schedule import create_lr_scheduler, validate_min_ratio
+from utils.stream_loss import refuse_stream_loss_off_moss
 from utils.checkpoint_layout import check_checkpoint_files, check_checkpoint_layers, shift_checkpoint_layers
 from utils.lora_plus import NAME as LORA_PLUS, apply_lora_plus_config_defaults, lora_plus_active, split_lora_plus_groups
 from utils.param_groups import check_resumed_param_groups, group_names, split_2d_param_groups
@@ -171,7 +172,9 @@ def set_config_defaults(config):
     apply_weight_decay_target_config_defaults(config)
 
     # Fail before any model is loaded, not when the scheduler is built.
-    validate_min_ratio(config.get('lr_scheduler_min_ratio'), config.get('lr_scheduler', 'constant'))
+    validate_min_ratio(config.get('lr_scheduler_min_ratio'), config.get('lr_scheduler', 'constant'),
+                       config.get('force_constant_lr'))
+    refuse_stream_loss_off_moss(config['model'])
 
     config.setdefault('logging_steps', 1)
     # The size of each step's change to the weights (utils/step_stats.py): on by default for an
@@ -1061,14 +1064,27 @@ if __name__ == '__main__':
     )
     model_engine.lr_scheduler = lr_scheduler
 
+    if 'force_constant_lr' in config:
+        # The rate every group will have (set for good below, after a resume restores the optimizer): the
+        # startup checks of the two decays that follow compare it with their strength.
+        for pg in optimizer.param_groups:
+            pg['lr'] = pg['initial_lr'] = config['force_constant_lr']
+
     # Before a resume replaces the weights: each tensor's reference RMS is the one it had at launch.
     # Only data-parallel rank 0 of each stage reports the metrics, the replicas hold the same weights.
+    # A build can fail on one pipeline stage only; all_ok stops the others too, before require_match's
+    # collective would wait for it.
     outlier_decay = None
     if 'outlier_decay' in config and config['outlier_decay']['rate'] > 0:
-        outlier_decay = OutlierDecay.build(
-            pipeline_model.named_parameters(), optimizer, config['outlier_decay'],
-            contributes=model_engine.grid.get_data_parallel_rank() == 0,
-        )
+        error = None
+        try:
+            outlier_decay = OutlierDecay.build(
+                pipeline_model.named_parameters(), optimizer, config['outlier_decay'],
+                contributes=model_engine.grid.get_data_parallel_rank() == 0,
+            )
+        except Exception as e:
+            error = e
+        all_ok(error)
         if model_engine.grid.get_data_parallel_rank() == 0:
             print(f'stage {model_engine.grid.get_pipe_parallel_rank()}: {outlier_decay.describe()}')
         outlier_decay.require_match()
@@ -1076,7 +1092,12 @@ if __name__ == '__main__':
     # Also before a resume: the launch weights are the anchors the decay pulls toward.
     weight_decay_target = None
     if weight_decay_target_active(config):
-        weight_decay_target = WeightDecayTarget.build(pipeline_model.named_parameters(), optimizer, config)
+        error = None
+        try:
+            weight_decay_target = WeightDecayTarget.build(pipeline_model.named_parameters(), optimizer, config)
+        except Exception as e:
+            error = e
+        all_ok(error)
         if model_engine.grid.get_data_parallel_rank() == 0:
             print(f'stage {model_engine.grid.get_pipe_parallel_rank()}: {weight_decay_target.describe()}')
         weight_decay_target.require_match()
@@ -1134,12 +1155,13 @@ if __name__ == '__main__':
         for pg in optimizer.param_groups:
             pg['lr'] = config['force_constant_lr']
 
-    if weight_decay_target is not None:
-        # Restoring the optimizer state brought back the decay the checkpoint was saved with.
-        weight_decay_target.claim_groups()
-    elif resume_from_checkpoint and restore_optimizer_decay(optimizer):
+    # The optimizer state of a run with weight_decay_target holds its groups with a decay of 0; give them the
+    # decay they had, then let this run's own setting take over the groups it acts on.
+    if resume_from_checkpoint and restore_optimizer_decay(optimizer) and weight_decay_target is None:
         if is_main_process():
             print('The checkpoint was saved with weight_decay_target on; the weight decay of those groups is back on.')
+    if weight_decay_target is not None:
+        weight_decay_target.claim_groups()
 
     eval_dataloaders = {
         name: dataset_util.PipelineDataLoader(eval_data, model_engine, config['eval_gradient_accumulation_steps'], model,

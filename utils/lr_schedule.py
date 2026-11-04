@@ -12,10 +12,14 @@ import math
 import torch
 
 
-def validate_min_ratio(min_ratio, scheduler_type):
-    """Raise ValueError for a bad lr_scheduler_min_ratio; None (not set) is fine for any scheduler."""
+def validate_min_ratio(min_ratio, scheduler_type, force_constant_lr=None):
+    """Raise ValueError for a bad lr_scheduler_min_ratio; None (not set) is fine for any scheduler.
+    force_constant_lr: its value when the config sets it; the schedule is then replaced by a constant."""
     if min_ratio is None:
         return
+    if force_constant_lr is not None:
+        raise ValueError('lr_scheduler_min_ratio shapes the learning rate schedule, which force_constant_lr replaces '
+                         'with a constant rate. Remove one of them.')
     if isinstance(min_ratio, bool) or not isinstance(min_ratio, (int, float)) or not 0 <= min_ratio < 1:
         raise ValueError(f'lr_scheduler_min_ratio must be a number in [0, 1), got {min_ratio!r}')
     if scheduler_type not in ('cosine', 'linear'):

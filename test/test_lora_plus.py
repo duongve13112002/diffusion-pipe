@@ -122,7 +122,8 @@ def test_inside_an_optimizer_with_the_weight_decay_split_and_a_schedule():
 
 
 def test_lora_plus_refuses_adaptive_optimizers_and_a_missing_lr():
-    for optimizer in ({'type': 'prodigy', 'lr': 1}, {'type': 'genericoptim', 'lr': 1e-4, 'automagic': True},
+    for optimizer in ({'type': 'prodigy', 'lr': 1}, {'type': 'automagic', 'lr': 1e-4},
+                      {'type': 'genericoptim', 'lr': 1e-4, 'automagic': True},
                       {'type': 'adamw'}):
         config = {'adapter': {'type': 'lora', 'lora_plus_ratio': 8}, 'optimizer': optimizer}
         with pytest.raises(ValueError):

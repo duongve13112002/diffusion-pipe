@@ -306,3 +306,10 @@ def test_require_match_raises_when_nothing_is_targeted():
     with pytest.raises(ValueError, match='no trained parameter of any pipeline stage'):
         nothing.require_match()
 
+
+
+@pytest.mark.parametrize('fields', [{'cap_start': 64.0}, {'cap_anneal': 100}])
+def test_cap_start_and_cap_anneal_come_as_a_pair(fields):
+    with pytest.raises(ValueError, match='cap_start and .*cap_anneal'):
+        apply_outlier_decay_config_defaults({'outlier_decay': {'rate': 1.0, **fields}})
+    apply_outlier_decay_config_defaults({'outlier_decay': {'rate': 1.0, 'cap_start': 64.0, 'cap_anneal': 100}})

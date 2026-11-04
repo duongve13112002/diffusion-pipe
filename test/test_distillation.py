@@ -413,3 +413,10 @@ def test_the_teacher_reads_the_embeddings_the_text_layer_encodes_on_the_fly(monk
     out, teacher = on_the_fly.pipeline_model(tuple(t.clone() for t in inputs))
     torch.testing.assert_close(teacher, expected.float(), rtol=1e-5, atol=1e-5)
     torch.testing.assert_close(out.detach(), expected, rtol=1e-5, atol=1e-5)
+
+
+def test_a_teacher_cannot_follow_an_adapter_started_from_existing_weights():
+    base = {'teacher': {'loss_weight': 0.5}, 'adapter': {'type': 'lora'}}
+    assert parse_distill_config(base) is not None
+    with pytest.raises(ValueError, match='init_from_existing'):
+        parse_distill_config({**base, 'adapter': {'type': 'lora', 'init_from_existing': 'some_lora'}})

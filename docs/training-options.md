@@ -102,7 +102,7 @@ height with a constant, linear or `lr_scheduler_min_ratio` schedule. A plain `co
 `lr_scheduler_min_ratio` to keep it all the way. The groups it adds are named `<name>+B` when the model
 names its groups.
 
-Refused: LoKr (no A/B pair), Prodigy and GenericOptim `automagic` (they adapt their own rates and would ignore the ratio), an `[optimizer]` without `lr`, `gradient_release`, `force_constant_lr` (it sets every group to one rate and
+Refused: LoKr (no A/B pair), Prodigy, Automagic and GenericOptim `automagic` (they adapt their own rates and would ignore the ratio), an `[optimizer]` without `lr`, `gradient_release`, `force_constant_lr` (it sets every group to one rate and
 would undo the ratio). A resumed run keeps the learning rates its optimizer saved, and turning LoRA+ on or off
 for an existing checkpoint changes the number of optimizer groups, which PyTorch refuses: use
 `--reset_optimizer`. `train/lr` logs the first group (the A side).
@@ -150,7 +150,8 @@ before fine-tuning, which limits how far a small dataset can drag it. The step l
 - The teacher forward runs in `TextEncoderLayer`, which is never activation-checkpointed, so it is not
   recomputed in backward; it sees the same embeddings the student does (cached or encoded on the fly) and
   its velocity travels with the activations to the loss. Training batches only.
-- Refused: `compile = true`, `blocks_to_swap`, an `[adapter]` with `pipeline_stages > 1`, unknown keys.
+- Refused: `compile = true`, `blocks_to_swap`, an `[adapter]` with `pipeline_stages > 1`, an `[adapter]` with
+  `init_from_existing` (the teacher would be the base model, not the model the run starts from), unknown keys.
   `decay = 'none'` is warned about: the term never fades, so the model is held near its start for the whole
   run, which is the point of a regulariser but caps how far the fine-tune can move.
 - Not part of KohakuMoss's default recipes, and no measured image-quality benefit was found; judge it from

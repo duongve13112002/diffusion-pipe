@@ -6,7 +6,7 @@ import pytest
 import torch
 from torch import nn
 
-from utils.lr_schedule import create_lr_scheduler
+from utils.lr_schedule import create_lr_scheduler, validate_min_ratio
 
 
 def _collect_lrs(scheduler, optimizer, steps):
@@ -155,3 +155,10 @@ def test_min_ratio_refusals(kind, ratio):
     with pytest.raises(ValueError, match='lr_scheduler_min_ratio'):
         create_lr_scheduler(_make_optimizer(), kind, total_steps=10, min_ratio=ratio)
 
+
+
+def test_min_ratio_is_refused_next_to_force_constant_lr():
+    validate_min_ratio(0.1, 'cosine', None)
+    with pytest.raises(ValueError, match='force_constant_lr'):
+        validate_min_ratio(0.1, 'cosine', 1e-4)
+    validate_min_ratio(None, 'cosine', 1e-4)

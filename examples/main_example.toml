@@ -51,7 +51,7 @@ warmup_steps = 100
 
 # Full fine-tune only. Weight decay pulls each weight toward 0 by default; 'start' pulls it toward the weight
 # it had when the run began, so decay stops eroding the pretrained model. Needs weight decay in [optimizer]
-# (adamw, adamw_optimi, stableadamw, adamw8bit or genericoptim). weight_decay_to_one: regex over parameter
+# (adamw, adamw_optimi, adamw8bit or genericoptim). weight_decay_to_one: regex over parameter
 # names that decay toward 1 instead (norm gains); the tensors must be 1D (no decay from the optimizer).
 #weight_decay_target = 'start'
 #weight_decay_to_one = '^layers\.41\.(q_norm|k_norm)\.weight$'

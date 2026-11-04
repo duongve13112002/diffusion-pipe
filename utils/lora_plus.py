@@ -41,7 +41,7 @@ def apply_lora_plus_config_defaults(config):
                          'parameter. Turn one of them off.')
     if isinstance(optimizer_config, dict):
         kind = str(optimizer_config.get('type', '')).lower()
-        if kind == 'prodigy' or (kind == 'genericoptim' and optimizer_config.get('automagic', False)):
+        if kind in ('prodigy', 'automagic') or (kind == 'genericoptim' and optimizer_config.get('automagic', False)):
             raise ValueError(f"{NAME} needs an optimizer that steps each group at its own learning rate; "
                              f"{optimizer_config.get('type')!r}{' with automagic' if kind == 'genericoptim' else ''} "
                              'adapts its own rates and would ignore the ratio. Use another optimizer, or remove '

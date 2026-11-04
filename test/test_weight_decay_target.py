@@ -276,3 +276,23 @@ def test_genericoptims_own_decay_is_the_decay_this_takes_over(muon):
     plain, _ = one_step(0.0)
     torch.testing.assert_close(decayed - plain, -1e-2 * 0.1 * start, rtol=0, atol=1e-6)
     assert config['optimizer']['type'] == 'genericoptim'
+
+
+def test_resuming_a_start_checkpoint_with_only_weight_decay_to_one_gives_the_2d_decay_back():
+    """train.py on a resume: restore_optimizer_decay first, then claim_groups when the feature is on.
+    A run with weight_decay_target = 'zero' and weight_decay_to_one claims no decayed group, so the
+    decay the checkpoint switched off must not stay off."""
+    module = Stub()
+    optimizer = split_optimizer(module, wd=0.1)
+    WeightDecayTarget.build(named(module), optimizer, make_config())
+    saved = optimizer.state_dict()
+
+    fresh_module = Stub()
+    fresh = split_optimizer(fresh_module, wd=0.1)
+    config = make_config(weight_decay_target='zero', weight_decay_to_one=r'norm\.weight')
+    decay = WeightDecayTarget.build(named(fresh_module), fresh, config)
+    fresh.load_state_dict(saved)
+    assert fresh.param_groups[0]['weight_decay'] == 0.0, 'the premise: the checkpoint holds the decay as 0'
+    restore_optimizer_decay(fresh)
+    decay.claim_groups()
+    assert fresh.param_groups[0]['weight_decay'] == 0.1
