@@ -337,10 +337,14 @@ def check_attention(report):
             before = fp8_training.counts()[1].get('fp8', 0)
             got = attention_step(block, q, k, v, grad)
             ran_fp8 = fp8_training.counts()[1].get('fp8', 0) > before
-            again = attention_step(block, q, k, v, grad, checkpoint=True)
+            # Recomputation under activation checkpointing against a plain run with the same scales:
+            # outside a training step TE does not update them (between two training steps it does,
+            # and delayed scaling then moves the numbers by a few percent, as it should).
+            plain = attention_step(block, q, k, v, grad, training=False)
+            again = attention_step(block, q, k, v, grad, checkpoint=True, training=False)
             ref = attention_reference(fn32, q, k, v, grad)
             errors = {name: rel_error(g, r) for name, g, r in zip(('out', 'dq', 'dk', 'dv'), got, ref)}
-            recompute = max(rel_error(a, g) for a, g in zip(again, got))
+            recompute = max(rel_error(a, g) for a, g in zip(again, plain))
             ok = (active and ran_fp8 and errors['out'] <= ATTENTION_LIMITS['out']
                   and all(errors[n] <= ATTENTION_LIMITS['grad'] for n in ('dq', 'dk', 'dv'))
                   and recompute <= RECOMPUTE_LIMIT)
