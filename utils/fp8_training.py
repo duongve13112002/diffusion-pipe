@@ -693,6 +693,8 @@ class _Site:
         self.forward_seen = False
         self.grad_seen = False
         self.ok = False
+        # why TE could not run this site, once it could not
+        self.error = None
 
     def record_forward(self, q, k, v, out):
         with torch.no_grad():
@@ -838,6 +840,7 @@ class AttentionSites:
             if site.ok or isinstance(error, torch.OutOfMemoryError):
                 raise
             site.state = 'off'
+            site.error = f'{type(error).__name__}: {error}'
             _print(f'WARNING: attention in {block.name} (call {index}, {mask_type}, q {tuple(q.shape)}) cannot run '
                    f'in fp8 ({type(error).__name__}: {error}); it runs without fp8 from here on')
             _attention_counts['sites where TE failed'] += 1

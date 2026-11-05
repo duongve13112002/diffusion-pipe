@@ -620,6 +620,8 @@ def test_attention_outside_blocks_and_te_failures(te):
     assert torch.isfinite(out).all()
     site = next(iter(fp8_training._attention.sites.values()))
     assert site.state == 'off'
+    # tools/check_fp8_training.py reports TE's reason
+    assert site.error == 'RuntimeError: no fused attention backend'
 
 
 @pytest.mark.parametrize('thd', [True, False], ids=['thd', 'padded'])
