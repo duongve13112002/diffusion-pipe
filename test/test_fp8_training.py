@@ -346,21 +346,50 @@ def test_bf16_for_calls_and_layers_fp8_cannot_take(te):
     reference = F.linear(torch.ones(3, 32), layer.weight, layer.bias)
     torch.testing.assert_close(layer(torch.ones(3, 32)), reference)
     assert not te.linear_calls
-    assert fp8_training.counts()[0]['calls whose token count is not a multiple of 8'] == 1
-    with fp8_training.disabled():
-        layer(torch.ones(8, 32))
-    assert not te.linear_calls
-    te.fail_linear = True
-    torch.testing.assert_close(layer(torch.ones(8, 32)), F.linear(torch.ones(8, 32), layer.weight, layer.bias))
-    assert layer.fp8_ok is False
-    te.fail_linear = False
+    assert fp8_training.counts()[0]['calls whose token count is not a multiple of 16'] == 1
+    # 8 tokens: the forward GEMM would take them, the weight-gradient GEMM (which reduces over the
+    # tokens) needs a multiple of 16
     layer(torch.ones(8, 32))
     assert not te.linear_calls
+    assert fp8_training.counts()[0]['calls whose token count is not a multiple of 16'] == 2
+    with fp8_training.disabled():
+        layer(torch.ones(16, 32))
+    assert not te.linear_calls
+    te.fail_linear = True
+    torch.testing.assert_close(layer(torch.ones(16, 32)), F.linear(torch.ones(16, 32), layer.weight, layer.bias))
+    assert layer.fp8_ok is False
+    te.fail_linear = False
+    layer(torch.ones(16, 32))
+    assert not te.linear_calls
     other = net.blocks[0].mlp[2]
-    other(torch.ones(8, 64))
+    other(torch.ones(16, 64))
     te.fail_linear = True
     with pytest.raises(RuntimeError, match='no fp8 GEMM'):
-        other(torch.ones(8, 64))
+        other(torch.ones(16, 64))
+
+
+def test_out_features_must_be_a_multiple_of_16(te):
+    # the input-gradient GEMM reduces over out_features
+    settings()
+
+    class Wide(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.a = nn.Linear(32, 24)
+            self.b = nn.Linear(32, 48)
+
+    class Holder(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.blocks = nn.ModuleList([Wide()])
+
+    class WidePipeline(Pipeline):
+        adapter_target_modules = ['Wide']
+
+    net = Holder()
+    summary = fp8_training.prepare_model(WidePipeline(net))
+    assert summary['fp8'] == 1 and summary['unfit'] == 1
+    assert isinstance(net.blocks[0].b, fp8_training.Fp8Linear) and not isinstance(net.blocks[0].a, fp8_training.Fp8Linear)
 
 
 def test_cache_frozen_weights_only_for_frozen_layers(te):
@@ -368,7 +397,7 @@ def test_cache_frozen_weights_only_for_frozen_layers(te):
     net = Net(blocks=1)
     fp8_training.prepare_model(Pipeline(net))
     net.blocks[0].mlp[0].weight.requires_grad_(False)
-    net(torch.randn(1, 8, 32))
+    net(torch.randn(1, 16, 32))
     cached = {id(c['module']): c['cache'] for c in te.linear_calls}
     assert cached[id(net.blocks[0].mlp[0]._te[0])] is True
     assert cached[id(net.blocks[0].mlp[2]._te[0])] is False
@@ -412,14 +441,14 @@ def test_direct_mode_uses_stored_e4m3_weights_with_current_scaling(te):
     assert summary['direct'] == 4 and summary['dequantized'] == 0
     layer = net.blocks[0].attn.qkv
     assert layer.fp8_recipe == 'current' and layer.weight is stored['blocks.0.attn.qkv']
-    layer(torch.randn(8, 32))
+    layer(torch.randn(16, 32))
     call = te.linear_calls[-1]
     assert call['direct'] and call['recipe'] == 'current'
     plain = Net(blocks=1)
     plain.blocks[0].attn.qkv.weight.data = torch.ones(96, 32, dtype=torch.float8_e4m3fn)
     fp8_training.prepare_model(Pipeline(plain))
     assert plain.blocks[0].attn.qkv.fp8_mode == 'direct'
-    plain.blocks[0].attn.qkv(torch.randn(8, 32))
+    plain.blocks[0].attn.qkv(torch.randn(16, 32))
     assert te.linear_calls[-1]['direct']
 
 
@@ -430,7 +459,7 @@ def test_pre_quant_scale_is_folded_into_the_weight(te):
     layer = net.blocks[0].attn.qkv
     pre = torch.linspace(0.5, 2.0, 32)
     layer.register_buffer('pre_quant_scale', pre)
-    x = torch.randn(8, 32, dtype=torch.bfloat16)
+    x = torch.randn(16, 32, dtype=torch.bfloat16)
     expected = F.linear(x.float() * pre, stored['blocks.0.attn.qkv'].dequantize(), layer.bias.float())
     summary = fp8_training.prepare_model(Pipeline(net))
     # Not 'direct': the stored weight alone is not what the layer multiplies by.
@@ -734,7 +763,7 @@ def test_report_lists_reasons(te, capsys):
     capsys.readouterr()
     fp8_training.report()
     out = capsys.readouterr().out
-    assert 'Linear calls ran fp8; without fp8: 1 calls whose token count is not a multiple of 8' in out
+    assert 'Linear calls ran fp8; without fp8: 1 calls whose token count is not a multiple of 16' in out
     assert '2 bf16 calibration' not in out and 'attention calls ran fp8' in out
 
 

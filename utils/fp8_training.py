@@ -19,9 +19,11 @@ and, in the backward, the dgrad and (for trained weights) wgrad GEMMs in fp8 as 
 compute their scales from the tensor being quantized, so a recomputation under activation
 checkpointing gives the forward's numbers again.
 
-TE runs a GEMM in fp8 only when the tokens (all dimensions but the last) are a multiple of 8 and
-in_features a multiple of 16 (out_features a multiple of 8). Layers whose weight does not fit stay
-bf16 for good; a call whose token count does not fit runs bf16 for that call only. Both are
+TE runs a GEMM in fp8 only when every dimension it reduces over is a multiple of 16: in_features
+(forward), out_features (input gradient) and the tokens, all dimensions but the last (weight
+gradient). A smaller multiple passes the forward and fails in the backward (block scaling:
+"Leading dimension requirement on NVTE_BLOCK_SCALING GEMM. Caller must pad."). Layers whose
+weight does not fit stay bf16 for good; a call whose token count does not fit runs bf16 for that call only. Both are
 counted and reported.
 
 `weights` decides what happens to base weights stored in fp8 or another quantized format:
@@ -469,8 +471,9 @@ class Fp8Linear(nn.Linear):
             return 'layers where TE failed'
         if not _backend.device_ok(x) or x.dtype not in HALF + (torch.float32,):
             return 'inputs that are not float CUDA tensors'
-        if x.shape[-1] != self.in_features or x.numel() == 0 or (x.numel() // x.shape[-1]) % 8:
-            return 'calls whose token count is not a multiple of 8'
+        if x.shape[-1] != self.in_features or x.numel() == 0 or (x.numel() // x.shape[-1]) % 16:
+            # the weight-gradient GEMM reduces over the tokens
+            return 'calls whose token count is not a multiple of 16'
         return None
 
     def forward(self, x):
@@ -612,7 +615,7 @@ def convert(target_model, classes, dtype, keep=()):
         if any(p.search(name) for p in settings.exclude):
             summary['excluded'] += 1
             continue
-        if module.in_features % 16 or module.out_features % 8:
+        if module.in_features % 16 or module.out_features % 16:
             summary['unfit'] += 1
             unfit.append(f'{name} ({module.in_features}->{module.out_features})')
             continue
@@ -649,8 +652,8 @@ def convert(target_model, classes, dtype, keep=()):
     if summary['excluded']:
         line += f"; {summary['excluded']} excluded by exclude"
     if unfit:
-        line += (f"; {len(unfit)} stay bf16, their sizes do not fit TE's fp8 GEMM (in_features a multiple of 16, "
-                 f"out_features of 8): {', '.join(unfit[:4])}{', ...' if len(unfit) > 4 else ''}")
+        line += (f"; {len(unfit)} stay bf16, their sizes do not fit TE's fp8 GEMM (in_features and out_features "
+                 f"multiples of 16): {', '.join(unfit[:4])}{', ...' if len(unfit) > 4 else ''}")
     _print(line)
     if summary['fp8'] == 0:
         raise ValueError(f'[{TABLE}] found no Linear layer to run in fp8 in the {", ".join(classes)} blocks')

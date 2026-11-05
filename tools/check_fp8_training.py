@@ -186,7 +186,7 @@ def bf16_linear(x, weight, bias, grad, train_weight):
 
 def check_linear(report, recipes):
     fresh()
-    shapes = [(4096, 3072, 3072), (4096, 3072, 12288), (2048, 12288, 3072), (1024, 5120, 13824), (520, 1536, 8960)]
+    shapes = [(4096, 3072, 3072), (4096, 3072, 12288), (2048, 12288, 3072), (1024, 5120, 13824), (528, 1536, 8960)]
     for recipe in recipes:
         for tokens, fin, fout in shapes:
             layer = linear_layer(recipe, fin, fout)
@@ -212,14 +212,16 @@ def check_linear(report, recipes):
     compare_linear(report, "weights = 'direct', stored e4m3, 4096x3072->3072", layer, x, grad,
                    data.float() * scale, False, bf16=False)
 
-    layer = linear_layer('current', 3072, 3072)
-    counts = fp8_training.counts()[0]
-    before = counts.get('fp8', 0)
-    layer(gen(7, 3072).requires_grad_()).sum().backward()
-    after = fp8_training.counts()[0]
-    ok = after.get('fp8', 0) == before and after.get('calls whose token count is not a multiple of 8', 0) >= 1
-    report.line(f'{"PASS" if ok else "FAIL"}  7 tokens (not a multiple of 8) run bf16 and are counted')
-    report.record({'case': 'odd token count'}, ok)
+    # 520 tokens (a multiple of 8, not 16): TE's weight-gradient GEMM refuses them, so they run bf16.
+    for recipe in recipes:
+        layer = linear_layer(recipe, 1536, 8960)
+        counts = fp8_training.counts()[0]
+        before, skipped = counts.get('fp8', 0), counts.get('calls whose token count is not a multiple of 16', 0)
+        layer(gen(520, 1536).requires_grad_()).sum().backward()
+        after = fp8_training.counts()[0]
+        ok = after.get('fp8', 0) == before and after.get('calls whose token count is not a multiple of 16', 0) == skipped + 1
+        report.line(f'{"PASS" if ok else "FAIL"}  {recipe}: 520 tokens (not a multiple of 16) run bf16 and are counted')
+        report.record({'case': f'{recipe}, token count not a multiple of 16'}, ok)
 
 
 class CheckBlock(nn.Module):
