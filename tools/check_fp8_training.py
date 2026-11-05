@@ -65,6 +65,8 @@ BF16 = torch.bfloat16
 # e4m3 keeps 3 mantissa bits, so a GEMM's fp8 error is several times bf16's: a few percent.
 LINEAR_LIMIT = 0.08
 ATTENTION_LIMITS = {'out': 0.1, 'grad': 0.25}
+# TE's message when no attention backend takes a call (head_dim 64 on H200 with cuDNN 9.20).
+NO_BACKEND = 'No dot product attention backend is available'
 # Activation checkpointing recomputes with the same scales: only kernel nondeterminism differs.
 RECOMPUTE_LIMIT = 1e-2
 
@@ -307,6 +309,12 @@ def attention_cases():
     fn, fn32 = sdpa_bhsd()
     cases.append(('SDPA, cross attention 1024 queries / 512 keys', fn, fn32,
                   [(b, h, s, 128), (b, h, 512, 128), (b, h, 512, 128)], (b, h, s, 128)))
+    # Long sequences, where attention = 'auto' runs fp8: the softmax scale is held at fp8_max for
+    # the forward, and TE hands the same scale to the backward, whose probabilities are the
+    # normalized ones (about 1 / keys); dv is the gradient to watch.
+    for heads, length in ((8, 16384), (2, 65536)):
+        fn, fn32 = sdpa_bhsd()
+        cases.append((f'SDPA, no mask, {length} tokens', fn, fn32, [(1, heads, length, 128)] * 3, (1, heads, length, 128)))
     lengths = [700, 1024, 333]
     for causal in (False, True):
         fn, fn32 = varlen_case(lengths, causal)
@@ -352,7 +360,10 @@ def check_attention(report):
             line = f'  {case}: ' + ', '.join(f'{k} {v:.4f}' for k, v in errors.items())
             line += f'; checkpointed vs not {recompute:.2e}'
             refused = [site.error for site in fp8_training._attention.sites.values() if site.error]
-            if not ran_fp8 and refused and errors['out'] <= ATTENTION_LIMITS['out'] / 4:
+            # Only TE's own 'no backend for these inputs' counts as a call kind it cannot take; any
+            # other exception at a site's first call is ours to fix (as the (q mask, kv mask) pair
+            # given to a 'self' DotProductAttention was) and stays a failure.
+            if not ran_fp8 and refused and all(NO_BACKEND in e for e in refused) and errors['out'] <= ATTENTION_LIMITS['out'] / 4:
                 # TE cannot take this kind of call on this GPU / cuDNN: it runs bf16, as training does.
                 ok = True
                 line += ' -- runs bf16, TE cannot take it here: ' + refused[0].splitlines()[0][:300]

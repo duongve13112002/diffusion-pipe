@@ -249,7 +249,8 @@ def test_config_defaults_and_refusals():
     refused({'attention': 'auto', 'attention_min_tokens': True}, 'whole number of tokens')
     refused({'attention': 'auto'}, 'compile = true', compile=True)
     refused({'attention_amax_history': 0}, 'from 1 to 1024')
-    refused({'attention_amax_history': 8}, 'applies only with attention = true')
+    refused({'attention_amax_history': 8}, 'applies only with attention on')
+    refused({'attention': 'auto'}, "attention = 'auto' cannot be combined with compile", compile=True)
     refused({'weights': 'direct'}, "needs an \\[adapter\\]")
     refused({'weights': 'direct'}, 'use_dora', adapter={'use_dora': True})
     refused({'cache_frozen_weights': True}, 'applies only to frozen base weights')
@@ -914,3 +915,15 @@ def test_a_site_seen_only_in_eval_waits_for_a_training_step(te):
     assert sites and all(site.state == 'calibrating' for site in sites)
     train_step(net, long)
     assert all(site.state == 'active' and site.module.primed[2] is not None for site in sites)
+
+
+def test_auto_with_only_short_calls_does_not_warn_of_no_attention(te, capsys):
+    net = attention_net(blocks=1)
+    settings(attention='auto', attention_min_tokens=4096)
+    fp8_training.prepare_model(Pipeline(net))
+    attention_util.install()
+    train_step(net, inputs(2, 16, 32))
+    capsys.readouterr()
+    fp8_training.report()
+    out = capsys.readouterr().out
+    assert 'sequences shorter than attention_min_tokens' in out and 'WARNING' not in out

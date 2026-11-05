@@ -159,7 +159,7 @@ def apply_fp8_training_config_defaults(config):
     if isinstance(history, bool) or not isinstance(history, int) or not 1 <= history <= 1024:
         raise ValueError(f'[{TABLE}] attention_amax_history must be a whole number from 1 to 1024, got {history!r}')
     if 'attention_amax_history' in given and not table['attention']:
-        raise ValueError(f'[{TABLE}] attention_amax_history applies only with attention = true; remove it or turn '
+        raise ValueError(f'[{TABLE}] attention_amax_history applies only with attention on (true or \'auto\'); remove it or turn '
                          'attention on')
 
     has_adapter = 'adapter' in config
@@ -179,10 +179,10 @@ def apply_fp8_training_config_defaults(config):
                              'copies would stay on the GPU while their blocks are swapped out')
     if table['attention']:
         if config.get('compile', False):
-            raise ValueError(f'[{TABLE}] attention = true cannot be combined with compile = true: torch.compile would '
+            raise ValueError(f'[{TABLE}] attention = {table["attention"]!r} cannot be combined with compile = true: torch.compile would '
                              'trace through the attention replacement and its per-call checks; turn one off')
         if config['model']['type'] == 'cosmos':
-            raise ValueError(f'[{TABLE}] attention = true does not apply to cosmos: Cosmos runs its attention '
+            raise ValueError(f'[{TABLE}] attention = {table["attention"]!r} does not apply to cosmos: Cosmos runs its attention '
                              'through its own Transformer Engine modules, not PyTorch SDPA or flash-attn')
     return table
 
@@ -265,7 +265,7 @@ class TransformerEngineBackend:
                     "block scaling needs Hopper and CUDA 12.9 or newer). Set recipe = 'current' (one scale per "
                     "tensor), which runs on every fp8 GPU")
         if settings.attention and (major, minor) < (9, 0):
-            raise RuntimeError(f"[{TABLE}] attention = true: {gpu} (compute capability {major}.{minor}) has no "
+            raise RuntimeError(f"[{TABLE}] attention = {settings.attention!r}: {gpu} (compute capability {major}.{minor}) has no "
                                "cuDNN fp8 attention for training; it needs Hopper (9.0) or newer. Turn attention off")
 
     def linear_recipe(self, name):
