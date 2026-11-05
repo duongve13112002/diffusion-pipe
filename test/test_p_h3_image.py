@@ -264,8 +264,8 @@ def test_the_text_encoder_must_be_the_minimax_one(text_encoders):
     ({'frame_buckets': [1, 33]}, 'images only'),
     ({'directory': [{'path': 'x', 'frame_buckets': [1, 33]}]}, r'images only.*\[\[directory\]\] x'),
     ({'directory': [{'path': 'x', 'control_path': 'c', 'control_path_2': 'd'}]}, 'control_path_N'),
-    ({'directory': [{'path': 'x', 'control_path': 'c', 'caption_dropout_rate': 0.1}]}, 'caption_dropout_rate does not apply'),
-    ({'caption_dropout_rate': 0.1, 'directory': [{'path': 'x', 'control_path': 'c'}]}, 'caption_dropout_rate does not apply'),
+    ({'directory': [{'path': 'x', 'control_path': 'c', 'caption_dropout_rate': 0.1}]}, 'caption_dropout_rate in it'),
+    ({'caption_dropout_rate': 0.1, 'directory': [{'path': 'x', 'control_path': 'c'}]}, 'the dataset caption_dropout_rate'),
 ])
 def test_dataset_refusals(dataset, match):
     pipe = ph3_pipeline(None)
@@ -275,6 +275,17 @@ def test_dataset_refusals(dataset, match):
     # caption dropout stays allowed for text to image, and an edit directory can turn it off
     pipe.model_specific_dataset_config_validation({'caption_dropout_rate': 0.1, 'directory': [
         {'path': 't2i'}, {'path': 'edit', 'control_path': 'c', 'caption_dropout_rate': 0}]})
+
+
+def test_uncond_fraction_reaches_edit_directories_too():
+    pipe = ph3_pipeline(None)
+    pipe.config['uncond_fraction'] = 0.1
+    with pytest.raises(ValueError, match='uncond_fraction of the training config'):
+        pipe.model_specific_dataset_config_validation({'directory': [{'path': 'x', 'control_path': 'c'}]})
+    # a directory rate of 0 or a dataset rate wins over it, as in utils/dataset.py
+    pipe.model_specific_dataset_config_validation({'directory': [{'path': 'x', 'control_path': 'c', 'caption_dropout_rate': 0}]})
+    pipe.model_specific_dataset_config_validation({'caption_dropout_rate': 0, 'directory': [{'path': 'x', 'control_path': 'c'}]})
+    pipe.model_specific_dataset_config_validation({'directory': [{'path': 't2i'}]})
 
 
 def test_load_vae_refuses_the_h3_video_vae(monkeypatch):

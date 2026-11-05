@@ -808,7 +808,8 @@ See [examples/p_h3_image.toml](../examples/p_h3_image.toml) and its dataset.
   latent (transparency onto white, no EXIF rotation), so both see the same image.
 - Refused: `frame_buckets` other than `[1]` (at the top or in a `[[directory]]`), MiniMax H3's
   `audio_vae` and `cfg`, a text encoder other than one with type `minimax`, a VAE that is not the
-  P-H3-Image one, and `caption_dropout_rate` on an edit directory (the cached empty caption has no
+  P-H3-Image one, and caption dropout on an edit directory (its `caption_dropout_rate`, the dataset's, or the
+  training config's `uncond_fraction` when neither is set; set `caption_dropout_rate = 0` in the directory) (the cached empty caption has no
   image, so a dropped edit caption would train a pairing ComfyUI never produces).
 - Everything MiniMax H3 has applies: LoRA, LoKr, DoRA, OPLoRA and full fine-tune, `[fp8_training]`
   (the adaLN projections stay in the checkpoint's precision, as in ComfyUI),

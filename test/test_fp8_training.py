@@ -8,6 +8,7 @@ tools/check_fp8_training.py runs the real TE on a GPU.
 import copy
 import re
 import json
+import math
 import pathlib
 import sys
 
@@ -86,7 +87,8 @@ class FakeTE:
         if self.fail_linear:
             raise RuntimeError('no fp8 GEMM for this shape')
         self.linear_calls.append(dict(module=module, recipe=recipe, cache=cache, direct=isinstance(weight, FakeWeight),
-                                      x_dtype=x.dtype, requires_grad=getattr(weight, 'requires_grad', False)))
+                                      x_dtype=x.dtype, requires_grad=getattr(weight, 'requires_grad', False),
+                                      x_shape=tuple(x.shape)))
         if isinstance(weight, FakeWeight):
             w = weight.dequantize()
         elif cache:
@@ -325,8 +327,9 @@ def test_full_finetune_gradients_reach_the_weights(te):
     assert all(call['requires_grad'] for call in te.linear_calls)
 
 
-@pytest.mark.parametrize('adapter', ['lora', 'lokr', 'dora'])
-def test_adapters_wrap_fp8_layers(te, adapter):
+@pytest.mark.parametrize('tokens', [16, 7], ids=['16-tokens', 'padded-7-tokens'])
+@pytest.mark.parametrize('adapter', ['lora', 'lokr', 'dora', 'oplora'])
+def test_adapters_wrap_fp8_layers(te, adapter, tokens):
     settings()
     torch.manual_seed(0)
     net = Net(blocks=1)
@@ -341,10 +344,18 @@ def test_adapters_wrap_fp8_layers(te, adapter):
         if p.requires_grad:
             # Adapters start as a zero update, where some factors get no gradient.
             nn.init.normal_(p, std=0.1)
-    model(torch.randn(2, 8, 32)).square().mean().backward()
+    if adapter == 'oplora':
+        from utils.oplora import OPLoRAProjector
+        projector = OPLoRAProjector.build(model, rank=2, full_svd=True)
+        assert len(projector) == len(targets)
+        projector.project()
+    model(torch.randn(1, tokens, 32)).square().mean().backward()
     trained = [(n, p) for n, p in model.named_parameters() if p.requires_grad]
     assert trained and all(p.grad is not None and p.grad.abs().sum() > 0 for _, p in trained)
     assert te.linear_calls and not any(call['requires_grad'] for call in te.linear_calls)
+    # every base layer ran fp8, a 7-token call on rows padded to 16
+    assert all(math.prod(call['x_shape'][:-1]) % 16 == 0 for call in te.linear_calls)
+    assert fp8_training.counts()[0]['fp8'] == len(te.linear_calls) == len(targets)
 
 
 def test_bf16_for_calls_and_layers_fp8_cannot_take(te):
@@ -352,15 +363,6 @@ def test_bf16_for_calls_and_layers_fp8_cannot_take(te):
     net = Net(blocks=1)
     fp8_training.prepare_model(Pipeline(net))
     layer = net.blocks[0].mlp[0]
-    reference = F.linear(torch.ones(3, 32), layer.weight, layer.bias)
-    torch.testing.assert_close(layer(torch.ones(3, 32)), reference)
-    assert not te.linear_calls
-    assert fp8_training.counts()[0]['calls whose token count is not a multiple of 16'] == 1
-    # 8 tokens: the forward GEMM would take them, the weight-gradient GEMM (which reduces over the
-    # tokens) needs a multiple of 16
-    layer(torch.ones(8, 32))
-    assert not te.linear_calls
-    assert fp8_training.counts()[0]['calls whose token count is not a multiple of 16'] == 2
     with fp8_training.disabled():
         layer(torch.ones(16, 32))
     assert not te.linear_calls
@@ -776,11 +778,13 @@ def test_report_lists_reasons(te, capsys):
     net = attention_net(blocks=1)
     setup_attention(net)
     net.blocks[0].mlp[0](torch.ones(3, 32, dtype=torch.bfloat16))
+    with fp8_training.disabled():
+        net.blocks[0].mlp[0](torch.ones(3, 32, dtype=torch.bfloat16))
     train_step(net, inputs(2, 16, 32))
     capsys.readouterr()
     fp8_training.report()
     out = capsys.readouterr().out
-    assert 'Linear calls ran fp8; without fp8: 1 calls whose token count is not a multiple of 16' in out
+    assert '(1 of them padded to a multiple of 16 tokens); without fp8: 1 sampling' in out
     assert '2 bf16 calibration' not in out and 'attention calls ran fp8' in out
 
 
@@ -864,3 +868,49 @@ def test_auto_attention_runs_fp8_only_on_long_sequences(te):
     fp8_training.reset(te)
     settings(attention=True)
     assert fp8_training._settings.attention_min_tokens == 0
+
+
+def test_token_counts_are_padded_to_a_multiple_of_16(te):
+    """TE's weight-gradient GEMM reduces over the tokens and needs a multiple of 16: other counts
+    run fp8 on zero-padded rows, with the same output and gradients as unpadded."""
+    settings()
+    torch.manual_seed(0)
+    net = Net(blocks=1)
+    fp8_training.prepare_model(Pipeline(net))
+    layer = net.blocks[0].mlp[0]
+    for shape in ((3, 32), (2, 5, 32), (16, 32)):
+        x = torch.randn(*shape)
+        tokens = x.numel() // 32
+        xs = x.detach().clone().requires_grad_()
+        layer.weight.grad = None
+        out = layer(xs)
+        assert math.prod(te.linear_calls[-1]['x_shape'][:-1]) % 16 == 0 and out.shape == (*shape[:-1], 64)
+        out.square().sum().backward()
+        grads = xs.grad.clone(), layer.weight.grad.clone()
+        # the same rows padded by hand, a call of a multiple of 16 tokens
+        rows = torch.cat([x.reshape(tokens, 32), torch.zeros(-tokens % 16, 32)]).requires_grad_()
+        layer.weight.grad = None
+        full = layer(rows)
+        full[:tokens].square().sum().backward()
+        torch.testing.assert_close(out.reshape(tokens, 64), full[:tokens].detach())
+        torch.testing.assert_close(grads[0].reshape(tokens, 32), rows.grad[:tokens])
+        torch.testing.assert_close(grads[1], layer.weight.grad)
+    counts = fp8_training.counts()[0]
+    assert counts['fp8'] == 6 and counts['fp8 calls padded to a multiple of 16 tokens'] == 2
+
+
+def test_a_site_seen_only_in_eval_waits_for_a_training_step(te):
+    """With 'auto', a long eval batch before short training steps creates sites whose backward
+    was never measured: they stay in calibration until a training step reaches them."""
+    net = attention_net()
+    settings(attention='auto', attention_min_tokens=16)
+    fp8_training.prepare_model(Pipeline(net))
+    attention_util.install()
+    short, long = inputs(2, 8, 32), inputs(2, 16, 32)
+    with torch.no_grad(), fp8_training.step_scope(training=False):
+        net(long)
+    train_step(net, short)
+    sites = list(fp8_training._attention.sites.values())
+    assert sites and all(site.state == 'calibrating' for site in sites)
+    train_step(net, long)
+    assert all(site.state == 'active' and site.module.primed[2] is not None for site in sites)

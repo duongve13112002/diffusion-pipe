@@ -24,8 +24,9 @@ TE runs a GEMM in fp8 only when every dimension it reduces over is a multiple of
 (forward), out_features (input gradient) and the tokens, all dimensions but the last (weight
 gradient). A smaller multiple passes the forward and fails in the backward (block scaling:
 "Leading dimension requirement on NVTE_BLOCK_SCALING GEMM. Caller must pad."). Layers whose
-weight does not fit stay bf16 for good; a call whose token count does not fit runs bf16 for that call only. Both are
-counted and reported.
+weight does not fit stay bf16 for good. A call whose token count is not a multiple of 16 (packed
+text of any caption length, as in MiniMax H3) gets zero rows up to the next multiple, which add
+nothing to the weight gradient, and its extra output rows are cut; such calls are counted.
 
 `weights` decides what happens to base weights stored in fp8 or another quantized format:
 'dequantize' (the default) turns them into the model dtype at load, so they take the same path as
@@ -510,9 +511,8 @@ class Fp8Linear(nn.Linear):
             return 'layers where TE failed'
         if not _backend.device_ok(x) or x.dtype not in HALF + (torch.float32,):
             return 'inputs that are not float CUDA tensors'
-        if x.shape[-1] != self.in_features or x.numel() == 0 or (x.numel() // x.shape[-1]) % 16:
-            # the weight-gradient GEMM reduces over the tokens
-            return 'calls whose token count is not a multiple of 16'
+        if x.shape[-1] != self.in_features or x.numel() == 0:
+            return 'inputs of another shape or empty'
         return None
 
     def forward(self, x):
@@ -521,8 +521,16 @@ class Fp8Linear(nn.Linear):
             _note(_linear_counts, reason, f'Linear calls that run bf16: {reason} (first: {self.fp8_name}, input '
                                           f'{tuple(x.shape)}); further ones are counted')
             return self._bf16(x)
+        tokens = x.numel() // x.shape[-1]
+        pad = -tokens % 16
         try:
-            out = self._fp8(x)
+            if pad:
+                # The weight-gradient GEMM reduces over the tokens, which TE needs to be a multiple
+                # of 16 ("Caller must pad"): zero rows add nothing to it, and their output is cut.
+                rows = F.pad(x.reshape(tokens, x.shape[-1]), (0, 0, 0, pad))
+                out = self._fp8(rows)[:tokens].reshape(*x.shape[:-1], self.out_features)
+            else:
+                out = self._fp8(x)
         except Exception as error:
             if self.fp8_ok or isinstance(error, torch.OutOfMemoryError):
                 raise
@@ -533,6 +541,8 @@ class Fp8Linear(nn.Linear):
             return self._bf16(x)
         self.fp8_ok = True
         _linear_counts['fp8'] += 1
+        if pad:
+            _linear_counts['fp8 calls padded to a multiple of 16 tokens'] += 1
         return out
 
     def _fp8(self, x):
@@ -730,6 +740,8 @@ class _Site:
         self.amax_fwd = None
         self.amax_bwd = None
         self.forward_seen = False
+        # seen in a training step, where the gradient hooks measure the backward
+        self.trained = False
         self.grad_seen = False
         self.ok = False
         # why TE could not run this site, once it could not
@@ -774,7 +786,10 @@ class _Site:
                 t.register_hook(on_input_grad)
 
     def ready(self):
-        return self.forward_seen and (self.amax_bwd is not None or not self.grad_seen)
+        # Not on an eval pass alone: eval measures no backward, and a site switched on from it would
+        # run its first training backward on TE's default scales of 1 (with 'auto' and buckets of
+        # several lengths, a long eval batch before short training steps does exactly that).
+        return self.forward_seen and self.trained and (self.amax_bwd is not None or not self.grad_seen)
 
 
 class AttentionSites:
@@ -875,6 +890,7 @@ class AttentionSites:
             seen = observe if observe is not None else (q, k, v)
             site.record_forward(*seen, out)
             if _scope:
+                site.trained = True
                 site.hook(*seen, out)
             _attention_counts['bf16 calibration'] += 1
             return out
@@ -1084,10 +1100,15 @@ def report():
         if not _is_main():
             continue
         fp8 = totals.pop('fp8', 0)
+        padded = totals.pop('fp8 calls padded to a multiple of 16 tokens', 0)
         line = f'so far, all ranks: {fp8} {what} calls ran fp8'
+        if padded:
+            line += f' ({padded} of them padded to a multiple of 16 tokens)'
         if totals:
             line += '; without fp8: ' + ', '.join(f'{n} {reason}' for reason, n in totals.most_common())
         _print(line)
-        if what == 'attention' and fp8 == 0 and not totals.get('bf16 calibration'):
+        # Only when no call came at all: calls that came and were skipped (too short for 'auto',
+        # head_dim 64, ...) are listed above with their reason.
+        if what == 'attention' and fp8 == 0 and not totals:
             _print('WARNING: no attention call reached fp8 attention: this model\'s attention does not go through '
                    'PyTorch SDPA or the flash-attn entry points it covers')

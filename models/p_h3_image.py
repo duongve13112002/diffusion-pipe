@@ -123,10 +123,18 @@ class PH3ImagePipeline(MinimaxH3Pipeline):
             # A dropped caption trains on the one cached empty-caption embedding, which has no
             # control image; ComfyUI never pairs that with a reference ("Edit <Picture 1>. " and
             # the image's vision tokens are what an empty edit prompt encodes to).
-            dropout = directory.get('caption_dropout_rate', dataset_config.get('caption_dropout_rate', 0))
+            # utils/dataset.py's order: the directory's rate, the dataset's, then the training
+            # config's uncond_fraction.
+            if 'caption_dropout_rate' in directory:
+                dropout, where = directory['caption_dropout_rate'], 'caption_dropout_rate in it'
+            elif 'caption_dropout_rate' in dataset_config:
+                dropout, where = dataset_config['caption_dropout_rate'], 'the dataset caption_dropout_rate'
+            else:
+                dropout, where = self.config.get('uncond_fraction', 0), 'uncond_fraction of the training config'
             if 'control_path' in directory and dropout:
-                raise ValueError(f"caption_dropout_rate does not apply to the edit directory {directory.get('path')} "
-                                 f'of p_h3_image: a dropped caption would lose its control image. Set it to 0 there.')
+                raise ValueError(f"caption dropout ({where}) does not apply to the edit directory "
+                                 f"{directory.get('path')} of p_h3_image: a dropped caption would lose its control "
+                                 'image. Set caption_dropout_rate = 0 in that [[directory]].')
 
     def text_encoder_cache_key(self, i):
         # How a caption with a control image is presented to the encoder.

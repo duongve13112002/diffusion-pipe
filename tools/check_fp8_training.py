@@ -212,16 +212,17 @@ def check_linear(report, recipes):
     compare_linear(report, "weights = 'direct', stored e4m3, 4096x3072->3072", layer, x, grad,
                    data.float() * scale, False, bf16=False)
 
-    # 520 tokens (a multiple of 8, not 16): TE's weight-gradient GEMM refuses them, so they run bf16.
+    # 520 tokens (a multiple of 8, not 16): TE's weight-gradient GEMM needs a multiple of 16, so the
+    # rows are padded with zeros to 528; the result must match an unpadded reference.
     for recipe in recipes:
         layer = linear_layer(recipe, 1536, 8960)
-        counts = fp8_training.counts()[0]
-        before, skipped = counts.get('fp8', 0), counts.get('calls whose token count is not a multiple of 16', 0)
-        layer(gen(520, 1536).requires_grad_()).sum().backward()
-        after = fp8_training.counts()[0]
-        ok = after.get('fp8', 0) == before and after.get('calls whose token count is not a multiple of 16', 0) == skipped + 1
-        report.line(f'{"PASS" if ok else "FAIL"}  {recipe}: 520 tokens (not a multiple of 16) run bf16 and are counted')
-        report.record({'case': f'{recipe}, token count not a multiple of 16'}, ok)
+        x, grad = gen(520, 1536, seed=3), gen(520, 8960, seed=4, scale=1e-3)
+        padded_before = fp8_training.counts()[0].get('fp8 calls padded to a multiple of 16 tokens', 0)
+        compare_linear(report, f'{recipe}, full fine-tune, 520 tokens (padded to 528) x1536->8960', layer, x, grad,
+                       layer.weight, True)
+        if fp8_training.counts()[0].get('fp8 calls padded to a multiple of 16 tokens', 0) != padded_before + 1:
+            report.line(f'FAIL  {recipe}: the 520-token call was not counted as padded')
+            report.record({'case': f'{recipe}, padded count'}, False)
 
 
 class CheckBlock(nn.Module):
