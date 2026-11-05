@@ -307,8 +307,13 @@ class TransformerEngineBackend:
         return major >= 10 and (torch.backends.cudnn.version() or 0) >= 92300
 
     def make_attention(self, heads, kv_heads, head_dim, layout, mask_type, scale):
+        # A padding mask comes as (query mask, key mask): queries stay valid where only keys are
+        # padded. TE reads the pair only for attention_type 'cross'; 'self' takes one mask for both
+        # and fails on a pair ('tuple' object has no attribute 'squeeze').
+        attention_type = 'cross' if 'padding' in mask_type else 'self'
         return self.te.DotProductAttention(heads, head_dim, num_gqa_groups=kv_heads, attention_dropout=0.0,
-                                           qkv_format=layout, attn_mask_type=mask_type, softmax_scale=scale)
+                                           qkv_format=layout, attn_mask_type=mask_type, softmax_scale=scale,
+                                           attention_type=attention_type)
 
     def prime_attention(self, module, recipe, amax_fwd, amax_bwd):
         """Sets a new DotProductAttention's scales from measured amaxes before its first fp8 call."""
@@ -334,6 +339,20 @@ class TransformerEngineBackend:
             put(bwd, META_DO, amax_bwd[0], max_bwd)
             put(bwd, META_DP, amax_bwd[1], max_bwd)
             put(bwd, META_DQKV, amax_bwd[2], max_bwd)
+
+    def pin_softmax_scale(self, module, recipe):
+        """Sets the softmax (S) scale back to fp8_max after TE's update. cuDNN's fused fp8 attention
+        quantizes the unnormalized probabilities exp(s - row max), whose largest value is 1 in every
+        row, but reports the amax of the normalized ones (about 0.12 for 1024 keys of random data):
+        TE's update then scaled S by 448 / 0.12 and saturated it, and every call without a causal
+        mask came out about 60% off (H200, TE 2.20.2, cuDNN 9.20; TE alone does the same). With a
+        causal mask the first row holds a single key, the amax is 1 and nothing goes wrong."""
+        from transformer_engine.pytorch.cpp_extensions.fused_attn import META_S
+        meta = module.fp8_meta
+        state = meta.get('scaling_fwd')
+        if state is None:
+            return
+        state.scale[int(META_S)] = meta['fp8_max_fwd'] / 2.0 ** recipe.margin
 
     def run_attention(self, module, recipe, q, k, v, mask_type, attention_mask=None, cu_seqlens_q=None,
                       cu_seqlens_kv=None, max_seqlen_q=None, max_seqlen_kv=None):
@@ -395,6 +414,11 @@ def step_scope(training):
     finally:
         _scope = None
         _backend.end_scope(update=training and completed)
+        if training and completed:
+            recipe = _backend.attention_recipe(_settings.attention_amax_history)
+            for site in _attention.sites.values():
+                if site.state == 'active':
+                    _backend.pin_softmax_scale(site.module, recipe)
         if not training:
             # Eval does not move the scales: what it measured is not kept for the next update.
             for site in _attention.sites.values():

@@ -7,6 +7,11 @@ way TE's documentation trains it (DelayedScaling, fp8_dpa, scales updated by TE 
 on the same inputs, and then with the scales utils/fp8_training sets before the first fp8 step.
 If TE alone is as wrong, the library is; if only the primed run is, our code is.
 
+Found with it (2026-11-05): TE alone is as wrong. cuDNN quantizes the unnormalized softmax
+exp(s - row max), whose largest value is 1, but TE scales it by the amax of the normalized one,
+which saturates it; utils/fp8_training now puts the softmax scale back to fp8_max after every
+update (the third block below checks that).
+
     python tools/diagnose_fp8_attention.py            # on the GPU machine
     python tools/diagnose_fp8_attention.py --steps 8
 
@@ -78,7 +83,7 @@ def scales(dpa, meta_key, indexes):
     return ', '.join(f'{name} scale {s[i]:.4g} amax {a[i]:.4g}' for name, i in indexes)
 
 
-def run_case(report, te, te_recipe, name, b, h, s, d, mask_type, causal, keep, steps, prime, history):
+def run_case(report, te, te_recipe, name, b, h, s, d, mask_type, causal, keep, steps, prime, pin, history):
     from transformer_engine.pytorch.cpp_extensions.fused_attn import (META_DO, META_DP, META_DQKV, META_O,
                                                                        META_QKV, META_S)
     q, k, v = (gen(b, s, h, d, seed=10 + i) for i in range(3))
@@ -88,7 +93,9 @@ def run_case(report, te, te_recipe, name, b, h, s, d, mask_type, causal, keep, s
                 f'|out| max {ref[0].abs().max().item():.3g}')
     recipe = recipe_for(te_recipe, history)
     try:
-        dpa = te.DotProductAttention(h, d, attention_dropout=0.0, qkv_format='bshd', attn_mask_type=mask_type)
+        # (query mask, key mask) pairs are read only for attention_type 'cross'
+        dpa = te.DotProductAttention(h, d, attention_dropout=0.0, qkv_format='bshd', attn_mask_type=mask_type,
+                                     attention_type='cross' if keep is not None else 'self')
         attention_mask = None
         if keep is not None:
             padded = ~keep
@@ -108,6 +115,9 @@ def run_case(report, te, te_recipe, name, b, h, s, d, mask_type, causal, keep, s
                 out = dpa(qs, ks, vs, attention_mask=attention_mask, attn_mask_type=mask_type)
             out = out.view(b, s, h, d)
             out.backward(grad)
+            if pin:
+                # what utils/fp8_training now does after each update: S scale back to fp8_max
+                dpa.fp8_meta['scaling_fwd'].scale[META_S] = dpa.fp8_meta['fp8_max_fwd']
             errors = [rel(out, ref[0]), rel(qs.grad, ref[1]), rel(ks.grad, ref[2]), rel(vs.grad, ref[3])]
             report.line(f'    step {step}: out {errors[0]:.4f}, dq {errors[1]:.4f}, dk {errors[2]:.4f}, dv {errors[3]:.4f}; '
                         + scales(dpa, 'scaling_fwd', (('QKV', META_QKV), ('S', META_S), ('O', META_O)))
@@ -146,13 +156,19 @@ def main():
         ('no mask, head_dim 64', 64, 'no_mask', False, None),
         ('key padding, head_dim 128', 128, 'padding', False, keep),
     ]
-    for prime in (False, True):
+    variants = [
+        (False, False, 'TE alone (scales start at 1, TE updates them after each step)'),
+        (True, False, 'TE with the scales utils/fp8_training primes before the first fp8 step'),
+        (True, True, 'As utils/fp8_training runs it now: primed, and the softmax (S) scale put back to '
+                     'fp8_max after each update'),
+    ]
+    for prime, pin, title in variants:
         report.line()
-        report.line('TE alone (scales start at 1, TE updates them after each step)' if not prime else
-                    'TE with the scales utils/fp8_training sets before the first fp8 step')
+        report.line(title)
         for name, d, mask_type, causal, mask in cases:
             torch.manual_seed(0)
-            run_case(report, te, te_recipe, name, b, h, s, d, mask_type, causal, mask, args.steps, prime, args.history)
+            run_case(report, te, te_recipe, name, b, h, s, d, mask_type, causal, mask, args.steps, prime, pin,
+                     args.history)
     report.line()
     report.line(f'Send back: ./{report.path}')
 

@@ -150,6 +150,9 @@ class FakeTE:
     def discard_amax(self, module):
         module.discarded = getattr(module, 'discarded', 0) + 1
 
+    def pin_softmax_scale(self, module, recipe):
+        module.pinned = getattr(module, 'pinned', 0) + 1
+
 
 @pytest.fixture
 def te():
@@ -527,8 +530,14 @@ def test_attention_calibrates_then_runs_fp8_with_measured_scales(te):
     assert recipe == ('delayed', 4)
     assert amax_fwd[1] == 1 and (amax_fwd > 0).all() and (amax_bwd > 0).all()
     assert te.updates == 1
+    # primed with S at 1; pinned there after every update from here on
+    assert not hasattr(site.module, 'pinned')
     train_step(net, x)
     assert len(te.attention_calls) == 2 and fp8_training.counts()[1]['fp8'] == 2
+    assert te.updates == 2 and all(s.module.pinned == 1 for s in sites.values())
+    with fp8_training.step_scope(training=False):
+        net(x)
+    assert all(s.module.pinned == 1 for s in sites.values())
     # TE's own use of the (patched) SDPA inside a call is part of that call, not another site.
     assert len(sites) == 2
 
@@ -806,3 +815,24 @@ def test_every_rank_promotes_the_same_sites_and_report_sums_all_ranks(world_size
     assert out.count('Linear calls ran fp8') == 1
     assert f"{linear['fp8'] * world_size} Linear calls ran fp8" in out
     assert f"{attention['fp8'] * world_size} attention calls ran fp8" in out
+
+
+def test_te_backend_pins_the_softmax_scale_and_takes_padding_masks_as_cross_attention(monkeypatch):
+    """The real backend against stand-ins for the TE pieces it calls (no GPU here)."""
+    import types
+    backend = object.__new__(fp8_training.TransformerEngineBackend)
+    made = []
+    backend.te = types.SimpleNamespace(DotProductAttention=lambda *a, **k: made.append(k) or k)
+    for mask_type, expected in (('no_mask', 'self'), ('causal', 'self'), ('padding', 'cross'), ('padding_causal', 'cross')):
+        backend.make_attention(16, 4, 128, 'bshd', mask_type, None)
+        assert made[-1]['attention_type'] == expected and made[-1]['attn_mask_type'] == mask_type
+
+    fused = types.ModuleType('transformer_engine.pytorch.cpp_extensions.fused_attn')
+    fused.META_S = 1
+    monkeypatch.setitem(sys.modules, 'transformer_engine.pytorch.cpp_extensions.fused_attn', fused)
+    state = types.SimpleNamespace(scale=torch.tensor([83.8, 3389.0, 959.4]))
+    module = types.SimpleNamespace(fp8_meta={'scaling_fwd': state, 'fp8_max_fwd': 448.0})
+    backend.pin_softmax_scale(module, types.SimpleNamespace(margin=0))
+    assert state.scale.tolist() == pytest.approx([83.8, 448.0, 959.4])
+    backend.pin_softmax_scale(module, types.SimpleNamespace(margin=1))
+    assert state.scale[1].item() == 224.0
