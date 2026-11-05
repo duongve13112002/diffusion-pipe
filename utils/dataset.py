@@ -3290,11 +3290,14 @@ class Dataset:
         global_batch_size = {size: bs * gradient_accumulation_steps * self.data_parallel_world_size for size, bs in per_device_batch_size.items()}
         global_batch_size_image = {size: bs * gradient_accumulation_steps * self.data_parallel_world_size for size, bs in per_device_batch_size_image.items()}
 
-        # group same size_bucket together
+        # Group same size_bucket together, but never directories with control images (edit) with
+        # directories without: a batch is collated by the keys of its first example, so a mixed
+        # batch either failed on control_latents or dropped them for every sample.
         datasets_by_size_bucket = defaultdict(list)
         for directory_dataset in self.directory_datasets:
+            has_control = getattr(directory_dataset, 'control_path', None) is not None
             for size_bucket_dataset in directory_dataset.get_size_bucket_datasets():
-                datasets_by_size_bucket[size_bucket_dataset.size_bucket].append(size_bucket_dataset)
+                datasets_by_size_bucket[(size_bucket_dataset.size_bucket, has_control)].append(size_bucket_dataset)
         self.buckets = []
         for datasets in datasets_by_size_bucket.values():
             self.buckets.append(ConcatenatedBatchedDataset(datasets))

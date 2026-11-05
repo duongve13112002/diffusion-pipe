@@ -557,3 +557,44 @@ def test_the_example_configs_are_accepted(monkeypatch):
     pipe = PH3ImagePipeline(toml.load(EXAMPLES / 'p_h3_image.toml'))
     assert pipe.edit_prompt_prefix is True
     pipe.model_specific_dataset_config_validation(toml.load(EXAMPLES / 'p_h3_image_dataset.toml'))
+
+
+def test_edit_and_text_to_image_directories_never_share_a_batch(monkeypatch):
+    """Directories with and without control images in one size bucket: a batch is collated by the
+    keys of its first example, so a mixed one lost control_latents or failed on them."""
+    import utils.dataset as dataset_module
+
+    class SizeBucket:
+        def __init__(self, size_bucket, name):
+            self.size_bucket, self.name = size_bucket, name
+
+    class Directory:
+        def __init__(self, name, control_path, size_buckets):
+            self.control_path = control_path
+            self.buckets = [SizeBucket(s, name) for s in size_buckets]
+
+        def get_size_bucket_datasets(self):
+            return self.buckets
+
+    class Bucket:
+        def __init__(self, datasets):
+            self.names = sorted(d.name for d in datasets)
+
+        def post_init(self, *args, **kwargs):
+            pass
+
+        def __len__(self):
+            return 1
+
+    monkeypatch.setattr(dataset_module, 'ConcatenatedBatchedDataset', Bucket)
+    ds = object.__new__(dataset_module.Dataset)
+    ds.batch_fill = None
+    ds.dataset_config = {}
+    ds._report_batch_fill = lambda: None
+    ds.directory_datasets = [
+        Directory('t2i', None, [(1.0, 512, 512, 1), (1.5, 608, 416, 1)]),
+        Directory('edit', '/control', [(1.0, 512, 512, 1)]),
+        Directory('t2i_2', None, [(1.0, 512, 512, 1)]),
+    ]
+    ds.post_init(0, 1, {None: 1}, 1, {None: 1})
+    assert sorted(b.names for b in ds.buckets) == [['edit'], ['t2i'], ['t2i', 't2i_2']]
