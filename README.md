@@ -141,6 +141,12 @@ pip install -r requirements.txt
 pip install flash-attn
 ```
 
+(Optional) Install NVIDIA Transformer Engine for [FP8 training](#fp8-training) (`[fp8_training]`). It's not in the requirements file either: it compiles against the installed PyTorch and needs the CUDA toolkit (`nvcc`) and cuDNN 9.12 or newer, which a plain `pip install -r requirements.txt` cannot assume. Runs without `[fp8_training]` never import it.
+```
+pip install --no-build-isolation 'transformer_engine[pytorch]'
+python tools/check_fp8_training.py
+```
+
 ### Cosmos requirements
 NVIDIA Cosmos (the original Cosmos video model, not Cosmos-Predict2) additionally requires TransformerEngine.
 
@@ -384,7 +390,7 @@ attention = false              # fp8 attention as well (Hopper and newer)
 ```
 Install TE in the training environment: `pip install --no-build-isolation 'transformer_engine[pytorch]'` (it compiles against the installed PyTorch; it needs the CUDA toolkit with `nvcc` and cuDNN 9.12 or newer). At startup `train.py` prints the TE, PyTorch, CUDA and cuDNN versions and the GPU, and stops with what to change if something does not fit.
 
-Linear layers: every `nn.Linear` inside the model's transformer blocks (the classes the adapters target; SDXL: its attention transformer blocks) is replaced before the adapter is built by a layer that keeps the same weight and bias and hands the GEMM to TE. The input and the weight are quantized to fp8 e4m3 for the forward; the gradients are e5m2 (`'current'`) or e4m3 (`'block'`) for the backward, where the input-gradient GEMM and, for trained weights, the weight-gradient GEMM run in fp8 too. The weights themselves, the optimizer state, the checkpoints and the saved adapters do not change: an adapter trained with fp8 loads like any other.
+Linear layers: every `nn.Linear` inside the model's transformer blocks (the classes the adapters target; SDXL: its attention transformer blocks) is replaced before the adapter is built by a layer that keeps the same weight and bias and hands the GEMM to TE. The input and the weight are quantized to fp8 e4m3 for the forward; the gradients are e5m2 (`'current'`) or e4m3 (`'block'`) for the backward, where the input-gradient GEMM and, for trained weights, the weight-gradient GEMM run in fp8 too. The weights themselves, the optimizer state, the checkpoints and the saved adapters do not change: an adapter trained with fp8 loads like any other. fp8 exists only inside the GEMMs: a full fine-tune trains bf16 weights and saves them in `save_dtype` (`'bfloat16'` in the examples; without it, in the dtype they trained in), never in fp8, and an adapter is saved the same way. To ship an fp8 model, quantize the saved file afterwards as for any bf16 checkpoint.
 - `recipe = 'block'`: a scale per 1x128 block of activations and per 128x128 block of weights (DeepSeek-V3's recipe), closest to bf16. Needs Hopper and CUDA 12.9 or newer; where it cannot run, the error says so and suggests `'current'`.
 - `recipe = 'current'`: one scale per tensor, computed from that tensor. Runs on every fp8 GPU (Ada, Hopper, Blackwell).
 - TE takes a GEMM in fp8 when the token count is a multiple of 8, in_features a multiple of 16 and out_features a multiple of 8. Layers whose size does not fit stay bf16 (listed at startup); a call whose token count does not fit runs bf16 for that call. Both are counted.
