@@ -368,6 +368,32 @@ def check_attention(report):
         except Exception:
             report.line(f'FAIL  {case}: crashed\n' + traceback.format_exc())
             report.record({'case': case, 'crash': traceback.format_exc()}, False)
+    check_auto_attention(report)
+
+
+def check_auto_attention(report):
+    """attention = 'auto': calls shorter than attention_min_tokens run bf16, longer ones fp8."""
+    try:
+        fresh(attention='auto', attention_min_tokens=2048)
+        fn, _ = sdpa_bhsd()
+        block = CheckBlock(fn)
+        fp8_training._attention.hook_blocks(block, ['CheckBlock'])
+        short = [gen(1, 8, 1024, 128, seed=10 + i) for i in range(3)]
+        long = [gen(1, 8, 2048, 128, seed=10 + i) for i in range(3)]
+        for _ in range(2):
+            attention_step(block, *short, gen(1, 8, 1024, 128, seed=20, scale=1e-2))
+        counts = fp8_training.counts()[1]
+        short_ok = counts.get('fp8', 0) == 0 and counts.get('sequences shorter than attention_min_tokens', 0) == 2
+        for _ in range(2):  # calibration, then fp8
+            attention_step(block, *long, gen(1, 8, 2048, 128, seed=20, scale=1e-2))
+        long_ok = fp8_training.counts()[1].get('fp8', 0) == 1
+        ok = short_ok and long_ok
+        report.line(f"{'PASS' if ok else 'FAIL'}  attention = 'auto' (attention_min_tokens 2048): 1024 tokens run bf16, "
+                    f"2048 run fp8; counts {fp8_training.counts()[1]}")
+        report.record({'case': "attention = 'auto'", 'counts': fp8_training.counts()[1]}, ok)
+    except Exception:
+        report.line("FAIL  attention = 'auto': crashed\n" + traceback.format_exc())
+        report.record({'case': "attention = 'auto'", 'crash': traceback.format_exc()}, False)
 
 
 def bench_linear(report, recipes, quick, iterations):

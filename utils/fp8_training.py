@@ -5,7 +5,8 @@
     weights = 'dequantize'         # or 'direct': base weights stored as e4m3 go into the fp8 GEMM as they are
     exclude = ['adaLN', 'proj_out']  # regexes on module names that stay in bf16
     cache_frozen_weights = false   # keep the fp8 copy of frozen base weights between steps (adapters only)
-    attention = false              # fp8 attention through TE's cuDNN kernels (opt-in)
+    attention = false              # fp8 attention through TE's cuDNN kernels: true, 'auto' or false
+    attention_min_tokens = 8192    # with 'auto': calls on shorter sequences run bf16
     attention_amax_history = 16    # steps of amax history behind each attention scale
 
 Linear layers
@@ -77,7 +78,11 @@ DEFAULTS = {
     'cache_frozen_weights': False,
     'attention': False,
     'attention_amax_history': 16,
+    'attention_min_tokens': 8192,
 }
+# fp8 attention pays off only on long sequences: on H200 (TE 2.20, cuDNN 9.20) 4096 tokens ran at
+# 0.36x the speed of cuDNN's bf16 attention, 16384 at 1.06x, two of 8192 at 1.31x.
+ATTENTION_MODES = (False, True, 'auto')
 INSTALL_HINT = ("pip install --no-build-isolation 'transformer_engine[pytorch]' (it compiles against the installed "
                 "PyTorch and needs the CUDA toolkit (nvcc) and cuDNN 9.12 or newer)")
 # TE's own minimum (docs/installation.rst).
@@ -106,6 +111,8 @@ class Settings:
         self.cache_frozen_weights = table['cache_frozen_weights']
         self.attention = table['attention']
         self.attention_amax_history = table['attention_amax_history']
+        # 'auto': calls shorter than this run bf16
+        self.attention_min_tokens = table['attention_min_tokens'] if table['attention'] == 'auto' else 0
 
 
 def apply_fp8_training_config_defaults(config):
@@ -136,9 +143,17 @@ def apply_fp8_training_config_defaults(config):
             re.compile(pattern)
         except re.error as error:
             raise ValueError(f'[{TABLE}] exclude: {pattern!r} is not a regular expression: {error}') from None
-    for key in ('cache_frozen_weights', 'attention'):
-        if not isinstance(table[key], bool):
-            raise ValueError(f'[{TABLE}] {key} must be true or false, got {table[key]!r}')
+    if not isinstance(table['cache_frozen_weights'], bool):
+        raise ValueError(f"[{TABLE}] cache_frozen_weights must be true or false, got {table['cache_frozen_weights']!r}")
+    if not any(table['attention'] is mode or (isinstance(mode, str) and table['attention'] == mode)
+               for mode in ATTENTION_MODES):
+        raise ValueError(f"[{TABLE}] attention must be true, false or 'auto', got {table['attention']!r}")
+    minimum = table['attention_min_tokens']
+    if isinstance(minimum, bool) or not isinstance(minimum, int) or minimum < 1:
+        raise ValueError(f'[{TABLE}] attention_min_tokens must be a whole number of tokens, got {minimum!r}')
+    if 'attention_min_tokens' in given and table['attention'] != 'auto':
+        raise ValueError(f"[{TABLE}] attention_min_tokens applies only with attention = 'auto'; remove it or set "
+                         "attention = 'auto'")
     history = table['attention_amax_history']
     if isinstance(history, bool) or not isinstance(history, int) or not 1 <= history <= 1024:
         raise ValueError(f'[{TABLE}] attention_amax_history must be a whole number from 1 to 1024, got {history!r}')
@@ -837,6 +852,14 @@ class AttentionSites:
         index = block.calls
         block.calls += 1
         reason = self._reason(layout, q, k, v)
+        if not reason and _settings.attention_min_tokens:
+            if layout == 'thd':
+                length = max(int(max_seqlen_q), int(max_seqlen_kv))
+            else:
+                axis = 2 if layout == 'bhsd' else 1
+                length = max(q.shape[axis], k.shape[axis])
+            if length < _settings.attention_min_tokens:
+                reason = 'sequences shorter than attention_min_tokens'
         if reason:
             self._skip(reason, q)
             return fallback()

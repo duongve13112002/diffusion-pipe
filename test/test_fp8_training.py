@@ -226,7 +226,7 @@ def test_config_defaults_and_refusals():
     config = {'model': {'type': 'flux'}, 'fp8_training': {}}
     table = fp8_training.apply_fp8_training_config_defaults(config)
     assert table == {'recipe': 'block', 'weights': 'dequantize', 'exclude': [], 'cache_frozen_weights': False,
-                     'attention': False, 'attention_amax_history': 16}
+                     'attention': False, 'attention_amax_history': 16, 'attention_min_tokens': 8192}
     assert fp8_training.apply_fp8_training_config_defaults({'model': {'type': 'flux'}}) is None
 
     def refused(table, match, **top):
@@ -239,7 +239,13 @@ def test_config_defaults_and_refusals():
     refused({'weights': 'fp8'}, 'weights must be one of')
     refused({'exclude': ['(']}, 'is not a regular expression')
     refused({'exclude': [1]}, 'list of regular expressions')
-    refused({'attention': 'yes'}, 'attention must be true or false')
+    refused({'attention': 'yes'}, "attention must be true, false or 'auto'")
+    refused({'attention': 1}, "attention must be true, false or 'auto'")
+    refused({'attention': True, 'attention_min_tokens': 4096}, "applies only with attention = 'auto'")
+    refused({'attention_min_tokens': 4096}, "applies only with attention = 'auto'")
+    refused({'attention': 'auto', 'attention_min_tokens': 0}, 'whole number of tokens')
+    refused({'attention': 'auto', 'attention_min_tokens': True}, 'whole number of tokens')
+    refused({'attention': 'auto'}, 'compile = true', compile=True)
     refused({'attention_amax_history': 0}, 'from 1 to 1024')
     refused({'attention_amax_history': 8}, 'applies only with attention = true')
     refused({'weights': 'direct'}, "needs an \\[adapter\\]")
@@ -836,3 +842,25 @@ def test_te_backend_pins_the_softmax_scale_and_takes_padding_masks_as_cross_atte
     assert state.scale.tolist() == pytest.approx([83.8, 448.0, 959.4])
     backend.pin_softmax_scale(module, types.SimpleNamespace(margin=1))
     assert state.scale[1].item() == 224.0
+
+
+def test_auto_attention_runs_fp8_only_on_long_sequences(te):
+    net = attention_net()
+    settings(attention='auto', attention_min_tokens=16)
+    fp8_training.prepare_model(Pipeline(net))
+    attention_util.install()
+    assert fp8_training.attention_enabled()
+    short, long = inputs(2, 8, 32), inputs(2, 16, 32)
+    train_step(net, short)
+    train_step(net, short)
+    assert not fp8_training._attention.sites and not te.attention_calls
+    assert fp8_training.counts()[1]['sequences shorter than attention_min_tokens'] == 4
+    train_step(net, long)  # bf16 calibration
+    train_step(net, long)
+    assert len(te.attention_calls) == 2 and fp8_training.counts()[1]['fp8'] == 2
+    train_step(net, short)
+    assert len(te.attention_calls) == 2
+    # true keeps every length
+    fp8_training.reset(te)
+    settings(attention=True)
+    assert fp8_training._settings.attention_min_tokens == 0

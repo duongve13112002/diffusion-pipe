@@ -66,7 +66,7 @@ save_dtype = 'bfloat16'
 # may fit without it on an H200 and train faster.
 activation_checkpointing = true
 
-# Not with [model] attention = 'flash3' or with fp8 attention.
+# Not with [model] attention = 'flash3' or with fp8 attention (attention = 'auto' or true).
 compile = false
 
 # Larger caching batches keep the H200 busy while latents and text embeddings are cached.
@@ -94,9 +94,11 @@ exclude = []
 # Quantize the frozen base weights once instead of at every step: faster, one byte per base weight
 # of GPU memory. Not with blocks_to_swap.
 cache_frozen_weights = true
-# fp8 attention as well. It pays off on long sequences (video, 2048 px); at 1024 px images FA3 bf16
-# is about as fast. Turn it on once tools/check_fp8_training.py sections 3 and 5 look right.
-attention = false
+# fp8 attention. 'auto' runs it only on sequences of attention_min_tokens or more (default 8192),
+# where it pays off (H200: 2x8192 tokens 1.31x, 16384 1.06x); shorter ones, such as 1024 px images
+# (about 4096 tokens: fp8 0.36x of bf16), run bf16. true runs every call fp8, false none.
+attention = 'auto'
+#attention_min_tokens = 8192
 
 [adapter]
 type = 'lora'

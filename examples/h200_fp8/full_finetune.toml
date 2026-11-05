@@ -83,7 +83,7 @@ save_dtype = 'bfloat16'
 
 activation_checkpointing = true
 
-# Not with [model] attention = 'flash3' or with fp8 attention.
+# Not with [model] attention = 'flash3' or with fp8 attention (attention = 'auto' or true).
 compile = false
 
 caching_batch_size = 8
@@ -109,9 +109,11 @@ weights = 'dequantize'
 # Module names (regexes) that stay bf16. Start empty; add the modulation layers (e.g. ['adaLN',
 # 'modulation']) if the loss trains worse than in a bf16 run.
 exclude = []
-# fp8 attention as well. It pays off on long sequences (video, 2048 px); at 1024 px images FA3 bf16
-# is about as fast. Turn it on once tools/check_fp8_training.py sections 3 and 5 look right.
-attention = false
+# fp8 attention. 'auto' runs it only on sequences of attention_min_tokens or more (default 8192),
+# where it pays off (H200: 2x8192 tokens 1.31x, 16384 1.06x); shorter ones, such as 1024 px images
+# (about 4096 tokens: fp8 0.36x of bf16), run bf16. true runs every call fp8, false none.
+attention = 'auto'
+#attention_min_tokens = 8192
 
 [optimizer]
 type = 'adamw_optimi'
