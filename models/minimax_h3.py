@@ -44,7 +44,14 @@ class MiniMaxH3ClipModel(comfy.sd1_clip.SDClipModel):
 comfy.text_encoders.minimax.MiniMaxH3ClipModel = MiniMaxH3ClipModel
 
 
+def _per_sample(segments):
+    # [batch][segment][3]: the samples of the batch have segments of their own.
+    return len(segments) > 0 and isinstance(segments[0][0], (list, tuple))
+
+
 def _mod_scale_shift(h, shift, scale, segments):
+    if _per_sample(segments):
+        return torch.cat([_mod_scale_shift(h[i:i + 1], shift[i:i + 1], scale[i:i + 1], s) for i, s in enumerate(segments)])
     dtype = h.dtype
     pieces = []
     # segments: [(start, stop, mod_row)] covering h contiguously.
@@ -54,6 +61,8 @@ def _mod_scale_shift(h, shift, scale, segments):
     return torch.cat(pieces, dim=1)
 
 def _mod_gate(x, gate, other, segments):
+    if _per_sample(segments):
+        return torch.cat([_mod_gate(x[i:i + 1], gate[i:i + 1], other[i:i + 1], s) for i, s in enumerate(segments)])
     dtype = x.dtype
     pieces = []
     # other is the fresh attn/mlp output: accumulate the gated residual into the stream in place, one fused kernel per segment
@@ -390,33 +399,7 @@ class MinimaxH3Pipeline(ComfyPipeline):
             mask = F.interpolate(mask, size=(h, w), mode='nearest-exact')  # resize to latent spatial dimension
             mask = mask.unsqueeze(2)
 
-        timestep_sample_method = self.model_config.get('timestep_sample_method', 'logit_normal')
-
-        if timestep_sample_method == 'logit_normal':
-            dist = torch.distributions.normal.Normal(0, 1)
-        elif timestep_sample_method == 'uniform':
-            dist = torch.distributions.uniform.Uniform(0, 1)
-        else:
-            raise NotImplementedError()
-
-        if timestep_quantile is not None:
-            t = dist.icdf(torch.full((bs,), timestep_quantile, device=device))
-        else:
-            t = dist.sample((bs,)).to(device)
-
-        if timestep_sample_method == 'logit_normal':
-            sigmoid_scale = self.model_config.get('sigmoid_scale', 1.0)
-            t = t * sigmoid_scale
-            t = torch.sigmoid(t)
-
-        shift = self.model_config.get('shift', None)
-        if f == 1:
-            shift = self.model_config.get('image_shift', shift)
-        if shift:
-            t = (t * shift) / (1 + (shift - 1) * t)
-        elif self.model_config.get('flux_shift', False):
-            mu = get_lin_function(y1=0.5, y2=1.15)((h // 2) * (w // 2))
-            t = time_shift(mu, 1.0, t)
+        t = self.sample_timesteps(bs, f, h, w, device, timestep_quantile)
 
         noise = torch.randn_like(latents)
         t_expanded = t.view(-1, 1, 1, 1, 1)
@@ -444,22 +427,55 @@ class MinimaxH3Pipeline(ComfyPipeline):
 
         return (noisy_latents, noisy_audio_latents, valid_audio, t, *conds, *unconds), (target, audio_target, mask)
 
+    def sample_timesteps(self, bs, f, h, w, device, timestep_quantile=None):
+        """Training sigmas in [0, 1] (1 = pure noise) for a batch of latents f x h x w."""
+        timestep_sample_method = self.model_config.get('timestep_sample_method', 'logit_normal')
+
+        if timestep_sample_method == 'logit_normal':
+            dist = torch.distributions.normal.Normal(0, 1)
+        elif timestep_sample_method == 'uniform':
+            dist = torch.distributions.uniform.Uniform(0, 1)
+        else:
+            raise NotImplementedError()
+
+        if timestep_quantile is not None:
+            t = dist.icdf(torch.full((bs,), timestep_quantile, device=device))
+        else:
+            t = dist.sample((bs,)).to(device)
+
+        if timestep_sample_method == 'logit_normal':
+            sigmoid_scale = self.model_config.get('sigmoid_scale', 1.0)
+            t = t * sigmoid_scale
+            t = torch.sigmoid(t)
+
+        shift = self.model_config.get('shift', None)
+        if f == 1:
+            shift = self.model_config.get('image_shift', shift)
+        if shift:
+            t = (t * shift) / (1 + (shift - 1) * t)
+        elif self.model_config.get('flux_shift', False):
+            mu = get_lin_function(y1=0.5, y2=1.15)((h // 2) * (w // 2))
+            t = time_shift(mu, 1.0, t)
+        return t
+
+    @torch.autocast('cuda', enabled=False)
+    def elementwise_loss(self, output, target, mask=None):
+        output = output.to(torch.float32)
+        target = target.to(output.device, torch.float32)
+        if 'huber_delta' in self.config:
+            loss = F.huber_loss(output, target, reduction='none', delta=self.config['huber_delta'])
+        elif 'smooth_l1_beta' in self.config:
+            loss = F.smooth_l1_loss(output, target, reduction='none', beta=self.config['smooth_l1_beta'])
+        else:
+            loss = F.mse_loss(output, target, reduction='none')
+        # empty tensor means no masking
+        if mask is not None and mask.numel() > 0:
+            mask = mask.to(output.device, torch.float32)
+            loss *= mask
+        return loss
+
     def get_loss_fn(self):
-        @torch.autocast('cuda', enabled=False)
-        def single_loss(output, target, mask=None):
-            output = output.to(torch.float32)
-            target = target.to(output.device, torch.float32)
-            if 'huber_delta' in self.config:
-                loss = F.huber_loss(output, target, reduction='none', delta=self.config['huber_delta'])
-            elif 'smooth_l1_beta' in self.config:
-                loss = F.smooth_l1_loss(output, target, reduction='none', beta=self.config['smooth_l1_beta'])
-            else:
-                loss = F.mse_loss(output, target, reduction='none')
-            # empty tensor means no masking
-            if mask is not None and mask.numel() > 0:
-                mask = mask.to(output.device, torch.float32)
-                loss *= mask
-            return loss
+        single_loss = self.elementwise_loss
 
         def loss_fn(outputs, label):
             output, audio_output = outputs
@@ -540,10 +556,16 @@ class InitialLayer(nn.Module):
         self.token_refiner = model.token_refiner
         self.model = [model]
 
+    # False: timestep rows deduplicated as ComfyUI builds them. True (P-H3-Image): one row per
+    # stream (text and video, audio, reference image), so every sample of a batch has the same
+    # rows even where ComfyUI merges two of them (a reference pinned at 0.999 meets an image
+    # timestep above it); the rows hold the same values, so the output does not change.
+    fixed_timestep_rows = False
+
     def __getattr__(self, name):
         return getattr(self.model[0], name)
 
-    def make_packed_sequence(self, video_x, audio_x, valid_audio, t, context, context_mask):
+    def make_packed_sequence(self, video_x, audio_x, valid_audio, t, context, context_mask, token_tags=None, ref_latent=None):
         assert video_x.shape[0] == 1  # needs batch dimension with batch size 1
 
         if not valid_audio.item():
@@ -551,6 +573,13 @@ class InitialLayer(nn.Module):
 
         transformer_options = {}
         payload = {}
+        if token_tags is not None:
+            # per text token: 0 for the tokens of an image shown to the text encoder (they take the
+            # video modulation), 1 for text
+            payload["text_token_tags"] = token_tags.view(-1)
+        if ref_latent is not None:
+            # one reference image, packed after the text as ComfyUI's minimax_refs places it
+            payload["refs"] = [{"kind": "image", "latent_h": ref_latent.shape[-2], "latent_w": ref_latent.shape[-1]}]
         device = video_x.device
         dtype = context.dtype  # compute dtype
 
@@ -589,18 +618,25 @@ class InitialLayer(nn.Module):
         seg_t = {"text": t_v, "video": t_v, "audio": t_a,
                  "cond": max(t_v, vis_aug), "ref_img": max(t_v, vis_aug),
                  "ref_audio": max(t_a, aud_aug)}
-        unique_t = sorted({t_v, t_a} | ({seg_t["cond"]} if has_vis_cond else set())
-                          | ({seg_t["ref_audio"]} if has_aud_cond else set()))
-        t_row = {t: i for i, t in enumerate(unique_t)}
+        if self.fixed_timestep_rows:
+            assert not has_aud_cond and not any(k == "cond" for _, _, k in layout.segments)
+            unique_t = [t_v, t_a] + ([seg_t["ref_img"]] if has_vis_cond else [])
+            kind_row = {"text": 0, "video": 0, "audio": 1, "ref_img": 2}
+        else:
+            unique_t = sorted({t_v, t_a} | ({seg_t["cond"]} if has_vis_cond else set())
+                              | ({seg_t["ref_audio"]} if has_aud_cond else set()))
+            t_row = {t: i for i, t in enumerate(unique_t)}
+            kind_row = {kind: t_row[value] for kind, value in seg_t.items() if value in t_row}
         seg_tag = {"text": 1, "video": 0, "audio": 2, "cond": 0, "ref_img": 0, "ref_audio": 2}
 
         text_tags = payload.get("text_token_tags")
         mod_segments = []
         for a, b, kind in layout.segments:
-            row_base = t_row[seg_t[kind]] * 3
+            row_base = kind_row[kind] * 3
             if kind == "text" and text_tags is not None:
                 # the presentation text span mixes tags (vision pads carry the video modality) split into tag runs
                 tags = text_tags.view(-1).tolist()
+                assert len(tags) == b - a, (len(tags), b - a)
                 run_start = 0
                 for i in range(1, b - a + 1):
                     if i == b - a or tags[i] != tags[run_start]:
@@ -614,7 +650,11 @@ class InitialLayer(nn.Module):
         audio_update = layout.audio_update.to(device)
         video_rows = patchify_video(video_x.to(torch.float32), self.patch_size)
         audio_rows = pack_audio(audio_x.to(torch.float32))
-        cond_video_rows = self._cond_video_rows(payload, device)
+        if ref_latent is not None:
+            # already noise-augmented by the pipeline (prepare_inputs)
+            cond_video_rows = patchify_video(ref_latent.to(torch.float32), self.patch_size)
+        else:
+            cond_video_rows = self._cond_video_rows(payload, device)
         cond_audio_rows = self._cond_audio_rows(payload, device)
 
         all_video_rows = video_rows
@@ -677,28 +717,42 @@ class InitialLayer(nn.Module):
             position_ids = torch.cat([unpadded[:n_text], pad_positions, unpadded[n_text:]])
         rope_freqs = rope_rotation_table(self.rope_freqs(position_ids, device), dtype)
 
-        video_seg = next((a, b, t_row[seg_t["video"]]) for a, b, k in layout.segments if k == "video")
-        audio_seg = next((a, b, t_row[seg_t["audio"]]) for a, b, k in layout.segments if k == "audio")
+        video_seg = next((a, b, kind_row["video"]) for a, b, k in layout.segments if k == "video")
+        audio_seg = next((a, b, kind_row["audio"]) for a, b, k in layout.segments if k == "audio")
         # pack these as ints so we can pass as tensor between pipeline parallel layers
         mod_segments = torch.tensor(mod_segments, dtype=torch.int32, device=h.device)
         extra_ints = torch.tensor([*video_seg, *audio_seg, latent_t, lat_h, lat_w], dtype=torch.int32, device=h.device)
 
         return h, attention_mask, t_emb, mod_segments, rope_freqs, extra_ints
 
-    def make_layer_inputs(self, video_x, audio_x, valid_audio, t, context, context_mask):
-        first_mod_seqments = None
-        h_list, attention_mask_list, t_emb_list, rope_freqs_list = [], [], [], []
-        for items in zip(video_x, audio_x, valid_audio, t, context, context_mask):
+    def make_layer_inputs(self, video_x, audio_x, valid_audio, t, context, context_mask, *extras):
+        # extras: per-sample tensors make_packed_sequence takes after context_mask (token tags,
+        # reference latents).
+        first_extra_ints = None
+        h_list, attention_mask_list, t_emb_list, rope_freqs_list, segments_list = [], [], [], [], []
+        for items in zip(video_x, audio_x, valid_audio, t, context, context_mask, *extras):
             h, attention_mask, t_emb, mod_segments, rope_freqs, extra_ints = self.make_packed_sequence(*(x.unsqueeze(0) for x in items))
-            if first_mod_seqments is None:
-                first_mod_seqments = mod_segments
+            if first_extra_ints is None:
+                first_extra_ints = extra_ints
             else:
-                # A critical assertion: the batch-enabled AdaLN code only works if all mod_segments are the same (which they will be for this training code).
-                assert (mod_segments == first_mod_seqments).all()
+                # FinalLayer reads the target streams' spans and timestep rows of the last sample for all.
+                assert (extra_ints == first_extra_ints).all()
+            segments_list.append(mod_segments)
             h_list.append(h)
             attention_mask_list.append(attention_mask)
             t_emb_list.append(t_emb)
             rope_freqs_list.append(rope_freqs)
+
+        if all(s.shape == segments_list[0].shape and (s == segments_list[0]).all() for s in segments_list[1:]):
+            mod_segments = segments_list[0]
+        else:
+            # Samples whose segments differ get one list each, [batch, segments, 3]; the shorter ones
+            # are padded with empty segments (start = stop), which modulate nothing.
+            n = max(s.shape[0] for s in segments_list)
+            mod_segments = torch.zeros((len(segments_list), n, 3), dtype=segments_list[0].dtype, device=segments_list[0].device)
+            for i, s in enumerate(segments_list):
+                mod_segments[i, :s.shape[0]] = s
+                mod_segments[i, s.shape[0]:, :2] = s[-1, 1]
 
         h = torch.stack(h_list, dim=0)
         attention_mask = torch.stack(attention_mask_list, dim=0)[:, None, None, :]  # 4D bool for SDPA

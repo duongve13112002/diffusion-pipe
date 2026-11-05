@@ -1,7 +1,7 @@
 # diffusion-pipe
 A pipeline parallel training script for diffusion models.
 
-Models supported: SDXL, Flux, LTX-Video, HunyuanVideo (t2v), Cosmos, Lumina Image 2.0, Wan2.1 (t2v and i2v), Chroma, HiDream, Stable Diffusion 3, Cosmos-Predict2, OmniGen2, Flux Kontext, Wan2.2, Qwen-Image, Qwen-Image-Edit, HunyuanImage-2.1, AuraFlow, Z-Image, HunyuanVideo-1.5, Flux 2 (Dev and Klein), Anima, Ernie-Image, LTX 2.3, Ideogram4, Krea 2, MiniMax H3, Qwen-Image-2.1, Iris-3B, MOSS-Image.
+Models supported: SDXL, Flux, LTX-Video, HunyuanVideo (t2v), Cosmos, Lumina Image 2.0, Wan2.1 (t2v and i2v), Chroma, HiDream, Stable Diffusion 3, Cosmos-Predict2, OmniGen2, Flux Kontext, Wan2.2, Qwen-Image, Qwen-Image-Edit, HunyuanImage-2.1, AuraFlow, Z-Image, HunyuanVideo-1.5, Flux 2 (Dev and Klein), Anima, Ernie-Image, LTX 2.3, Ideogram4, Krea 2, MiniMax H3, P-H3-Image, Qwen-Image-2.1, Iris-3B, MOSS-Image.
 
 ## Features
 - Pipeline parallelism, for training models larger than can fit on a single GPU
@@ -15,6 +15,7 @@ Models supported: SDXL, Flux, LTX-Video, HunyuanVideo (t2v), Cosmos, Lumina Imag
 
 ## Recent changes
 - 2026-11-05
+  - Support P-H3-Image (PrunaAI's MiniMax H3 fine-tune): text to image and editing (a `control_path` per directory, one reference image), with every adapter type and full fine-tune. Captions with a control image are encoded with the image as ComfyUI's P-H3-Image Conditioning node encodes them. See [supported models](docs/supported_models.md#p-h3-image) and `examples/p_h3_image.toml`. ComfyUI is updated to fb2b26fda for it.
   - Fixed: a model quantized by NVIDIA ModelOpt (ComfyUI checkpoints with `pre_quant_scale`, such as nvfp4) trained with dequantized weights (adapters on a quantized base) lost that input scale, so every such layer computed a different output than the checkpoint's. The scale now goes into the dequantized weight.
   - FP8 training with NVIDIA Transformer Engine, for every model, adapter (LoRA, LoKr, DoRA, OPLoRA) and full fine-tune: an `[fp8_training]` table. The Linear layers of the transformer blocks run their GEMMs (forward, input gradient and weight gradient) in fp8 with block scaling (`recipe = 'block'`, default) or one scale per tensor (`'current'`); `attention = true` (opt-in, Hopper and newer) runs attention in fp8 too. Weights, checkpoints and saved adapters stay as they are; sampling previews run bf16. `tools/check_fp8_training.py` checks a GPU, the error against float32 and the speed-up. See [FP8 training](#fp8-training).
 - 2026-11-02

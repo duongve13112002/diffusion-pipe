@@ -34,12 +34,13 @@ See [source snapshots and cache profiles](caption-processing.md#source-snapshots
 |Ideogram4       |✅    |✅              |✅                |
 |Krea 2          |✅    |✅              |✅                |
 |MiniMax H3      |✅    |✅              |✅                |
+|P-H3-Image      |✅    |✅              |✅                |
 |Qwen-Image-2.1  |✅    |✅              |✅                |
 |Iris-3B         |✅    |✅              |❌                |
 |MOSS-Image      |✅    |✅              |✅                |
 
 The models loaded from ComfyUI files (Z-Image, HunyuanVideo-1.5, Flux 2, Ernie-Image, LTX 2.3,
-Ideogram4, Krea 2, MiniMax H3, Qwen-Image-2.1, MOSS-Image) encode captions as ComfyUI encodes a
+Ideogram4, Krea 2, MiniMax H3, P-H3-Image, Qwen-Image-2.1, MOSS-Image) encode captions as ComfyUI encodes a
 prompt, so a LoRA trains on the embeddings it is sampled with in ComfyUI. Several official
 pipelines cut long prompts (Z-Image and Flux 2 at 512 tokens, Krea 2 at 507, LTX 2.3 at 1024,
 HunyuanVideo-1.5 at 1000, Ernie-Image and Ideogram4 at 2048) where ComfyUI keeps them whole.
@@ -764,6 +765,50 @@ VSA checkpoints retain their optional `to_gate_compress` projection when loaded 
 saved. Training uses dense attention; retaining the projection does not enable VSA.
 
 Everything is ComfyUI format, including the saved models. You can now train LoRAs directly on quantized models, and it is recommended to use int8 convrot (faster, better quality, and less VRAM).
+
+## P-H3-Image
+[P-H3-Image](https://huggingface.co/PrunaAI/P-H3-Image) (PrunaAI) is a MiniMax H3 fine-tune for
+text to image and image editing, with Qwen3-VL-4B and a text connector as its text encoder and its
+own image VAE. It is step- and guidance-distilled: 8 steps, no CFG. The weights are ComfyUI files
+([PrunaAI/P-H3-Image-Comfy](https://huggingface.co/PrunaAI/P-H3-Image-Comfy)), and saved LoRAs and
+fine-tunes load in ComfyUI's own loaders.
+```
+[model]
+type = 'p_h3_image'
+diffusion_model = '/data/models/P-H3-Image-Comfy/diffusion_models/p-h3-image_int8_convrot.safetensors'
+vae = '/data/models/P-H3-Image-Comfy/vae/p-h3-image_vae_bf16.safetensors'
+text_encoders = [
+    {path = '/data/models/P-H3-Image-Comfy/text_encoders/p-h3-image_text_encoder_bf16.safetensors', type = 'minimax'}
+]
+dtype = 'bfloat16'
+timestep_sample_method = 'logit_normal'
+shift = 12
+#merge_adapters = ['/data/models/p_h3_image_training_adapter_v1.safetensors']
+#edit_prompt_prefix = true
+```
+See [examples/p_h3_image.toml](../examples/p_h3_image.toml) and its dataset.
+
+- Text to image: images and captions, as for any model.
+- Editing: a dataset directory with `control_path` (the image to edit, same file name as the
+  target) and the instruction as caption. Each caption is encoded as ComfyUI's P-H3-Image
+  Conditioning node encodes it: `"Edit <Picture 1>. "` in front (unless it already starts with
+  `Edit <Picture N>` or `subject_definitions:`; `edit_prompt_prefix = false` turns this off) and
+  the control image shown to Qwen3-VL at most 1 MP. The control image's latent is the reference,
+  noise-augmented to t = 0.999 as ComfyUI does. Its vision tokens take the image modulation, as in
+  ComfyUI. One reference per sample: `control_path_2` and further are refused.
+- The model packs two audio latents with every image; they are noise at the image's sigma and
+  have no loss, as in ComfyUI and ai-toolkit.
+- `shift`: the checkpoint samples at sigmas 1.0, 0.98, 0.97, 0.95, 0.93, 0.88, 0.81, 0.53, 0, so
+  training sits near pure noise too; ai-toolkit uses 12.
+- Distillation: training erodes the 8-step sampling. ostris's training adapter
+  ([ostris/minimax_h3_training_adapter](https://huggingface.co/ostris/minimax_h3_training_adapter),
+  `p_h3_image_training_adapter_v1.safetensors`) merged with `merge_adapters` keeps it (as
+  ai-toolkit's assistant LoRA); the trained LoRA is then used on the plain model.
+- Refused: `frame_buckets` other than `[1]`, MiniMax H3's `audio_vae` and `cfg`, a text encoder
+  other than one with type `minimax`, and a VAE that is not the P-H3-Image one.
+- Everything MiniMax H3 has applies: LoRA, LoKr, DoRA, OPLoRA and full fine-tune, `[fp8_training]`,
+  FlashAttention-3/4, block swap, on-the-fly or cached text and latents (with their dtypes), eval,
+  multi-GPU and multi-node. `--test_sample` samples text to image with the 8-step schedule.
 
 ## Qwen-Image-2.1
 ```

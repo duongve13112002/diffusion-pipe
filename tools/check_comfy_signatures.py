@@ -29,8 +29,12 @@ import inspect
 import os
 import sys
 
-# Make the vendored ComfyUI importable the same way train.py does.
+# Make the vendored ComfyUI importable the same way train.py does. The repo's utils.common goes
+# first: ComfyUI's regular utils package would shadow the repo's namespace package once ComfyUI
+# is on sys.path, and the checks import models/*.py (test/test_import_order.py).
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, _REPO_ROOT)
+import utils.common  # noqa: E402,F401
 sys.path.insert(0, os.path.join(_REPO_ROOT, 'submodules', 'ComfyUI'))
 
 
@@ -201,6 +205,23 @@ def run_checks():
            has_default(Attention.__init__, 'gate_compress'))
     record('patched minimax.DiTBlock.__init__ accepts gate_compress',
            has_default(DiTBlock.__init__, 'gate_compress'))
+
+    # P-H3-Image (models/p_h3_image.py) swaps in a clip model with attention masks on, which
+    # PH3ImageTEModel picks up only while it looks the class up by its module-level name.
+    import comfy.text_encoders.minimax as minimax_te
+    import comfy.ldm.minimax.vae as minimax_vae
+    record('minimax_te.PH3ImageTEModel builds the module-level PH3ImageClipModel',
+           'PH3ImageClipModel' in minimax_te.PH3ImageTEModel.__init__.__code__.co_names)
+    record('minimax_te.PH3ImageTokenizer.tokenize_with_weights accepts images',
+           accepts(minimax_te.PH3ImageTokenizer.tokenize_with_weights, 'images'))
+    record('sd1_clip.SDClipModel reads enable_attention_masks / return_attention_masks',
+           {'enable_attention_masks', 'return_attention_masks'}
+           <= set(sd1.SDClipModel.forward.__code__.co_names) | set(sd1.SDClipModel.encode.__code__.co_names)
+           | set(sd1.ClipTokenWeightEncoder.encode_token_weights.__code__.co_names))
+    record('minimax_vae.PH3ImageVAE exists', hasattr(minimax_vae, 'PH3ImageVAE'))
+    record('minimax.VISUAL_COND_TIMESTEP exists', hasattr(minimax, 'VISUAL_COND_TIMESTEP'))
+    record('utils.common_upscale(samples, width, height, upscale_method, crop)',
+           required_positional_names(cu.common_upscale) == ['samples', 'width', 'height', 'upscale_method', 'crop'])
 
     return results
 

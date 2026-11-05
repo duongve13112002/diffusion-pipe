@@ -1,0 +1,29 @@
+# Dataset for P-H3-Image (examples/p_h3_image.toml). Images only.
+
+resolutions = [1024]
+
+enable_ar_bucket = true
+min_ar = 0.5
+max_ar = 2.0
+num_ar_buckets = 9
+
+# P-H3-Image trains on images: every frame bucket but 1 is refused.
+frame_buckets = [1]
+
+num_repeats = 1
+
+# Text to image: images and their captions.
+[[directory]]
+path = '/data/images/t2i'
+
+# Editing: the target images (what the model learns to produce) in path, the image to edit in
+# control_path under the same name, and the instruction as the caption ("make the sky red").
+# The caption is encoded with "Edit <Picture 1>. " in front and the control image shown to the
+# text encoder (at most 1 MP), as ComfyUI's P-H3-Image Conditioning node does; a caption that
+# already starts with "Edit <Picture N>" or "subject_definitions:" is kept as it is. The control
+# image is also the reference latent, cropped to the target's bucket. One control image per
+# target: control_path_2 and further are refused.
+# Text-to-image and edit images go in different directories.
+#[[directory]]
+#path = '/data/images/edit/target'
+#control_path = '/data/images/edit/control'

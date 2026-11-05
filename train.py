@@ -502,6 +502,9 @@ if __name__ == '__main__':
     elif model_type == 'minimax_h3':
         from models import minimax_h3
         model = minimax_h3.MinimaxH3Pipeline(config)
+    elif model_type == 'p_h3_image':
+        from models import p_h3_image
+        model = p_h3_image.PH3ImagePipeline(config)
     elif model_type == 'qwen_image21':
         from models import qwen_image21
         model = qwen_image21.QwenImage21Pipeline(config)
