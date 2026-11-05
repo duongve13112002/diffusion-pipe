@@ -34,13 +34,17 @@ _flash_attn_2_varlen = hunyuan_attention.flash_attn_varlen_func
 
 def _varlen_attention(q, k, v, cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seqlen_kv):
     """HunyuanVideo's flash-attn 2 varlen call, run by FlashAttention-3 / -4 with [model] attention =
-    'flash3' / 'flash4'."""
-    if attention_util.flash_enabled():
-        return attention_util.flash_varlen(q, k, v, cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seqlen_kv)
-    if _flash_attn_2_varlen is None:
-        raise ImportError("HunyuanVideo needs flash-attn 2, or [model] attention = 'flash3' / 'flash4' with "
-                          "FlashAttention-3 / -4")
-    return _flash_attn_2_varlen(q, k, v, cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seqlen_kv)
+    'flash3' / 'flash4', and offered to fp8 attention with [fp8_training] attention = true."""
+    def run():
+        if attention_util.flash_enabled():
+            return attention_util.flash_varlen(q, k, v, cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seqlen_kv)
+        if _flash_attn_2_varlen is None:
+            raise ImportError("HunyuanVideo needs flash-attn 2, or [model] attention = 'flash3' / 'flash4' with "
+                              "FlashAttention-3 / -4")
+        return _flash_attn_2_varlen(q, k, v, cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seqlen_kv)
+
+    return attention_util.fp8_varlen(q, k, v, cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seqlen_kv, None, False,
+                                     run)
 
 
 hunyuan_attention.flash_attn_varlen_func = _varlen_attention

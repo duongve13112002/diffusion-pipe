@@ -27,13 +27,19 @@ def _varlen_attention(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seq
                       causal=False, softmax_scale=None):
     """OmniGen2's flash-attn 2 varlen call (its processor when flash-attn is installed), run by
     FlashAttention-3 / -4 with [model] attention = 'flash3' / 'flash4'. Without flash-attn it uses its SDPA
-    processor, which the SDPA replacement covers."""
-    if attention_util.flash_enabled() and not dropout_p:
-        return attention_util.flash_varlen(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k,
-                                         softmax_scale=softmax_scale, causal=causal)
-    return _flash_attn_2_varlen(q, k, v, cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=cu_seqlens_k,
-                                max_seqlen_q=max_seqlen_q, max_seqlen_k=max_seqlen_k, dropout_p=dropout_p,
-                                causal=causal, softmax_scale=softmax_scale)
+    processor, which the SDPA replacement covers. Offered to fp8 attention with [fp8_training] attention = true."""
+    def run():
+        if attention_util.flash_enabled() and not dropout_p:
+            return attention_util.flash_varlen(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k,
+                                               softmax_scale=softmax_scale, causal=causal)
+        return _flash_attn_2_varlen(q, k, v, cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=cu_seqlens_k,
+                                    max_seqlen_q=max_seqlen_q, max_seqlen_k=max_seqlen_k, dropout_p=dropout_p,
+                                    causal=causal, softmax_scale=softmax_scale)
+
+    if dropout_p:
+        return run()
+    return attention_util.fp8_varlen(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, softmax_scale,
+                                     causal, run)
 
 
 if _flash_attn_2_varlen is not None:

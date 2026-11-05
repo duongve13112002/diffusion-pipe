@@ -247,6 +247,22 @@ timestep_sample_method = 'logit_normal'
 # values is rebuilt.
 
 # For models that support full fine tuning, simply delete or comment out the [adapter] table to FFT.
+# FP8 training with NVIDIA Transformer Engine (any model, any adapter or full fine-tune; Ada / Hopper /
+# Blackwell). The Linear GEMMs of the transformer blocks run in fp8; weights, checkpoints and saved
+# adapters are unchanged. See README "FP8 training"; tools/check_fp8_training.py tests a GPU and install.
+#[fp8_training]
+# 'block' (default; Hopper, CUDA 12.9+) scales each 1x128 / 128x128 block; 'current' one scale per tensor.
+#recipe = 'block'
+# 'dequantize' (default) or 'direct': e4m3 base weights (transformer_dtype = 'float8') go into the fp8
+# GEMM as they are (adapters only).
+#weights = 'dequantize'
+# Module names (regexes) that stay bf16.
+#exclude = ['adaLN']
+# Adapters only: keep the fp8 copy of frozen base weights between steps (not with blocks_to_swap).
+#cache_frozen_weights = true
+# fp8 attention too (Hopper and newer; not with compile = true).
+#attention = true
+
 [adapter]
 type = 'lora'
 rank = 32

@@ -358,6 +358,8 @@ def apply_debiased_estimation(loss, timesteps, noise_scheduler, v_prediction=Fal
 
 
 class SDXLPipeline(BasePipeline):
+    # [fp8_training]: the Linear layers and attention of the UNet's transformer blocks.
+    fp8_target_modules = ['Transformer2DModel', 'BasicTransformerBlock']
     encodes_text_on_the_fly = True
     # Unique name, used to make the cache_dir path.
     name = 'sdxl'

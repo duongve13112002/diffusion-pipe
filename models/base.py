@@ -412,6 +412,14 @@ class CommonPipeline:
             return {'latents': latents}
         return fn
 
+    def fp8_target_model(self):
+        """The network whose transformer blocks [fp8_training] converts (utils/fp8_training.py)."""
+        for name in ('diffusion_model', 'transformer', 'unet'):
+            module = getattr(self, name, None)
+            if isinstance(module, nn.Module):
+                return module
+        raise ValueError(f'[fp8_training] found no diffusion model on {type(self).__name__}')
+
     def get_target_modules(self, target_model):
         target_modules = set()
         for name, module in target_model.named_modules():
@@ -810,7 +818,14 @@ class ComfyPipeline(CommonPipeline):
             is_quantized = False
             for p_name, p in module.named_parameters(recurse=False):
                 if p.__class__.__name__ == 'QuantizedTensor':
-                    module.register_parameter(p_name, nn.Parameter(p.dequantize()))
+                    value = p.dequantize()
+                    pre_quant_scale = getattr(module, 'pre_quant_scale', None)
+                    if p_name == 'weight' and pre_quant_scale is not None:
+                        # ComfyUI's quantized Linear scales its input by it (ModelOpt checkpoints); the
+                        # plain Linear that replaces it takes it in the weight.
+                        scale = pre_quant_scale.to(value.device, torch.float32).reshape(1, -1)
+                        value = (value.float() * scale).to(value.dtype)
+                    module.register_parameter(p_name, nn.Parameter(value))
                     p = getattr(module, p_name)
                     is_quantized = True
 

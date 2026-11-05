@@ -86,13 +86,13 @@ def flash_attention(
     cu_seqlens_k = torch.cat([k_lens.new_zeros([1]), k_lens]).cumsum(0, dtype=torch.int32).to(q.device, non_blocking=True)
 
     # apply attention
-    if use_flash:
-        # deterministic=False is Wan's default, not a choice: None follows torch.use_deterministic_algorithms.
-        x = attention_util.flash_varlen(
-            q, k, v, cu_seqlens_q, cu_seqlens_k, lq, lk, softmax_scale=softmax_scale, causal=causal,
-            window_size=window_size, deterministic=deterministic or None).unflatten(0, (b, lq))
-    else:
-        x = flash_attn.flash_attn_varlen_func(
+    def run():
+        if use_flash:
+            # deterministic=False is Wan's default, not a choice: None follows torch.use_deterministic_algorithms.
+            return attention_util.flash_varlen(
+                q, k, v, cu_seqlens_q, cu_seqlens_k, lq, lk, softmax_scale=softmax_scale, causal=causal,
+                window_size=window_size, deterministic=deterministic or None)
+        return flash_attn.flash_attn_varlen_func(
             q=q,
             k=k,
             v=v,
@@ -104,7 +104,14 @@ def flash_attention(
             softmax_scale=softmax_scale,
             causal=causal,
             window_size=window_size,
-            deterministic=deterministic).unflatten(0, (b, lq))
+            deterministic=deterministic)
+
+    if dropout_p or tuple(-1 if w is None else w for w in window_size) != (-1, -1):
+        x = run()
+    else:
+        # [fp8_training] attention = true takes the call in fp8 where it can.
+        x = attention_util.fp8_varlen(q, k, v, cu_seqlens_q, cu_seqlens_k, lq, lk, softmax_scale, causal, run)
+    x = x.unflatten(0, (b, lq))
 
     # output
     return x.type(out_dtype)

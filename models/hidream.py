@@ -33,14 +33,21 @@ if not hasattr(flash_attn_2, 'flash_attn_func'):
 
 def _hidream_attention(query, key, value):
     """HiDream's attention (it picks FA3 whenever it is installed), with [model] attention deciding:
-    'flash3' / 'flash4' run FlashAttention-3 / -4; 'sdpa' runs flash-attn 2, or PyTorch SDPA without it."""
-    if attention_util.flash_enabled():
-        hidden_states = attention_util.flash_dense(query, key, value)
-    elif flash_attn_2 is not None:
-        hidden_states = flash_attn_2.flash_attn_func(query, key, value, dropout_p=0., causal=False)
-    else:
-        hidden_states = F.scaled_dot_product_attention(
+    'flash3' / 'flash4' run FlashAttention-3 / -4; 'sdpa' runs flash-attn 2, or PyTorch SDPA without it.
+    [fp8_training] attention = true offers the call to fp8 attention first."""
+    def run():
+        if attention_util.flash_enabled():
+            return attention_util.flash_dense(query, key, value)
+        if flash_attn_2 is not None:
+            return flash_attn_2.flash_attn_func(query, key, value, dropout_p=0., causal=False)
+        return F.scaled_dot_product_attention(
             query.transpose(1, 2), key.transpose(1, 2), value.transpose(1, 2)).transpose(1, 2)
+
+    if flash_attn_2 is None and not attention_util.flash_enabled():
+        # The SDPA call is offered to fp8 attention by the SDPA replacement.
+        hidden_states = run()
+    else:
+        hidden_states = attention_util.fp8_dense(query, key, value, None, False, run)
     hidden_states = hidden_states.flatten(-2)
     return hidden_states.to(query.dtype)
 

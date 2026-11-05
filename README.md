@@ -14,6 +14,9 @@ Models supported: SDXL, Flux, LTX-Video, HunyuanVideo (t2v), Cosmos, Lumina Imag
 - Optional OPLoRA (orthogonal projection LoRA) to reduce catastrophic forgetting when training LoRAs
 
 ## Recent changes
+- 2026-11-05
+  - Fixed: a model quantized by NVIDIA ModelOpt (ComfyUI checkpoints with `pre_quant_scale`, such as nvfp4) trained with dequantized weights (adapters on a quantized base) lost that input scale, so every such layer computed a different output than the checkpoint's. The scale now goes into the dequantized weight.
+  - FP8 training with NVIDIA Transformer Engine, for every model, adapter (LoRA, LoKr, DoRA, OPLoRA) and full fine-tune: an `[fp8_training]` table. The Linear layers of the transformer blocks run their GEMMs (forward, input gradient and weight gradient) in fp8 with block scaling (`recipe = 'block'`, default) or one scale per tensor (`'current'`); `attention = true` (opt-in, Hopper and newer) runs attention in fp8 too. Weights, checkpoints and saved adapters stay as they are; sampling previews run bf16. `tools/check_fp8_training.py` checks a GPU, the error against float32 and the speed-up. See [FP8 training](#fp8-training).
 - 2026-11-02
   - Five opt-in training settings ported from KohakuMossTrainer, all off by default (a config that does not mention them trains as before). See [docs/training-options.md](docs/training-options.md).
     - `skip_nonfinite_steps = true` (every model, every training type): an optimizer step whose gradient has a NaN or inf is dropped, leaving the weights, optimizer state and LR schedule as they were, and counted in `train/nonfinite_skipped`; `nonfinite_patience` (default 8) stops the run after that many in a row.
@@ -367,6 +370,40 @@ Keys in this repo that pick among them:
 - `[model] sdpa_prefer_cudnn`: `false` (default) or `true`; the startup line `[attention] PyTorch SDPA kernel order: ...` shows the result.
 - Iris only: `[model] attn_backend` (`sdpa`, `torch_flash`, `torch_cudnn`, `fa3`, `fa4`) forces one kernel, and `allow_cudnn_attention` (default `false`) keeps cuDNN switched off for it (see [supported models](docs/supported_models.md)).
 - Tools: `tools/check_sdpa_priority.py` (the kernel order under checkpointing), `tools/sdpa_probe.py` (every kernel on Iris's shapes), `tools/check_flash_attention.py` (FlashAttention-3 / -4), `train.py --nan_check` (replays a non-finite layer with each kernel).
+
+## FP8 training
+FP8 training runs the GEMMs of the transformer blocks in 8-bit floating point through [NVIDIA Transformer Engine](https://github.com/NVIDIA/TransformerEngine) (TE). It works with every model, every adapter type (LoRA, LoKr, DoRA, OPLoRA) and full fine-tuning, on one GPU, several GPUs and several nodes:
+```
+[fp8_training]
+recipe = 'block'               # 'block' (default) or 'current'
+weights = 'dequantize'         # 'dequantize' (default) or 'direct'
+exclude = []                   # regexes on module names that stay bf16, e.g. ['adaLN', 'proj_out']
+cache_frozen_weights = false   # adapters only: keep the fp8 copy of the frozen base weights
+attention = false              # fp8 attention as well (Hopper and newer)
+#attention_amax_history = 16   # with attention = true: steps of history behind each scale
+```
+Install TE in the training environment: `pip install --no-build-isolation 'transformer_engine[pytorch]'` (it compiles against the installed PyTorch; it needs the CUDA toolkit with `nvcc` and cuDNN 9.12 or newer). At startup `train.py` prints the TE, PyTorch, CUDA and cuDNN versions and the GPU, and stops with what to change if something does not fit.
+
+Linear layers: every `nn.Linear` inside the model's transformer blocks (the classes the adapters target; SDXL: its attention transformer blocks) is replaced before the adapter is built by a layer that keeps the same weight and bias and hands the GEMM to TE. The input and the weight are quantized to fp8 e4m3 for the forward; the gradients are e5m2 (`'current'`) or e4m3 (`'block'`) for the backward, where the input-gradient GEMM and, for trained weights, the weight-gradient GEMM run in fp8 too. The weights themselves, the optimizer state, the checkpoints and the saved adapters do not change: an adapter trained with fp8 loads like any other.
+- `recipe = 'block'`: a scale per 1x128 block of activations and per 128x128 block of weights (DeepSeek-V3's recipe), closest to bf16. Needs Hopper and CUDA 12.9 or newer; where it cannot run, the error says so and suggests `'current'`.
+- `recipe = 'current'`: one scale per tensor, computed from that tensor. Runs on every fp8 GPU (Ada, Hopper, Blackwell).
+- TE takes a GEMM in fp8 when the token count is a multiple of 8, in_features a multiple of 16 and out_features a multiple of 8. Layers whose size does not fit stay bf16 (listed at startup); a call whose token count does not fit runs bf16 for that call. Both are counted.
+- `weights`: base weights stored in fp8 (`transformer_dtype = 'float8'`, ComfyUI `float8_e4m3fn` checkpoints) or another quantized format are turned into the model dtype at load with `'dequantize'`. `'direct'` (adapters only) gives an e4m3 weight with one scale per tensor to the fp8 GEMM as it is, without quantizing it again and keeping its memory at 1 byte per weight; those layers use `'current'` whatever `recipe` says. Other formats (mxfp8, nvfp4, int8, e5m2) are dequantized either way.
+- `cache_frozen_weights = true` (adapters only, not with `blocks_to_swap`): the fp8 copy of each frozen base weight is made once and kept, instead of at every call. Faster, and it costs one byte per base weight of GPU memory.
+- `exclude`: layers whose full name matches one of the regexes stay bf16 (`'adaLN'`, `'modulation'`, final projections, ... when a model trains worse with them in fp8).
+
+Attention (`attention = true`): calls to PyTorch SDPA, the flash-attn calls of Wan, HiDream, HunyuanVideo, HunyuanImage-2.1, OmniGen2 and Lumina 2, and Iris's `fa3` / `fa4` kernels go to TE's fp8 attention (cuDNN) where the call fits: float16 / bfloat16, the same head size for queries and values (a multiple of 16 up to 256), no mask, `is_causal`, or a key-padding mask (the kept keys are gathered to the front, so masked keys may sit anywhere, as with padded text before image tokens); grouped-query attention too. Packed variable-length calls (flash-attn's varlen) run padded with query and key padding masks before Blackwell, where TE has no fp8 backward for the packed layout. On Hopper TE trains fp8 attention only with delayed scaling, where each call site keeps a history of the largest values it saw and takes its scales from it. Here:
+- each call site's first training step runs in bf16 and measures what fp8 needs (q, k, v, the output, and through gradient hooks the gradients); its fp8 steps start from those scales;
+- the scales change only between optimizer steps, so the forward and its recomputation under activation checkpointing (PyTorch's, DeepSpeed's or unsloth's) use the same scales, and every micro-batch of a step uses the same ones too;
+- each rank keeps its own scales (no all-reduce at every step, which would hang pipeline stages that hold different layers).
+
+Calls fp8 attention does not take (outside the transformer blocks, arbitrary masks or biases, dropout, float32, head size 512 of the VAEs, sliding windows, ...) run as before: FlashAttention with `[model] attention = 'flash3'` / `'flash4'`, else PyTorch SDPA. Refused: `attention = true` with `compile = true`, and with Cosmos (its attention is TE's own module). Eval runs fp8 (it measures the model you train), sampling previews bf16.
+
+What it prints: `[fp8] N Linear layers run their GEMMs in fp8 ...` at startup, then after the first step and at the end of training, summed over all GPUs, how many Linear and attention calls ran fp8 and why the others did not. A layer or attention site where TE fails at its first call (a shape TE has no kernel for) prints a warning and runs bf16 from then on; a failure after it worked once stops the run.
+
+Speed: fp8 tensor cores on H100 / H200 have twice the throughput of bf16 (about 1979 against 989 dense TFLOPS), but training does not get twice as fast: quantizing costs time, the GEMMs are only part of a step (norms, activations, attention, the optimizer, data), and small layers gain little. Expect roughly 1.2-1.5x on large models with long sequences, less on small ones; `tools/check_fp8_training.py` measures it on your GPU.
+
+To check a GPU and an install, run `python tools/check_fp8_training.py` in the training environment (no weights needed, 5-15 minutes, `--quick` for shorter; `torchrun --nproc_per_node <gpus> tools/check_fp8_training.py --distributed` checks several GPUs as well). It compares the fp8 Linear layers (both recipes, frozen and trained weights, cached weights, `'direct'`) and fp8 attention (each mask kind, grouped-query, varlen, recomputation) with a float32 reference, times them against bf16, trains a small DiT in bf16, fp8 Linear and fp8 Linear + attention with LoRA and full fine-tuning, and tries `torch.compile`. It writes `fp8_training_check_<host>_<time>.txt` (and a `.json`) as it goes; send the `.txt` back.
 
 ## Reducing VRAM requirements
 The [wan_14b_min_vram.toml](./examples/wan_14b_min_vram.toml) example file has all of these settings enabled.

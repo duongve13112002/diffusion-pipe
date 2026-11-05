@@ -22,6 +22,7 @@ import numpy as np
 
 from utils import dataset as dataset_util
 from utils import attention as attention_util
+from utils import fp8_training
 from utils import startup_timing
 from utils import common
 from utils.common import is_main_process, get_rank, DTYPE_MAP, empty_cuda_cache, all_ok
@@ -205,6 +206,8 @@ def set_config_defaults(config):
     config.setdefault('compile', False)
     # [model] attention: 'sdpa', 'flash3' or 'flash4' (FlashAttention-3 / -4); checked before anything loads.
     attention_util.attention_setting(config)
+    # [fp8_training]: fp8 GEMMs (and optionally attention) through Transformer Engine (utils/fp8_training.py).
+    fp8_training.apply_fp8_training_config_defaults(config)
     config.setdefault('x_axis_examples', False)
 
 
@@ -241,7 +244,8 @@ def evaluate_single(model_engine, eval_dataloader, eval_gradient_accumulation_st
     while True:
         model_engine.reset_activation_shape()
         iterator = get_data_iterator_for_step(eval_dataloader, model_engine, num_micro_batches=eval_gradient_accumulation_steps)
-        loss = model_engine.eval_batch(iterator, num_micro_batches=eval_gradient_accumulation_steps).item()
+        with fp8_training.step_scope(training=False):
+            loss = model_engine.eval_batch(iterator, num_micro_batches=eval_gradient_accumulation_steps).item()
         eval_dataloader.sync_epoch()
         if pbar:
             pbar.update(1)
@@ -390,6 +394,8 @@ if __name__ == '__main__':
         # context would leave PyTorch's kernel order changed after it, and checkpointing's
         # recomputation of that call would pick another kernel than the forward did.
         attention_util.settle_sdpa_priority(attention_util.sdpa_prefer_cudnn_setting(config))
+        # Fails before caching when Transformer Engine or this GPU cannot run the [fp8_training] recipes.
+        fp8_training.check_environment(config)
 
     resume_from_checkpoint = (
         args.resume_from_checkpoint if args.resume_from_checkpoint is not None
@@ -707,6 +713,8 @@ if __name__ == '__main__':
         model.prepare_sample_test('a golden retriever running through a grassy field', cfg=1)
 
     model.load_diffusion_model()
+    # Before the adapter, which then wraps the fp8 layers like any Linear.
+    fp8_training.prepare_model(model)
 
     if adapter_config := config.get('adapter', None):
         model.configure_adapter(adapter_config)
@@ -851,7 +859,8 @@ if __name__ == '__main__':
 
     if args.test_sample:
         import torchvision
-        img = model.sample(w=512, h=512)
+        with fp8_training.disabled():
+            img = model.sample(w=512, h=512)
         img = img.squeeze(0).movedim(-1, 0)
         print(img.shape, img.min().item(), img.max().item())
         torchvision.utils.save_image(img, 'example.png')
@@ -1243,9 +1252,11 @@ if __name__ == '__main__':
             outlier_decay.before_step()
         if weight_decay_target is not None:
             weight_decay_target.before_step()
-        loss = model_engine.train_batch(iterator).item()
+        with fp8_training.step_scope(training=True):
+            loss = model_engine.train_batch(iterator).item()
         if not attention_reported:
             attention_util.report()
+            fp8_training.report()
             attention_reported = True
         if nan_check is not None:
             nan_check.after_step(step, loss)
@@ -1349,6 +1360,7 @@ if __name__ == '__main__':
     if not checkpointed:
         saver.save_checkpoint(step, examples)
     attention_util.report()
+    fp8_training.report()
 
     if is_main_process():
         print('TRAINING COMPLETE!')

@@ -20,11 +20,20 @@ from hyimage.models.hunyuan.modules.posemb_layers import apply_rotary_emb
 
 def flash_attn_no_pad(qkv, key_padding_mask, causal=False, dropout_p=0.0, softmax_scale=None, deterministic=False):
     """HunyuanImage's flash-attn 2 call on packed (B, S, 3, H, D) qkv, run by FlashAttention-3 / -4
-    with [model] attention = 'flash3' / 'flash4' (flash-attn 2 still for attention dropout, which they lack)."""
+    with [model] attention = 'flash3' / 'flash4' (flash-attn 2 still for attention dropout, which they lack),
+    and offered to fp8 attention with [fp8_training] attention = true."""
     if attention_util.flash_enabled() and not dropout_p:
         q, k, v = qkv.unbind(2)
         return attention_util.flash_unpadded(q, k, v, key_padding_mask, softmax_scale=softmax_scale, causal=causal,
                                            deterministic=deterministic or None)
+    if attention_util.fp8_training.attention_enabled() and not dropout_p:
+        q, k, v = qkv.unbind(2)
+        # Built from q, k, v, so the fp8 calibration sees the gradients that reach them.
+        return attention_util.flash_unpadded(
+            q, k, v, key_padding_mask, softmax_scale=softmax_scale, causal=causal,
+            fallback=lambda: _flash_attn_2_no_pad(torch.stack([q, k, v], dim=2), key_padding_mask, causal=causal,
+                                                  dropout_p=dropout_p, softmax_scale=softmax_scale,
+                                                  deterministic=deterministic))
     return _flash_attn_2_no_pad(qkv, key_padding_mask, causal=causal, dropout_p=dropout_p,
                                 softmax_scale=softmax_scale, deterministic=deterministic)
 

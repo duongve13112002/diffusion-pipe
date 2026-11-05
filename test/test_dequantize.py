@@ -26,3 +26,29 @@ def test_keywords_match_the_full_path():
         high = p.ndim == 1 or name.startswith(('time_in.', 'txt_in.', 'final_layer.'))
         assert p.dtype == (torch.float32 if high else torch.float16), name
     assert model.blocks[0]['attn'].weight.dtype == torch.float16
+
+
+class QuantizedTensor:
+    """ComfyUI's quantized weight as dequantize() sees it."""
+
+    def __init__(self, value):
+        self.value = value
+
+    def dequantize(self):
+        return self.value
+
+
+def test_pre_quant_scale_goes_into_the_weight():
+    """ModelOpt checkpoints: ComfyUI's quantized Linear computes (x * pre_quant_scale) @ W^T, and the
+    plain Linear that replaces it must give the same."""
+    pipe = object.__new__(ComfyPipeline)
+    pipe.keep_in_high_precision = []
+    model = nn.ModuleDict({'proj': nn.Linear(4, 3)})
+    weight = torch.randn(3, 4)
+    pre = torch.tensor([0.5, 1.0, 2.0, 4.0])
+    model['proj']._parameters['weight'] = QuantizedTensor(weight)
+    model['proj'].register_buffer('pre_quant_scale', pre)
+    x = torch.randn(2, 4)
+    expected = nn.functional.linear(x * pre, weight, model['proj'].bias)
+    pipe.dequantize(model, torch.float32)
+    torch.testing.assert_close(model['proj'](x), expected)

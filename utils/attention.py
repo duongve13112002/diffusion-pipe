@@ -17,6 +17,11 @@ Models that call flash-attn directly (Wan, HiDream, HunyuanVideo, HunyuanImage, 
 flash_dense / flash_varlen / flash_unpadded below when flash_enabled(); Iris maps the key onto its
 own attn_backend. 'sdpa' (the default) changes nothing for SDPA models.
 
+With `[fp8_training] attention = true` (utils/fp8_training.py) the replacement is installed for
+every `attention` value and first offers each call to Transformer Engine's fp8 attention; calls it
+does not take go on as described above. The direct flash-attn models offer theirs through
+fp8_dense / fp8_varlen / flash_unpadded.
+
 settle_sdpa_priority fixes PyTorch's SDPA kernel order before the model runs, for every
 `attention` value: PyTorch (2.9 on) changes that order the first time SDPA picks a kernel, and
 when that first time falls inside ComfyUI's sdpa_kernel(..., set_priority=True), the change is
@@ -33,6 +38,8 @@ import weakref
 import torch
 import torch.nn.functional as F
 from torch.nn.attention import SDPBackend
+
+from utils import fp8_training
 
 CHOICES = ('sdpa', 'flash3', 'flash4')
 LABELS = {'flash3': 'FlashAttention-3', 'flash4': 'FlashAttention-4'}
@@ -235,8 +242,9 @@ def kernel_checks():
 
 def flash_enabled():
     """Whether FlashAttention runs: from install(), after caching, on. Before it (caching, and the
-    --cache_only / --cache_status / --metadata_only runs) the models' own attention runs as with 'sdpa'."""
-    return _original_sdpa is not None
+    --cache_only / --cache_status / --metadata_only runs) the models' own attention runs as with 'sdpa'.
+    With 'sdpa', install() can still replace SDPA (for [fp8_training] attention): FlashAttention does not run."""
+    return _original_sdpa is not None and _backend != 'sdpa'
 
 
 def note_if_unused(model_name, used):
@@ -247,18 +255,25 @@ def note_if_unused(model_name, used):
 
 
 def install():
-    """Routes torch.nn.functional.scaled_dot_product_attention through FlashAttention."""
+    """Routes torch.nn.functional.scaled_dot_product_attention through FlashAttention and, with
+    [fp8_training] attention on, through Transformer Engine's fp8 attention."""
     global _original_sdpa
-    if _backend == 'sdpa' or _original_sdpa is not None:
+    fp8 = fp8_training.attention_enabled()
+    if (_backend == 'sdpa' and not fp8) or _original_sdpa is not None:
         return
-    flash_module()
+    if _backend != 'sdpa':
+        flash_module()
     _original_sdpa = F.scaled_dot_product_attention
     F.scaled_dot_product_attention = scaled_dot_product_attention
     if _is_main():
-        line = f'[attention] {label()} replaces PyTorch SDPA from here on; calls it cannot take run SDPA and are counted'
-        if _backend == 'flash4':
-            line += ' (FA4 compiles its kernels the first time each configuration runs: the first steps are slow)'
-        print(line)
+        if _backend != 'sdpa':
+            line = (f'[attention] {label()} replaces PyTorch SDPA from here on; calls it cannot take run SDPA and '
+                    'are counted')
+            if _backend == 'flash4':
+                line += ' (FA4 compiles its kernels the first time each configuration runs: the first steps are slow)'
+            print(line)
+        if fp8:
+            print('[attention] Transformer Engine fp8 attention is offered every attention call from here on')
         _note_comfy_attention()
 
 
@@ -308,7 +323,7 @@ def _is_main():
 
 def report():
     """Prints how many attention calls ran FlashAttention and SDPA (and why), all ranks together."""
-    if _original_sdpa is None:
+    if _original_sdpa is None or _backend == 'sdpa':
         return
     totals = collections.Counter(_counts)
     if torch.distributed.is_initialized():
@@ -428,20 +443,51 @@ def flash_varlen(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k
                    window_size, deterministic)
 
 
-def flash_unpadded(q, k, v, keep, softmax_scale=None, causal=False, deterministic=None):
+def fp8_dense(q, k, v, softmax_scale, causal, fallback):
+    """(B, L, H, D) attention through Transformer Engine fp8 where [fp8_training] attention is on
+    and the call fits; fallback() otherwise."""
+    if _bypass or not fp8_training.attention_enabled():
+        return fallback()
+    return fp8_training.dense(q, k, v, softmax_scale, causal, fallback)
+
+
+def fp8_varlen(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, softmax_scale, causal, fallback,
+               post=None, observe=None):
+    """Packed (total, H, D) attention through Transformer Engine fp8 where [fp8_training] attention
+    is on and the call fits; fallback() otherwise. post() turns the packed fp8 output into what
+    fallback() returns; observe is the (q, k, v) fallback() computes from, when not these."""
+    if _bypass or not fp8_training.attention_enabled():
+        return fallback()
+    return fp8_training.varlen(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, softmax_scale,
+                               causal, fallback, post=post, observe=observe)
+
+
+def flash_unpadded(q, k, v, keep, softmax_scale=None, causal=False, deterministic=None, fallback=None):
     """Self-attention on (B, S, H, D) where `keep` (B, S) marks the real tokens of both queries and
-    keys, as flash-attn 2's unpad_input / pad_input do it: padded output rows are zero."""
+    keys, as flash-attn 2's unpad_input / pad_input do it: padded output rows are zero. With fp8
+    attention on, fallback() (or FlashAttention when it is enabled) runs the calls fp8 does not take."""
     b, s = keep.shape
     keep = keep.bool()
     index = keep.flatten().nonzero().flatten()
     lengths = keep.sum(1, dtype=torch.int32)
     cu = F.pad(torch.cumsum(lengths, 0, dtype=torch.int32), (1, 0))
     longest = int(lengths.max())
-    out = flash_varlen(q.flatten(0, 1)[index], k.flatten(0, 1)[index], v.flatten(0, 1)[index], cu, cu, longest,
-                       longest, softmax_scale=softmax_scale, causal=causal, deterministic=deterministic)
-    full = out.new_zeros((b * s, *out.shape[1:]))
-    full = full.index_copy(0, index, out)
-    return full.view(b, s, *out.shape[1:])
+    packed = q.flatten(0, 1)[index], k.flatten(0, 1)[index], v.flatten(0, 1)[index]
+
+    def unpack(out):
+        full = out.new_zeros((b * s, *out.shape[1:]))
+        full = full.index_copy(0, index, out)
+        return full.view(b, s, *out.shape[1:])
+
+    def flash():
+        return unpack(flash_varlen(*packed, cu, cu, longest, longest, softmax_scale=softmax_scale, causal=causal,
+                                   deterministic=deterministic))
+
+    if fallback is None or flash_enabled():
+        return fp8_varlen(*packed, cu, cu, longest, longest, softmax_scale, causal, flash, post=unpack)
+    # fallback() computes from q, k, v themselves.
+    return fp8_varlen(*packed, cu, cu, longest, longest, softmax_scale, causal, fallback, post=unpack,
+                      observe=(q, k, v))
 
 
 class _KeyPadding:
@@ -563,8 +609,25 @@ def _flash_reason(q, k, v, dropout_p, is_causal, enable_gqa, extra):
 
 def scaled_dot_product_attention(query, key, value, attn_mask=None, dropout_p=0.0, is_causal=False, scale=None,
                                  enable_gqa=False, **extra):
-    """torch.nn.functional.scaled_dot_product_attention, run by FlashAttention where it can."""
+    """torch.nn.functional.scaled_dot_product_attention, run by Transformer Engine fp8 (with
+    [fp8_training] attention on) or FlashAttention where it can."""
     if _bypass:
+        kwargs = dict(attn_mask=attn_mask, dropout_p=dropout_p, is_causal=is_causal, scale=scale, **extra)
+        if enable_gqa:
+            kwargs['enable_gqa'] = enable_gqa
+        return _original_sdpa(query, key, value, **kwargs)
+
+    def run():
+        return _flash_or_sdpa(query, key, value, attn_mask, dropout_p, is_causal, scale, enable_gqa, extra)
+
+    if fp8_training.attention_enabled():
+        return fp8_training.sdpa(query, key, value, attn_mask, dropout_p, is_causal, scale, enable_gqa, extra, run,
+                                 _mask_info)
+    return run()
+
+
+def _flash_or_sdpa(query, key, value, attn_mask, dropout_p, is_causal, scale, enable_gqa, extra):
+    if _backend == 'sdpa':
         kwargs = dict(attn_mask=attn_mask, dropout_p=dropout_p, is_causal=is_causal, scale=scale, **extra)
         if enable_gqa:
             kwargs['enable_gqa'] = enable_gqa

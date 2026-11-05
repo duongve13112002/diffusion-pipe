@@ -62,9 +62,9 @@ DEVICE = 'cuda'
 class Report:
     """Lines to the console and the .txt as they come (flushed), results to the .json at the end."""
 
-    def __init__(self, out_dir):
+    def __init__(self, out_dir, prefix='flash_attention_check'):
         stamp = datetime.datetime.now().strftime('%Y%m%d-%H%M%S')
-        base = os.path.join(out_dir, f'flash_attention_check_{socket.gethostname()}_{stamp}')
+        base = os.path.join(out_dir, f'{prefix}_{socket.gethostname()}_{stamp}')
         self.txt_path, self.json_path = base + '.txt', base + '.json'
         self.file = open(self.txt_path, 'w')
         self.results = {'sections': {}}

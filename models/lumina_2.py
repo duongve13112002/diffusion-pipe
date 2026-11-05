@@ -27,13 +27,20 @@ _flash_attn_2_varlen = lumina_2_model.flash_attn_varlen_func
 def _varlen_attention(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, dropout_p=0.0,
                       causal=False, softmax_scale=None):
     """Lumina 2's flash-attn 2 varlen call (every bf16 / fp16 attention of its DiT), run by
-    FlashAttention-3 / -4 with [model] attention = 'flash3' / 'flash4'."""
-    if attention_util.flash_enabled() and not dropout_p:
-        return attention_util.flash_varlen(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k,
-                                           softmax_scale=softmax_scale, causal=causal)
-    return _flash_attn_2_varlen(q, k, v, cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=cu_seqlens_k,
-                                max_seqlen_q=max_seqlen_q, max_seqlen_k=max_seqlen_k, dropout_p=dropout_p,
-                                causal=causal, softmax_scale=softmax_scale)
+    FlashAttention-3 / -4 with [model] attention = 'flash3' / 'flash4', and offered to fp8 attention
+    with [fp8_training] attention = true."""
+    def run():
+        if attention_util.flash_enabled() and not dropout_p:
+            return attention_util.flash_varlen(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k,
+                                               softmax_scale=softmax_scale, causal=causal)
+        return _flash_attn_2_varlen(q, k, v, cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=cu_seqlens_k,
+                                    max_seqlen_q=max_seqlen_q, max_seqlen_k=max_seqlen_k, dropout_p=dropout_p,
+                                    causal=causal, softmax_scale=softmax_scale)
+
+    if dropout_p:
+        return run()
+    return attention_util.fp8_varlen(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, softmax_scale,
+                                     causal, run)
 
 
 lumina_2_model.flash_attn_varlen_func = _varlen_attention

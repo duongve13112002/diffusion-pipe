@@ -402,6 +402,33 @@ def iris_attn_backend(model_config):
 IRIS_FLASH_GPUS = {'fa3': (9,), 'fa4': (9, 10)}
 
 
+import iris3b.models.blocks.single_stream as _iris_single_stream  # noqa: E402
+import iris3b.nn.attention as _iris_attention_module  # noqa: E402
+
+_iris_scaled_dot_product = _iris_attention_module.scaled_dot_product
+
+
+def _scaled_dot_product(q, k, v, backend='sdpa', attn_mask=None, enable_gqa=False):
+    """Iris's attention on (B, H, N, D). [fp8_training] attention = true reaches its SDPA backends
+    ('sdpa', 'torch_flash', 'torch_cudnn') through the SDPA replacement; 'fa3' / 'fa4' call
+    FlashAttention themselves, so their calls are offered to fp8 attention here, with Iris's own
+    kernel running the calls fp8 does not take."""
+    if backend not in IRIS_FLASH_GPUS or attn_mask is not None or not attention_util.fp8_training.attention_enabled():
+        return _iris_scaled_dot_product(q, k, v, backend=backend, attn_mask=attn_mask, enable_gqa=enable_gqa)
+    qt, kt, vt = (t.transpose(1, 2) for t in (q, k, v))
+
+    def run():
+        # From qt, kt, vt, so the fp8 calibration sees the gradients that reach them.
+        return _iris_scaled_dot_product(qt.transpose(1, 2), kt.transpose(1, 2), vt.transpose(1, 2), backend=backend,
+                                        enable_gqa=enable_gqa).transpose(1, 2)
+
+    return attention_util.fp8_dense(qt, kt, vt, None, False, run).transpose(1, 2)
+
+
+_iris_attention_module.scaled_dot_product = _scaled_dot_product
+_iris_single_stream.scaled_dot_product = _scaled_dot_product
+
+
 def check_iris_flash_backend(backend):
     """Refuses an fa3 / fa4 attn_backend that Iris would only refuse at the first forward, after
     caching: its kernel's module must import (Iris imports FA3 as flash_attn_3.flash_attn_interface
