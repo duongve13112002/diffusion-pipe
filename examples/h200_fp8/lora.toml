@@ -1,0 +1,132 @@
+# Adapter training (LoRA, LoKr, DoRA, OPLoRA) on H200 GPUs with FP8 training ([fp8_training]).
+# It works for every model: change [model] to the model's section from docs/supported_models.md
+# and keep the rest. full_finetune.toml is the full fine-tune counterpart.
+#
+# Before the first run, install Transformer Engine and check the GPU and install once (README "FP8 training"):
+#   pip install --no-build-isolation 'transformer_engine[pytorch]'
+#   python tools/check_fp8_training.py
+#
+# One GPU:
+#   deepspeed --num_gpus=1 train.py --deepspeed --config examples/h200_fp8/lora.toml
+# One node, 8 GPUs (data parallel):
+#   deepspeed --num_gpus=8 train.py --deepspeed --config examples/h200_fp8/lora.toml
+# Several nodes, 8 GPUs each (output_dir and the dataset must be on a volume every node shares; see
+# README "Multi-node training" for the network variables):
+#   torchrun --nnodes 2 --node_rank <0|1> --nproc_per_node 8 --master_addr <node 0> --master_port 29500 \
+#       train.py --deepspeed --config examples/h200_fp8/lora.toml
+#
+# Per model:
+# - Video models (wan, hunyuan-video, hunyuan_video_15, ltx-video, ltx2, cosmos_predict2): add frame
+#   buckets to the dataset; lower micro_batch_size_per_gpu for long clips.
+# - cosmos (Cosmos 1): remove [model] attention and keep [fp8_training] attention = false; Cosmos runs
+#   its attention through Transformer Engine's own module. Its Linear layers still run in fp8.
+# - iris: attention = 'flash3' runs Iris with attn_backend = 'fa3' (do not set both).
+# - sdxl: only the attention transformer blocks of the UNet run in fp8; the gain is small. Its
+#   learning rates are unet_lr / text_encoder_1_lr / text_encoder_2_lr in [model].
+# - Per-component learning rates (Anima llm_adapter_lr, MOSS-Image attn_lr / ffn_lr / ..., ...) go in
+#   [model] as each model's section in docs/supported_models.md shows.
+# - The H200 has room for bf16 base weights, so this example leaves transformer_dtype /
+#   diffusion_model_dtype unset. On a smaller GPU, setting it to 'float8' together with
+#   [fp8_training] weights = 'direct' keeps the base at one byte per weight and feeds it to the fp8
+#   GEMM without quantizing it again.
+
+output_dir = '/data/training_runs/h200_fp8_lora'
+dataset = 'examples/h200_fp8/dataset.toml'
+#eval_datasets = [
+#    {name = 'eval', config = 'examples/h200_fp8/eval_dataset.toml'},
+#]
+
+epochs = 1000
+#max_steps = 5000
+# Per GPU. A starting point at 1024 px; raise it for smaller models while memory allows, lower it
+# for video and higher resolutions.
+micro_batch_size_per_gpu = 4
+pipeline_stages = 1
+gradient_accumulation_steps = 1
+gradient_clipping = 1.0
+warmup_steps = 100
+#lr_scheduler = 'cosine'
+#lr_scheduler_min_ratio = 0.1
+
+# A NaN or inf gradient skips the step instead of reaching the adapter; the run stops after 8 in a row.
+skip_nonfinite_steps = true
+nonfinite_patience = 8
+
+eval_every_n_epochs = 1
+eval_before_first_step = true
+eval_micro_batch_size_per_gpu = 4
+
+save_every_n_epochs = 2
+#save_every_n_steps = 500
+checkpoint_every_n_minutes = 60
+keep_last_n_checkpoints = 3
+save_dtype = 'bfloat16'
+
+# Keep it on for large models and long sequences. Small image models (Anima, Lumina 2, SDXL, Iris)
+# may fit without it on an H200 and train faster.
+activation_checkpointing = true
+
+# Not with [model] attention = 'flash3' or with fp8 attention.
+compile = false
+
+# Larger caching batches keep the H200 busy while latents and text embeddings are cached.
+caching_batch_size = 8
+steps_per_print = 1
+
+[model]
+# Replace this table with the model's section from docs/supported_models.md.
+type = 'qwen_image'
+diffusers_path = '/data/models/Qwen-Image'
+dtype = 'bfloat16'
+timestep_sample_method = 'logit_normal'
+# FlashAttention-3 for the attention calls that do not run in fp8 (or all of them with fp8 attention
+# off). Needs the flash_attn_3 package; tools/check_flash_attention.py checks it. Remove for 'sdpa'.
+attention = 'flash3'
+
+[fp8_training]
+# Block scaling (a scale per 1x128 / 128x128 block) is the closest to bf16 and runs on Hopper with
+# CUDA 12.9 or newer. If startup says it cannot run, use 'current'.
+recipe = 'block'
+weights = 'dequantize'
+# Module names (regexes) that stay bf16. Start empty; add the modulation layers (e.g. ['adaLN',
+# 'modulation']) if the loss trains worse than in a bf16 run.
+exclude = []
+# Quantize the frozen base weights once instead of at every step: faster, one byte per base weight
+# of GPU memory. Not with blocks_to_swap.
+cache_frozen_weights = true
+# fp8 attention as well. It pays off on long sequences (video, 2048 px); at 1024 px images FA3 bf16
+# is about as fast. Turn it on once tools/check_fp8_training.py sections 3 and 5 look right.
+attention = false
+
+[adapter]
+type = 'lora'
+rank = 64
+dtype = 'bfloat16'
+#init_from_existing = '/data/training_runs/something/epoch50'
+# LoRA+: lora_B learns this many times faster than lora_A.
+#lora_plus_ratio = 16
+# DoRA (not with oplora):
+#use_dora = true
+# OPLoRA, which protects the base weights' top singular directions (docs/oplora.md):
+#oplora = true
+#oplora_rank = 16
+
+# LoKr instead of LoRA:
+#[adapter]
+#type = 'lokr'
+#rank = 1e6
+#decompose_factor = 4
+#dtype = 'bfloat16'
+
+[optimizer]
+type = 'adamw_optimi'
+lr = 1e-4
+betas = [0.9, 0.99]
+weight_decay = 0.01
+eps = 1e-8
+
+[monitoring]
+enable_wandb = false
+wandb_api_key = ''
+wandb_tracker_name = ''
+wandb_run_name = ''

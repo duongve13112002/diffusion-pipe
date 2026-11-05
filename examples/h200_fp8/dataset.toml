@@ -1,0 +1,26 @@
+# Dataset for the H200 fp8 examples (lora.toml, full_finetune.toml). Every option is documented in
+# examples/dataset.toml.
+
+# 1024 px area per image. An H200 has room for more: add 1536 or 2048 for multi-resolution training.
+resolutions = [1024]
+
+enable_ar_bucket = true
+min_ar = 0.5
+max_ar = 2.0
+num_ar_buckets = 9
+
+# Images only. For a video model (Wan, HunyuanVideo, LTX, Cosmos) add frame buckets, e.g.
+# frame_buckets = [1, 33, 65, 97]; long clips are where fp8 attention pays off most.
+frame_buckets = [1]
+
+# Each bucket setting keeps its own metadata and caches, so switching buckets back costs nothing
+# (README "Changing the buckets").
+reuse_metadata_cache = true
+
+# Complete each bucket's last batch instead of dropping it: with 8 GPUs and more the global batch
+# is large, and 'drop' would cut the same samples every epoch.
+batch_fill_strategy = 'fill'
+
+[[directory]]
+path = '/data/datasets/my_images'
+num_repeats = 1

@@ -403,6 +403,8 @@ What it prints: `[fp8] N Linear layers run their GEMMs in fp8 ...` at startup, t
 
 Speed: fp8 tensor cores on H100 / H200 have twice the throughput of bf16 (about 1979 against 989 dense TFLOPS), but training does not get twice as fast: quantizing costs time, the GEMMs are only part of a step (norms, activations, attention, the optimizer, data), and small layers gain little. Expect roughly 1.2-1.5x on large models with long sequences, less on small ones; `tools/check_fp8_training.py` measures it on your GPU.
 
+Example configs for H200 GPUs, for any model (replace `[model]` with the model's section from [docs/supported_models.md](./docs/supported_models.md)): [adapters](./examples/h200_fp8/lora.toml) and [full fine-tune](./examples/h200_fp8/full_finetune.toml), with a [dataset config](./examples/h200_fp8/dataset.toml). They give the launch commands for one GPU, one node and several nodes, and per-model notes.
+
 To check a GPU and an install, run `python tools/check_fp8_training.py` in the training environment (no weights needed, 5-15 minutes, `--quick` for shorter; `torchrun --nproc_per_node <gpus> tools/check_fp8_training.py --distributed` checks several GPUs as well). It compares the fp8 Linear layers (both recipes, frozen and trained weights, cached weights, `'direct'`) and fp8 attention (each mask kind, grouped-query, varlen, recomputation) with a float32 reference, times them against bf16, trains a small DiT in bf16, fp8 Linear and fp8 Linear + attention with LoRA and full fine-tuning, and tries `torch.compile`. It writes `fp8_training_check_<host>_<time>.txt` (and a `.json`) as it goes; send the `.txt` back.
 
 ## Reducing VRAM requirements

@@ -1,0 +1,135 @@
+# Full fine-tune on H200 GPUs with FP8 training ([fp8_training]). It works for every model that supports a
+# full fine-tune: change [model] to the model's section from docs/supported_models.md and keep the
+# rest. lora.toml is the adapter counterpart.
+#
+# No full fine-tune (use lora.toml): ltx-video, hunyuan-video, cosmos, hidream, sd3, omnigen2,
+# auraflow, ltx2 (docs/supported_models.md, "Summary").
+#
+# Before the first run, install Transformer Engine and check the GPU and install once (README "FP8 training"):
+#   pip install --no-build-isolation 'transformer_engine[pytorch]'
+#   python tools/check_fp8_training.py
+#   torchrun --nproc_per_node 8 tools/check_fp8_training.py --distributed
+#
+# One GPU:
+#   deepspeed --num_gpus=1 train.py --deepspeed --config examples/h200_fp8/full_finetune.toml
+# One node, 8 GPUs:
+#   deepspeed --num_gpus=8 train.py --deepspeed --config examples/h200_fp8/full_finetune.toml
+# Several nodes, 8 GPUs each (output_dir and the dataset must be on a volume every node shares; see
+# README "Multi-node training"):
+#   torchrun --nnodes 2 --node_rank <0|1> --nproc_per_node 8 --master_addr <node 0> --master_port 29500 \
+#       train.py --deepspeed --config examples/h200_fp8/full_finetune.toml
+#
+# Memory: fp8 training does not change what the weights and the optimizer hold. With bf16 weights
+# and adamw_optimi a full fine-tune keeps about 10 bytes per parameter (weights 2, gradients 2, two
+# moments 4, Kahan summation 2), before activations; AdamW8bitKahan about 8. On a 141 GB H200:
+# - up to about 8B parameters (Anima, Lumina 2, SDXL, Z-Image, Iris, Wan 1.3B, ...): pipeline_stages = 1;
+# - about 8B to 20B (Flux, Chroma, Wan 14B, Qwen-Image, HunyuanImage-2.1, ...): pipeline_stages = 2,
+#   i.e. each copy of the model is split over 2 GPUs (the GPU count must be a multiple of it);
+# - larger (Flux 2 dev): pipeline_stages = 4.
+# Check the parameter count the startup log prints and adjust; weight_decay_target = 'start' and
+# a GPU EMA add to it (see below).
+#
+# Per model:
+# - Video models: add frame buckets to the dataset and lower micro_batch_size_per_gpu for long clips.
+# - iris: attention = 'flash3' runs Iris with attn_backend = 'fa3' (do not set both).
+# - sdxl: only the attention transformer blocks of the UNet run in fp8. Learning rates per part:
+#   unet_lr / text_encoder_1_lr / text_encoder_2_lr in [model].
+# - Per-component learning rates (Anima llm_adapter_lr, MOSS-Image attn_lr / ffn_lr / ..., ...) go in
+#   [model] as each model's section in docs/supported_models.md shows.
+# - Leave transformer_dtype / diffusion_model_dtype unset: a full fine-tune trains bf16 weights.
+
+output_dir = '/data/training_runs/h200_fp8_full_finetune'
+dataset = 'examples/h200_fp8/dataset.toml'
+#eval_datasets = [
+#    {name = 'eval', config = 'examples/h200_fp8/eval_dataset.toml'},
+#]
+
+epochs = 1000
+#max_steps = 20000
+# Per GPU; a starting point at 1024 px. Global batch = micro batch x accumulation x GPUs / pipeline_stages.
+micro_batch_size_per_gpu = 2
+# 1 for a model that fits on one GPU; 2 or 4 for large models (see Memory above). With more than one
+# stage, raise gradient_accumulation_steps so the stages overlap (smaller pipeline bubbles).
+pipeline_stages = 1
+gradient_accumulation_steps = 2
+gradient_clipping = 1.0
+warmup_steps = 200
+lr_scheduler = 'cosine'
+lr_scheduler_min_ratio = 0.1
+
+# A NaN or inf gradient skips the step instead of reaching the weights; the run stops after 8 in a row.
+skip_nonfinite_steps = true
+nonfinite_patience = 8
+
+# Weight decay pulls each weight toward the weight it had when the run began instead of toward 0,
+# so it does not erode the pretrained model. It keeps that copy on the GPU (2 more bytes per
+# parameter) and needs adamw_optimi, adamw, adamw8bit or genericoptim (not AdamW8bitKahan).
+#weight_decay_target = 'start'
+
+# EMA of the trained weights, written to <save dir>/ema/. In host RAM so it costs no GPU memory.
+#ema_decay = 0.9999
+#ema_update_every = 10
+#ema_device = 'cpu'
+
+eval_every_n_epochs = 1
+eval_before_first_step = true
+eval_micro_batch_size_per_gpu = 2
+
+save_every_n_epochs = 1
+#save_every_n_steps = 2000
+checkpoint_every_n_minutes = 60
+keep_last_n_checkpoints = 3
+save_dtype = 'bfloat16'
+
+activation_checkpointing = true
+
+# Not with [model] attention = 'flash3' or with fp8 attention.
+compile = false
+
+caching_batch_size = 8
+steps_per_print = 1
+
+[model]
+# Replace this table with the model's section from docs/supported_models.md.
+type = 'qwen_image'
+diffusers_path = '/data/models/Qwen-Image'
+dtype = 'bfloat16'
+timestep_sample_method = 'logit_normal'
+# FlashAttention-3 for the attention calls that do not run in fp8. Needs the flash_attn_3 package;
+# tools/check_flash_attention.py checks it. Remove for 'sdpa'.
+attention = 'flash3'
+
+[fp8_training]
+# Block scaling is the closest to bf16 and runs on Hopper with CUDA 12.9 or newer. If startup says
+# it cannot run, use 'current'.
+recipe = 'block'
+# A full fine-tune trains the base weights, so they are bf16 and quantized at every step:
+# 'direct' and cache_frozen_weights apply to adapters only.
+weights = 'dequantize'
+# Module names (regexes) that stay bf16. Start empty; add the modulation layers (e.g. ['adaLN',
+# 'modulation']) if the loss trains worse than in a bf16 run.
+exclude = []
+# fp8 attention as well. It pays off on long sequences (video, 2048 px); at 1024 px images FA3 bf16
+# is about as fast. Turn it on once tools/check_fp8_training.py sections 3 and 5 look right.
+attention = false
+
+[optimizer]
+type = 'adamw_optimi'
+lr = 1e-5
+betas = [0.9, 0.99]
+weight_decay = 0.01
+eps = 1e-8
+
+# About 2 bytes per parameter less:
+#[optimizer]
+#type = 'AdamW8bitKahan'
+#lr = 1e-5
+#betas = [0.9, 0.99]
+#weight_decay = 0.01
+#stabilize = false
+
+[monitoring]
+enable_wandb = false
+wandb_api_key = ''
+wandb_tracker_name = ''
+wandb_run_name = ''
