@@ -23,7 +23,8 @@ path = '/data/images/t2i'
 # already starts with "Edit <Picture N>" or "subject_definitions:" is kept as it is. The control
 # image is also the reference latent, cropped to the target's bucket. One control image per
 # target: control_path_2 and further are refused.
-# Text-to-image and edit images go in different directories.
+# Text-to-image and edit images go in different directories; they are batched separately.
+# caption_dropout_rate is refused for an edit directory (a dropped caption would lose its image).
 #[[directory]]
 #path = '/data/images/edit/target'
 #control_path = '/data/images/edit/control'

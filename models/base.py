@@ -70,7 +70,8 @@ def make_contiguous(*values):
     return tuple(x.contiguous() if torch.is_tensor(x) else x for x in values)
 
 
-def convert_crop_and_resize(pil_img, width_and_height):
+def convert_to_rgb(pil_img):
+    """RGB as the dataset reads every image: transparency composited onto white."""
     if pil_img.mode not in ['RGB', 'RGBA'] and 'transparency' in pil_img.info:
         pil_img = pil_img.convert('RGBA')
 
@@ -78,11 +79,12 @@ def convert_crop_and_resize(pil_img, width_and_height):
     if pil_img.mode == 'RGBA':
         canvas = Image.new('RGBA', pil_img.size, (255, 255, 255))
         canvas.alpha_composite(pil_img)
-        pil_img = canvas.convert('RGB')
-    else:
-        pil_img = pil_img.convert('RGB')
+        return canvas.convert('RGB')
+    return pil_img.convert('RGB')
 
-    return ImageOps.fit(pil_img, width_and_height)
+
+def convert_crop_and_resize(pil_img, width_and_height):
+    return ImageOps.fit(convert_to_rgb(pil_img), width_and_height)
 
 
 class PreprocessMediaFile:

@@ -219,6 +219,10 @@ class MinimaxH3Pipeline(ComfyPipeline):
     name = 'minimax_h3'
     checkpointable_layers = ['TransformerLayer']
     adapter_target_modules = ['DiTBlock', 'RefinerBlock']
+    # [fp8_training] leaves the adaLN projections alone: ComfyUI runs them in the checkpoint's
+    # precision (fp32 in the curve-form checkpoints, P-H3-Image's among them), and an error in
+    # them reaches every token's modulation.
+    fp8_keep_modules = ['adaln']
     keep_in_high_precision = ['time_embedder', 'audio_patch_proj', 'condition_proj', 'final_layer', 'rope.inv_freq', 'token_refiner', 'video_patch_proj', 'adaln_t_table']
     spatial_compression = 16
     channels = 24

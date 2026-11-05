@@ -6,6 +6,7 @@ tools/check_fp8_training.py runs the real TE on a GPU.
 """
 
 import copy
+import re
 import json
 import pathlib
 import sys
@@ -279,6 +280,30 @@ def test_convert_replaces_block_linears_and_keeps_parameters(te):
     assert len(te.linear_calls) == 6
     assert not torch.equal(out, expected)
     torch.testing.assert_close(out, expected, rtol=0.1, atol=0.1)
+
+
+def test_a_model_keeps_its_fp8_keep_modules_whatever_exclude_says(te):
+    settings()
+    net = Net(blocks=2)
+
+    class KeepingPipeline(Pipeline):
+        fp8_keep_modules = ['mlp\\.0']
+
+    summary = fp8_training.prepare_model(KeepingPipeline(net))
+    # qkv, out and mlp.2 in each block run in fp8; mlp.0 is the model's own to keep.
+    assert summary['fp8'] == 6 and summary['kept'] == 2 and summary['excluded'] == 0
+    assert not isinstance(net.blocks[0].mlp[0], fp8_training.Fp8Linear)
+    assert isinstance(net.blocks[0].mlp[2], fp8_training.Fp8Linear)
+
+
+def test_minimax_h3_keeps_its_adaln_projections_out_of_fp8():
+    from models.minimax_h3 import MinimaxH3Pipeline
+    from models.p_h3_image import PH3ImagePipeline
+    for cls in (MinimaxH3Pipeline, PH3ImagePipeline):
+        keep = [re.compile(p) for p in cls.fp8_keep_modules]
+        assert any(p.search('blocks.3.adaln_proj.linear') for p in keep)
+        assert any(p.search('token_refiner.blocks.0.adaln_proj.linear') for p in keep)
+        assert not any(p.search('blocks.3.attn.qkv') or p.search('blocks.3.mlp.fc1') for p in keep)
 
 
 def test_full_finetune_gradients_reach_the_weights(te):

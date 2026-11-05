@@ -262,13 +262,19 @@ def test_the_text_encoder_must_be_the_minimax_one(text_encoders):
 
 @pytest.mark.parametrize('dataset, match', [
     ({'frame_buckets': [1, 33]}, 'images only'),
+    ({'directory': [{'path': 'x', 'frame_buckets': [1, 33]}]}, r'images only.*\[\[directory\]\] x'),
     ({'directory': [{'path': 'x', 'control_path': 'c', 'control_path_2': 'd'}]}, 'control_path_N'),
+    ({'directory': [{'path': 'x', 'control_path': 'c', 'caption_dropout_rate': 0.1}]}, 'caption_dropout_rate does not apply'),
+    ({'caption_dropout_rate': 0.1, 'directory': [{'path': 'x', 'control_path': 'c'}]}, 'caption_dropout_rate does not apply'),
 ])
 def test_dataset_refusals(dataset, match):
     pipe = ph3_pipeline(None)
     with pytest.raises(ValueError, match=match):
         pipe.model_specific_dataset_config_validation(dataset)
     pipe.model_specific_dataset_config_validation({'frame_buckets': [1], 'directory': [{'path': 'x', 'control_path': 'c'}]})
+    # caption dropout stays allowed for text to image, and an edit directory can turn it off
+    pipe.model_specific_dataset_config_validation({'caption_dropout_rate': 0.1, 'directory': [
+        {'path': 't2i'}, {'path': 'edit', 'control_path': 'c', 'caption_dropout_rate': 0}]})
 
 
 def test_load_vae_refuses_the_h3_video_vae(monkeypatch):
@@ -598,3 +604,25 @@ def test_edit_and_text_to_image_directories_never_share_a_batch(monkeypatch):
     ]
     ds.post_init(0, 1, {None: 1}, 1, {None: 1})
     assert sorted(b.names for b in ds.buckets) == [['edit'], ['t2i'], ['t2i', 't2i_2']]
+
+
+def test_the_vision_image_is_decoded_as_the_reference_latent_is(tmp_path):
+    """The control image reaches the text encoder decoded as the dataset decodes it into the
+    reference latent: transparency onto white, no EXIF rotation (a phone photo shown rotated to
+    the encoder but not in the latent would teach the edit on a mismatched pair)."""
+    from models.base import convert_crop_and_resize
+    from models.p_h3_image import load_vision_image
+    rng = np.random.default_rng(0)
+    rgba = rng.integers(0, 256, (64, 96, 4), dtype=np.uint8)
+    rgba[:16, :, 3] = 0
+    Image.fromarray(rgba, 'RGBA').save(tmp_path / 'alpha.png')
+    exif = Image.Exif()
+    exif[0x0112] = 6  # rotate 90 degrees on display
+    Image.fromarray(rgba[..., :3]).save(tmp_path / 'rotated.jpg', exif=exif, quality=95)
+    for name in ('alpha.png', 'rotated.jpg'):
+        with Image.open(tmp_path / name) as img:
+            expected = np.array(convert_crop_and_resize(img, img.size)).astype(np.float32) / 255.0
+        vision = load_vision_image(tmp_path / name)
+        assert vision.shape == (1, 64, 96, 3), name
+        assert torch.equal(vision[0], torch.from_numpy(expected)), name
+    assert load_vision_image(tmp_path / 'alpha.png')[0, :16].eq(1).all()

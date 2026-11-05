@@ -27,7 +27,7 @@ keep_last_n_checkpoints = 3
 save_dtype = 'bfloat16'
 
 activation_checkpointing = true
-# Up to the number of blocks; lowers VRAM at some speed cost.
+# At most the number of blocks minus 2; lowers VRAM at some speed cost.
 #blocks_to_swap = 20
 caching_batch_size = 1
 steps_per_print = 1

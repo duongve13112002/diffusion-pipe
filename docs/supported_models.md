@@ -804,9 +804,14 @@ See [examples/p_h3_image.toml](../examples/p_h3_image.toml) and its dataset.
   ([ostris/minimax_h3_training_adapter](https://huggingface.co/ostris/minimax_h3_training_adapter),
   `p_h3_image_training_adapter_v1.safetensors`) merged with `merge_adapters` keeps it (as
   ai-toolkit's assistant LoRA); the trained LoRA is then used on the plain model.
-- Refused: `frame_buckets` other than `[1]`, MiniMax H3's `audio_vae` and `cfg`, a text encoder
-  other than one with type `minimax`, and a VAE that is not the P-H3-Image one.
-- Everything MiniMax H3 has applies: LoRA, LoKr, DoRA, OPLoRA and full fine-tune, `[fp8_training]`,
+- The control image reaches the text encoder decoded as the dataset decodes it for the reference
+  latent (transparency onto white, no EXIF rotation), so both see the same image.
+- Refused: `frame_buckets` other than `[1]` (at the top or in a `[[directory]]`), MiniMax H3's
+  `audio_vae` and `cfg`, a text encoder other than one with type `minimax`, a VAE that is not the
+  P-H3-Image one, and `caption_dropout_rate` on an edit directory (the cached empty caption has no
+  image, so a dropped edit caption would train a pairing ComfyUI never produces).
+- Everything MiniMax H3 has applies: LoRA, LoKr, DoRA, OPLoRA and full fine-tune, `[fp8_training]`
+  (the adaLN projections stay in the checkpoint's precision, as in ComfyUI),
   FlashAttention-3/4, block swap, on-the-fly or cached text and latents (with their dtypes), eval,
   multi-GPU and multi-node. `--test_sample` samples text to image with the 8-step schedule.
 

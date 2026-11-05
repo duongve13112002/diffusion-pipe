@@ -22,10 +22,10 @@ import re
 import numpy as np
 import torch
 import torch.nn.functional as F
-from PIL import Image, ImageOps
+from PIL import Image
 from tqdm import tqdm
 
-from models.base import PreprocessMediaFile
+from models.base import PreprocessMediaFile, convert_to_rgb
 from models.minimax_h3 import MinimaxH3Pipeline, InitialLayer, TransformerLayer, FinalLayer
 from utils.common import AUTOCAST_DTYPE
 import comfy.model_management
@@ -73,13 +73,12 @@ def size_within_area(width, height, pixels):
 
 
 def load_vision_image(path):
-    """The control image as ComfyUI's LoadImage gives it ([1, H, W, 3] in 0..1), at the size
-    PH3ImageConditioning shows it to the text encoder."""
+    """The control image ([1, H, W, 3] in 0..1) at the size PH3ImageConditioning shows it to the
+    text encoder. Decoded as the dataset decodes the same file into the reference latent
+    (convert_to_rgb: no EXIF rotation, transparency onto white), so the encoder and the latent
+    see one image; for an RGB file without EXIF rotation that is what ComfyUI's LoadImage gives."""
     with Image.open(path) as img:
-        img = ImageOps.exif_transpose(img)
-        if img.mode == 'I':
-            img = img.point(lambda i: i * (1 / 255))
-        img = img.convert('RGB')
+        img = convert_to_rgb(img)
         image = torch.from_numpy(np.array(img).astype(np.float32) / 255.0)[None]
     size = size_within_area(image.shape[2], image.shape[1], VISION_PIXELS)
     if (image.shape[2], image.shape[1]) == size:
@@ -112,13 +111,22 @@ class PH3ImagePipeline(MinimaxH3Pipeline):
         self.edit_prompt_prefix = edit_prompt_prefix
 
     def model_specific_dataset_config_validation(self, dataset_config):
-        frame_buckets = dataset_config.get('frame_buckets', [1])
-        if any(f != 1 for f in frame_buckets):
-            raise ValueError(f'p_h3_image trains images only; frame_buckets must be [1], got {frame_buckets}')
-        for directory in dataset_config.get('directory', []):
+        directories = dataset_config.get('directory', [])
+        for where, config in [('the dataset', dataset_config)] + [(f"[[directory]] {d.get('path')}", d) for d in directories]:
+            frame_buckets = config.get('frame_buckets', [1])
+            if any(f != 1 for f in frame_buckets):
+                raise ValueError(f'p_h3_image trains images only; frame_buckets must be [1], got {frame_buckets} in {where}')
+        for directory in directories:
             if any(k.startswith('control_path_') for k in directory):
                 raise ValueError('p_h3_image takes one reference image per sample (control_path); '
                                  'several references (control_path_N) are not supported on this branch')
+            # A dropped caption trains on the one cached empty-caption embedding, which has no
+            # control image; ComfyUI never pairs that with a reference ("Edit <Picture 1>. " and
+            # the image's vision tokens are what an empty edit prompt encodes to).
+            dropout = directory.get('caption_dropout_rate', dataset_config.get('caption_dropout_rate', 0))
+            if 'control_path' in directory and dropout:
+                raise ValueError(f"caption_dropout_rate does not apply to the edit directory {directory.get('path')} "
+                                 f'of p_h3_image: a dropped caption would lose its control image. Set it to 0 there.')
 
     def text_encoder_cache_key(self, i):
         # How a caption with a control image is presented to the encoder.

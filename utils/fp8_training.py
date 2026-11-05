@@ -588,9 +588,10 @@ def target_classes(model):
     return list(classes)
 
 
-def convert(target_model, classes, dtype):
+def convert(target_model, classes, dtype, keep=()):
     """Replaces the Linear layers inside the blocks of `target_model` whose class name is in
-    `classes`; returns a summary Counter."""
+    `classes`; returns a summary Counter. Layers whose name matches a regex of `keep` (the model's
+    fp8_keep_modules) stay as they are whatever `exclude` says."""
     settings = _settings
     summary = collections.Counter()
     formats = collections.Counter()
@@ -605,6 +606,9 @@ def convert(target_model, classes, dtype):
     modules = dict(target_model.named_modules())
     for name in names:
         module = modules[name]
+        if any(p.search(name) for p in keep):
+            summary['kept'] += 1
+            continue
         if any(p.search(name) for p in settings.exclude):
             summary['excluded'] += 1
             continue
@@ -640,6 +644,8 @@ def convert(target_model, classes, dtype):
     if formats:
         line += '; dequantized at load to ' + str(dtype).replace('torch.', '') + ': ' + ', '.join(
             f'{n} {fmt}' for fmt, n in formats.most_common())
+    if summary['kept']:
+        line += f"; {summary['kept']} kept in their dtype by the model (fp8_keep_modules)"
     if summary['excluded']:
         line += f"; {summary['excluded']} excluded by exclude"
     if unfit:
@@ -658,7 +664,8 @@ def prepare_model(model):
         return None
     target = model.fp8_target_model()
     classes = target_classes(model)
-    summary = convert(target, classes, model.model_config['dtype'])
+    keep = [re.compile(p) for p in getattr(model, 'fp8_keep_modules', ())]
+    summary = convert(target, classes, model.model_config['dtype'], keep)
     if _settings.attention:
         _attention.hook_blocks(target, classes)
     return summary
