@@ -483,6 +483,14 @@ class MinimaxH3Pipeline(ComfyPipeline):
             loss *= mask
         return loss
 
+    def save_model(self, save_dir, sd):
+        # ComfyUI detects the model from rope.inv_freq (and adaln_t_table) and loads them: buffers, which the
+        # trained parameters do not include.
+        sd = dict(sd)
+        for name, buffer in self.diffusion_model.named_buffers():
+            sd[name] = buffer.detach().cpu()
+        super().save_model(save_dir, sd)
+
     def get_loss_fn(self):
         single_loss = self.elementwise_loss
 

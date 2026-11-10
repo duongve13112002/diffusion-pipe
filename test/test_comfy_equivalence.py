@@ -880,3 +880,15 @@ def test_minimax_h3_builds_with_the_current_comfyui_signature():
     comfy.ldm.minimax.model.MiniMaxH3Model(**MINIMAX_CONFIG, pdd_steps=1, dtype=torch.float32, operations=comfy.ops.manual_cast)
     with pytest.raises(NotImplementedError, match='PDD'):
         comfy.ldm.minimax.model.MiniMaxH3Model(**MINIMAX_CONFIG, pdd_steps=4, dtype=torch.float32, operations=comfy.ops.manual_cast)
+
+
+def test_minimax_h3_export_carries_the_buffers_comfyui_detects_the_model_by(tmp_path):
+    import safetensors.torch
+    model, _ = tiny_minimax_pair()
+    pipe = minimax_pipeline(model)
+    sd = {name: p.detach() for name, p in model.named_parameters()}
+    assert 'rope.inv_freq' not in sd
+    pipe.save_model(tmp_path, sd)
+    saved = safetensors.torch.load_file(tmp_path / 'model.safetensors')
+    assert set(saved) == set(model.state_dict())
+    torch.testing.assert_close(saved['rope.inv_freq'], model.rope.inv_freq)
