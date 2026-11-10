@@ -223,6 +223,26 @@ def run_checks():
     record('utils.common_upscale(samples, width, height, upscale_method, crop)',
            required_positional_names(cu.common_upscale) == ['samples', 'width', 'height', 'upscale_method', 'crop'])
 
+    # MiniMax-H3-Image (models/minimax_h3_image.py)
+    record('minimax.MiniMaxH3ImageModel(pdd_sigmas, pdd_steps) exists',
+           hasattr(minimax, 'MiniMaxH3ImageModel') and accepts(minimax.MiniMaxH3ImageModel.__init__, 'pdd_sigmas')
+           and accepts(minimax.MiniMaxH3ImageModel.__init__, 'pdd_steps'))
+    record('minimax_vae.MiniMaxH3ImageVAE exists', hasattr(minimax_vae, 'MiniMaxH3ImageVAE'))
+    record('minimax.PackedLayout accepts refs', accepts(minimax.PackedLayout.__init__, 'refs'))
+    record('minimax_te.MiniMaxH3Tokenizer.tokenize_with_weights accepts picture_label',
+           accepts(minimax_te.MiniMaxH3Tokenizer.tokenize_with_weights, 'picture_label'))
+    record('minimax_te.MiniMaxH3TEModel / MiniMaxH3ClipModel exist',
+           hasattr(minimax_te, 'MiniMaxH3TEModel') and hasattr(minimax_te, 'MiniMaxH3ClipModel'))
+    import comfy.text_encoders.qwen3vl as qwen3vl
+    record('qwen3vl.QWEN3VL_CONFIGS and QWEN3VL_VISION have qwen3vl_32b',
+           'qwen3vl_32b' in qwen3vl.QWEN3VL_CONFIGS and 'qwen3vl_32b' in qwen3vl.QWEN3VL_VISION)
+    record('minimax._pdd_head(head, h, grid, start, stop) exists',
+           required_positional_names(minimax._pdd_head) == ['head', 'h', 'grid', 'start', 'stop'])
+    record('sd.load_text_encoder_state_dicts accepts clip_type and disable_dynamic',
+           accepts(sd.load_text_encoder_state_dicts, 'clip_type') and accepts(sd.load_text_encoder_state_dicts, 'disable_dynamic'))
+    record('sd.load_diffusion_model_state_dict accepts metadata', accepts(sd.load_diffusion_model_state_dict, 'metadata'))
+    record('utils.load_torch_file accepts return_metadata', accepts(cu.load_torch_file, 'return_metadata'))
+
     return results
 
 

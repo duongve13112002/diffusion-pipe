@@ -445,7 +445,7 @@ class ImageInitialLayer(nn.Module):
         t_ref = max(t_v, VISUAL_COND_TIMESTEP)
         unique_t = [t_v] + ([t_ref] if refs else [])
         kind_row = {'text': 0, 'video': 0, 'ref_img': 1}
-        seg_tag = {'text': 1, 'video': 0, 'ref_img': 0}
+        seg_tag = {'video': 0, 'ref_img': 0}  # text takes its tags from token_tags
         tags = token_tags.view(-1).tolist()
         mod_segments = []
         for a, b, kind in layout.segments:

@@ -34,13 +34,14 @@ See [source snapshots and cache profiles](caption-processing.md#source-snapshots
 |Ideogram4       |✅    |✅              |✅                |
 |Krea 2          |✅    |✅              |✅                |
 |MiniMax H3      |✅    |✅              |✅                |
+|MiniMax-H3-Image|✅    |✅              |✅                |
 |P-H3-Image      |✅    |✅              |✅                |
 |Qwen-Image-2.1  |✅    |✅              |✅                |
 |Iris-3B         |✅    |✅              |❌                |
 |MOSS-Image      |✅    |✅              |✅                |
 
 The models loaded from ComfyUI files (Z-Image, HunyuanVideo-1.5, Flux 2, Ernie-Image, LTX 2.3,
-Ideogram4, Krea 2, MiniMax H3, P-H3-Image, Qwen-Image-2.1, MOSS-Image) encode captions as ComfyUI encodes a
+Ideogram4, Krea 2, MiniMax H3, MiniMax-H3-Image, P-H3-Image, Qwen-Image-2.1, MOSS-Image) encode captions as ComfyUI encodes a
 prompt, so a LoRA trains on the embeddings it is sampled with in ComfyUI. Several official
 pipelines cut long prompts (Z-Image and Flux 2 at 512 tokens, Krea 2 at 507, LTX 2.3 at 1024,
 HunyuanVideo-1.5 at 1000, Ernie-Image and Ideogram4 at 2048) where ComfyUI keeps them whole.
@@ -765,6 +766,65 @@ VSA checkpoints retain their optional `to_gate_compress` projection when loaded 
 saved. Training uses dense attention; retaining the projection does not enable VSA.
 
 Everything is ComfyUI format, including the saved models. You can now train LoRAs directly on quantized models, and it is recommended to use int8 convrot (faster, better quality, and less VRAM).
+
+## MiniMax-H3-Image
+[MiniMax-H3-Image](https://huggingface.co/MiniMaxAI/MiniMax-H3-Image) (MiniMaxAI) is a 33B DiT (50 layers) for
+text to image and image editing, without H3's audio stream. Its text encoder is the first 50 layers of Qwen3-VL-32B
+(ComfyUI's type `minimax`, the unnormalized state after layer 50) and its VAE has a 2D ViT decoder with a 16x
+downsampling. It is distilled: 6 steps without CFG on the sigmas of `pdd_config.json`, one output head per step.
+
+Inputs, each in any of its layouts (detected; `diffusion_model_format` forces one):
+
+|              |ComfyUI file                       |Official repository                                  |Diffusers                       |
+|--------------|-----------------------------------|------------------------------------------------------|--------------------------------|
+|`diffusion_model`|one `.safetensors` ([Comfy-Org](https://huggingface.co/Comfy-Org/MiniMax-H3-Image))|the repository root, `transformer/`, or its index `.json`|the root or `transformer_diffusers/`|
+|`vae`         |the VAE file                       |`vae/`                                                |`vae_diffusers/`                |
+|`text_encoders`|the file                          |`text_encoder/` shards (cut to 50 layers when read)   |(the same shards)               |
+
+The official layout's six heads are in `pdd_fused_heads.safetensors` at the repository root (`pdd_heads` names it when
+it is elsewhere); without it only the base head is there and previews are not available as the six-step sampler.
+Whatever the input, the saved full fine-tune is ComfyUI's single file (the heads stacked as ComfyUI reads them, the
+sigma grid in its metadata) and LoRAs load in ComfyUI's own loaders.
+```
+[model]
+type = 'minimax_h3_image'
+diffusion_model = '/data/models/MiniMax-H3-Image'
+vae = '/data/models/MiniMax-H3-Image/vae'
+text_encoders = [
+    {path = '/data/models/MiniMax-H3-Image/text_encoder', type = 'minimax'}
+]
+dtype = 'bfloat16'
+timestep_sample_method = 'logit_normal'
+#shift = 3
+#diffusion_model_format = 'official'
+#pdd_heads = '/data/models/pdd_fused_heads.safetensors'
+#blocks_lr = 1e-5
+#token_refiner_lr = 1e-5
+```
+See [examples/minimax_h3_image.toml](../examples/minimax_h3_image.toml) and its dataset.
+
+- Text to image: images and captions, as for any model.
+- Editing: a dataset directory with `control_path` (the image to edit, same file name as the target) and the
+  instruction as caption. As ComfyUI's MiniMax H3 Image Conditioning node encodes it: `"Picture 1: "` and the control
+  image (short edge 1024, sides a multiple of 32) in front of the caption, whose vision tokens take the image
+  modulation. The control image's latent is the reference, noise-augmented to t = 0.999 and pinned there. One
+  reference per sample: `control_path_2` and further are refused for now (ComfyUI takes several; this needs
+  dataset support).
+- Heads: head 0 of the bank trains. Every other head of a checkpoint is head 0 plus a fixed offset, so a full
+  fine-tune moves all six together; the offsets stay as they were and the export stacks them again. A LoRA leaves
+  the heads alone. `--test_sample` and the eval previews run the six heads, one per step, on the checkpoint's grid.
+  Training head 0 at every noise level is an approximation for a distilled model: the six-step quality can drift as
+  with any distilled model, so check the previews.
+- `shift`: when none of `shift`, `image_shift` and `flux_shift` is set it is 3, the shift under which the uniform
+  sampling grid of `pdd_config.json` is the base grid. This is not a measured optimum for training: try 1 to 3.
+- Per-component learning rates (`blocks_lr`, `token_refiner_lr`, and for a full fine-tune `text_projection_lr`,
+  `patch_embed_lr`, `head_lr`; 0 freezes). With an adapter the last three are refused.
+- Refused: `frame_buckets` other than `[1]`, `audio_vae`, `cfg`, a text encoder other than one of type `minimax`, a
+  VAE that is not the MiniMax-H3-Image one, an audio transformer (MiniMax H3: use `minimax_h3`), `pdd_heads` with a
+  layout other than the official one, and caption dropout on an edit directory (see the P-H3-Image notes).
+- Everything MiniMax H3 has applies: LoRA, LoKr, DoRA, OPLoRA and full fine-tune, `[fp8_training]` (the adaLN
+  projections stay in the checkpoint's precision), FlashAttention-3/4, block swap, on-the-fly or cached text and
+  latents (with their dtypes), eval, multi-GPU and multi-node. The 33B model needs block swap or fp8 on most GPUs.
 
 ## P-H3-Image
 [P-H3-Image](https://huggingface.co/PrunaAI/P-H3-Image) (PrunaAI) is a MiniMax H3 fine-tune for
