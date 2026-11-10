@@ -103,7 +103,7 @@ def diffusers_to_comfy(sd, rope_theta=DEFAULT_ROPE_THETA, rope_freq_dim=DEFAULT_
     for prefix, qkv in parts.items():
         if set(qkv) != {'q', 'k', 'v'}:
             raise ValueError(f'{prefix} lacks one of to_q / to_k / to_v')
-        out[diffusers_key(prefix) + '.attn.qkv_proj.weight'] = torch.cat([qkv['q'], qkv['k'], qkv['v']], dim=0)
+        out[diffusers_key(prefix + '.attn.qkv_proj.weight')] = torch.cat([qkv['q'], qkv['k'], qkv['v']], dim=0)
     if 'rope.inv_freq' not in out:
         out['rope.inv_freq'] = rope_inv_freq(rope_theta, rope_freq_dim)
     return out
@@ -178,12 +178,18 @@ def detect_layout(hint, files, keys, directory, forced=None):
         with open(config_path) as f:
             if json.load(f).get('_class_name') == 'MiniMaxH3DiTModel':
                 return 'official'
-    # Several shards without a config are the official ones; one file is ComfyUI's.
-    return 'official' if len(files) > 1 else 'comfy'
+    if len(files) == 1:
+        return 'comfy'
+    # The official shards and a sharded ComfyUI file have the same names and shapes: only the qkv row order differs,
+    # so a guess would silently scramble the attention.
+    if find_official_heads(directory) is not None:
+        return 'official'
+    raise ValueError(f'cannot tell whether the {len(files)} shards of {directory} are the official layout (interleaved qkv) or '
+                     f"ComfyUI's: set [model] diffusion_model_format = 'official' or 'comfy'")
 
 
 def check_is_image_model(keys):
-    if 'audio_patch_proj.weight' in keys:
+    if any(key.startswith(('audio_patch_proj.', 'audio_proj_in.', 'final_layer.audio_out.')) or '.audio_' in key for key in keys):
         raise ValueError("this transformer has an audio stream: it is MiniMax H3 (video and audio), not MiniMax-H3-Image. "
                          "Use type = 'minimax_h3'")
     diffusers = any(k.startswith('transformer_blocks.') for k in keys)
@@ -220,11 +226,14 @@ def find_official_heads(directory, explicit=None):
     return None
 
 
-def transformer_metadata(steps, sigmas):
+def transformer_metadata(steps, sigmas, base=None):
+    """The metadata ComfyUI's loader reads; `base` is a file's own metadata, whose other keys are kept."""
     if len(sigmas) != steps + 1 or sigmas[0] != 1.0 or sigmas[-1] != 0.0:
         raise ValueError(f'{steps} PDD heads need a grid of {steps + 1} sigmas from 1.0 to 0.0 (pdd_config.json next to the '
                          f'transformer or the heads file), got {sigmas}')
-    return {'config': json.dumps({'transformer': {'pdd_steps': steps, 'pdd_sigmas': sigmas}}), 'format': 'pt'}
+    config = json.loads((base or {}).get('config') or '{}')
+    config['transformer'] = {**config.get('transformer', {}), 'pdd_steps': steps, 'pdd_sigmas': sigmas}
+    return {**(base or {}), 'config': json.dumps(config), 'format': 'pt'}
 
 
 def load_checkpoint(path, forced_layout=None, heads_path=None):
@@ -249,7 +258,7 @@ def load_checkpoint(path, forced_layout=None, heads_path=None):
         if sigmas is None:
             # A file without the grid (a single-head export, say): ComfyUI's model needs one to be built.
             sigmas = find_pdd_sigmas(directory) or (list(DEFAULT_PDD_SIGMAS) if steps == len(DEFAULT_PDD_SIGMAS) - 1 else [1.0, 0.0])
-        return sd, transformer_metadata(steps, sigmas), layout, steps
+        return sd, transformer_metadata(steps, sigmas, metadata), layout, steps
 
     if layout == 'diffusers':
         theta, freq_dim = DEFAULT_ROPE_THETA, DEFAULT_ROPE_FREQ_DIM

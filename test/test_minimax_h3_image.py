@@ -324,6 +324,8 @@ def write_diffusers(root, model, steps, heads=True):
             continue
         if key.endswith('.attn.qkv_proj.weight'):
             base = key[:-len('.attn.qkv_proj.weight')]
+            for pattern, replacement in DIFFUSERS_NAMES[:2]:
+                base = re.sub(pattern, replacement, base + '.').rstrip('.')
             for name, part in zip('qkv', tensor.chunk(3, dim=0)):
                 out[f'{base}.attn.to_{name}.weight'] = part
             continue
@@ -409,6 +411,51 @@ def test_the_diffusers_layout_loads_as_comfys(tmp_path, how):
     assert_same_state(sd, expected)
     assert json.loads(metadata['config'])['transformer'] == {'pdd_steps': 3, 'pdd_sigmas': SIGMAS[3]}
     assert weights.inspect_checkpoint(str(path)) == ('diffusers', 3)
+
+
+def test_the_diffusers_fixture_uses_the_published_names(tmp_path):
+    """Guard for the fixture itself: the qkv parts are named as diffusers names them (transformer_blocks.N,
+    token_refiner.refiner_blocks.N), so the loader's renaming of the concatenated key is exercised."""
+    model, _ = tiny_pair(1)
+    write_diffusers(tmp_path, model, 1)
+    with safetensors.safe_open(next((tmp_path / 'transformer_diffusers').glob('*0001*.safetensors')), framework='pt') as f:
+        keys = set(f.keys())
+    with safetensors.safe_open(next((tmp_path / 'transformer_diffusers').glob('*0002*.safetensors')), framework='pt') as f:
+        keys |= set(f.keys())
+    assert 'transformer_blocks.0.attn.to_q.weight' in keys and 'token_refiner.refiner_blocks.0.attn.to_k.weight' in keys
+    assert not any(k.startswith(('blocks.', 'token_refiner.blocks.')) for k in keys)
+
+
+def test_a_sharded_checkpoint_of_unknown_layout_is_not_guessed(tmp_path):
+    from utils import minimax_h3_weights as weights
+    model, _ = tiny_pair(1)
+    sd = {k: v.clone() for k, v in model.state_dict().items()}
+    save_shards(tmp_path / 'shards', sd)
+    with pytest.raises(ValueError, match="diffusion_model_format"):
+        weights.load_checkpoint(str(tmp_path / 'shards'))
+    loaded, _, layout, _ = weights.load_checkpoint(str(tmp_path / 'shards'), 'comfy')
+    assert layout == 'comfy'
+    assert_same_state(loaded, sd)
+
+
+def test_the_file_metadata_is_kept(tmp_path):
+    from utils import minimax_h3_weights as weights
+    model, _ = tiny_pair(1)
+    sd = {k: v.clone() for k, v in model.state_dict().items()}
+    config = {'transformer': {'other_key': 7}, 'unet': {'x': 1}}
+    safetensors.torch.save_file(sd, tmp_path / 'm.safetensors', metadata={'config': json.dumps(config), 'note': 'kept'})
+    _, metadata, _, _ = weights.load_checkpoint(str(tmp_path / 'm.safetensors'))
+    merged = json.loads(metadata['config'])
+    assert merged['transformer'] == {'other_key': 7, 'pdd_steps': 1, 'pdd_sigmas': [1.0, 0.0]} and merged['unet'] == {'x': 1}
+    assert metadata['note'] == 'kept'
+
+
+def test_a_diffusers_audio_transformer_is_refused(tmp_path):
+    from utils import minimax_h3_weights as weights
+    safetensors.torch.save_file({'transformer_blocks.0.norm1.weight': torch.zeros(2), 'proj_in.weight': torch.zeros(2, 2),
+                                 'context_embedder.weight': torch.zeros(2, 2), 'audio_proj_in.weight': torch.zeros(2, 2)}, tmp_path / 'a.safetensors')
+    with pytest.raises(ValueError, match='minimax_h3'):
+        weights.inspect_checkpoint(str(tmp_path / 'a.safetensors'))
 
 
 def test_a_diffusers_checkpoint_of_other_heads_needs_its_grid(tmp_path):
