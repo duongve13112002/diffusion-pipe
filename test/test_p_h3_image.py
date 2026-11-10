@@ -346,7 +346,7 @@ def tiny_clip(monkeypatch):
     return clip
 
 
-def _node_namespace():
+def _node_namespace(node_name='PH3ImageConditioning'):
     import os
     import comfy.model_management
     import comfy.nested_tensor
@@ -354,14 +354,14 @@ def _node_namespace():
     import comfy.ldm.minimax.model as minimax_model
     path = os.path.join(os.path.dirname(minimax_model.__file__), '..', '..', '..', 'comfy_extras', 'nodes_minimax_h3.py')
     tree = ast.parse(open(path).read())
-    wanted = {'_resize', '_size_within_area', '_resize_to', '_av_latent'}
+    wanted = {'_resize', '_size_within_area', '_size_short_edge', '_resize_to', '_av_latent', '_image_refs'}
     body = []
     for node in tree.body:
-        if isinstance(node, ast.Assign) and all(isinstance(t, ast.Name) and (t.id.startswith('PH3_') or t.id == 'CANVAS_MULTIPLE') for t in node.targets):
+        if isinstance(node, ast.Assign) and all(isinstance(t, ast.Name) and (t.id.startswith(('PH3_', 'IMAGE_')) or t.id == 'CANVAS_MULTIPLE') for t in node.targets):
             body.append(node)
         elif isinstance(node, ast.FunctionDef) and node.name in wanted:
             body.append(node)
-        elif isinstance(node, ast.ClassDef) and node.name == 'PH3ImageConditioning':
+        elif isinstance(node, ast.ClassDef) and node.name == node_name:
             execute = next(n for n in node.body if isinstance(n, ast.FunctionDef) and n.name == 'execute')
             execute.decorator_list = []
             execute.returns = None
