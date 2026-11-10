@@ -809,10 +809,19 @@ class ComfyPipeline(CommonPipeline):
                 paths = [paths]
             clip_type = getattr(comfy.sd.CLIPType, te_config['type'].upper(), comfy.sd.CLIPType.STABLE_DIFFUSION)
 
-            def load_fn():
-                return comfy.sd.load_clip(ckpt_paths=paths, clip_type=clip_type, disable_dynamic=True)
+            # Bound as defaults: the wrapper loads later, after this loop has moved on to the next encoder.
+            def load_fn(paths=paths, clip_type=clip_type):
+                return self.load_text_encoder(paths, clip_type)
 
             self.text_encoders.append(ModelWrapper(load_fn))
+
+    def load_text_encoder(self, paths, clip_type):
+        return comfy.sd.load_clip(ckpt_paths=paths, clip_type=clip_type, disable_dynamic=True)
+
+    def load_model_patcher(self, model_options):
+        """The diffusion model's ModelPatcher. A pipeline whose checkpoints come in layouts ComfyUI does not
+        read overrides this."""
+        return comfy.sd.load_diffusion_model(self.model_config['diffusion_model'], model_options=model_options, disable_dynamic=True)
 
     def dequantize(self, model, diffusion_model_dtype, prefix=''):
         operations = comfy.ops.disable_weight_init
@@ -871,7 +880,7 @@ class ComfyPipeline(CommonPipeline):
         dtype = self.model_config['dtype']
         model_options = {}
         model_options['dtype'] = dtype
-        model_patcher = comfy.sd.load_diffusion_model(self.model_config['diffusion_model'], model_options=model_options, disable_dynamic=True)
+        model_patcher = self.load_model_patcher(model_options)
 
         merging_adapter = False
         for adapter_path in self.model_config.get('merge_adapters', []):

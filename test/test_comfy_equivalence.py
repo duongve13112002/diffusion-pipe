@@ -823,7 +823,10 @@ def test_minimax_h3_layers_match_comfyui(audio_t):
     inputs = minimax_inputs([6, 6], audio_t=audio_t)
     video, audio, valid_audio, t, text, mask = inputs
     actual_video, actual_audio = run_layers(layers, inputs)
-    for i in range(video.shape[0]):
+    assert actual_audio.shape == audio.shape
+    # ComfyUI's forward no longer takes a sample without audio (its layout has no audio segment then and the
+    # forward looks one up), so only a sample with audio has a reference; the layers must still run without it.
+    for i in range(video.shape[0] if audio_t else 0):
         expected_video, expected_audio = reference([video[i:i + 1], audio[i:i + 1]], t[i:i + 1] * 1000, text[i:i + 1])
         assert_close(actual_video[i:i + 1], expected_video)
         assert_close(actual_audio[i:i + 1], expected_audio)

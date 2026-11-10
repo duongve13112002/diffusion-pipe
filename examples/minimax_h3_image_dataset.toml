@@ -1,0 +1,29 @@
+# Dataset for MiniMax-H3-Image (examples/minimax_h3_image.toml). Images only.
+
+resolutions = [1024]
+
+enable_ar_bucket = true
+min_ar = 0.5
+max_ar = 2.0
+num_ar_buckets = 9
+
+# MiniMax-H3-Image trains on images: every frame bucket but 1 is refused.
+frame_buckets = [1]
+
+num_repeats = 1
+
+# Text to image: images and their captions.
+[[directory]]
+path = '/data/images/t2i'
+
+# Editing: the target images (what the model learns to produce) in path, the image to edit in control_path under the
+# same name, and the instruction as the caption. The caption is encoded with "Picture 1: " and the control image
+# (short edge 1024) in front, as ComfyUI's MiniMax H3 Image Conditioning node does. The control image is also the
+# reference latent, cropped to the target's bucket. One control image per target: control_path_2 and further are
+# not supported yet and are refused.
+# Text-to-image and edit images go in different directories; they are batched separately.
+# Caption dropout is refused for an edit directory (a dropped caption would lose its image): leave
+# caption_dropout_rate unset or 0 there, and set caption_dropout_rate = 0 in it if uncond_fraction is on.
+#[[directory]]
+#path = '/data/images/edit/target'
+#control_path = '/data/images/edit/control'

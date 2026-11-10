@@ -1,0 +1,75 @@
+# MiniMax-H3-Image (MiniMaxAI, 33B DiT, text to image and editing): a LoRA.
+# The transformer is read from any of its layouts: ComfyUI's single file (Comfy-Org/MiniMax-H3-Image), the official
+# repository (MiniMaxAI/MiniMax-H3-Image: transformer/ and pdd_fused_heads.safetensors) or its diffusers folder
+# (transformer_diffusers/). The VAE and the text encoder likewise (ComfyUI's files, vae/ or vae_diffusers/,
+# the text_encoder/ shards).
+#
+# One GPU:
+#   deepspeed --num_gpus=1 train.py --deepspeed --config examples/minimax_h3_image.toml
+# One node, 8 GPUs:
+#   deepspeed --num_gpus=8 train.py --deepspeed --config examples/minimax_h3_image.toml
+# Several nodes: README "Multi-node training".
+
+output_dir = '/data/training_runs/minimax_h3_image'
+dataset = 'examples/minimax_h3_image_dataset.toml'
+
+epochs = 100
+micro_batch_size_per_gpu = 1
+pipeline_stages = 1
+gradient_accumulation_steps = 4
+gradient_clipping = 1.0
+warmup_steps = 50
+
+eval_every_n_epochs = 1
+eval_before_first_step = true
+eval_micro_batch_size_per_gpu = 1
+
+save_every_n_epochs = 1
+checkpoint_every_n_minutes = 120
+keep_last_n_checkpoints = 3
+save_dtype = 'bfloat16'
+
+activation_checkpointing = true
+# At most the number of blocks minus 2; lowers VRAM at some speed cost.
+#blocks_to_swap = 20
+caching_batch_size = 1
+steps_per_print = 1
+
+[model]
+type = 'minimax_h3_image'
+# A file, a shard index (.json), a folder of shards, or the repository root.
+diffusion_model = '/data/models/MiniMax-H3-Image'
+# Normally detected: 'comfy', 'official' or 'diffusers'.
+#diffusion_model_format = 'official'
+# The official layout's six PDD output heads, when pdd_fused_heads.safetensors is not at the repository root.
+#pdd_heads = '/data/models/pdd_fused_heads.safetensors'
+# vae/ (or vae_diffusers/) of the repository, or ComfyUI's VAE file. No audio_vae: images only.
+vae = '/data/models/MiniMax-H3-Image/vae'
+# Qwen3-VL-32B cut to its first 50 layers: ComfyUI's file, or the text_encoder/ shards of the repository.
+text_encoders = [
+    {path = '/data/models/MiniMax-H3-Image/text_encoder', type = 'minimax'}
+]
+dtype = 'bfloat16'
+timestep_sample_method = 'logit_normal'
+# The released checkpoint samples 6 steps on the uniform grid under flow shift 3 (pdd_config.json), and shift = 3 is
+# the default here. It is not a measured optimum for training: try 1 to 3.
+#shift = 3
+# The model is distilled into six output heads. Head 0 trains (every head of the checkpoint is that head plus a fixed
+# offset, so a full fine-tune moves all six); the sampling previews run the six heads on the checkpoint's grid.
+# cfg (CFG-augmented training) and audio_vae are refused.
+# Per-component learning rates (a LoRA leaves the heads and projections frozen: head_lr, patch_embed_lr and
+# text_projection_lr are refused with [adapter]; 0 freezes a component of a full fine-tune):
+#blocks_lr = 1e-5
+#token_refiner_lr = 1e-5
+
+[adapter]
+type = 'lora'
+rank = 32
+dtype = 'bfloat16'
+
+[optimizer]
+type = 'adamw_optimi'
+lr = 1e-4
+betas = [0.9, 0.99]
+weight_decay = 0.01
+eps = 1e-8

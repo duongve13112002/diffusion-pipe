@@ -168,28 +168,33 @@ class FinalLayer(nn.Module):
     def __init__(self, hidden, t_dim, video_dim, audio_dim, eps, apply_silu=True, adaln_dtype=None, pdd_steps=1,
                  dtype=None, device=None, operations=None):
         super().__init__()
-        if pdd_steps != 1:
-            # A PDD (distilled) checkpoint stacks pdd_steps output heads per stream, picked by the
-            # sampler's sigma schedule; this layer trains the single head of the base model.
+        if pdd_steps != 1 and audio_dim is not None:
+            # A PDD (distilled) video checkpoint stacks pdd_steps output heads per stream, picked by the
+            # sampler's sigma schedule; this layer trains the single head of the base model. (MiniMax-H3-Image
+            # has no audio and keeps its heads as a bank: see models/minimax_h3_image.py.)
             raise NotImplementedError(
                 f'MiniMax H3 PDD checkpoints (pdd_steps = {pdd_steps}) cannot be trained; use the base model')
         self.video_dim = video_dim
+        self.pdd_steps = pdd_steps
         self.norm = operations.RMSNorm(hidden, eps=eps, dtype=dtype, device=device)
         self.adaln_proj = AdalnProj(t_dim, hidden, 2, 1, apply_silu=apply_silu,
                                     dtype=adaln_dtype if adaln_dtype is not None else dtype,
                                     device=device, operations=operations)
         # output heads are the checkpoint's fp32 island; norm/adaln are stored at model dtype
-        self.video_out = operations.Linear(hidden, video_dim, bias=True, dtype=torch.float32, device=device)
-        self.audio_out = operations.Linear(hidden, audio_dim, bias=True, dtype=torch.float32, device=device)
+        self.video_out = operations.Linear(hidden, video_dim * pdd_steps, bias=True, dtype=torch.float32, device=device)
+        self.audio_out = None
+        if audio_dim is not None:
+            self.audio_out = operations.Linear(hidden, audio_dim, bias=True, dtype=torch.float32, device=device)
+
+    def modulate(self, x, shift, scale, seg):
+        a, b, row = seg
+        return (self.norm(x[:, a:b]) * (1.0 + scale[:, row, None]) + shift[:, row, None]).to(torch.float32)
 
     def forward(self, x, t_emb, video_seg, audio_seg):
         # video_seg / audio_seg: (start, stop, timestep_row) of the target streams
         shift, scale = self.adaln_proj(t_emb)
-        va, vb, vrow = video_seg
-        aa, ab, arow = audio_seg
-        hv = (self.norm(x[:, va:vb]) * (1.0 + scale[:, vrow, None]) + shift[:, vrow, None]).to(torch.float32)
-        ha = (self.norm(x[:, aa:ab]) * (1.0 + scale[:, arow, None]) + shift[:, arow, None]).to(torch.float32)
-        return self.video_out(hv), self.audio_out(ha)
+        return (self.video_out(self.modulate(x, shift, scale, video_seg)),
+                self.audio_out(self.modulate(x, shift, scale, audio_seg)))
 
 # batch-enabled
 comfy.ldm.minimax.model.FinalLayer = FinalLayer
@@ -722,7 +727,9 @@ class InitialLayer(nn.Module):
         rope_freqs = rope_rotation_table(self.rope_freqs(position_ids, device), dtype)
 
         video_seg = next((a, b, kind_row["video"]) for a, b, k in layout.segments if k == "video")
-        audio_seg = next((a, b, kind_row["audio"]) for a, b, k in layout.segments if k == "audio")
+        # A sample without audio has no audio segment (ComfyUI's layout stopped adding an empty one): the audio
+        # head then reads an empty span.
+        audio_seg = next(((a, b, kind_row["audio"]) for a, b, k in layout.segments if k == "audio"), (video_seg[0], video_seg[0], kind_row["audio"]))
         # pack these as ints so we can pass as tensor between pipeline parallel layers
         mod_segments = torch.tensor(mod_segments, dtype=torch.int32, device=h.device)
         extra_ints = torch.tensor([*video_seg, *audio_seg, latent_t, lat_h, lat_w], dtype=torch.int32, device=h.device)
