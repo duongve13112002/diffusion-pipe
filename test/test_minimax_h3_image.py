@@ -1008,3 +1008,82 @@ def test_the_example_configs_are_accepted(monkeypatch):
     pipe = MiniMaxH3ImagePipeline(config)
     assert config['model']['type'] == 'minimax_h3_image'
     pipe.model_specific_dataset_config_validation(toml.load(EXAMPLES / 'minimax_h3_image_dataset.toml'))
+
+
+def test_save_dtype_leaves_the_float32_islands_unrounded(tmp_path):
+    """save_dtype = bfloat16 rounds the blocks but not the output head (rounding head 0 would move every head, the
+    offsets being relative to it) nor the patch projection and time embedder."""
+    from utils.saver import convert_state_dict_dtype
+    model, _ = tiny_pair(3)
+    original = {k: v.clone() for k, v in model.state_dict().items()}
+    pipe = image_pipeline(model)
+    pipe.split_pdd_head()
+    name_parameters(model)
+    sd = {p.original_name: p.detach() for p in model.parameters()}
+    convert_state_dict_dtype(sd, torch.bfloat16, pipe.save_float32_prefixes)
+    assert sd['blocks.0.attn.qkv_proj.weight'].dtype == torch.bfloat16
+    for name in ('final_layer.video_out.weight', 'video_patch_proj.weight', 'time_embedder.proj_in.weight'):
+        assert sd[name].dtype == torch.float32, name
+    pipe.save_model(tmp_path, sd)
+    saved = safetensors.torch.load_file(tmp_path / 'model.safetensors')
+    assert torch.equal(saved['final_layer.video_out.weight'], original['final_layer.video_out.weight'])
+    assert torch.equal(saved['video_patch_proj.weight'], original['video_patch_proj.weight'])
+    assert saved['blocks.0.attn.qkv_proj.weight'].dtype == torch.bfloat16
+    # an unlisted model rounds everything, as before
+    plain = {'a.weight': torch.randn(2, 2)}
+    convert_state_dict_dtype(plain, torch.bfloat16)
+    assert plain['a.weight'].dtype == torch.bfloat16
+
+
+def test_each_sample_trains_through_the_head_of_its_noise_interval():
+    """The grid is [1, .6, .3, 0]: a sample at noise .8 sits in head 0's interval, .5 and .59 in head 1's, .2 in
+    head 2's (a step from .6 down uses head 1, as ComfyUI picks it). The heads of one batch differ per sample."""
+    model, _ = tiny_pair(3)
+    pipe = image_pipeline(model)
+    pipe.split_pdd_head()
+    layers = pipe.to_layers()
+    video, t, text, mask, tags, _, augmented = image_inputs([6, 6, 6, 6], [(1, 2)] * 4, [0.8, 0.5, 0.2, 0.59])
+    inputs = (video, t, text, mask, tags, augmented)
+    assert layers[0](inputs)[5].tolist()[6:] == [0, 1, 2, 1]
+    by_sigma = run_layers(layers, inputs)
+    forced = []
+    for head in range(3):
+        pipe.final_layer_module.head = head
+        forced.append(run_layers(layers, inputs))
+    pipe.final_layer_module.head = None
+    for i, head in enumerate([0, 1, 2, 1]):
+        assert_close(by_sigma[i], forced[head][i])
+    assert not torch.allclose(forced[0][1], forced[1][1])
+
+    # train_pdd_head = 0: head 0 whatever the noise
+    head0 = image_pipeline(model, {'train_pdd_head': 0}).to_layers()
+    assert head0[0](inputs)[5].tolist()[6:] == [0, 0, 0, 0]
+    assert_close(run_layers(head0, inputs), forced[0])
+    # one head: nothing to pick
+    single, _ = tiny_pair(1)
+    assert image_pipeline(single).to_layers()[0](inputs)[5].tolist()[6:] == [0, 0, 0, 0]
+
+
+def test_the_gradient_of_a_later_head_reaches_head_0():
+    model, _ = tiny_pair(3)
+    pipe = image_pipeline(model)
+    pipe.split_pdd_head()
+    layers = pipe.to_layers()
+    video, t, text, mask, tags, _, augmented = image_inputs([6], [(1, 2)], [0.2])
+    run_layers(layers, (video, t, text, mask, tags, augmented)).square().mean().backward()
+    assert model.final_layer.video_out.weight.grad.abs().sum() > 0
+    assert model.final_layer.pdd_offset_weight.grad is None
+
+
+def test_train_pdd_head_is_checked(tmp_path):
+    from models.minimax_h3_image import MiniMaxH3ImagePipeline
+    with pytest.raises(ValueError, match="train_pdd_head must be 'sigma' or 0"):
+        MiniMaxH3ImagePipeline({'model': {'text_encoders': [{'path': 'x', 'type': 'minimax'}], 'train_pdd_head': 2}})
+    model, _ = tiny_pair(1)
+    write_comfy(tmp_path, model, 1)
+    pipe = image_pipeline(None, {'diffusion_model': str(tmp_path / 'comfy.safetensors'), 'train_pdd_head': 0})
+    with pytest.raises(ValueError, match='train_pdd_head does not apply'):
+        pipe.refuse_unsupported_checkpoint()
+    three, _ = tiny_pair(3)
+    write_comfy(tmp_path / '..', three, 3)
+    image_pipeline(None, {'diffusion_model': str(tmp_path / '..' / 'comfy.safetensors'), 'train_pdd_head': 0}).refuse_unsupported_checkpoint()

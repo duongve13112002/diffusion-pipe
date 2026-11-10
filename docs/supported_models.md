@@ -796,6 +796,7 @@ text_encoders = [
 dtype = 'bfloat16'
 timestep_sample_method = 'logit_normal'
 #shift = 3
+#train_pdd_head = 'sigma'
 #diffusion_model_format = 'official'
 #pdd_heads = '/data/models/pdd_fused_heads.safetensors'
 #blocks_lr = 1e-5
@@ -810,13 +811,18 @@ See [examples/minimax_h3_image.toml](../examples/minimax_h3_image.toml) and its 
   modulation. The control image's latent is the reference, noise-augmented to t = 0.999 and pinned there. One
   reference per sample: `control_path_2` and further are refused for now (ComfyUI takes several; this needs
   dataset support).
-- Heads: head 0 of the bank trains. Every other head of a checkpoint is head 0 plus a fixed offset, so a full
-  fine-tune moves all six together; the offsets stay as they were and the export stacks them again. A LoRA leaves
-  the heads alone. `--test_sample` and the eval previews run the six heads, one per step, on the checkpoint's grid.
-  Training head 0 at every noise level is an approximation for a distilled model: the six-step quality can drift as
-  with any distilled model, so check the previews.
-- `shift`: when none of `shift`, `image_shift` and `flux_shift` is set it is 3, the shift under which the uniform
-  sampling grid of `pdd_config.json` is the base grid. This is not a measured optimum for training: try 1 to 3.
+- Heads: head 0 of the bank is the trainable weight; every other head of a checkpoint is head 0 plus a fixed offset
+  (measured on the released heads: the offsets are 2% of head 0's norm for the weight, 8% for the bias), so a full
+  fine-tune moves all six together and the export stacks them again. A LoRA leaves the heads alone. By default a sample
+  trains through the head of the sampling interval its noise level falls in, as ComfyUI applies it at that step
+  (`train_pdd_head = 0` trains through head 0 alone; it is refused for a checkpoint with one head). `--test_sample`
+  and the eval previews run the six heads, one per step, on the checkpoint's grid. The heads of a distilled model
+  predict an average velocity over their step while the loss target is the instantaneous `noise - latent`: this
+  is what fine-tuning any distilled model does, so check the previews.
+- `shift`: when none of `shift`, `image_shift` and `flux_shift` is set it is 3. That is a common value for images of this
+  size, not a measured optimum; the checkpoint's own sampling grid is not a shifted uniform grid. Try 1 to 3.
+- `save_dtype` leaves the output heads, the patch projection and the time embedder in float32 (the checkpoint's float32
+  islands; rounding head 0 would move every head).
 - Per-component learning rates (`blocks_lr`, `token_refiner_lr`, and for a full fine-tune `text_projection_lr`,
   `patch_embed_lr`, `head_lr`; 0 freezes). With an adapter the last three are refused.
 - Refused: `frame_buckets` other than `[1]`, `audio_vae`, `cfg`, a text encoder other than one of type `minimax`, a

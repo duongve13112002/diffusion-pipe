@@ -51,11 +51,13 @@ text_encoders = [
 ]
 dtype = 'bfloat16'
 timestep_sample_method = 'logit_normal'
-# The released checkpoint samples 6 steps on the uniform grid under flow shift 3 (pdd_config.json), and shift = 3 is
-# the default here. It is not a measured optimum for training: try 1 to 3.
+# Training shift when none of shift / image_shift / flux_shift is set: 3. It is a common value for images of this size,
+# not a measured optimum (the checkpoint's own 6-step sampling grid is not a shifted uniform grid): try 1 to 3.
 #shift = 3
-# The model is distilled into six output heads. Head 0 trains (every head of the checkpoint is that head plus a fixed
-# offset, so a full fine-tune moves all six); the sampling previews run the six heads on the checkpoint's grid.
+# The model is distilled into six output heads. Head 0 is the trainable weight and every other head is head 0 plus a fixed
+# offset, so a full fine-tune moves all six; a LoRA leaves them alone. A sample trains through the head of the sampling
+# interval its noise level falls in (as sampling applies it); 0 trains through head 0 alone. The previews run the six heads.
+#train_pdd_head = 'sigma'
 # cfg (CFG-augmented training) and audio_vae are refused.
 # Per-component learning rates (a LoRA leaves the heads and projections frozen: head_lr, patch_embed_lr and
 # text_projection_lr are refused with [adapter]; 0 freezes a component of a full fine-tune):

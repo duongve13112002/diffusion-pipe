@@ -9,9 +9,10 @@ Weights come in the layouts of utils/minimax_h3_weights.py: ComfyUI's single fil
 (with pdd_fused_heads.safetensors) or transformer_diffusers/; the VAE as vae/, vae_diffusers/ or ComfyUI's file; the text
 encoder as ComfyUI's file or the Hugging Face text_encoder/ shards.
 
-Training: flow matching on the velocity noise - latent, one head at a time. Head 0 of the bank trains (every head of a
-checkpoint that carries one is that head plus a fixed offset, so a full fine-tune moves all six together); adapters leave
-the heads alone. Sampling previews run the six heads on the checkpoint's sigma grid.
+Training: flow matching on the velocity noise - latent. Head 0 of the bank is the trainable weight and every other head
+of a checkpoint is that head plus a fixed offset, so a full fine-tune moves all six together and adapters leave them
+alone. A sample trains through the head of the grid interval its noise level falls in, as sampling applies it
+(train_pdd_head = 0 trains through head 0 alone). Sampling previews run the six heads on the checkpoint's sigma grid.
 
 Editing (a dataset directory with control_path): as ComfyUI's MiniMaxH3ImageConditioning node builds it. The caption is
 preceded by "Picture 1: " and the control image shown to the text encoder at a 1024 short edge; the vision block's
@@ -43,8 +44,10 @@ from comfy.ldm.minimax.model import (
 VISION_SHORT_EDGE = 1024
 CANVAS_MULTIPLE = 32
 PICTURE_LABEL = 'Picture %d: '
-# The uniform sampling grid of pdd_config.json is the base grid under this flow shift.
+# A common flow shift for images of this size. The checkpoint's own sampling grid (pdd_config.json) is not a shifted
+# uniform grid, so this is a default, not a measured optimum.
 DEFAULT_SHIFT = 3.0
+TRAIN_HEADS = ('sigma', 0)
 HEAD_LR_KEYS = ('head_lr', 'patch_embed_lr', 'text_projection_lr')
 LR_KEYS = HEAD_LR_KEYS + ('blocks_lr', 'token_refiner_lr')
 REFUSED_MODEL_KEYS = {
@@ -77,6 +80,8 @@ class MiniMaxH3ImagePipeline(MinimaxH3Pipeline):
     name = 'minimax_h3_image'
     is_video_vae = False
     vae_latent_keys = ('latents', 'control_latents')
+    # fp32 islands of the checkpoint: save_dtype leaves them unrounded (rounding head 0 moves all six heads)
+    save_float32_prefixes = ('final_layer.video_out.', 'video_patch_proj.', 'time_embedder.')
 
     def __init__(self, config):
         model_config = config['model']
@@ -87,6 +92,8 @@ class MiniMaxH3ImagePipeline(MinimaxH3Pipeline):
         if len(text_encoders) != 1 or str(text_encoders[0].get('type', '')).lower() != 'minimax':
             raise ValueError("minimax_h3_image needs one text encoder, the MiniMax H3 Qwen3-VL-32B (ComfyUI's file, or the "
                              "text_encoder/ shards of MiniMaxAI/MiniMax-H3-Image) with type = 'minimax'")
+        if model_config.get('train_pdd_head', 'sigma') not in TRAIN_HEADS:
+            raise ValueError(f"[model] train_pdd_head must be 'sigma' or 0, got {model_config['train_pdd_head']!r}")
         if 'diffusion_model_format' in model_config and model_config['diffusion_model_format'] not in weights.LAYOUTS:
             raise ValueError(f"[model] diffusion_model_format must be one of {weights.LAYOUTS}, "
                              f"got {model_config['diffusion_model_format']!r}")
@@ -94,15 +101,17 @@ class MiniMaxH3ImagePipeline(MinimaxH3Pipeline):
             raise ValueError(f'[model] {", ".join(keys)} do not apply to adapter training: they set the learning rate of '
                              'weights an adapter leaves frozen. Remove them (blocks_lr and token_refiner_lr do apply).')
         if not any(k in model_config for k in ('shift', 'image_shift', 'flux_shift')):
-            # The checkpoint's own sampling grid is the uniform grid at flow shift 3 (pdd_config.json).
             model_config['shift'] = DEFAULT_SHIFT
         super().__init__(config)
         self.is_video_vae = False
         self.pdd_offsets = None
 
     def refuse_unsupported_checkpoint(self):
-        layout, _ = weights.inspect_checkpoint(self.model_config['diffusion_model'], self.model_config.get('diffusion_model_format'),
-                                               self.model_config.get('pdd_heads'))
+        layout, heads = weights.inspect_checkpoint(self.model_config['diffusion_model'], self.model_config.get('diffusion_model_format'),
+                                                   self.model_config.get('pdd_heads'))
+        if heads == 1 and 'train_pdd_head' in self.model_config:
+            raise ValueError('[model] train_pdd_head does not apply: this diffusion_model has one output head, not the PDD bank '
+                             'of six. Remove it.')
         if 'pdd_heads' in self.model_config and layout != 'official':
             raise ValueError(f"[model] pdd_heads applies to the official transformer/ layout only; this diffusion_model is "
                              f"in the {layout} layout, which carries its heads itself. Remove pdd_heads.")
@@ -346,7 +355,7 @@ class MiniMaxH3ImagePipeline(MinimaxH3Pipeline):
 
     def to_layers(self):
         diffusion_model = self.diffusion_model
-        layers = [ImageInitialLayer(diffusion_model)]
+        layers = [ImageInitialLayer(diffusion_model, self.model_config.get('train_pdd_head', 'sigma') == 'sigma')]
         for i, block in enumerate(diffusion_model.blocks):
             layers.append(TransformerLayer(block, i, self.offloader))
         self.final_layer_module = ImageFinalLayer(diffusion_model)
@@ -394,7 +403,7 @@ class MiniMaxH3ImagePipeline(MinimaxH3Pipeline):
                 v = self.pipeline_model((x, t, *self.conds))
                 x = x + (sigma_next - sigma) * v.float()
         finally:
-            self.final_layer_module.head = 0
+            self.final_layer_module.head = None
         self.vae.load_model_if_needed()
         img = self.vae_decode(x)
         comfy.model_management.unload_all_models()
@@ -406,8 +415,11 @@ class MiniMaxH3ImagePipeline(MinimaxH3Pipeline):
 class ImageInitialLayer(nn.Module):
     """Text, reference image and target image packed into one sequence, with their modulation rows and rope table."""
 
-    def __init__(self, model):
+    def __init__(self, model, head_by_sigma=False):
         super().__init__()
+        # With a PDD bank each sample trains through the head of the grid interval its noise level falls in, as sampling
+        # applies it; otherwise head 0.
+        self.pdd_grid = list(model.pdd_sigmas) if head_by_sigma and model.final_layer.pdd_steps > 1 else None
         if model.use_adaln_curves:
             self.adaln_t_table = model.adaln_t_table
         else:
@@ -510,19 +522,25 @@ class ImageInitialLayer(nn.Module):
 
         va, vb, _ = layout.segments[-1]  # the target image is the last segment
         mod_segments = torch.tensor(mod_segments, dtype=torch.int32, device=device)
-        extra_ints = torch.tensor([va, vb, kind_row['video'], latent_t, lat_h, lat_w], dtype=torch.int32, device=device)
+        head = 0
+        if self.pdd_grid is not None:
+            # the interval [grid[k + 1], grid[k]] holds the noise level; the last interval takes the end point
+            head = sum(1 for g in self.pdd_grid[1:-1] if float(t.flatten()[0]) <= g)
+        extra_ints = torch.tensor([va, vb, kind_row['video'], latent_t, lat_h, lat_w, head], dtype=torch.int32, device=device)
         return h, attention_mask, t_emb, mod_segments, rope_freqs, extra_ints
 
     def make_layer_inputs(self, video_x, t, context, context_mask, token_tags, *ref):
         first_extra_ints = None
+        heads = []
         h_list, attention_mask_list, t_emb_list, rope_freqs_list, segments_list = [], [], [], [], []
         for items in zip(video_x, t, context, context_mask, token_tags, *ref):
             h, attention_mask, t_emb, mod_segments, rope_freqs, extra_ints = self.make_packed_sequence(*(x.unsqueeze(0) for x in items))
             if first_extra_ints is None:
                 first_extra_ints = extra_ints
             else:
-                # ImageFinalLayer reads the target span and timestep row of the last sample for all.
-                assert (extra_ints == first_extra_ints).all()
+                # ImageFinalLayer reads the target span and timestep row of the first sample for all.
+                assert (extra_ints[:6] == first_extra_ints[:6]).all()
+            heads.append(extra_ints[6:])
             segments_list.append(mod_segments)
             h_list.append(h)
             attention_mask_list.append(attention_mask)
@@ -544,7 +562,9 @@ class ImageInitialLayer(nn.Module):
         attention_mask = torch.stack(attention_mask_list, dim=0)[:, None, None, :]  # 4D bool for SDPA
         t_emb = torch.stack(t_emb_list)
         rope_freqs = torch.cat(rope_freqs_list, dim=0)
-        outputs = make_contiguous(h, attention_mask, t_emb, mod_segments, rope_freqs, first_extra_ints)
+        # the shared layout, then each sample's PDD head
+        extra_ints = torch.cat([first_extra_ints[:6], *heads])
+        outputs = make_contiguous(h, attention_mask, t_emb, mod_segments, rope_freqs, extra_ints)
         for item in outputs:
             if torch.is_floating_point(item):
                 item.requires_grad_(True)
@@ -559,8 +579,9 @@ class ImageInitialLayer(nn.Module):
 
 
 class ImageFinalLayer(nn.Module):
-    # The PDD head a forward uses: 0 trains, a sampling preview walks 0..n-1.
-    head = 0
+    # The PDD head every sample of a forward uses: a sampling preview walks 0..n-1. None: each sample's own, as the
+    # initial layer chose it from its noise level.
+    head = None
 
     def __init__(self, model):
         super().__init__()
@@ -574,17 +595,21 @@ class ImageFinalLayer(nn.Module):
     @torch.compiler.disable
     def forward(self, inputs):
         h, attention_mask, t_emb, mod_segments, rope_freqs, extra_ints = inputs
-        va, vb, row, latent_t, lat_h, lat_w = extra_ints.tolist()
+        va, vb, row, latent_t, lat_h, lat_w, *heads = extra_ints.tolist()
         final = self.final_layer
         shift, scale = final.adaln_proj(t_emb)
         hv = final.modulate(h, shift, scale, (va, vb, row))
         out = final.video_out
-        weight, bias = out.weight, out.bias
-        if self.head > 0:
-            weight = weight + final.pdd_offset_weight[self.head - 1]
-            bias = bias + final.pdd_offset_bias[self.head - 1]
-        # The head is the checkpoint's fp32 island: no autocast.
+        if self.head is not None:
+            heads = [self.head] * hv.shape[0]
+        assert len(heads) == hv.shape[0], (len(heads), hv.shape[0])
+        # The head is the checkpoint's fp32 island: no autocast. Head k is head 0 plus the offset of the bank.
         with torch.autocast('cuda', enabled=False):
-            v = F.linear(hv.float(), weight.float(), bias.float())
+            weights = [out.weight if k == 0 else out.weight + final.pdd_offset_weight[k - 1] for k in heads]
+            biases = [out.bias if k == 0 else out.bias + final.pdd_offset_bias[k - 1] for k in heads]
+            if all(k == heads[0] for k in heads):
+                v = F.linear(hv.float(), weights[0].float(), biases[0].float())
+            else:
+                v = torch.einsum('bsd,bod->bso', hv.float(), torch.stack(weights).float()) + torch.stack(biases).float()[:, None]
         video_out = unpatchify_video(v, latent_t, lat_h // 2, lat_w // 2, self.latents_dim, self.patch_size)
         return -video_out

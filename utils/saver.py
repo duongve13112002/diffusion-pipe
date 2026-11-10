@@ -13,9 +13,12 @@ from utils.dora import saved_key, saved_value
 from utils.ema import EMA_SUBDIR, save_ema_checkpoint
 
 
-def convert_state_dict_dtype(state_dict, dtype):
+def convert_state_dict_dtype(state_dict, dtype, keep_float32=()):
+    """keep_float32: name prefixes of tensors a model keeps in float32 (checkpoint islands such as MiniMax-H3-Image's
+    output heads): they are moved to the CPU but not rounded."""
     for key, v in state_dict.items():
-        state_dict[key] = v.to(device='cpu', dtype=dtype)
+        keep = v.is_floating_point() and key.startswith(tuple(keep_float32))
+        state_dict[key] = v.to(device='cpu', dtype=torch.float32 if keep else dtype)
 
 
 def publish_dir(staging, final):
@@ -302,7 +305,7 @@ class Saver:
             try:
                 partial_state_dict = collect()
                 if 'save_dtype' in self.config:
-                    convert_state_dict_dtype(partial_state_dict, self.config['save_dtype'])
+                    convert_state_dict_dtype(partial_state_dict, self.config['save_dtype'], getattr(self.model, 'save_float32_prefixes', ()))
                 torch_save_atomic(partial_state_dict, tmp_dir / f'state_dict_{stage_id}.bin')
             except Exception as e:
                 error = e
