@@ -33,7 +33,7 @@ from PIL import Image
 from tqdm import tqdm
 
 from models.base import PreprocessMediaFile, convert_to_rgb, make_contiguous
-from models.minimax_h3 import MinimaxH3Pipeline, TransformerLayer
+from models.minimax_h3 import MinimaxH3Pipeline, TransformerLayer, pack_references, pad_sequences
 from utils import minimax_h3_weights as weights
 from utils.common import AUTOCAST_DTYPE, is_main_process
 import comfy.model_management
@@ -104,7 +104,7 @@ def load_scaled_image(path, low, high):
 
 
 class ImagePreprocess(PreprocessMediaFile):
-    def preprocess_control(self, path, size_bucket=None):
+    def preprocess_control(self, path, size_bucket=None, index=0):
         """A reference at its own size (the target's size bucket does not matter), as ComfyUI sizes it for the VAE: the
         short edge into REFERENCE_SHORT_EDGE, the aspect ratio kept (up to the multiple of 32), the sides a multiple of 32.
         [3, H, W] in 0..1."""
@@ -384,26 +384,7 @@ class MiniMaxH3ImagePipeline(MinimaxH3Pipeline):
             model_inputs = (*model_inputs, *self.pack_references([inputs[key] for key in keys], bs))
         return model_inputs, (target, mask)
 
-    @staticmethod
-    def pack_references(references, bs):
-        """The references of a batch (a [B, 24, 1, h, w] tensor, or a list of B such latents of their own sizes, for each
-        reference) -> ([B, R, 96] their noise-augmented patch rows one after the other, zero-padded to the longest sample,
-        [B, N, 2] their latent heights and widths)."""
-        samples = [[reference[i].float() for reference in references] for i in range(bs)]
-        rows = []
-        shapes = torch.zeros(bs, len(references), 2, dtype=torch.long, device=samples[0][0].device)
-        for i, sample in enumerate(samples):
-            parts = []
-            for n, latent in enumerate(sample):
-                # ComfyUI's visual condition noise augmentation.
-                latent = VISUAL_COND_TIMESTEP * latent + (1.0 - VISUAL_COND_TIMESTEP) * torch.randn_like(latent)
-                parts.append(patchify_video(latent[None]))
-                shapes[i, n] = torch.tensor(latent.shape[-2:], device=latent.device)
-            rows.append(torch.cat(parts))
-        packed = rows[0].new_zeros(bs, max(r.shape[0] for r in rows), rows[0].shape[1])
-        for i, r in enumerate(rows):
-            packed[i, :r.shape[0]] = r
-        return packed, shapes
+    pack_references = staticmethod(pack_references)
 
     def get_loss_fn(self):
         def loss_fn(output, label):
@@ -649,18 +630,7 @@ class ImageInitialLayer(nn.Module):
             t_emb_list.append(t_emb)
             rope_freqs_list.append(rope_freqs)
 
-        # Samples whose references differ in size have sequences of different lengths: the shorter ones are padded at
-        # the end, with the rows masked out as keys, in a modulation segment of their own, with rotations that do nothing.
-        length = max(h.shape[0] for h in h_list)
-        for i, h in enumerate(h_list):
-            pad = length - h.shape[0]
-            if pad:
-                h_list[i] = torch.cat([h, h.new_zeros(pad, h.shape[1])])
-                attention_mask_list[i] = torch.cat([attention_mask_list[i], attention_mask_list[i].new_zeros(pad)])
-                identity = torch.eye(2, dtype=rope_freqs_list[i].dtype, device=h.device).expand(1, pad, 1, *rope_freqs_list[i].shape[3:])
-                rope_freqs_list[i] = torch.cat([rope_freqs_list[i], identity], dim=1)
-                segments_list[i] = torch.cat([segments_list[i], segments_list[i].new_tensor([[h.shape[0], length, 0]])])
-
+        pad_sequences(h_list, attention_mask_list, rope_freqs_list, segments_list)
         if all(s.shape == segments_list[0].shape and (s == segments_list[0]).all() for s in segments_list[1:]):
             mod_segments = segments_list[0]
         else:

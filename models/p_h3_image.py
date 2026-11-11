@@ -8,13 +8,15 @@ encoder with a single-frame decoder (PH3ImageVAE).
 Text to image: images and captions, as for MiniMax H3, with the two audio latents a still image
 spans (noise at the image's sigma, no loss).
 
-Editing (a dataset directory with control_path): as ComfyUI's PH3ImageConditioning node builds it.
-The caption gets "Edit <Picture 1>. " in front unless it already names the picture to edit
-(edit_prompt_prefix = false leaves every caption as it is), and the control image is shown to the
-text encoder at <= 1 MP. The vision block's tokens are tagged 0 (they take the video modulation),
-the rest 1; the tags travel with the embeddings. The control image's latent (cropped to the
-target's bucket) is the reference, packed after the text, noise-augmented to t = 0.999, pinned at
-max(t, 0.999) like ComfyUI's minimax_refs.
+Editing (a dataset directory with control_path, and control_path_2, ..., control_path_9 for further reference
+images): as ComfyUI's PH3ImageConditioning node builds it. The caption gets "Edit <Picture 1>. " in front unless it
+already names the picture to edit (edit_prompt_prefix = false leaves every caption as it is), and every image is shown
+to the text encoder at <= 1 MP. The vision blocks' tokens are tagged 0 (they take the video modulation), the rest 1; the
+tags travel with the embeddings. The latent of the first image (control_path, the one edited; cropped to the target's
+bucket, so it stays aligned with the target) and of each further one (scaled within the target's pixel area, its own
+aspect ratio, sides a multiple of 32, as ComfyUI sizes them) are the references, packed after the text in the order of
+the pictures, noise-augmented to t = 0.999, pinned at max(t, 0.999) like ComfyUI's minimax_refs. Samples with references
+of different sizes share a batch: their sequences are padded at the end and the padding is masked.
 """
 
 import re
@@ -26,20 +28,23 @@ from PIL import Image
 from tqdm import tqdm
 
 from models.base import PreprocessMediaFile, convert_to_rgb
-from models.minimax_h3 import MinimaxH3Pipeline, InitialLayer, TransformerLayer, FinalLayer
+from models.minimax_h3 import MinimaxH3Pipeline, InitialLayer, TransformerLayer, FinalLayer, pack_references
+from models.minimax_h3_image import control_key
 from utils.common import AUTOCAST_DTYPE
 import comfy.model_management
 import comfy.sd
 import comfy.text_encoders.minimax
 import comfy.utils
 import comfy.ldm.minimax.vae
-from comfy.ldm.minimax.model import VISUAL_COND_TIMESTEP
 
 # The checkpoint's sampling grid (8 steps).
 SAMPLE_SIGMAS = [1.0, 0.984753, 0.967905, 0.951688, 0.925372, 0.881923, 0.810083, 0.528718, 0.0]
 # ComfyUI comfy_extras/nodes_minimax_h3.py: reference images reach Qwen at <= 1 MP, sides /32.
 VISION_PIXELS = 1000000
 CANVAS_MULTIPLE = 32
+# ComfyUI's PH3ImageConditioning takes images image_1 ... image_9.
+MAX_REFERENCES = 9
+CONTROL_KEYS = tuple(control_key(n) for n in range(MAX_REFERENCES))
 EDIT_PROMPT = 'Edit <Picture 1>. {}'
 # An instruction that already names the picture to edit, or an edit brief from the prompt
 # upsampler, is encoded as it is.
@@ -72,19 +77,35 @@ def size_within_area(width, height, pixels):
     return tuple(max(CANVAS_MULTIPLE, round(side * scale / CANVAS_MULTIPLE) * CANVAS_MULTIPLE) for side in (width, height))
 
 
-def load_vision_image(path):
-    """The control image ([1, H, W, 3] in 0..1) at the size PH3ImageConditioning shows it to the
-    text encoder. Decoded as the dataset decodes the same file into the reference latent
-    (convert_to_rgb: no EXIF rotation, transparency onto white), so the encoder and the latent
-    see one image; for an RGB file without EXIF rotation that is what ComfyUI's LoadImage gives."""
+def load_within_area(path, pixels):
+    """The image ([1, H, W, 3] in 0..1) scaled as ComfyUI's _resize_to scales it for a pixel area (down only, the aspect
+    ratio kept up to the sides being a multiple of 32, the whole image stretched with lanczos, untouched when already
+    there). Decoded as the dataset decodes the same file (convert_to_rgb: no EXIF rotation, transparency onto white), so
+    the encoder's picture and the reference latent see one image; for an RGB file without EXIF rotation that is what
+    ComfyUI's LoadImage gives."""
     with Image.open(path) as img:
         img = convert_to_rgb(img)
         image = torch.from_numpy(np.array(img).astype(np.float32) / 255.0)[None]
-    size = size_within_area(image.shape[2], image.shape[1], VISION_PIXELS)
+    size = size_within_area(image.shape[2], image.shape[1], pixels)
     if (image.shape[2], image.shape[1]) == size:
         return image
     samples = comfy.utils.common_upscale(image.movedim(-1, 1), size[0], size[1], 'lanczos', 'disabled')
     return samples.movedim(1, -1)
+
+
+def load_vision_image(path):
+    """The image at the size PH3ImageConditioning shows it to the text encoder."""
+    return load_within_area(path, VISION_PIXELS)
+
+
+class ImagePreprocess(PreprocessMediaFile):
+    def preprocess_control(self, path, size_bucket, index=0):
+        """Reference `index` (0: control_path) of a sample whose target has the size bucket (width, height, frames). The
+        first is cropped to the bucket, as the target is, so the edit stays aligned with it. The others are scaled within the
+        target's pixel area with their own aspect ratio, as ComfyUI sizes the images after the first. [3, H, W] in 0..1."""
+        if index == 0:
+            return self((None, path), None, size_bucket)[0][0]
+        return load_within_area(path, size_bucket[0] * size_bucket[1])[0].movedim(-1, 0)
 
 
 def edit_prompt(caption):
@@ -110,6 +131,8 @@ class PH3ImagePipeline(MinimaxH3Pipeline):
         self.is_video_vae = False
         self.edit_prompt_prefix = edit_prompt_prefix
 
+    max_control_images = MAX_REFERENCES
+
     def model_specific_dataset_config_validation(self, dataset_config):
         directories = dataset_config.get('directory', [])
         for where, config in [('the dataset', dataset_config)] + [(f"[[directory]] {d.get('path')}", d) for d in directories]:
@@ -117,9 +140,6 @@ class PH3ImagePipeline(MinimaxH3Pipeline):
             if any(f != 1 for f in frame_buckets):
                 raise ValueError(f'p_h3_image trains images only; frame_buckets must be [1], got {frame_buckets} in {where}')
         for directory in directories:
-            if any(k.startswith('control_path_') for k in directory):
-                raise ValueError('p_h3_image takes one reference image per sample (control_path); '
-                                 'several references (control_path_N) are not supported on this branch')
             # A dropped caption trains on the one cached empty-caption embedding, which has no
             # control image; ComfyUI never pairs that with a reference ("Edit <Picture 1>. " and
             # the image's vision tokens are what an empty edit prompt encodes to).
@@ -156,7 +176,7 @@ class PH3ImagePipeline(MinimaxH3Pipeline):
         self.diffusion_model.sigma_shift_audio = 1.0
 
     def get_preprocess_media_file_fn(self):
-        return PreprocessMediaFile(self.config, support_video=False, round_height=32, round_width=32)
+        return ImagePreprocess(self.config, support_video=False, round_height=32, round_width=32)
 
     def encode_images(self, images, vae=None):
         """[B, C, H, W] (or [B, C, 1, H, W]) pixels in 0..1 -> [B, 24, 1, h, w] latents. One image
@@ -173,13 +193,19 @@ class PH3ImagePipeline(MinimaxH3Pipeline):
     def vae_encode(self, img, vae=None):
         return self.encode_images(img, vae)
 
-    vae_latent_keys = ('latents', 'control_latents')
+    vae_latent_keys = ('latents',) + CONTROL_KEYS
 
     def get_call_vae_fn(self, vae):
         def fn(images, control_images=None):
+            """control_images: one list per sample of its reference images, [3, H, W] (or [3, 1, H, W]) each, sizes may
+            differ, or [B, 3, H, W] for one reference per sample. The latents are one list per reference, an entry per
+            sample."""
             result = {'latents': self.encode_images(images, vae)}
             if control_images is not None:
-                result['control_latents'] = self.encode_images(control_images, vae)
+                if torch.is_tensor(control_images):
+                    control_images = [[image] for image in control_images]
+                for n in range(len(control_images[0])):
+                    result[control_key(n)] = [self.encode_images(sample[n][None], vae)[0] for sample in control_images]
             return result
         return fn
 
@@ -192,7 +218,7 @@ class PH3ImagePipeline(MinimaxH3Pipeline):
                 raise ValueError('The text encoder is not the P-H3-Image one (Qwen3-VL-4B with its text connector)')
 
         @torch.inference_mode()
-        def fn(captions: list[str], is_video: list[bool], control_file: list[str] | None = None):
+        def fn(captions: list[str], is_video: list[bool], control_file: list[str | list[str]] | None = None):
             check_encoder()
             if any(is_video):
                 raise ValueError('p_h3_image trains images only')
@@ -205,12 +231,12 @@ class PH3ImagePipeline(MinimaxH3Pipeline):
             # Edit: one caption at a time with its control image, as ComfyUI encodes it. The vision
             # blocks of a batch differ in length, so the rows are a list.
             embeds, masks, tags = [], [], []
-            for caption, path in zip(captions, control_file):
-                images = []
-                if path is not None:
-                    images = [load_vision_image(path)]
-                    if self.edit_prompt_prefix:
-                        caption = edit_prompt(caption)
+            for caption, paths in zip(captions, control_file):
+                # one path, or the list of a sample's reference images
+                paths = [] if paths is None else [paths] if isinstance(paths, str) else list(paths)
+                images = [load_vision_image(path) for path in paths]
+                if images and self.edit_prompt_prefix:
+                    caption = edit_prompt(caption)
                 tokens = text_encoder.tokenize(caption, images=images)
                 cond, extra = text_encoder.encode_from_tokens_scheduled(tokens)[0]
                 assert cond.shape[0] == 1, cond.shape
@@ -268,15 +294,14 @@ class PH3ImagePipeline(MinimaxH3Pipeline):
 
         text_embeds, attention_mask, token_tags = self.get_conds(inputs)
         model_inputs = (noisy_latents, noisy_audio, valid_audio, t, text_embeds, attention_mask, token_tags)
-        control_latents = inputs.get('control_latents')
-        if control_latents is not None:
-            control_latents = control_latents.float()
-            if control_latents.shape != latents.shape:
-                raise ValueError(f'The control latents {tuple(control_latents.shape)} and the latents '
-                                 f'{tuple(latents.shape)} do not match')
-            # ComfyUI's visual condition noise augmentation.
-            ref = VISUAL_COND_TIMESTEP * control_latents + (1.0 - VISUAL_COND_TIMESTEP) * torch.randn_like(control_latents)
-            model_inputs = (*model_inputs, ref)
+        keys = [key for key in CONTROL_KEYS if key in inputs]
+        if keys:
+            # the first reference is the image to edit, cropped to the target's bucket
+            for i, control in enumerate(inputs['control_latents']):
+                if control.shape != latents[i].shape:
+                    raise ValueError(f'The control latents {tuple(control.shape)} and the latents '
+                                     f'{tuple(latents[i].shape)} do not match')
+            model_inputs = (*model_inputs, *pack_references([inputs[key] for key in keys], bs))
         return model_inputs, (target, mask)
 
     def get_loss_fn(self):
@@ -330,6 +355,6 @@ class PH3InitialLayer(InitialLayer):
     @torch.autocast('cuda', dtype=AUTOCAST_DTYPE)
     @torch.compiler.disable
     def forward(self, inputs):
-        # (video, audio, valid_audio, t, text, text mask, token tags[, reference latents])
+        # (video, audio, valid_audio, t, text, text mask, token tags[, reference patch rows, their latent sizes])
         video_x, audio_x, valid_audio, t, context, context_mask, token_tags, *ref = inputs
         return self.make_layer_inputs(video_x, audio_x, valid_audio, t, context, context_mask, token_tags, *ref)

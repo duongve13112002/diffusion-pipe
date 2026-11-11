@@ -3746,7 +3746,7 @@ def _cache_stage(datasets, queue, preprocess_media_file_fn, num_text_encoders, r
                 if own_size_controls:
                     # The model sizes each reference itself; the images of a batch may differ in size, so a
                     # sample's references are a list.
-                    control_tensors_and_masks.append([preprocess_control(file, size_bucket) for file in control_files])
+                    control_tensors_and_masks.append([preprocess_control(file, size_bucket, n) for n, file in enumerate(control_files)])
                 else:
                     control_items = preprocess_media_file_fn((None, control_files[0]), None, size_bucket)
                     assert len(control_items) == 1

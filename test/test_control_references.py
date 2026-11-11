@@ -26,7 +26,7 @@ from test_text_encoding_on_the_fly import (  # noqa: E402,F401
 class OwnSize(PreprocessMediaFile):
     """A reference at its file's own size, as a model that keeps them (minimax_h3_image) preprocesses it."""
 
-    def preprocess_control(self, path, size_bucket=None):
+    def preprocess_control(self, path, size_bucket=None, index=0):
         with Image.open(path) as img:
             width, height = img.size
         return self((None, path), None, (width, height, 1))[0][0]
@@ -86,6 +86,27 @@ def test_every_reference_reaches_the_vae_and_the_text_encoder(tmp_path, cache_te
         assert batch[key].shape == (3, *shape), key
     names = [Path(spec[1]).name for spec in batch['image_spec']]
     assert batch['control_names'] == [[f'ref1/{n}', f'ref2/{n}', f'ref3/{n}'] for n in names]
+
+
+def test_the_preprocessor_is_told_which_reference_it_is(tmp_path):
+    """A model sizes its first reference (control_path) and the further ones differently (p_h3_image: the first is cropped
+    to the target's bucket), so the preprocessor is given each one's index."""
+    seen = []
+
+    class Recording(OwnSize):
+        def preprocess_control(self, path, size_bucket=None, index=0):
+            seen.append((Path(path).parent.name, index))
+            return super().preprocess_control(path, size_bucket, index)
+
+    class RecordingModel(ReferenceModel):
+        def get_preprocess_media_file_fn(self):
+            return Recording({})
+
+    images = make_images(tmp_path / 'images', CAPTIONS[:3])
+    first = make_controls(tmp_path / 'ref1', 3, (32, 32))
+    second = make_controls(tmp_path / 'ref2', 3, (32, 32))
+    batches(RecordingModel(), dataset_config(images, control_path=str(first), control_path_2=str(second)))
+    assert set(seen) == {('ref1', 0), ('ref2', 1)}
 
 
 def test_a_missing_reference_file_is_named(tmp_path):

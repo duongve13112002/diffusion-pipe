@@ -191,8 +191,13 @@ class FinalLayer(nn.Module):
         return (self.norm(x[:, a:b]) * (1.0 + scale[:, row, None]) + shift[:, row, None]).to(torch.float32)
 
     def forward(self, x, t_emb, video_seg, audio_seg):
-        # video_seg / audio_seg: (start, stop, timestep_row) of the target streams
+        # video_seg / audio_seg: (start, stop, timestep_row) of the target streams; lists of them, one per sample, when
+        # the samples have references of different sizes before the target
         shift, scale = self.adaln_proj(t_emb)
+        if isinstance(video_seg, list):
+            def heads(head, segs):
+                return torch.cat([head(self.modulate(x[i:i + 1], shift[i:i + 1], scale[i:i + 1], seg)) for i, seg in enumerate(segs)])
+            return heads(self.video_out, video_seg), heads(self.audio_out, audio_seg)
         return (self.video_out(self.modulate(x, shift, scale, video_seg)),
                 self.audio_out(self.modulate(x, shift, scale, audio_seg)))
 
@@ -559,6 +564,42 @@ class MinimaxH3Pipeline(ComfyPipeline):
         self.offloader.prepare_block_devices_before_forward()
 
 
+def pack_references(references, bs):
+    """The references of a batch (for each reference a [B, 24, 1, h, w] tensor, or a list of B such latents of their own
+    sizes) -> ([B, R, 96] their noise-augmented patch rows one after the other, zero-padded to the longest sample,
+    [B, N, 2] their latent heights and widths)."""
+    samples = [[reference[i].float() for reference in references] for i in range(bs)]
+    rows = []
+    shapes = torch.zeros(bs, len(references), 2, dtype=torch.long, device=samples[0][0].device)
+    for i, sample in enumerate(samples):
+        parts = []
+        for n, latent in enumerate(sample):
+            # ComfyUI's visual condition noise augmentation.
+            latent = VISUAL_COND_TIMESTEP * latent + (1.0 - VISUAL_COND_TIMESTEP) * torch.randn_like(latent)
+            parts.append(patchify_video(latent[None]))
+            shapes[i, n] = torch.tensor(latent.shape[-2:], device=latent.device)
+        rows.append(torch.cat(parts))
+    packed = rows[0].new_zeros(bs, max(r.shape[0] for r in rows), rows[0].shape[1])
+    for i, r in enumerate(rows):
+        packed[i, :r.shape[0]] = r
+    return packed, shapes
+
+
+def pad_sequences(h_list, attention_mask_list, rope_freqs_list, segments_list):
+    """Samples whose references differ in size have sequences of different lengths: the shorter ones are padded at the
+    end (in place in the lists), with the rows masked out as keys, in a modulation segment of their own, with rotations
+    that do nothing."""
+    length = max(h.shape[0] for h in h_list)
+    for i, h in enumerate(h_list):
+        pad = length - h.shape[0]
+        if pad:
+            h_list[i] = torch.cat([h, h.new_zeros(pad, h.shape[1])])
+            attention_mask_list[i] = torch.cat([attention_mask_list[i], attention_mask_list[i].new_zeros(pad)])
+            identity = torch.eye(2, dtype=rope_freqs_list[i].dtype, device=h.device).expand(1, pad, 1, *rope_freqs_list[i].shape[3:])
+            rope_freqs_list[i] = torch.cat([rope_freqs_list[i], identity], dim=1)
+            segments_list[i] = torch.cat([segments_list[i], segments_list[i].new_tensor([[h.shape[0], length, 0]])])
+
+
 class InitialLayer(nn.Module):
     def __init__(self, model):
         super().__init__()
@@ -582,7 +623,10 @@ class InitialLayer(nn.Module):
     def __getattr__(self, name):
         return getattr(self.model[0], name)
 
-    def make_packed_sequence(self, video_x, audio_x, valid_audio, t, context, context_mask, token_tags=None, ref_latent=None):
+    def make_packed_sequence(self, video_x, audio_x, valid_audio, t, context, context_mask, token_tags=None,
+                            ref_rows=None, ref_shapes=None):
+        """ref_rows [1, R, 96]: the patch rows of the N reference images one after the other (zero-padded at the end),
+        ref_shapes [1, N, 2] the latent size of each; the padding is cut off here."""
         assert video_x.shape[0] == 1  # needs batch dimension with batch size 1
 
         if not valid_audio.item():
@@ -594,9 +638,11 @@ class InitialLayer(nn.Module):
             # per text token: 0 for the tokens of an image shown to the text encoder (they take the
             # video modulation), 1 for text
             payload["text_token_tags"] = token_tags.view(-1)
-        if ref_latent is not None:
-            # one reference image, packed after the text as ComfyUI's minimax_refs places it
-            payload["refs"] = [{"kind": "image", "latent_h": ref_latent.shape[-2], "latent_w": ref_latent.shape[-1]}]
+        if ref_rows is not None:
+            # the reference images, packed after the text in their order as ComfyUI's minimax_refs places them
+            sizes = ref_shapes[0].tolist()
+            payload["refs"] = [{"kind": "image", "latent_h": h, "latent_w": w} for h, w in sizes]
+            ref_rows = ref_rows[0, :sum(h // 2 * (w // 2) for h, w in sizes)].detach()
         device = video_x.device
         dtype = context.dtype  # compute dtype
 
@@ -667,9 +713,9 @@ class InitialLayer(nn.Module):
         audio_update = layout.audio_update.to(device)
         video_rows = patchify_video(video_x.to(torch.float32), self.patch_size)
         audio_rows = pack_audio(audio_x.to(torch.float32))
-        if ref_latent is not None:
+        if ref_rows is not None:
             # already noise-augmented by the pipeline (prepare_inputs)
-            cond_video_rows = patchify_video(ref_latent.to(torch.float32), self.patch_size)
+            cond_video_rows = ref_rows.to(torch.float32)
         else:
             cond_video_rows = self._cond_video_rows(payload, device)
         cond_audio_rows = self._cond_audio_rows(payload, device)
@@ -747,21 +793,18 @@ class InitialLayer(nn.Module):
     def make_layer_inputs(self, video_x, audio_x, valid_audio, t, context, context_mask, *extras):
         # extras: per-sample tensors make_packed_sequence takes after context_mask (token tags,
         # reference latents).
-        first_extra_ints = None
+        ints_list = []
         h_list, attention_mask_list, t_emb_list, rope_freqs_list, segments_list = [], [], [], [], []
         for items in zip(video_x, audio_x, valid_audio, t, context, context_mask, *extras):
             h, attention_mask, t_emb, mod_segments, rope_freqs, extra_ints = self.make_packed_sequence(*(x.unsqueeze(0) for x in items))
-            if first_extra_ints is None:
-                first_extra_ints = extra_ints
-            else:
-                # FinalLayer reads the target streams' spans and timestep rows of the last sample for all.
-                assert (extra_ints == first_extra_ints).all()
+            ints_list.append(extra_ints)
             segments_list.append(mod_segments)
             h_list.append(h)
             attention_mask_list.append(attention_mask)
             t_emb_list.append(t_emb)
             rope_freqs_list.append(rope_freqs)
 
+        pad_sequences(h_list, attention_mask_list, rope_freqs_list, segments_list)
         if all(s.shape == segments_list[0].shape and (s == segments_list[0]).all() for s in segments_list[1:]):
             mod_segments = segments_list[0]
         else:
@@ -778,6 +821,12 @@ class InitialLayer(nn.Module):
         t_emb = torch.stack(t_emb_list)
         # per sample: each sample's rope positions follow its own caption length
         rope_freqs = torch.cat(rope_freqs_list, dim=0)
+        # [video span, audio span, latent shape] of the first sample; the spans of the others follow when they differ
+        # (references of another size in front of the target): FinalLayer then reads one span per sample.
+        extra_ints = ints_list[0]
+        assert all(torch.equal(i[6:], extra_ints[6:]) for i in ints_list[1:]), 'the target of every sample has one size'
+        if any(not torch.equal(i[:6], extra_ints[:6]) for i in ints_list[1:]):
+            extra_ints = torch.cat([extra_ints, *(i[:6] for i in ints_list[1:])])
         outputs = make_contiguous(h, attention_mask, t_emb, mod_segments, rope_freqs, extra_ints)
         for item in outputs:
             if torch.is_floating_point(item):
@@ -850,13 +899,22 @@ class FinalLayer(nn.Module):
     def __getattr__(self, name):
         return getattr(self.model[0], name)
 
+    @staticmethod
+    def target_spans(extra_ints):
+        """(video span, audio span, (latent_t, lat_h, lat_w)) of extra_ints; the spans are lists, one per sample, when the
+        samples' differ."""
+        shape = extra_ints[6:9]
+        if extra_ints.shape[0] == 9:
+            return extra_ints[:3], extra_ints[3:6], shape
+        values = extra_ints.tolist()
+        spans = [values[:6]] + [values[i:i + 6] for i in range(9, len(values), 6)]
+        return [s[:3] for s in spans], [s[3:] for s in spans], shape
+
     @torch.autocast('cuda', dtype=AUTOCAST_DTYPE)
     @torch.compiler.disable
     def forward(self, inputs):
         h, attention_mask, t_emb, mod_segments, rope_freqs, extra_ints, *uncond_tensors = inputs
-        video_seg = extra_ints[:3]
-        audio_seg = extra_ints[3:6]
-        latent_t, lat_h, lat_w = extra_ints[6:]
+        video_seg, audio_seg, (latent_t, lat_h, lat_w) = self.target_spans(extra_ints)
 
         v, a = self.final_layer(h, t_emb, video_seg, audio_seg)
         video_out = unpatchify_video(v, latent_t, lat_h // 2, lat_w // 2, self.latents_dim, self.patch_size)
@@ -865,9 +923,7 @@ class FinalLayer(nn.Module):
         if len(uncond_tensors) > 0:
             assert self.cfg > 1
             h_uncond, attention_mask_uncond, mod_segments_uncond, rope_freqs_uncond, extra_ints_uncond = uncond_tensors
-            video_seg = extra_ints_uncond[:3]
-            audio_seg = extra_ints_uncond[3:6]
-            latent_t, lat_h, lat_w = extra_ints_uncond[6:]
+            video_seg, audio_seg, (latent_t, lat_h, lat_w) = self.target_spans(extra_ints_uncond)
             with torch.no_grad():
                 v_uncond, a_uncond = self.final_layer(h_uncond, t_emb, video_seg, audio_seg)
             video_out_uncond = unpatchify_video(v_uncond, latent_t, lat_h // 2, lat_w // 2, self.latents_dim, self.patch_size)

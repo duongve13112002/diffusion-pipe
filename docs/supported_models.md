@@ -890,7 +890,20 @@ See [examples/p_h3_image.toml](../examples/p_h3_image.toml) and its dataset.
   `Edit <Picture N>` or `subject_definitions:`; `edit_prompt_prefix = false` turns this off) and
   the control image shown to Qwen3-VL at most 1 MP. The control image's latent is the reference,
   noise-augmented to t = 0.999 as ComfyUI does. Its vision tokens take the image modulation, as in
-  ComfyUI. One reference per sample: `control_path_2` and further are refused.
+  ComfyUI.
+- Several pictures: `control_path_2`, `control_path_3`, ... up to `control_path_9` (ComfyUI's
+  `image_1` ... `image_9`; the prompt refers to them as `<Picture 2>`, ...). `control_path` is the
+  image to edit, cropped to the target's bucket so it stays aligned with the target; each further
+  picture is scaled within the target's pixel area with its own aspect ratio (down only, sides a
+  multiple of 32, lanczos), as ComfyUI sizes the images after the first, then packed after the text in
+  the order of the pictures. Every picture is also shown to Qwen3-VL at most 1 MP. The caption gets
+  `"Edit <Picture 1>. "` once. Samples of a batch may have pictures of different sizes: their sequences
+  are padded at the end and the padding is masked, which changes nothing in the others' output. A
+  directory has the same number of pictures for all its samples (a file missing from
+  `control_path_N` is an error naming it), and directories with another number are batched
+  separately. A directory with one `control_path` keeps its latent cache (the first picture is
+  encoded as before); one with `control_path_2` has its own cache, and `--trust_cache` with a metadata
+  cache scanned before `control_path_2` was added is refused with a message to scan again.
 - The model packs two audio latents with every image; they are noise at the image's sigma and
   have no loss, as in ComfyUI and ai-toolkit.
 - `shift`: the checkpoint samples at sigmas 1.0, 0.98, 0.97, 0.95, 0.93, 0.88, 0.81, 0.53, 0, so

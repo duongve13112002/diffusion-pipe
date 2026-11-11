@@ -69,13 +69,32 @@ def comfy_augmented(ref, seed=0):
     return out
 
 
+def pad_refs(samples):
+    """[[ref latent [24, 1, h, w], ...] per sample] as the layers take them: the patch rows of each sample's references one
+    after the other, zero-padded to the longest, and the references' latent sizes."""
+    from comfy.ldm.minimax.model import patchify_video
+    rows = [torch.cat([patchify_video(r[None]) for r in sample]) for sample in samples]
+    packed = torch.zeros(len(samples), max(r.shape[0] for r in rows), rows[0].shape[1])
+    for i, r in enumerate(rows):
+        packed[i, :r.shape[0]] = r
+    shapes = torch.tensor([[list(r.shape[-2:]) for r in sample] for sample in samples])
+    return packed, shapes
+
+
+def pack_refs(latents):
+    """[B, 24, 1, h, w] reference latents (one reference per sample) as the layers take them."""
+    return pad_refs([[latent] for latent in latents])
+
+
 def reference_forward(reference, video, audio, t, text, tags=None, ref=None):
+    """ref: a clean reference latent [1, 24, 1, h, w], or a list of them."""
     payload = {'seed': 0}
     if tags is not None:
         payload['text_token_tags'] = tags
     if ref is not None:
-        payload['refs'] = [{'kind': 'image', 'latent_h': ref.shape[-2], 'latent_w': ref.shape[-1]}]
-        payload['cond_video_latents'] = [ref]
+        refs = ref if isinstance(ref, list) else [ref]
+        payload['refs'] = [{'kind': 'image', 'latent_h': r.shape[-2], 'latent_w': r.shape[-1]} for r in refs]
+        payload['cond_video_latents'] = refs
     return reference([video, audio], t * 1000, text, transformer_options=dict(SHIFTS), minimax_payload=payload)
 
 
@@ -127,7 +146,7 @@ def test_edit_layers_match_comfyui(t):
     layers = ph3_pipeline(model).to_layers()
     lengths, vision = [9, 6], [(2, 4), (1, 2)]
     video, audio, valid, tt, text, mask, tags, ref, augmented = edit_inputs(lengths, vision, t)
-    inputs = (video, audio, valid, tt, text, mask, tags, augmented)
+    inputs = (video, audio, valid, tt, text, mask, tags, *pack_refs(augmented))
     first = layers[0](inputs)
     assert first[3].ndim == 3, 'the samples have different segments: one list per sample'
     actual_video, actual_audio = run_layers(layers, inputs)
@@ -144,12 +163,56 @@ def test_edit_layers_match_comfyui(t):
         assert p.grad is not None and torch.isfinite(p.grad).all(), name
 
 
+@pytest.mark.parametrize('t', [[0.3, 0.7], [0.3, 0.0005]], ids=['ordinary', 'sigma-below-ref-pin'])
+def test_several_references_of_other_sizes_match_comfyui(t):
+    """Three references per sample, of sizes that differ between the samples: the sequences differ in length, so the
+    shorter is padded (masked at the end), the target rows sit at another position and the final layer reads one span per
+    sample. Each sample is what ComfyUI gives it alone, with its pictures in order; the audio too."""
+    model, reference = tiny_pair()
+    layers = ph3_pipeline(model).to_layers()
+    g = torch.Generator().manual_seed(5)
+    # the first reference has the target's size; the others any
+    sizes = [[(4, 6), (6, 4), (2, 2)], [(4, 6), (2, 4), (2, 6)]]
+    clean = [[torch.randn(1, 24, 1, h, w, generator=g) for h, w in sample] for sample in sizes]
+    video, audio, valid, tt, text, mask, tags, _, _ = edit_inputs([9, 6], [(2, 4), (1, 2)], t)
+    inputs = (video, audio, valid, tt, text, mask, tags, *pad_refs([[comfy_augmented(r)[0] for r in sample] for sample in clean]))
+    first = layers[0](inputs)
+    assert first[3].ndim == 3 and first[5].shape[0] > 9, 'one span per sample reaches the final layer'
+    actual_video, actual_audio = run_layers(layers, inputs)
+    for i in range(2):
+        n = int(mask[i].sum())
+        expected_video, expected_audio = reference_forward(
+            reference, video[i:i + 1], audio[i:i + 1], tt[i:i + 1], text[i:i + 1, :n], tags[i, :n], clean[i])
+        assert_close(actual_video[i:i + 1], expected_video)
+        assert_close(actual_audio[i:i + 1], expected_audio)
+
+    model.zero_grad(set_to_none=True)
+    actual_video, _ = run_layers(layers, inputs)
+    actual_video.square().mean().backward()
+    for name, p in model.blocks.named_parameters():
+        assert p.grad is not None and torch.isfinite(p.grad).all(), name
+
+
+def test_the_padding_of_a_shorter_sequence_changes_nothing():
+    """The same sample alone and in a batch with a sample that has a longer reference: the same output."""
+    model, _ = tiny_pair()
+    layers = ph3_pipeline(model).to_layers()
+    g = torch.Generator().manual_seed(6)
+    short = [torch.randn(24, 1, LATENT_H, LATENT_W, generator=g), torch.randn(24, 1, 2, 4, generator=g)]
+    long = [torch.randn(24, 1, LATENT_H, LATENT_W, generator=g), torch.randn(24, 1, 6, 6, generator=g)]
+    video, audio, valid, t, text, mask, tags, _, _ = edit_inputs([7, 7], [(1, 3), (1, 3)], [0.4, 0.4])
+    both_video, both_audio = run_layers(layers, (video, audio, valid, t, text, mask, tags, *pad_refs([short, long])))
+    alone_video, alone_audio = run_layers(layers, (video[:1], audio[:1], valid[:1], t[:1], text[:1], mask[:1], tags[:1], *pad_refs([short])))
+    assert_close(both_video[:1], alone_video)
+    assert_close(both_audio[:1], alone_audio)
+
+
 def test_same_segments_stay_shared():
     """Samples whose segments agree keep one shared list (the batched modulation path)."""
     model, _ = tiny_pair()
     layers = ph3_pipeline(model).to_layers()
     video, audio, valid, t, text, mask, tags, _, augmented = edit_inputs([7, 5], [(1, 3), (1, 3)], [0.2, 0.0005])
-    first = layers[0]((video, audio, valid, t, text, mask, tags, augmented))
+    first = layers[0]((video, audio, valid, t, text, mask, tags, *pack_refs(augmented)))
     assert first[3].ndim == 2
 
 
@@ -158,8 +221,8 @@ def test_the_tags_change_the_output():
     model, _ = tiny_pair()
     layers = ph3_pipeline(model).to_layers()
     video, audio, valid, t, text, mask, tags, _, augmented = edit_inputs([7], [(1, 3)], [0.4])
-    with_tags, _ = run_layers(layers, (video, audio, valid, t, text, mask, tags, augmented))
-    without, _ = run_layers(layers, (video, audio, valid, t, text, mask, torch.ones_like(tags), augmented))
+    with_tags, _ = run_layers(layers, (video, audio, valid, t, text, mask, tags, *pack_refs(augmented)))
+    without, _ = run_layers(layers, (video, audio, valid, t, text, mask, torch.ones_like(tags), *pack_refs(augmented)))
     assert not torch.allclose(with_tags, without)
 
 
@@ -196,7 +259,14 @@ def test_images_are_encoded_one_at_a_time(monkeypatch):
     assert vae.batch_sizes == [1] * 6
     alone = pipe.latent_format.process_in(StubVAE().encode(images[2:3].movedim(1, -1)))
     assert_close(result['latents'][2:3], alone)
-    assert result['control_latents'].shape == (3, 24, 1, 4, 6)
+    assert [c.shape for c in result['control_latents']] == [(24, 1, 4, 6)] * 3
+    # several references per sample, of sizes of their own: one list of latents per reference
+    vae.batch_sizes.clear()
+    samples = [[images[i], torch.rand(3, 32, 64)] for i in range(3)]
+    result = pipe.get_call_vae_fn(vae)(images, samples)
+    assert vae.batch_sizes == [1] * 9
+    assert [c.shape for c in result['control_latents']] == [(24, 1, 4, 6)] * 3
+    assert [c.shape for c in result['control_latents_2']] == [(24, 1, 2, 4)] * 3
     # 5D input (a one-frame bucket) as the dataset hands it
     assert_close(pipe.encode_images(images[:, :, None], StubVAE()), result['latents'])
 
@@ -211,13 +281,16 @@ def test_prepare_inputs():
     tags = [tags_with_vision(n, 1, 1) for n in (5, 7, 2)]
     inputs = {'latents': latents, 'mask': None, 'control_latents': control, 'text_embeds_0': text,
               'attention_mask_0': [torch.ones(n, dtype=torch.int64) for n in (5, 7, 2)], 'token_tags_0': tags}
-    (noisy, noisy_audio, valid, t, text_embeds, attention_mask, token_tags, ref), (target, mask) = pipe.prepare_inputs(inputs)
+    (noisy, noisy_audio, valid, t, text_embeds, attention_mask, token_tags, rows, shapes), (target, mask) = pipe.prepare_inputs(inputs)
     assert noisy.shape == latents.shape and target.shape == latents.shape
     assert noisy_audio.shape == (bs, 32, 2, 2) and valid.all()
     assert text_embeds.shape == (bs, 7, 40) and attention_mask.dtype == torch.bool
     assert token_tags.tolist()[2] == [1, 0, 1, 1, 1, 1, 1], 'padding takes tag 1'
     # the reference keeps 99.9% of the clean latent
-    assert (ref - 0.999 * control).abs().max() < 0.01 and not torch.equal(ref, control)
+    from comfy.ldm.minimax.model import patchify_video
+    clean = torch.cat([patchify_video(c[None]) for c in control]).view(bs, -1, 96)
+    assert rows.shape == (bs, LATENT_H // 2 * (LATENT_W // 2), 96) and shapes.tolist() == [[[LATENT_H, LATENT_W]]] * bs
+    assert (rows - 0.999 * clean).abs().max() < 0.01 and not torch.equal(rows, clean)
     # the audio is silence noised at the image's sigma
     assert torch.allclose(noisy_audio.flatten(1).std(1), t, rtol=0.6)
     assert mask is None
@@ -228,6 +301,69 @@ def test_prepare_inputs():
         pipe.prepare_inputs({**inputs, 'latents': torch.randn(bs, 24, 2, LATENT_H, LATENT_W)})
     (*model_inputs,), _ = pipe.prepare_inputs({k: v for k, v in inputs.items() if k != 'control_latents'})
     assert len(model_inputs) == 7
+
+
+def test_prepare_inputs_packs_further_references_of_their_own_sizes():
+    torch.manual_seed(0)
+    pipe = ph3_pipeline(None, {'timestep_sample_method': 'uniform'})
+    bs = 2
+    latents = torch.randn(bs, 24, 1, LATENT_H, LATENT_W)
+    first = torch.randn(bs, 24, 1, LATENT_H, LATENT_W)
+    second = [torch.randn(24, 1, 2, 4), torch.randn(24, 1, 6, 2)]
+    third = torch.randn(bs, 24, 1, 2, 2)
+    inputs = {'latents': latents, 'mask': None, 'control_latents': first, 'control_latents_2': second,
+              'control_latents_3': third, 'text_embeds_0': [torch.randn(4, 40)] * bs,
+              'attention_mask_0': [torch.ones(4, dtype=torch.int64)] * bs, 'token_tags_0': [torch.ones(4, dtype=torch.long)] * bs}
+    (*_, rows, shapes), _ = pipe.prepare_inputs(inputs)
+    assert shapes.tolist() == [[[LATENT_H, LATENT_W], [2, 4], [2, 2]], [[LATENT_H, LATENT_W], [6, 2], [2, 2]]]
+    # patch rows: 6 + 2 + 1 for the first sample, 6 + 3 + 1 for the second (zero-padded to 10)
+    assert rows.shape == (bs, 10, 96) and rows[0, 9:].abs().max() == 0 and rows[0, :9].abs().min(dim=1).values.max() > 0
+    assert rows[1].abs().max() > 0
+    # the first reference must be the target's size; the others may be any
+    with pytest.raises(ValueError, match='do not match'):
+        pipe.prepare_inputs({**inputs, 'control_latents': first[..., :2]})
+
+
+def test_equal_references_keep_one_shared_span():
+    """References of one size: the same nine integers as without any, whatever the number of references."""
+    model, _ = tiny_pair()
+    layers = ph3_pipeline(model).to_layers()
+    video, audio, valid, t, text, mask, tags, _, _ = edit_inputs([7, 7], [(1, 3), (1, 3)], [0.4, 0.4])
+    one = torch.randn(2, 24, 1, LATENT_H, LATENT_W)
+    out = layers[0]((video, audio, valid, t, text, mask, tags, *pad_refs([[one[0], one[1]], [one[1], one[0]]])))
+    assert out[5].shape == (9,)
+
+
+def test_a_reference_is_sized_as_comfyui_sizes_it(tmp_path):
+    """The first reference is cropped to the target's bucket (aligned with it); the others are scaled within the target's pixel
+    area as PH3ImageConditioning scales every image, so their latents have the sizes of the node's reference blocks."""
+    from models.p_h3_image import ImagePreprocess
+    ns = _node_namespace()
+    preprocess = ImagePreprocess({}, support_video=False, round_height=32, round_width=32)
+    bucket = (640, 480, 1)
+    paths = [write_image(tmp_path / 'a.png', 800, 600, 0), write_image(tmp_path / 'b.png', 1920, 1080, 1),
+             write_image(tmp_path / 'c.png', 300, 700, 2), write_image(tmp_path / 'd.png', 200, 150, 3)]
+    refs = [preprocess.preprocess_control(path, bucket, n) for n, path in enumerate(paths)]
+    assert refs[0].shape == (3, 480, 640)
+    for n, path in enumerate(paths):
+        clip = types.SimpleNamespace(tokenize=lambda *a, **k: None, encode_from_tokens_scheduled=lambda *a: [[None, {}]])
+        (cond, _) = ns['execute'](None, clip, 'x', 640, 480, vae=NodeVAE(), images={'image_1': load_comfy_image(path)})
+        block = cond[0][1]['minimax_refs'][0]
+        height, width = refs[n].shape[-2:]
+        assert (block['latent_h'], block['latent_w']) == (height // 16, width // 16), n
+    for n in (1, 2, 3):
+        assert refs[n].ndim == 3 and refs[n].shape[0] == 3 and 0 <= refs[n].min() and refs[n].max() <= 1
+        assert refs[n].shape[1] * refs[n].shape[2] <= 640 * 480
+
+
+def test_the_model_takes_nine_pictures():
+    """ComfyUI's PH3ImageConditioning has image_1 ... image_9: control_path and control_path_2 ... control_path_9."""
+    from models.p_h3_image import PH3ImagePipeline
+    assert PH3ImagePipeline.max_control_images == 9
+    assert PH3ImagePipeline.vae_latent_keys == ('latents', 'control_latents', *(f'control_latents_{n}' for n in range(2, 10)))
+    pipe = ph3_pipeline(None)
+    pipe.model_specific_dataset_config_validation({'directory': [
+        {'path': 'x', 'control_path': 'c', **{f'control_path_{n}': 'd' for n in range(2, 10)}}]})
 
 
 def test_the_loss_ignores_the_audio():
@@ -263,7 +399,6 @@ def test_the_text_encoder_must_be_the_minimax_one(text_encoders):
 @pytest.mark.parametrize('dataset, match', [
     ({'frame_buckets': [1, 33]}, 'images only'),
     ({'directory': [{'path': 'x', 'frame_buckets': [1, 33]}]}, r'images only.*\[\[directory\]\] x'),
-    ({'directory': [{'path': 'x', 'control_path': 'c', 'control_path_2': 'd'}]}, 'control_path_N'),
     ({'directory': [{'path': 'x', 'control_path': 'c', 'caption_dropout_rate': 0.1}]}, 'caption_dropout_rate in it'),
     ({'caption_dropout_rate': 0.1, 'directory': [{'path': 'x', 'control_path': 'c'}]}, 'the dataset caption_dropout_rate'),
 ])
@@ -437,6 +572,32 @@ def test_edit_captions_are_encoded_as_comfyui_encodes_them(tiny_clip, tmp_path, 
         assert unprefixed['text_embeds_0'][0].shape[0] < result['text_embeds_0'][0].shape[0]
 
 
+def test_several_pictures_are_encoded_as_comfyui_encodes_them(tiny_clip, tmp_path):
+    """control_path then control_path_2, ...: the node's image_1, image_2, ... In ComfyUI the prompt gets "Edit <Picture 1>. "
+    once, every picture is shown at <= 1 MP and labelled in order."""
+    ns = _node_namespace()
+    pipe = te_pipeline(tiny_clip)
+    fn = pipe.get_call_text_encoder_fn(tiny_clip)
+    pictures = [
+        [write_image(tmp_path / 'a1.png', 1280, 960, 0), write_image(tmp_path / 'a2.png', 200, 320, 1)],
+        [write_image(tmp_path / 'b1.png', 320, 320, 2), write_image(tmp_path / 'b2.png', 1500, 1100, 3), write_image(tmp_path / 'b3.png', 64, 64, 4)],
+    ]
+    caption = 'put the cat from picture 2 on the sofa'
+    result = fn([caption, caption], [False, False], pictures)
+    for i, paths in enumerate(pictures):
+        images = {f'image_{k + 1}': load_comfy_image(path) for k, path in enumerate(paths)}
+        (cond, _) = ns['execute'](None, tiny_clip, caption, 0, 0, vae=NodeVAE(), images=images)
+        expected, extra = cond[0]
+        assert_close(result['text_embeds_0'][i], expected[0])
+        assert torch.equal(result['token_tags_0'][i], extra['minimax_token_tags'].long())
+    # the same sample with one picture or a string path is the single-image encoding
+    single = fn([caption], [False], [pictures[0][0]])
+    as_list = fn([caption], [False], [[pictures[0][0]]])
+    assert_close(single['text_embeds_0'][0], as_list['text_embeds_0'][0])
+    # more pictures, more vision tokens
+    assert result['token_tags_0'][1].eq(0).sum() > single['token_tags_0'][0].eq(0).sum() - 1
+
+
 def test_text_to_image_captions_are_batched(tiny_clip):
     """Without control images the captions are encoded together, padded; each row's real tokens
     are the caption encoded alone (as the node encodes it), its tags all 1."""
@@ -469,7 +630,10 @@ def _step_inputs():
     lengths, vision = [9, 6], [(2, 4), (1, 2)]
     video, audio, valid, t, text, mask, tags, _, augmented = edit_inputs(lengths, vision, [0.3, 0.0005], seed=3)
     target = torch.randn(video.shape, generator=torch.Generator().manual_seed(5))
-    return (video, audio, valid, t, text, mask, tags, augmented), (target, None)
+    # a second picture of another size per sample: the sequences differ in length and the final layer reads one span each
+    g = torch.Generator().manual_seed(7)
+    second = [comfy_augmented(torch.randn(1, 24, 1, h, w, generator=g))[0] for h, w in ((2, 4), (6, 2))]
+    return (video, audio, valid, t, text, mask, tags, *pad_refs([[a, b] for a, b in zip(augmented, second)])), (target, None)
 
 
 def _trained_weights(model):
@@ -537,7 +701,7 @@ def _engine_worker(rank, world_size, num_stages, init_file, out_dir):
 @pytest.mark.parametrize('world_size, num_stages', [(2, 2), (2, 1)], ids=['pp2', 'dp2'])
 def test_a_training_step_through_the_pipeline_engine(world_size, num_stages, tmp_path):
     """The P-H3-Image layers split over pipeline stages pass their tensors (the per-sample adaLN
-    segments, the token tags, the reference latents) from stage to stage and step as one
+    segments, the token tags, two pictures of other sizes per sample, padded) from stage to stage and step as one
     process does; with data parallelism every rank steps on the same gradient."""
     mp.spawn(_engine_worker, args=(world_size, num_stages, str(tmp_path / 'init'), str(tmp_path)), nprocs=world_size)
     expected = _expected_weights()
