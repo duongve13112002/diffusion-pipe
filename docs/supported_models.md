@@ -804,12 +804,20 @@ dtype = 'bfloat16'
 See [examples/minimax_h3_image.toml](../examples/minimax_h3_image.toml) and its dataset.
 
 - Text to image: images and captions, as for any model.
-- Editing: a dataset directory with `control_path` (the image to edit, same file name as the target) and the
-  instruction as caption. As ComfyUI's MiniMax H3 Image Conditioning node encodes it: `"Picture 1: "` and the control
-  image (short edge 1024, sides a multiple of 32) in front of the caption, whose vision tokens take the image
-  modulation. The control image's latent is the reference, noise-augmented to t = 0.999 and pinned there. One
-  reference per sample: `control_path_2` and further are refused for now (ComfyUI takes several; this needs
-  dataset support).
+- Editing: a dataset directory with `control_path` (a reference image, same file name as the target) and the
+  instruction as caption; `control_path_2`, `control_path_3`, ... (up to 16 in all, no gaps) add further references, which
+  the caption names `<Picture 1>`, `<Picture 2>`, ... in that order. As ComfyUI's MiniMax H3 Image Conditioning node
+  encodes it: `"Picture 1: "`, `"Picture 2: "`, ... and the images (short edge 1024, sides a multiple of 32) in front of
+  the caption, whose vision tokens take the image modulation. Each reference's latent is encoded at the reference's own
+  size, as ComfyUI and AI Toolkit do (short edge between 1024 and 2048, its own aspect ratio, sides a multiple of 32;
+  not cropped or shrunk to the target's bucket, so a small training bucket still gets references of the size the model
+  sees at inference), packed after the text in the order of the pictures, noise-augmented to t = 0.999 and pinned there.
+  A reference below 1024 on its short edge is scaled up. Samples of a batch may have references of different sizes: their
+  sequences are padded at the end and the padding is masked, which changes nothing in the others' output. A directory
+  has the same number of references for all its samples (a file missing from `control_path_N` is an error naming it), and
+  directories with another number of references are batched separately.
+- The latent cache of an edit directory holds the references at their own size (identity `references=own_size`): a cache
+  made before this, with references at the target's size, is rebuilt.
 - Heads: head 0 of the bank is the trainable weight; every other head of a checkpoint is head 0 plus a fixed offset
   (measured on the released heads: the offsets are 2% of head 0's norm for the weight, 8% for the bias), so a full
   fine-tune moves all six together and the export stacks them again. A LoRA leaves the heads alone. `--test_sample`
@@ -836,9 +844,8 @@ See [examples/minimax_h3_image.toml](../examples/minimax_h3_image.toml) and its 
   merged, so the previews run with it on.
 - Resolution: AI Toolkit notes the model is tuned for 4 MP to 20 MP outputs (2048x2048 and up) and shows more artifacts
   below that. Training at 1024 is faster but may not reproduce that quality.
-- Reference size: ComfyUI and AI Toolkit encode a reference at its own size (short edge between 1024 and 2048); here the
-  control image's latent is the target's size (the bucket), so with buckets below 1024 the reference is smaller than at
-  inference.
+- A long reference sequence costs memory: a reference with a 1024 short edge is 1024 tokens (2048: 4096), per picture,
+  on top of the target's, so several large references need `[fp8_training]`, block swap or smaller buckets.
 - `save_dtype` leaves the output heads, the patch projection and the time embedder in float32 (the checkpoint's float32
   islands; rounding head 0 would move every head).
 - Per-component learning rates (`blocks_lr`, `token_refiner_lr`, and for a full fine-tune `text_projection_lr`,

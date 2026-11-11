@@ -1,6 +1,7 @@
 from pathlib import Path
 import os.path
 import random
+import re
 from collections import OrderedDict, defaultdict, deque
 import math
 import os
@@ -133,6 +134,34 @@ def _files_by_stem(directory):
     in the order Path.glob('*') lists them."""
     with os.scandir(directory) as entries:
         return {Path(entry.name).stem: directory / entry.name for entry in entries if _is_file(entry)}
+
+
+def extra_control_paths(directory_config):
+    """The directories of control_path_2, control_path_3, ... in order (a directory's further reference images,
+    which a model that takes several reads). They continue control_path without gaps."""
+    numbered = {}
+    for key in directory_config:
+        match = re.fullmatch(r'control_path_(\d+)', key)
+        if match:
+            numbered[int(match.group(1))] = Path(directory_config[key])
+    if not numbered:
+        return []
+    if 'control_path' not in directory_config:
+        raise ValueError(f"control_path_{min(numbered)} needs control_path: the first reference image is control_path, "
+                         f"then control_path_2, control_path_3, ...")
+    missing = [n for n in range(2, max(numbered) + 1) if n not in numbered]
+    if 1 in numbered or 0 in numbered or missing:
+        raise ValueError('the reference images are control_path, control_path_2, control_path_3, ... without gaps '
+                         f'(and no control_path_0 or control_path_1); this directory has control_path_{sorted(numbered)}')
+    return [numbered[n] for n in range(2, max(numbered) + 1)]
+
+
+def text_encoder_control_files(row):
+    """What a text encoder is given for a metadata row: its control image's path, or the list of all its reference
+    images' paths when the directory has more than one (None without any)."""
+    first = row.get('control_file')
+    extras = row.get('control_extra_file')
+    return first if not extras else [first, *extras]
 
 
 def shuffle_with_seed(l, seed=None):
@@ -1547,7 +1576,7 @@ class SizeBucketDataset:
                 # are cached row for row with the metadata.
                 row = self.metadata_dataset[int(entry['latents_idx'])]
                 assert tuple(row['image_spec']) == tuple(entry['image_spec']), (row['image_spec'], entry['image_spec'])
-                ret[IS_VIDEO_KEY], ret[CONTROL_FILE_KEY] = row['is_video'], row.get('control_file')
+                ret[IS_VIDEO_KEY], ret[CONTROL_FILE_KEY] = row['is_video'], text_encoder_control_files(row)
         return ret
 
     def __len__(self):
@@ -2069,6 +2098,7 @@ class DirectoryDataset:
         self.path = Path(self.directory_config['path'])
         self.mask_path = Path(self.directory_config['mask_path']) if 'mask_path' in self.directory_config else None
         self.control_path = Path(self.directory_config['control_path']) if 'control_path' in self.directory_config else None
+        self.control_extra_paths = extra_control_paths(self.directory_config)
         # For testing. Default if a mask is missing.
         self.default_mask_file = Path(self.directory_config['default_mask_file']) if 'default_mask_file' in self.directory_config else None
         self.cache_dir = self.path / 'cache' / self.model_name
@@ -2165,6 +2195,9 @@ class DirectoryDataset:
             raise RuntimeError(f'Invalid mask_path: {self.mask_path}')
         if self.control_path is not None and (not self.control_path.exists() or not self.control_path.is_dir()):
             raise RuntimeError(f'Invalid control_path: {self.control_path}')
+        for number, extra in enumerate(self.control_extra_paths, 2):
+            if not extra.exists() or not extra.is_dir():
+                raise RuntimeError(f'Invalid control_path_{number}: {extra}')
         if self.default_mask_file is not None and (not self.default_mask_file.exists() or not self.default_mask_file.is_file()):
             raise RuntimeError(f'Invalid default_mask_file: {self.default_mask_file}')
 
@@ -2284,6 +2317,9 @@ class DirectoryDataset:
                 'framerate': self.framerate if framerate is _OWN else framerate,
                 'mask_path': str(self.mask_path), 'control_path': str(self.control_path),
                 'default_mask_file': str(self.default_mask_file), 'shuffle': self.shuffle_metadata}
+        if self.control_extra_paths:
+            # Only when there are some: the geometry (and so the snapshot) of every other directory stays.
+            geometry['control_extra_paths'] = [str(path) for path in self.control_extra_paths]
         if self.use_size_buckets and not self.size_buckets_matched_before:
             # A snapshot of these size buckets from before the matching fix has media in the
             # wrong buckets, or none at all: make a new one.
@@ -2384,7 +2420,7 @@ class DirectoryDataset:
                 if self.use_size_buckets
                 else self.ars is not None and old['ar_bucket'] is not None and old['ar_bucket'][0] in self.ars
                 and old['ar_bucket'][1] in self.frame_buckets)
-            if compatible and all(old.get(k) == row.get(k) for k in ('mask_file', 'control_file')):
+            if compatible and all(old.get(k) == row.get(k) for k in ('mask_file', 'control_file', 'control_extra_file')):
                 result = old
                 result['caption'] = captions or ['']
             else:
@@ -2803,6 +2839,7 @@ class DirectoryDataset:
             # Mask can have any extension, it just needs to have the same stem as the image.
             mask_file_stems = _files_by_stem(self.mask_path) if self.mask_path is not None else {}
             control_file_stems = _files_by_stem(self.control_path) if self.control_path is not None else {}
+            control_extra_stems = [_files_by_stem(path) for path in self.control_extra_paths]
 
             def process_file(file):
                 if file.suffix != '.tar':
@@ -2817,6 +2854,7 @@ class DirectoryDataset:
             caption_files = []
             mask_files = []
             control_files = []
+            control_extra_files = []
             for file in tqdm(files):
                 for image_spec in process_file(file):
                     image_file = Path(image_spec[1])
@@ -2841,11 +2879,19 @@ class DirectoryDataset:
                         if image_file.stem not in control_file_stems:
                             raise RuntimeError(f'No control file exists for image {image_file}')
                         control_files.append(str(control_file_stems[image_file.stem]))
+                        extras = []
+                        for number, stems in enumerate(control_extra_stems, 2):
+                            if image_file.stem not in stems:
+                                raise RuntimeError(f'No control_path_{number} file exists for image {image_file}')
+                            extras.append(str(stems[image_file.stem]))
+                        control_extra_files.append(extras)
             assert len(image_specs) > 0, f'Directory {self.path} had no images/videos!'
 
             d = {'image_spec': image_specs, 'caption_file': caption_files, 'mask_file': mask_files}
             if self.control_path:
                 d['control_file'] = control_files
+                if self.control_extra_paths:
+                    d['control_extra_file'] = control_extra_files
             metadata_dataset = datasets.Dataset.from_dict(d)
 
             if captions_json.exists():
@@ -2931,6 +2977,8 @@ class DirectoryDataset:
             empty_return = {'image_spec': [], 'mask_file': [], 'caption': [], 'ar_bucket': [], 'size_bucket': [], 'is_video': []}
             if self.control_path:
                 empty_return['control_file'] = []
+                if self.control_extra_paths:
+                    empty_return['control_extra_file'] = []
             # batch size always 1
             caption_file = example['caption_file'][0]
             image_spec = example['image_spec'][0]
@@ -3052,6 +3100,8 @@ class DirectoryDataset:
             }
             if self.control_path:
                 ret['control_file'] = [example['control_file'][0]]
+                if self.control_extra_paths:
+                    ret['control_extra_file'] = [example['control_extra_file'][0]]
             return ret
 
         return fn
@@ -3241,6 +3291,13 @@ class Dataset:
             dataset_config, batch_fill_defaults, batch_fill_overrides)
         if not skip_dataset_validation:
             self.model.model_specific_dataset_config_validation(self.dataset_config)
+            max_controls = getattr(self.model, 'max_control_images', 1)
+            for directory_config in dataset_config.get('directory', []):
+                extras = [key for key in directory_config if re.fullmatch(r'control_path_\d+', key)]
+                if extras and max_controls == 1:
+                    raise ValueError(f"{', '.join(sorted(extras))} in the directory {directory_config.get('path')}: "
+                                     f"{self.model_name} takes one control image per sample (control_path)")
+                extra_control_paths(directory_config)
 
         on_the_fly_media = None
         if getattr(self.model, 'load_media_on_the_fly', False):
@@ -3291,13 +3348,13 @@ class Dataset:
         global_batch_size_image = {size: bs * gradient_accumulation_steps * self.data_parallel_world_size for size, bs in per_device_batch_size_image.items()}
 
         # Group same size_bucket together, but never directories with control images (edit) with
-        # directories without: a batch is collated by the keys of its first example, so a mixed
-        # batch either failed on control_latents or dropped them for every sample.
+        # directories without, or with another number of them: a batch is collated by the keys of its
+        # first example, so a mixed batch either failed on control_latents or dropped them for every sample.
         datasets_by_size_bucket = defaultdict(list)
         for directory_dataset in self.directory_datasets:
-            has_control = getattr(directory_dataset, 'control_path', None) is not None
+            controls = (getattr(directory_dataset, 'control_path', None) is not None) + len(getattr(directory_dataset, 'control_extra_paths', ()))
             for size_bucket_dataset in directory_dataset.get_size_bucket_datasets():
-                datasets_by_size_bucket[(size_bucket_dataset.size_bucket, has_control)].append(size_bucket_dataset)
+                datasets_by_size_bucket[(size_bucket_dataset.size_bucket, controls)].append(size_bucket_dataset)
         self.buckets = []
         for datasets in datasets_by_size_bucket.values():
             self.buckets.append(ConcatenatedBatchedDataset(datasets))
@@ -3633,6 +3690,9 @@ def _cache_stage(datasets, queue, preprocess_media_file_fn, num_text_encoders, r
 
     pipes = {}
 
+    preprocess_control = getattr(preprocess_media_file_fn, 'preprocess_control', None)
+    own_size_controls = preprocess_control is not None
+
     def latents_map_fn(example, rank):
         is_edit_dataset = ('control_file' in example)
         first_size_bucket = example['size_bucket'][0]
@@ -3649,11 +3709,18 @@ def _cache_stage(datasets, queue, preprocess_media_file_fn, num_text_encoders, r
             image_specs.extend([image_spec] * len(items))
             captions.extend([caption] * len(items))
             if is_edit_dataset:
-                control_file = example['control_file'][i]
-                control_items = preprocess_media_file_fn((None, control_file), None, size_bucket)
-                assert len(control_items) == 1
                 assert len(items) == 1
-                control_tensors_and_masks.append(control_items[0])
+                control_files = [example['control_file'][i]]
+                if 'control_extra_file' in example:
+                    control_files += example['control_extra_file'][i]
+                if own_size_controls:
+                    # The model sizes each reference itself; the images of a batch may differ in size, so a
+                    # sample's references are a list.
+                    control_tensors_and_masks.append([preprocess_control(file, size_bucket) for file in control_files])
+                else:
+                    control_items = preprocess_media_file_fn((None, control_files[0]), None, size_bucket)
+                    assert len(control_items) == 1
+                    control_tensors_and_masks.append(control_items[0])
             else:
                 control_tensors_and_masks.append(None)
 
@@ -3665,7 +3732,12 @@ def _cache_stage(datasets, queue, preprocess_media_file_fn, num_text_encoders, r
         results = defaultdict(list)
         for i in range(0, len(tensors_and_masks), caching_batch_size):
             tensor = torch.stack([t[0] for t in tensors_and_masks[i:i+caching_batch_size]])
-            c_tensor = torch.stack([t[0] for t in control_tensors_and_masks[i:i+caching_batch_size]]) if is_edit_dataset else None
+            if not is_edit_dataset:
+                c_tensor = None
+            elif own_size_controls:
+                c_tensor = control_tensors_and_masks[i:i+caching_batch_size]
+            else:
+                c_tensor = torch.stack([t[0] for t in control_tensors_and_masks[i:i+caching_batch_size]])
             audio_list = [t[1] for t in tensors_and_masks[i:i+caching_batch_size]]  # needs to be list because any example's audio could be None
             if rank not in pipes:
                 pipes[rank] = mp.Pipe(duplex=False)
@@ -3691,7 +3763,12 @@ def _cache_stage(datasets, queue, preprocess_media_file_fn, num_text_encoders, r
             if rank not in pipes:
                 pipes[rank] = mp.Pipe(duplex=False)
             parent_conn, child_conn = pipes[rank]
-            control_file = example['control_file'] if 'control_file' in example else None
+            control_file = None
+            if 'control_file' in example:
+                control_file = example['control_file']
+                if 'control_extra_file' in example:
+                    control_file = [text_encoder_control_files({'control_file': first, 'control_extra_file': extras})
+                                    for first, extras in zip(control_file, example['control_extra_file'])]
             queue.put((text_encoder_idx+1, example['caption'], example['is_video'], control_file, child_conn))
             result = parent_conn.recv()  # dict
             result['image_spec'] = example['image_spec']

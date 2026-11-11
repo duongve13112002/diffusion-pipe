@@ -79,6 +79,12 @@ def reference_forward(reference, video, t, text, tags=None, ref=None, sample_sig
     return reference(video, t * 1000, text, transformer_options=options, minimax_payload=payload)
 
 
+def pack_refs(latents):
+    """[B, 24, 1, h, w] reference latents (one reference per sample) as the layers take them: [B, 1, 24, 1, h, w] and
+    their latent sizes."""
+    return latents[:, None], torch.tensor([latents.shape[-2:]] * latents.shape[0])[:, None]
+
+
 def image_inputs(lengths, vision, t, seed=1):
     """Batch of samples: captions of `lengths` tokens whose vision block is vision[i] = (start, length), padded to the
     longest; reference latents clean and noise-augmented as prepare_inputs makes them."""
@@ -124,7 +130,7 @@ def test_edit_layers_match_comfyui(t):
     model, reference = tiny_pair()
     layers = image_pipeline(model).to_layers()
     video, tt, text, mask, tags, ref, augmented = image_inputs([9, 6], [(2, 4), (1, 2)], t)
-    inputs = (video, tt, text, mask, tags, augmented)
+    inputs = (video, tt, text, mask, tags, *pack_refs(augmented))
     assert layers[0](inputs)[3].ndim == 3, 'the samples have different segments: one list per sample'
     actual = run_layers(layers, inputs)
     assert_close(actual, expected_outputs(reference, video, tt, text, mask, tags, ref))
@@ -136,19 +142,74 @@ def test_edit_layers_match_comfyui(t):
     assert model.final_layer.video_out.weight.grad is not None
 
 
+def pad_refs(samples):
+    """[[ref latent [24, 1, h, w], ...] per sample] as the layers take them: zero-padded to the largest, and their sizes."""
+    height = max(r.shape[-2] for sample in samples for r in sample)
+    width = max(r.shape[-1] for sample in samples for r in sample)
+    packed = torch.zeros(len(samples), len(samples[0]), 24, 1, height, width)
+    shapes = torch.zeros(len(samples), len(samples[0]), 2, dtype=torch.long)
+    for i, sample in enumerate(samples):
+        for n, r in enumerate(sample):
+            packed[i, n, :, :, :r.shape[-2], :r.shape[-1]] = r
+            shapes[i, n] = torch.tensor(r.shape[-2:])
+    return packed, shapes
+
+
+@pytest.mark.parametrize('t', [[0.3, 0.7], [0.3, 0.0005]], ids=['ordinary', 'sigma-below-ref-pin'])
+def test_several_references_of_other_sizes_match_comfyui(t):
+    """Two references per sample, of sizes that differ between the samples: their sequences differ in length, so the
+    shorter is padded (masked at the end) and the target rows sit at another position. Each sample is what ComfyUI
+    gives it alone, with its pictures in order."""
+    model, reference = tiny_pair()
+    layers = image_pipeline(model).to_layers()
+    g = torch.Generator().manual_seed(5)
+    sizes = [[(4, 6), (6, 4)], [(2, 4), (4, 2)]]
+    clean = [[torch.randn(1, 24, 1, h, w, generator=g) for h, w in sample] for sample in sizes]
+    video, tt, text, mask, tags, _, _ = image_inputs([9, 6], [(2, 4), (1, 2)], t)
+    inputs = (video, tt, text, mask, tags, *pad_refs([[comfy_augmented(r)[0] for r in sample] for sample in clean]))
+    out = layers[0](inputs)
+    assert out[0].shape[1] == 9 + 12 + 6 and out[3].ndim == 3, 'the longer sample sets the length'
+    expected = []
+    for i in range(2):
+        n = int(mask[i].sum())
+        payload = {'seed': 0, 'text_token_tags': tags[i, :n],
+                   'refs': [{'kind': 'image', 'latent_h': r.shape[-2], 'latent_w': r.shape[-1]} for r in clean[i]],
+                   'cond_video_latents': clean[i]}
+        expected.append(reference(video[i:i + 1], tt[i:i + 1] * 1000, text[i:i + 1, :n], transformer_options={}, minimax_payload=payload))
+    assert_close(run_layers(layers, inputs), torch.cat(expected))
+
+    model.zero_grad(set_to_none=True)
+    run_layers(layers, inputs).square().mean().backward()
+    for name, p in model.blocks.named_parameters():
+        assert p.grad is not None and torch.isfinite(p.grad).all(), name
+
+
+def test_the_padding_of_a_shorter_sequence_changes_nothing():
+    """The same sample alone and in a batch with a sample that has a longer reference: the same output."""
+    model, _ = tiny_pair()
+    layers = image_pipeline(model).to_layers()
+    g = torch.Generator().manual_seed(6)
+    short = [torch.randn(24, 1, 2, 4, generator=g)]
+    long = [torch.randn(24, 1, 6, 6, generator=g)]
+    video, t, text, mask, tags, _, _ = image_inputs([7, 7], [(1, 3), (1, 3)], [0.4, 0.4])
+    both = run_layers(layers, (video, t, text, mask, tags, *pad_refs([short, long])))
+    alone = run_layers(layers, (video[:1], t[:1], text[:1], mask[:1], tags[:1], *pad_refs([short])))
+    assert_close(both[:1], alone)
+
+
 def test_same_segments_stay_shared():
     model, _ = tiny_pair()
     layers = image_pipeline(model).to_layers()
     video, t, text, mask, tags, _, augmented = image_inputs([7, 5], [(1, 3), (1, 3)], [0.2, 0.0005])
-    assert layers[0]((video, t, text, mask, tags, augmented))[3].ndim == 2
+    assert layers[0]((video, t, text, mask, tags, *pack_refs(augmented)))[3].ndim == 2
 
 
 def test_the_tags_change_the_output():
     model, _ = tiny_pair()
     layers = image_pipeline(model).to_layers()
     video, t, text, mask, tags, _, augmented = image_inputs([7], [(1, 3)], [0.4])
-    with_tags = run_layers(layers, (video, t, text, mask, tags, augmented))
-    without = run_layers(layers, (video, t, text, mask, torch.ones_like(tags), augmented))
+    with_tags = run_layers(layers, (video, t, text, mask, tags, *pack_refs(augmented)))
+    without = run_layers(layers, (video, t, text, mask, torch.ones_like(tags), *pack_refs(augmented)))
     assert not torch.allclose(with_tags, without)
 
 
@@ -156,7 +217,7 @@ def test_the_reference_changes_the_output():
     model, _ = tiny_pair()
     layers = image_pipeline(model).to_layers()
     video, t, text, mask, tags, _, augmented = image_inputs([7], [(1, 3)], [0.4])
-    with_ref = run_layers(layers, (video, t, text, mask, tags, augmented))
+    with_ref = run_layers(layers, (video, t, text, mask, tags, *pack_refs(augmented)))
     without = run_layers(layers, (video, t, text, mask, tags))
     assert not torch.allclose(with_ref, without)
 
@@ -190,7 +251,7 @@ def test_the_head_split_keeps_every_head():
     for head in range(3):
         pipe.final_layer_module.head = head
         t_head = torch.full((2,), SIGMAS[3][head])
-        actual = run_layers(layers, (video, t_head, text, mask, tags, augmented))
+        actual = run_layers(layers, (video, t_head, text, mask, tags, *pack_refs(augmented)))
         assert_close(actual, expected_outputs(reference, video, t_head, text, mask, tags, ref, sample_sigmas=SIGMAS[3]), atol=2e-5)
         outputs.append(actual)
     # the heads differ, or the loop above proves nothing
@@ -619,7 +680,9 @@ def test_prepare_inputs():
               'text_embeds_0': [torch.randn(n, 40) for n in lengths],
               'attention_mask_0': [torch.ones(n, dtype=torch.int64) for n in lengths],
               'token_tags_0': [tags_with_vision(n, 1, 1) for n in lengths]}
-    (noisy, t, text_embeds, attention_mask, token_tags, ref), (target, mask) = pipe.prepare_inputs(inputs)
+    (noisy, t, text_embeds, attention_mask, token_tags, refs, ref_shapes), (target, mask) = pipe.prepare_inputs(inputs)
+    ref = refs[:, 0]
+    assert refs.shape == (bs, 1, 24, 1, LATENT_H, LATENT_W) and ref_shapes.tolist() == [[[LATENT_H, LATENT_W]]] * bs
     assert noisy.shape == latents.shape and target.shape == latents.shape and t.shape == (bs,)
     assert torch.allclose(noisy, (1 - t.view(-1, 1, 1, 1, 1)) * latents + t.view(-1, 1, 1, 1, 1) * (target + latents))
     assert text_embeds.shape == (bs, 7, 40) and attention_mask.dtype == torch.bool
@@ -627,16 +690,62 @@ def test_prepare_inputs():
     assert (ref - 0.999 * control).abs().max() < 0.01 and not torch.equal(ref, control)
     assert mask is None
 
-    with pytest.raises(ValueError, match='do not match'):
-        pipe.prepare_inputs({**inputs, 'control_latents': control[..., :2]})
     with pytest.raises(ValueError, match='images only'):
         pipe.prepare_inputs({**inputs, 'latents': torch.randn(bs, 24, 2, LATENT_H, LATENT_W)})
     model_inputs, _ = pipe.prepare_inputs({k: v for k, v in inputs.items() if k != 'control_latents'})
     assert len(model_inputs) == 5
     # without token tags every token is text
     no_tags = {k: v for k, v in inputs.items() if k != 'token_tags_0'}
-    (_, _, _, _, token_tags, _), _ = pipe.prepare_inputs(no_tags)
+    (_, _, _, _, token_tags, *_), _ = pipe.prepare_inputs(no_tags)
     assert token_tags.eq(1).all()
+
+
+def test_prepare_inputs_packs_references_of_other_sizes():
+    torch.manual_seed(0)
+    pipe = image_pipeline(None, {'timestep_sample_method': 'uniform'})
+    bs = 2
+    first = [torch.randn(24, 1, 4, 6), torch.randn(24, 1, 2, 8)]  # the first reference of each sample
+    second = torch.randn(bs, 24, 1, 4, 4)
+    lengths = (5, 4)
+    inputs = {'latents': torch.randn(bs, 24, 1, LATENT_H, LATENT_W), 'mask': None, 'control_latents': first, 'control_latents_2': second,
+              'text_embeds_0': [torch.randn(n, 40) for n in lengths],
+              'attention_mask_0': [torch.ones(n, dtype=torch.int64) for n in lengths]}
+    model_inputs, _ = pipe.prepare_inputs(inputs)
+    refs, shapes = model_inputs[5:]
+    assert refs.shape == (bs, 2, 24, 1, 4, 8)
+    assert shapes.tolist() == [[[4, 6], [4, 4]], [[2, 8], [4, 4]]]
+    # noise-augmented, inside the size of each reference; zero outside
+    assert (refs[0, 0, :, :, :4, :6] - 0.999 * first[0]).abs().max() < 0.01
+    assert (refs[1, 0, :, :, :2, :8] - 0.999 * first[1]).abs().max() < 0.01
+    assert refs[0, 0, :, :, :, 6:].eq(0).all() and refs[1, 0, :, :, 2:, :].eq(0).all()
+    assert (refs[0, 1, :, :, :, :4] - 0.999 * second[0]).abs().max() < 0.01 and refs[0, 1, :, :, :, 4:].eq(0).all()
+
+
+def test_references_are_encoded_at_the_size_they_are_given(monkeypatch):
+    monkeypatch.setattr(torch.Tensor, 'to', _cpu_to(torch.Tensor.to))
+    pipe = image_pipeline(None, {'dtype': torch.float32})
+    pipe.__dict__['_vae_dtypes'] = types.SimpleNamespace(encode=None)
+    vae = StubVAE()
+    images = torch.rand(2, 3, 64, 96)
+    controls = [[torch.rand(3, 32, 48), torch.rand(3, 64, 32)], [torch.rand(3, 48, 48), torch.rand(3, 16, 80)]]
+    result = pipe.get_call_vae_fn(vae)(images, controls)
+    assert vae.batch_sizes == [1] * 6
+    assert [c.shape for c in result['control_latents']] == [(24, 1, 2, 3), (24, 1, 3, 3)]
+    assert [c.shape for c in result['control_latents_2']] == [(24, 1, 4, 2), (24, 1, 1, 5)]
+    assert 'control_latents_3' not in result
+
+
+def test_the_preprocessing_gives_a_reference_its_own_size(tmp_path):
+    from models.minimax_h3_image import ImagePreprocess, size_short_edge
+    preprocess = ImagePreprocess({}, support_video=False, round_height=32, round_width=32)
+    for size in ((600, 400), (3000, 2000), (1200, 1500), (5000, 3000), (1024, 1024)):
+        path = tmp_path / f'{size[0]}x{size[1]}.png'
+        Image.new('RGB', size, (10, 20, 30)).save(path)
+        # the size bucket of the target is not the reference's
+        tensor = preprocess.preprocess_control(str(path), (320, 320, 1))
+        width, height = size_short_edge(*size, 1024, 2048)
+        assert tensor.shape == (3, height, width), size
+        assert min(width, height) >= 1000 and min(width, height) <= 2048
 
 
 def test_the_loss():
@@ -673,7 +782,7 @@ def test_images_are_encoded_one_at_a_time(monkeypatch):
     assert vae.batch_sizes == [1] * 6
     alone = pipe.latent_format.process_in(StubVAE().encode(images[2:3].movedim(1, -1)))
     assert_close(result['latents'][2:3], alone)
-    assert result['control_latents'].shape == (3, 24, 1, 4, 6)
+    assert len(result['control_latents']) == 3 and all(c.shape == (24, 1, 4, 6) for c in result['control_latents'])
     assert_close(pipe.encode_images(images[:, :, None], StubVAE()), result['latents'])
     assert 'control_latents' not in pipe.get_call_vae_fn(StubVAE())(images)
 
@@ -775,7 +884,7 @@ def test_without_a_method_the_checkpoints_grid_is_trained_on(tmp_path, monkeypat
 @pytest.mark.parametrize('dataset, match', [
     ({'frame_buckets': [1, 33]}, 'images only'),
     ({'directory': [{'path': 'x', 'frame_buckets': [1, 33]}]}, r'images only.*\[\[directory\]\] x'),
-    ({'directory': [{'path': 'x', 'control_path': 'c', 'control_path_2': 'd'}]}, 'control_path_N'),
+    ({'directory': [{'path': 'x', 'control_path': 'c', **{f'control_path_{n}': 'd' for n in range(2, 18)}}]}, 'up to 16 reference images'),
     ({'directory': [{'path': 'x', 'control_path': 'c', 'caption_dropout_rate': 0.1}]}, 'caption_dropout_rate in it'),
     ({'caption_dropout_rate': 0.1, 'directory': [{'path': 'x', 'control_path': 'c'}]}, 'the dataset caption_dropout_rate'),
 ])
@@ -909,6 +1018,23 @@ def test_edit_captions_are_encoded_as_comfyui_encodes_them(tiny_clip, tmp_path):
     assert mixed['token_tags_0'][1].eq(1).all()
 
 
+def test_several_pictures_are_encoded_as_comfyui_encodes_them(tiny_clip, tmp_path):
+    """A sample's reference images in a list: the node's image_1, image_2, ... in that order, the prompt naming them
+    <Picture 1>, <Picture 2>."""
+    ns = _node_namespace('MiniMaxH3ImageConditioning')
+    fn = te_pipeline(tiny_clip).get_call_text_encoder_fn(tiny_clip)
+    caption = 'put the person of <Picture 2> into <Picture 1>'
+    paths = [write_image(tmp_path / 'a.png', 1280, 1100, 0), write_image(tmp_path / 'b.png', 300, 1200, 1)]
+    result = fn([caption, caption], [False, False], [paths, paths[:1]])
+    for i, group in enumerate([paths, paths[:1]]):
+        cond, _ = ns['execute'](None, tiny_clip, caption, 0, 0, vae=NodeVAE(),
+                                images={f'image_{n + 1}': load_comfy_image(path) for n, path in enumerate(group)})
+        expected, extra = cond[0]
+        assert_close(result['text_embeds_0'][i], expected[0], atol=1e-4)
+        assert torch.equal(result['token_tags_0'][i], extra['minimax_token_tags'].long())
+    assert result['token_tags_0'][0].shape[0] > result['token_tags_0'][1].shape[0]
+
+
 def test_text_to_image_captions_are_batched(tiny_clip):
     """Without control images the captions are encoded together, padded; each row's real tokens are the caption
     encoded alone, as the node encodes it, its tags all 1."""
@@ -943,9 +1069,12 @@ def test_the_conditioning_cache_key_names_the_picture_label():
 # A training step through DeepSpeed's pipeline engine in real gloo process groups.
 
 def _step_inputs():
-    video, t, text, mask, tags, _, augmented = image_inputs([9, 6], [(2, 4), (1, 2)], [0.3, 0.0005], seed=3)
+    video, t, text, mask, tags, _, _ = image_inputs([9, 6], [(2, 4), (1, 2)], [0.3, 0.0005], seed=3)
     target = torch.randn(video.shape, generator=torch.Generator().manual_seed(5))
-    return (video, t, text, mask, tags, augmented), (target, None)
+    # two references per sample, of sizes that differ between the samples: sequences of different lengths
+    g = torch.Generator().manual_seed(8)
+    refs = [[torch.randn(24, 1, h, w, generator=g) for h, w in sample] for sample in [[(4, 6), (6, 4)], [(2, 4), (4, 2)]]]
+    return (video, t, text, mask, tags, *pad_refs(refs)), (target, None)
 
 
 LR = 0.1
@@ -1000,7 +1129,7 @@ def _engine_worker(rank, world_size, num_stages, init_file, out_dir):
 @pytest.mark.parametrize('world_size, num_stages', [(2, 2), (2, 1)], ids=['pp2', 'dp2'])
 def test_a_training_step_through_the_pipeline_engine(world_size, num_stages, tmp_path):
     """The layers split over pipeline stages pass their tensors (the per-sample adaLN segments, the reference
-    latents) from stage to stage and step as one process does; with data parallelism every rank steps on the same
+    latents, two per sample and of different sizes, so the sequences are padded) from stage to stage and step as one process does; with data parallelism every rank steps on the same
     gradient. The head the layers train is the split head 0."""
     mp.spawn(_engine_worker, args=(world_size, num_stages, str(tmp_path / 'init'), str(tmp_path)), nprocs=world_size)
     expected = _expected_weights()
@@ -1073,8 +1202,8 @@ def test_each_sample_trains_through_the_head_of_its_noise_interval():
     pipe.split_pdd_head()
     layers = pipe.to_layers()
     video, t, text, mask, tags, _, augmented = image_inputs([6, 6, 6, 6], [(1, 2)] * 4, [0.8, 0.5, 0.2, 0.59])
-    inputs = (video, t, text, mask, tags, augmented)
-    assert layers[0](inputs)[5].tolist()[6:] == [0, 1, 2, 1]
+    inputs = (video, t, text, mask, tags, *pack_refs(augmented))
+    assert layers[0](inputs)[5].tolist()[6::3] == [0, 1, 2, 1]
     by_sigma = run_layers(layers, inputs)
     forced = []
     for head in range(3):
@@ -1087,11 +1216,11 @@ def test_each_sample_trains_through_the_head_of_its_noise_interval():
 
     # train_pdd_head = 0: head 0 whatever the noise
     head0 = image_pipeline(model, {'train_pdd_head': 0}).to_layers()
-    assert head0[0](inputs)[5].tolist()[6:] == [0, 0, 0, 0]
+    assert head0[0](inputs)[5].tolist()[6::3] == [0, 0, 0, 0]
     assert_close(run_layers(head0, inputs), forced[0])
     # one head: nothing to pick
     single, _ = tiny_pair(1)
-    assert image_pipeline(single).to_layers()[0](inputs)[5].tolist()[6:] == [0, 0, 0, 0]
+    assert image_pipeline(single).to_layers()[0](inputs)[5].tolist()[6::3] == [0, 0, 0, 0]
 
 
 def test_the_gradient_of_a_later_head_reaches_head_0():
@@ -1100,7 +1229,7 @@ def test_the_gradient_of_a_later_head_reaches_head_0():
     pipe.split_pdd_head()
     layers = pipe.to_layers()
     video, t, text, mask, tags, _, augmented = image_inputs([6], [(1, 2)], [0.2])
-    run_layers(layers, (video, t, text, mask, tags, augmented)).square().mean().backward()
+    run_layers(layers, (video, t, text, mask, tags, *pack_refs(augmented))).square().mean().backward()
     assert model.final_layer.video_out.weight.grad.abs().sum() > 0
     assert model.final_layer.pdd_offset_weight.grad is None
 
@@ -1134,7 +1263,7 @@ def test_pdd_grid_timesteps_are_the_samplers_sigmas():
     layers = pipe.to_layers()
     video, _, text, mask, tags, _, augmented = image_inputs([6, 6, 6], [(1, 2)] * 3, [1.0, 0.6, 0.3])
     sigmas = torch.tensor([torch.tensor(g).item() for g in SIGMAS[3][:-1]])
-    assert layers[0]((video, sigmas, text, mask, tags, augmented))[5].tolist()[6:] == [0, 1, 2]
+    assert layers[0]((video, sigmas, text, mask, tags, *pack_refs(augmented)))[5].tolist()[6::3] == [0, 1, 2]
     # the other methods are untouched
     other = image_pipeline(model, {'timestep_sample_method': 'uniform'})
     assert not set(other.sample_timesteps(50, 1, 4, 6, 'cpu').tolist()) <= set(t.tolist())

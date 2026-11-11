@@ -185,6 +185,9 @@ def check_snapshot(plan, snapshot, sample, header_sample, seed=0, check_all=Fals
     if ('control_file' in snapshot.column_names) != (target.control_path is not None):
         plan.note('donor snapshot and this dataset disagree about control_path.')
         return False
+    if ('control_extra_file' in snapshot.column_names) != bool(target.control_extra_paths):
+        plan.note('donor snapshot and this dataset disagree about control_path_2 and further.')
+        return False
     plan.rows = len(snapshot)
     if plan.rows == 0:
         plan.note('donor snapshot is empty.')

@@ -14,11 +14,16 @@ of a checkpoint is that head plus a fixed offset, so a full fine-tune moves all 
 alone. A sample trains through the head of the grid interval its noise level falls in, as sampling applies it
 (train_pdd_head = 0 trains through head 0 alone). Sampling previews run the six heads on the checkpoint's sigma grid.
 
-Editing (a dataset directory with control_path): as ComfyUI's MiniMaxH3ImageConditioning node builds it. The caption is
-preceded by "Picture 1: " and the control image shown to the text encoder at a 1024 short edge; the vision block's
-tokens are tagged 0 (they take the video modulation), the rest 1. The control image's latent (cropped to the target's
-bucket) is the reference, packed after the text, noise-augmented to t = 0.999, pinned at max(t, 0.999).
+Editing (a dataset directory with control_path, and control_path_2, control_path_3, ... for further references): as
+ComfyUI's MiniMaxH3ImageConditioning node builds it. The caption is preceded by "Picture 1: " (then "Picture 2: ", ...) and
+each reference shown to the text encoder at a 1024 short edge; the vision blocks' tokens are tagged 0 (they take the video
+modulation), the rest 1. Each reference's latent is encoded at its own size (short edge between 1024 and 2048, sides a
+multiple of 32, its own aspect ratio; not the target's bucket), packed after the text in the order of the pictures,
+noise-augmented to t = 0.999, pinned at max(t, 0.999). Samples with references of different sizes share a batch: their
+sequences are padded at the end and the padding is masked.
 """
+
+import re
 
 import numpy as np
 import torch
@@ -43,6 +48,9 @@ from comfy.ldm.minimax.model import (
 # ComfyUI comfy_extras/nodes_minimax_h3.py: the text encoder sees reference images at a 1024 short edge, sides /32.
 VISION_SHORT_EDGE = 1024
 CANVAS_MULTIPLE = 32
+# ComfyUI: a reference is encoded with its short edge in this range (the vision copy has the short edge VISION_SHORT_EDGE)
+REFERENCE_SHORT_EDGE = (1024, 2048)
+MAX_REFERENCES = 16
 PICTURE_LABEL = 'Picture %d: '
 # The checkpoint's sampling grid (pdd_config.json) is flow shift 3 applied to a base grid that is symmetric about 1/2
 # (base[k] + base[n - k] = 1), which is the training shift used when none is configured.
@@ -72,6 +80,24 @@ def size_short_edge(width, height, low, high):
     return tuple(max(CANVAS_MULTIPLE, round(side * scale / CANVAS_MULTIPLE) * CANVAS_MULTIPLE) for side in (width, height))
 
 
+def control_key(n):
+    """The cache key of reference n (0-based): control_latents, control_latents_2, ..."""
+    return 'control_latents' if n == 0 else f'control_latents_{n + 1}'
+
+
+CONTROL_KEYS = tuple(control_key(n) for n in range(MAX_REFERENCES))
+
+
+class ImagePreprocess(PreprocessMediaFile):
+    def preprocess_control(self, path, size_bucket=None):
+        """A reference at its own size (the target's size bucket does not matter), as ComfyUI sizes it for the VAE: the
+        short edge into REFERENCE_SHORT_EDGE, the aspect ratio kept, the sides a multiple of 32. [3, H, W] in 0..1."""
+        with Image.open(path) as img:
+            width, height = img.size
+        size = size_short_edge(width, height, *REFERENCE_SHORT_EDGE)
+        return self((None, path), None, (*size, 1))[0][0]
+
+
 def load_vision_image(path):
     """The control image ([1, H, W, 3] in 0..1) at the size MiniMaxH3ImageConditioning shows it to the text encoder.
     Decoded as the dataset decodes the same file into the reference latent (convert_to_rgb: no EXIF rotation,
@@ -89,7 +115,8 @@ def load_vision_image(path):
 class MiniMaxH3ImagePipeline(MinimaxH3Pipeline):
     name = 'minimax_h3_image'
     is_video_vae = False
-    vae_latent_keys = ('latents', 'control_latents')
+    vae_latent_keys = ('latents',) + CONTROL_KEYS
+    max_control_images = MAX_REFERENCES
     # fp32 islands of the checkpoint: save_dtype leaves them unrounded (rounding head 0 moves all six heads)
     save_float32_prefixes = ('final_layer.video_out.', 'video_patch_proj.', 'time_embedder.')
 
@@ -152,9 +179,10 @@ class MiniMaxH3ImagePipeline(MinimaxH3Pipeline):
             if any(f != 1 for f in frame_buckets):
                 raise ValueError(f'minimax_h3_image trains images only; frame_buckets must be [1], got {frame_buckets} in {where}')
         for directory in directories:
-            if any(k.startswith('control_path_') for k in directory):
-                raise ValueError('minimax_h3_image takes one reference image per sample (control_path); '
-                                 'several references (control_path_N) are not supported yet')
+            references = 1 + len([k for k in directory if re.fullmatch(r'control_path_\d+', k)])
+            if references > MAX_REFERENCES:
+                raise ValueError(f'minimax_h3_image takes up to {MAX_REFERENCES} reference images per sample '
+                                 f"(control_path, control_path_2, ...); {directory.get('path')} has {references}")
             # A dropped caption trains on the one cached empty-caption embedding, which has no control
             # image; ComfyUI never pairs that with a reference.
             if 'caption_dropout_rate' in directory:
@@ -237,7 +265,11 @@ class MiniMaxH3ImagePipeline(MinimaxH3Pipeline):
         return grid[index]
 
     def get_preprocess_media_file_fn(self):
-        return PreprocessMediaFile(self.config, support_video=False, round_height=32, round_width=32)
+        return ImagePreprocess(self.config, support_video=False, round_height=32, round_width=32)
+
+    def vae_cache_key(self):
+        # references are encoded at their own size since this; a cache from before holds them at the target's
+        return super().vae_cache_key() + '|references=own_size'
 
     def encode_images(self, images, vae=None):
         """[B, C, H, W] (or [B, C, 1, H, W]) pixels in 0..1 -> [B, 24, 1, h, w] latents. One image per call: the VAE's
@@ -256,9 +288,14 @@ class MiniMaxH3ImagePipeline(MinimaxH3Pipeline):
 
     def get_call_vae_fn(self, vae):
         def fn(images, control_images=None):
+            """control_images: one list per sample of its reference images, [3, H, W] each (sizes may differ), or
+            [B, 3, H, W] for one reference per sample. The latents are one list per reference, an entry per sample."""
             result = {'latents': self.encode_images(images, vae)}
             if control_images is not None:
-                result['control_latents'] = self.encode_images(control_images, vae)
+                if torch.is_tensor(control_images):
+                    control_images = [[image] for image in control_images]
+                for n in range(len(control_images[0])):
+                    result[control_key(n)] = [self.encode_images(sample[n][None], vae)[0] for sample in control_images]
             return result
         return fn
 
@@ -283,8 +320,10 @@ class MiniMaxH3ImagePipeline(MinimaxH3Pipeline):
             # Edit: one caption at a time with its control image, as ComfyUI encodes it. The vision blocks of a
             # batch differ in length, so the rows are a list.
             embeds, masks, tags = [], [], []
-            for caption, path in zip(captions, control_file):
-                images = [] if path is None else [load_vision_image(path)]
+            for caption, paths in zip(captions, control_file):
+                # one path, or the list of a sample's reference images
+                paths = [] if paths is None else [paths] if isinstance(paths, str) else list(paths)
+                images = [load_vision_image(path) for path in paths]
                 tokens = text_encoder.tokenize(caption, images=images, picture_label=PICTURE_LABEL)
                 cond, extra = text_encoder.encode_from_tokens_scheduled(tokens)[0]
                 assert cond.shape[0] == 1, cond.shape
@@ -337,16 +376,28 @@ class MiniMaxH3ImagePipeline(MinimaxH3Pipeline):
 
         text_embeds, attention_mask, token_tags = self.get_conds(inputs)
         model_inputs = (noisy_latents, t, text_embeds, attention_mask, token_tags)
-        control_latents = inputs.get('control_latents')
-        if control_latents is not None:
-            control_latents = control_latents.float()
-            if control_latents.shape != latents.shape:
-                raise ValueError(f'The control latents {tuple(control_latents.shape)} and the latents '
-                                 f'{tuple(latents.shape)} do not match')
-            # ComfyUI's visual condition noise augmentation.
-            ref = VISUAL_COND_TIMESTEP * control_latents + (1.0 - VISUAL_COND_TIMESTEP) * torch.randn_like(control_latents)
-            model_inputs = (*model_inputs, ref)
+        keys = [key for key in CONTROL_KEYS if key in inputs]
+        if keys:
+            model_inputs = (*model_inputs, *self.pack_references([inputs[key] for key in keys], bs))
         return model_inputs, (target, mask)
+
+    @staticmethod
+    def pack_references(references, bs):
+        """The references of a batch (a [B, 24, 1, h, w] tensor, or a list of B such latents of their own sizes, for each
+        reference) -> ([B, N, 24, 1, H, W] noise-augmented latents zero-padded to the largest size, [B, N, 2] their
+        latent heights and widths)."""
+        samples = [[reference[i].float() for reference in references] for i in range(bs)]
+        height = max(latent.shape[-2] for sample in samples for latent in sample)
+        width = max(latent.shape[-1] for sample in samples for latent in sample)
+        packed = samples[0][0].new_zeros(bs, len(references), *samples[0][0].shape[:2], height, width)
+        shapes = torch.zeros(bs, len(references), 2, dtype=torch.long, device=packed.device)
+        for i, sample in enumerate(samples):
+            for n, latent in enumerate(sample):
+                # ComfyUI's visual condition noise augmentation.
+                latent = VISUAL_COND_TIMESTEP * latent + (1.0 - VISUAL_COND_TIMESTEP) * torch.randn_like(latent)
+                packed[i, n, :, :, :latent.shape[-2], :latent.shape[-1]] = latent
+                shapes[i, n] = torch.tensor(latent.shape[-2:], device=packed.device)
+        return packed, shapes
 
     def get_loss_fn(self):
         def loss_fn(output, label):
@@ -474,13 +525,17 @@ class ImageInitialLayer(nn.Module):
     def __getattr__(self, name):
         return getattr(self.model[0], name)
 
-    def make_packed_sequence(self, video_x, t, context, context_mask, token_tags, ref_latent=None):
+    def make_packed_sequence(self, video_x, t, context, context_mask, token_tags, ref_latents=None, ref_shapes=None):
+        """ref_latents [1, N, 24, 1, H, W] zero-padded to the largest reference, ref_shapes [1, N, 2] the latent size of
+        each (the padding is cut off here)."""
         assert video_x.shape[0] == 1  # one sample, with a batch dimension
         device = video_x.device
         dtype = context.dtype  # compute dtype
         refs = None
-        if ref_latent is not None:
-            refs = [{'kind': 'image', 'latent_h': ref_latent.shape[-2], 'latent_w': ref_latent.shape[-1]}]
+        if ref_latents is not None:
+            sizes = ref_shapes[0].tolist()
+            ref_latents = [ref_latents[:, n, :, :, :h, :w] for n, (h, w) in enumerate(sizes)]
+            refs = [{'kind': 'image', 'latent_h': h, 'latent_w': w} for h, w in sizes]
         latent_t, lat_h, lat_w = video_x.shape[2], video_x.shape[3], video_x.shape[4]
         text_len = context.shape[1]
         # The captions of a batch are padded to the longest. ComfyUI never pads a prompt, so the sample is built as
@@ -516,9 +571,9 @@ class ImageInitialLayer(nn.Module):
 
         video_rows = patchify_video(video_x.to(torch.float32), self.patch_size)
         all_rows = video_rows
-        if ref_latent is not None:
-            # already noise-augmented by the pipeline (prepare_inputs)
-            ref_rows = patchify_video(ref_latent.to(torch.float32), self.patch_size)
+        if refs:
+            # already noise-augmented by the pipeline (prepare_inputs); in the order of the pictures
+            ref_rows = torch.cat([patchify_video(latent.to(torch.float32), self.patch_size) for latent in ref_latents])
             img_update = layout.img_update.to(device)
             all_rows = torch.empty(img_update.shape[0], video_rows.shape[1], dtype=torch.float32, device=device)
             all_rows[~img_update] = ref_rows
@@ -567,26 +622,39 @@ class ImageInitialLayer(nn.Module):
         if self.pdd_grid is not None:
             # the interval [grid[k + 1], grid[k]] holds the noise level; the last interval takes the end point
             head = sum(1 for g in self.pdd_grid[1:-1] if float(t.flatten()[0]) <= g + GRID_TOLERANCE)
-        extra_ints = torch.tensor([va, vb, kind_row['video'], latent_t, lat_h, lat_w, head], dtype=torch.int32, device=device)
+        extra_ints = torch.tensor([kind_row['video'], latent_t, lat_h, lat_w, va, vb, head], dtype=torch.int32, device=device)
         return h, attention_mask, t_emb, mod_segments, rope_freqs, extra_ints
 
-    def make_layer_inputs(self, video_x, t, context, context_mask, token_tags, *ref):
-        first_extra_ints = None
-        heads = []
+    def make_layer_inputs(self, video_x, t, context, context_mask, token_tags, *refs):
+        shared_ints = None
+        per_sample = []
         h_list, attention_mask_list, t_emb_list, rope_freqs_list, segments_list = [], [], [], [], []
-        for items in zip(video_x, t, context, context_mask, token_tags, *ref):
+        for items in zip(video_x, t, context, context_mask, token_tags, *refs):
             h, attention_mask, t_emb, mod_segments, rope_freqs, extra_ints = self.make_packed_sequence(*(x.unsqueeze(0) for x in items))
-            if first_extra_ints is None:
-                first_extra_ints = extra_ints
+            if shared_ints is None:
+                shared_ints = extra_ints[:4]
             else:
-                # ImageFinalLayer reads the target span and timestep row of the first sample for all.
-                assert (extra_ints[:6] == first_extra_ints[:6]).all()
-            heads.append(extra_ints[6:])
+                # the target image of every sample has the same size (a size bucket); only its position in the sequence
+                # and the references before it differ
+                assert (extra_ints[:4] == shared_ints).all()
+            per_sample.append(extra_ints[4:])
             segments_list.append(mod_segments)
             h_list.append(h)
             attention_mask_list.append(attention_mask)
             t_emb_list.append(t_emb)
             rope_freqs_list.append(rope_freqs)
+
+        # Samples whose references differ in size have sequences of different lengths: the shorter ones are padded at
+        # the end, with the rows masked out as keys, in a modulation segment of their own, with rotations that do nothing.
+        length = max(h.shape[0] for h in h_list)
+        for i, h in enumerate(h_list):
+            pad = length - h.shape[0]
+            if pad:
+                h_list[i] = torch.cat([h, h.new_zeros(pad, h.shape[1])])
+                attention_mask_list[i] = torch.cat([attention_mask_list[i], attention_mask_list[i].new_zeros(pad)])
+                identity = torch.eye(2, dtype=rope_freqs_list[i].dtype, device=h.device).expand(1, pad, 1, *rope_freqs_list[i].shape[3:])
+                rope_freqs_list[i] = torch.cat([rope_freqs_list[i], identity], dim=1)
+                segments_list[i] = torch.cat([segments_list[i], segments_list[i].new_tensor([[h.shape[0], length, 0]])])
 
         if all(s.shape == segments_list[0].shape and (s == segments_list[0]).all() for s in segments_list[1:]):
             mod_segments = segments_list[0]
@@ -603,8 +671,8 @@ class ImageInitialLayer(nn.Module):
         attention_mask = torch.stack(attention_mask_list, dim=0)[:, None, None, :]  # 4D bool for SDPA
         t_emb = torch.stack(t_emb_list)
         rope_freqs = torch.cat(rope_freqs_list, dim=0)
-        # the shared layout, then each sample's PDD head
-        extra_ints = torch.cat([first_extra_ints[:6], *heads])
+        # the shared layout, then each sample's target span and PDD head
+        extra_ints = torch.cat([shared_ints, *per_sample])
         outputs = make_contiguous(h, attention_mask, t_emb, mod_segments, rope_freqs, extra_ints)
         for item in outputs:
             if torch.is_floating_point(item):
@@ -614,7 +682,7 @@ class ImageInitialLayer(nn.Module):
     @torch.autocast('cuda', dtype=AUTOCAST_DTYPE)
     @torch.compiler.disable
     def forward(self, inputs):
-        # (video, t, text, text mask, token tags[, reference latents])
+        # (video, t, text, text mask, token tags[, reference latents, their latent sizes])
         video_x, t, context, context_mask, token_tags, *ref = inputs
         return self.make_layer_inputs(video_x, t, context, context_mask, token_tags, *ref)
 
@@ -636,10 +704,17 @@ class ImageFinalLayer(nn.Module):
     @torch.compiler.disable
     def forward(self, inputs):
         h, attention_mask, t_emb, mod_segments, rope_freqs, extra_ints = inputs
-        va, vb, row, latent_t, lat_h, lat_w, *heads = extra_ints.tolist()
+        row, latent_t, lat_h, lat_w, *spans = extra_ints.tolist()
+        spans = [spans[i:i + 3] for i in range(0, len(spans), 3)]
+        heads = [head for _, _, head in spans]
         final = self.final_layer
         shift, scale = final.adaln_proj(t_emb)
-        hv = final.modulate(h, shift, scale, (va, vb, row))
+        if all(span[:2] == spans[0][:2] for span in spans):
+            hv = final.modulate(h, shift, scale, (*spans[0][:2], row))
+        else:
+            # the references before the target differ in length: each sample's target rows
+            hv = torch.cat([final.modulate(h[i:i + 1], shift[i:i + 1], scale[i:i + 1], (va, vb, row))
+                            for i, (va, vb, _) in enumerate(spans)])
         out = final.video_out
         if self.head is not None:
             heads = [self.head] * hv.shape[0]

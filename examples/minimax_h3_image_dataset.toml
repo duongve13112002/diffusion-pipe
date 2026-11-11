@@ -18,14 +18,16 @@ num_repeats = 1
 [[directory]]
 path = '/data/images/t2i'
 
-# Editing: the target images (what the model learns to produce) in path, the image to edit in control_path under the
-# same name, and the instruction as the caption. The caption is encoded with "Picture 1: " and the control image
-# (short edge 1024) in front, as ComfyUI's MiniMax H3 Image Conditioning node does. The control image is also the
-# reference latent, cropped to the target's bucket. One control image per target: control_path_2 and further are
-# not supported yet and are refused.
+# Editing: the target images (what the model learns to produce) in path, a reference image in control_path under the
+# same name, and the instruction as the caption. The caption is encoded with "Picture 1: " and the reference (short edge
+# 1024) in front, as ComfyUI's MiniMax H3 Image Conditioning node does, and the reference's own latent is a reference
+# block of the sequence, at the reference's own size (short edge 1024 to 2048, its own aspect ratio), not the target's.
+# Further references: control_path_2, control_path_3, ... (the caption calls them <Picture 2>, <Picture 3>); every
+# target needs a file of the same name in each of them.
 # Text-to-image and edit images go in different directories; they are batched separately.
 # Caption dropout is refused for an edit directory (a dropped caption would lose its image): leave
 # caption_dropout_rate unset or 0 there, and set caption_dropout_rate = 0 in it if uncond_fraction is on.
 #[[directory]]
 #path = '/data/images/edit/target'
 #control_path = '/data/images/edit/control'
+#control_path_2 = '/data/images/edit/control_2'
