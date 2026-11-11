@@ -895,7 +895,8 @@ See [examples/p_h3_image.toml](../examples/p_h3_image.toml) and its dataset.
   `image_1` ... `image_9`; the prompt refers to them as `<Picture 2>`, ...). `control_path` is the
   image to edit, cropped to the target's bucket so it stays aligned with the target; each further
   picture is scaled within the target's pixel area with its own aspect ratio (down only, sides a
-  multiple of 32, lanczos), as ComfyUI sizes the images after the first, then packed after the text in
+  multiple of 32, lanczos), as ComfyUI sizes the images when the node's width and height are the output size
+  (at 0 / 0 it uses 2912 x 2912, so set them to the size you trained at), then packed after the text in
   the order of the pictures. Every picture is also shown to Qwen3-VL at most 1 MP. The caption gets
   `"Edit <Picture 1>. "` once. Samples of a batch may have pictures of different sizes: their sequences
   are padded at the end and the padding is masked, which changes nothing in the others' output. A

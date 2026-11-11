@@ -793,6 +793,9 @@ class InitialLayer(nn.Module):
     def make_layer_inputs(self, video_x, audio_x, valid_audio, t, context, context_mask, *extras):
         # extras: per-sample tensors make_packed_sequence takes after context_mask (token tags,
         # reference latents).
+        if len(valid_audio) > 1 and not bool((valid_audio == valid_audio[0]).all()):
+            raise ValueError('A batch mixes clips with and without audio; MiniMax H3 packs the audio stream per batch. Keep them '
+                             'in separate directories (or set micro_batch_size_per_gpu = 1).')
         ints_list = []
         h_list, attention_mask_list, t_emb_list, rope_freqs_list, segments_list = [], [], [], [], []
         for items in zip(video_x, audio_x, valid_audio, t, context, context_mask, *extras):

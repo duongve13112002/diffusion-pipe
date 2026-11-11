@@ -23,7 +23,8 @@ path = '/data/images/t2i'
 # already starts with "Edit <Picture N>" or "subject_definitions:" is kept as it is. The control
 # image is also the reference latent, cropped to the target's bucket. Further pictures: control_path_2,
 # control_path_3, ... up to control_path_9 (the prompt refers to them as <Picture 2>, ...), the same file
-# name in each directory; each is scaled within the target's pixel area with its own aspect ratio and is
+# name in each directory; each is scaled within the target's pixel area with its own aspect ratio (ComfyUI's
+# node does the same when its width and height are the output size; at 0 / 0 it uses 2912 x 2912) and is
 # also shown to the text encoder. A directory has the same number of pictures for all its samples.
 # Text-to-image and edit images go in different directories; they are batched separately.
 # Caption dropout is refused for an edit directory (a dropped caption would lose its image): leave

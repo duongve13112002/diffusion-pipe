@@ -324,6 +324,16 @@ def test_prepare_inputs_packs_further_references_of_their_own_sizes():
         pipe.prepare_inputs({**inputs, 'control_latents': first[..., :2]})
 
 
+def test_a_batch_mixing_clips_with_and_without_audio_is_refused():
+    """The audio stream is packed per batch (the H3 layers' base): a mixed batch fails with a message, not deep in a layer."""
+    model, _ = tiny_pair()
+    layers = ph3_pipeline(model).to_layers()
+    video, audio, valid, t, text, mask, tags, _, augmented = edit_inputs([7, 7], [(1, 3), (1, 3)], [0.4, 0.4])
+    with pytest.raises(ValueError, match='mixes clips with and without audio'):
+        layers[0]((video, audio, torch.tensor([True, False]), t, text, mask, tags, *pack_refs(augmented)))
+    layers[0]((video, audio, torch.tensor([False, False]).logical_or(valid), t, text, mask, tags, *pack_refs(augmented)))
+
+
 def test_equal_references_keep_one_shared_span():
     """References of one size: the same nine integers as without any, whatever the number of references."""
     model, _ = tiny_pair()
@@ -345,6 +355,12 @@ def test_a_reference_is_sized_as_comfyui_sizes_it(tmp_path):
              write_image(tmp_path / 'c.png', 300, 700, 2), write_image(tmp_path / 'd.png', 200, 150, 3)]
     refs = [preprocess.preprocess_control(path, bucket, n) for n, path in enumerate(paths)]
     assert refs[0].shape == (3, 480, 640)
+    # the first picture is exactly what the single-control path of the dataset made of it (so old caches stay valid), also
+    # when its aspect ratio is not the bucket's
+    wide = write_image(tmp_path / 'wide.png', 1000, 500, 5)
+    cropped = preprocess.preprocess_control(wide, bucket, 0)
+    assert torch.equal(cropped, preprocess((None, wide), None, bucket)[0][0])
+    assert cropped.shape == (3, 480, 640) and not torch.equal(cropped, preprocess.preprocess_control(wide, bucket, 1)[..., :480, :640])
     for n, path in enumerate(paths):
         clip = types.SimpleNamespace(tokenize=lambda *a, **k: None, encode_from_tokens_scheduled=lambda *a: [[None, {}]])
         (cond, _) = ns['execute'](None, clip, 'x', 640, 480, vae=NodeVAE(), images={'image_1': load_comfy_image(path)})

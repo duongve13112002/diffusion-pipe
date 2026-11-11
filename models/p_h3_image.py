@@ -15,7 +15,8 @@ to the text encoder at <= 1 MP. The vision blocks' tokens are tagged 0 (they tak
 tags travel with the embeddings. The latent of the first image (control_path, the one edited; cropped to the target's
 bucket, so it stays aligned with the target) and of each further one (scaled within the target's pixel area, its own
 aspect ratio, sides a multiple of 32, as ComfyUI sizes them) are the references, packed after the text in the order of
-the pictures, noise-augmented to t = 0.999, pinned at max(t, 0.999) like ComfyUI's minimax_refs. Samples with references
+the pictures, noise-augmented to t = 0.999, pinned at max(t, 0.999) like ComfyUI's minimax_refs. (ComfyUI scales
+every picture within the area of the node's width x height, 2912 x 2912 when they are 0: set them to the output size.) Samples with references
 of different sizes share a batch: their sequences are padded at the end and the padding is masked.
 """
 
