@@ -1,5 +1,7 @@
 # Dataset for MiniMax-H3-Image (examples/minimax_h3_image.toml). Images only.
 
+# AI Toolkit notes the model is tuned for 4 MP to 20 MP outputs (2048x2048 and up) and shows more artifacts below that:
+# train at [2048] if memory allows (block swap, fp8). 1024 trains faster.
 resolutions = [1024]
 
 enable_ar_bucket = true

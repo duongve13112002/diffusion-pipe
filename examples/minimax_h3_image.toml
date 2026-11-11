@@ -50,14 +50,23 @@ text_encoders = [
     {path = '/data/models/MiniMax-H3-Image/text_encoder', type = 'minimax'}
 ]
 dtype = 'bfloat16'
-timestep_sample_method = 'logit_normal'
-# Training shift when none of shift / image_shift / flux_shift is set: 3. It is a common value for images of this size,
-# not a measured optimum (the checkpoint's own 6-step sampling grid is not a shifted uniform grid): try 1 to 3.
+# 'pdd_grid' trains on the six sigmas the 6-step sampler runs (the checkpoint's pdd_config.json grid), each through its own
+# output head, and nothing in between: the model only ever runs at those noise levels. It needs the PDD bank (the ComfyUI
+# file, or pdd_fused_heads.safetensors with the official transformer/) and replaces shift. 'logit_normal' and 'uniform'
+# draw any noise level and are shifted by `shift` (default 3: the checkpoint's grid is shift 3 applied to a base grid
+# symmetric about 1/2; not a measured training optimum, try 1 to 3).
+timestep_sample_method = 'pdd_grid'
 #shift = 3
 # The model is distilled into six output heads. Head 0 is the trainable weight and every other head is head 0 plus a fixed
-# offset, so a full fine-tune moves all six; a LoRA leaves them alone. A sample trains through the head of the sampling
-# interval its noise level falls in (as sampling applies it); 0 trains through head 0 alone. The previews run the six heads.
+# offset, so a full fine-tune moves all six; a LoRA leaves them alone. With logit_normal / uniform a sample trains through
+# the head of the sampling interval its noise level falls in (as sampling applies it); 0 trains through head 0 alone.
+# The previews run the six heads.
 #train_pdd_head = 'sigma'
+# The model is step- and guidance-distilled: training it without care erodes the 6-step sampling. ostris's training adapter,
+# merged before training (not saved with the LoRA), keeps it; the LoRA is then used on the plain model. Its H3-Image file
+# is in ComfyUI's layout, rank 16 on the blocks and the token refiner:
+# https://huggingface.co/ostris/minimax_h3_training_adapter (minimax_h3_image_training_adapter_v1.safetensors)
+#merge_adapters = ['/data/models/minimax_h3_image_training_adapter_v1.safetensors']
 # cfg (CFG-augmented training) and audio_vae are refused.
 # Per-component learning rates (a LoRA leaves the heads and projections frozen: head_lr, patch_embed_lr and
 # text_projection_lr are refused with [adapter]; 0 freezes a component of a full fine-tune):

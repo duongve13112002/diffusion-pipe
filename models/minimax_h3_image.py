@@ -44,9 +44,14 @@ from comfy.ldm.minimax.model import (
 VISION_SHORT_EDGE = 1024
 CANVAS_MULTIPLE = 32
 PICTURE_LABEL = 'Picture %d: '
-# A common flow shift for images of this size. The checkpoint's own sampling grid (pdd_config.json) is not a shifted
-# uniform grid, so this is a default, not a measured optimum.
+# The checkpoint's sampling grid (pdd_config.json) is flow shift 3 applied to a base grid that is symmetric about 1/2
+# (base[k] + base[n - k] = 1), which is the training shift used when none is configured.
 DEFAULT_SHIFT = 3.0
+SAMPLE_METHODS = ('logit_normal', 'uniform', 'pdd_grid')
+# keys of the continuous timestep sampling, which 'pdd_grid' replaces
+CONTINUOUS_SAMPLING_KEYS = ('shift', 'image_shift', 'flux_shift', 'sigmoid_scale')
+# a float32 noise level sitting on a grid point owns the head that starts there
+GRID_TOLERANCE = 1e-5
 TRAIN_HEADS = ('sigma', 0)
 HEAD_LR_KEYS = ('head_lr', 'patch_embed_lr', 'text_projection_lr')
 LR_KEYS = HEAD_LR_KEYS + ('blocks_lr', 'token_refiner_lr')
@@ -100,7 +105,14 @@ class MiniMaxH3ImagePipeline(MinimaxH3Pipeline):
         if 'adapter' in config and (keys := [k for k in HEAD_LR_KEYS if k in model_config]):
             raise ValueError(f'[model] {", ".join(keys)} do not apply to adapter training: they set the learning rate of '
                              'weights an adapter leaves frozen. Remove them (blocks_lr and token_refiner_lr do apply).')
-        if not any(k in model_config for k in ('shift', 'image_shift', 'flux_shift')):
+        method = model_config.get('timestep_sample_method', 'logit_normal')
+        if method not in SAMPLE_METHODS:
+            raise ValueError(f'[model] timestep_sample_method must be one of {SAMPLE_METHODS}, got {method!r}')
+        if method == 'pdd_grid':
+            if keys := [k for k in CONTINUOUS_SAMPLING_KEYS if k in model_config]:
+                raise ValueError(f"[model] {', '.join(keys)} do not apply with timestep_sample_method = 'pdd_grid': it trains "
+                                 "on the sigmas of the checkpoint's sampling grid only. Remove them.")
+        elif not any(k in model_config for k in ('shift', 'image_shift', 'flux_shift')):
             model_config['shift'] = DEFAULT_SHIFT
         super().__init__(config)
         self.is_video_vae = False
@@ -109,6 +121,10 @@ class MiniMaxH3ImagePipeline(MinimaxH3Pipeline):
     def refuse_unsupported_checkpoint(self):
         layout, heads = weights.inspect_checkpoint(self.model_config['diffusion_model'], self.model_config.get('diffusion_model_format'),
                                                    self.model_config.get('pdd_heads'))
+        if heads == 1 and self.model_config.get('timestep_sample_method') == 'pdd_grid':
+            raise ValueError("[model] timestep_sample_method = 'pdd_grid' needs the PDD bank: this diffusion_model has one output "
+                             'head and no sampling grid. For an official transformer/ give its pdd_fused_heads.safetensors '
+                             '(pdd_heads), or use logit_normal / uniform.')
         if heads == 1 and 'train_pdd_head' in self.model_config:
             raise ValueError('[model] train_pdd_head does not apply: this diffusion_model has one output head, not the PDD bank '
                              'of six. Remove it.')
@@ -194,6 +210,18 @@ class MiniMaxH3ImagePipeline(MinimaxH3Pipeline):
             p.original_name = f'final_layer.video_out.{name}'
             p.requires_grad_(True)
         self.pdd_offsets = (final.pdd_offset_weight.detach().cpu(), final.pdd_offset_bias.detach().cpu())
+
+    def sample_timesteps(self, bs, f, h, w, device, timestep_quantile=None):
+        if self.model_config.get('timestep_sample_method') != 'pdd_grid':
+            return super().sample_timesteps(bs, f, h, w, device, timestep_quantile)
+        # The sigmas the sampler runs (the grid without its end point), each drawn equally often; an evaluation
+        # quantile picks one of them.
+        grid = torch.tensor(self.diffusion_model.pdd_sigmas[:-1], dtype=torch.float32, device=device)
+        if timestep_quantile is not None:
+            index = torch.full((bs,), min(int(timestep_quantile * len(grid)), len(grid) - 1), dtype=torch.long, device=device)
+        else:
+            index = torch.randint(0, len(grid), (bs,), device=device)
+        return grid[index]
 
     def get_preprocess_media_file_fn(self):
         return PreprocessMediaFile(self.config, support_video=False, round_height=32, round_width=32)
@@ -525,7 +553,7 @@ class ImageInitialLayer(nn.Module):
         head = 0
         if self.pdd_grid is not None:
             # the interval [grid[k + 1], grid[k]] holds the noise level; the last interval takes the end point
-            head = sum(1 for g in self.pdd_grid[1:-1] if float(t.flatten()[0]) <= g)
+            head = sum(1 for g in self.pdd_grid[1:-1] if float(t.flatten()[0]) <= g + GRID_TOLERANCE)
         extra_ints = torch.tensor([va, vb, kind_row['video'], latent_t, lat_h, lat_w, head], dtype=torch.int32, device=device)
         return h, attention_mask, t_emb, mod_segments, rope_freqs, extra_ints
 

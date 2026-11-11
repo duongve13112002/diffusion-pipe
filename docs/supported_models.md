@@ -794,8 +794,7 @@ text_encoders = [
     {path = '/data/models/MiniMax-H3-Image/text_encoder', type = 'minimax'}
 ]
 dtype = 'bfloat16'
-timestep_sample_method = 'logit_normal'
-#shift = 3
+timestep_sample_method = 'pdd_grid'
 #train_pdd_head = 'sigma'
 #diffusion_model_format = 'official'
 #pdd_heads = '/data/models/pdd_fused_heads.safetensors'
@@ -813,14 +812,30 @@ See [examples/minimax_h3_image.toml](../examples/minimax_h3_image.toml) and its 
   dataset support).
 - Heads: head 0 of the bank is the trainable weight; every other head of a checkpoint is head 0 plus a fixed offset
   (measured on the released heads: the offsets are 2% of head 0's norm for the weight, 8% for the bias), so a full
-  fine-tune moves all six together and the export stacks them again. A LoRA leaves the heads alone. By default a sample
-  trains through the head of the sampling interval its noise level falls in, as ComfyUI applies it at that step
-  (`train_pdd_head = 0` trains through head 0 alone; it is refused for a checkpoint with one head). `--test_sample`
+  fine-tune moves all six together and the export stacks them again. A LoRA leaves the heads alone. `--test_sample`
   and the eval previews run the six heads, one per step, on the checkpoint's grid. The heads of a distilled model
   predict an average velocity over their step while the loss target is the instantaneous `noise - latent`: this
   is what fine-tuning any distilled model does, so check the previews.
-- `shift`: when none of `shift`, `image_shift` and `flux_shift` is set it is 3. That is a common value for images of this
-  size, not a measured optimum; the checkpoint's own sampling grid is not a shifted uniform grid. Try 1 to 3.
+- Noise levels: `timestep_sample_method = 'pdd_grid'` trains on the six sigmas the sampler runs (the grid of
+  `pdd_config.json`: 1, .9675, .8875, .75, .5328, .232), each equally often and through its own head, and nothing in
+  between, as the model only ever runs at those levels. It replaces `shift` (refused with it) and needs the PDD bank
+  (refused for a checkpoint with one head). `logit_normal` (the default) and `uniform` draw any noise level, shifted by
+  `shift`; a sample then trains through the head of the grid interval its noise level falls in (`train_pdd_head = 0`
+  trains through head 0 alone; refused for a checkpoint with one head). AI Toolkit trains on the six sigmas only.
+- `shift` (for `logit_normal` / `uniform`): 3 when none of `shift`, `image_shift` and `flux_shift` is set. The
+  checkpoint's grid is flow shift 3 applied to a base grid symmetric about 1/2 (`base[k] + base[6 - k] = 1`); shift 3 is
+  not a measured training optimum, try 1 to 3.
+- Distillation: the model is step- and guidance-distilled, so training erodes the 6-step sampling.
+  ostris's [training adapter](https://huggingface.co/ostris/minimax_h3_training_adapter)
+  (`minimax_h3_image_training_adapter_v1.safetensors`: ComfyUI layout, rank 16 on the blocks and the token refiner,
+  which loads whatever layout `diffusion_model` was in) merged with `merge_adapters` keeps it; the trained LoRA is then
+  used on the plain model. AI Toolkit applies it as a live assistant LoRA and switches it off for previews; here it is
+  merged, so the previews run with it on.
+- Resolution: AI Toolkit notes the model is tuned for 4 MP to 20 MP outputs (2048x2048 and up) and shows more artifacts
+  below that. Training at 1024 is faster but may not reproduce that quality.
+- Reference size: ComfyUI and AI Toolkit encode a reference at its own size (short edge between 1024 and 2048); here the
+  control image's latent is the target's size (the bucket), so with buckets below 1024 the reference is smaller than at
+  inference.
 - `save_dtype` leaves the output heads, the patch projection and the time embedder in float32 (the checkpoint's float32
   islands; rounding head 0 would move every head).
 - Per-component learning rates (`blocks_lr`, `token_refiner_lr`, and for a full fine-tune `text_projection_lr`,

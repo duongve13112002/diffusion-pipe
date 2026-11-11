@@ -1087,3 +1087,38 @@ def test_train_pdd_head_is_checked(tmp_path):
     three, _ = tiny_pair(3)
     write_comfy(tmp_path / '..', three, 3)
     image_pipeline(None, {'diffusion_model': str(tmp_path / '..' / 'comfy.safetensors'), 'train_pdd_head': 0}).refuse_unsupported_checkpoint()
+
+
+def test_pdd_grid_timesteps_are_the_samplers_sigmas():
+    """timestep_sample_method = 'pdd_grid': the noise levels are the grid points the sampler runs, each through its own
+    head, including the float32 value of a grid point (which sits above the double)."""
+    model, _ = tiny_pair(3)
+    pipe = image_pipeline(model, {'timestep_sample_method': 'pdd_grid'})
+    pipe.split_pdd_head()
+    torch.manual_seed(0)
+    t = pipe.sample_timesteps(600, 1, LATENT_H, LATENT_W, 'cpu')
+    assert set(t.tolist()) == {torch.tensor(g).item() for g in SIGMAS[3][:-1]}
+    assert all(abs(t.eq(torch.tensor(g)).float().mean() - 1 / 3) < 0.08 for g in SIGMAS[3][:-1])
+    assert pipe.sample_timesteps(2, 1, 4, 6, 'cpu', timestep_quantile=0.5).tolist() == [torch.tensor(0.6).item()] * 2
+    assert pipe.sample_timesteps(1, 1, 4, 6, 'cpu', timestep_quantile=0.99).tolist() == [torch.tensor(0.3).item()]
+    layers = pipe.to_layers()
+    video, _, text, mask, tags, _, augmented = image_inputs([6, 6, 6], [(1, 2)] * 3, [1.0, 0.6, 0.3])
+    sigmas = torch.tensor([torch.tensor(g).item() for g in SIGMAS[3][:-1]])
+    assert layers[0]((video, sigmas, text, mask, tags, augmented))[5].tolist()[6:] == [0, 1, 2]
+    # the other methods are untouched
+    other = image_pipeline(model, {'timestep_sample_method': 'uniform'})
+    assert not set(other.sample_timesteps(50, 1, 4, 6, 'cpu').tolist()) <= set(t.tolist())
+
+
+def test_pdd_grid_replaces_the_continuous_sampling_keys(tmp_path):
+    from models.minimax_h3_image import MiniMaxH3ImagePipeline
+    text_encoders = [{'path': 'x', 'type': 'minimax'}]
+    with pytest.raises(ValueError, match="shift, sigmoid_scale do not apply with timestep_sample_method = 'pdd_grid'"):
+        MiniMaxH3ImagePipeline({'model': {'text_encoders': text_encoders, 'timestep_sample_method': 'pdd_grid', 'shift': 3, 'sigmoid_scale': 1.0}})
+    with pytest.raises(ValueError, match='timestep_sample_method must be one of'):
+        MiniMaxH3ImagePipeline({'model': {'text_encoders': text_encoders, 'timestep_sample_method': 'sigmoid'}})
+    model, _ = tiny_pair(1)
+    write_comfy(tmp_path, model, 1)
+    pipe = image_pipeline(None, {'diffusion_model': str(tmp_path / 'comfy.safetensors'), 'timestep_sample_method': 'pdd_grid'})
+    with pytest.raises(ValueError, match="'pdd_grid' needs the PDD bank"):
+        pipe.refuse_unsupported_checkpoint()
