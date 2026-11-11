@@ -50,7 +50,7 @@ text_encoders = [
     {path = '/data/models/MiniMax-H3-Image/text_encoder', type = 'minimax'}
 ]
 dtype = 'bfloat16'
-# 'pdd_grid' trains on the six sigmas the 6-step sampler runs (the checkpoint's pdd_config.json grid), each through its own
+# 'pdd_grid' (the default for a checkpoint with the PDD bank) trains on the six sigmas the 6-step sampler runs (the checkpoint's pdd_config.json grid), each through its own
 # output head, and nothing in between: the model only ever runs at those noise levels. It needs the PDD bank (the ComfyUI
 # file, or pdd_fused_heads.safetensors with the official transformer/) and replaces shift. 'logit_normal' and 'uniform'
 # draw any noise level and are shifted by `shift` (default 3: the checkpoint's grid is shift 3 applied to a base grid

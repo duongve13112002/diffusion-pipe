@@ -737,9 +737,39 @@ def test_the_default_shift_is_the_grid_of_the_checkpoint(monkeypatch):
 
     monkeypatch.setattr(models.minimax_h3.MinimaxH3Pipeline, '__init__', base_init)
     text_encoders = [{'path': 'x', 'type': 'minimax'}]
-    assert MiniMaxH3ImagePipeline({'model': {'text_encoders': text_encoders}}).model_config['shift'] == 3.0
-    assert 'shift' not in MiniMaxH3ImagePipeline({'model': {'text_encoders': text_encoders, 'image_shift': 2.0}}).model_config
-    assert MiniMaxH3ImagePipeline({'model': {'text_encoders': text_encoders, 'shift': 1.0}}).model_config['shift'] == 1.0
+    uniform = {'text_encoders': text_encoders, 'timestep_sample_method': 'uniform'}
+    assert MiniMaxH3ImagePipeline({'model': dict(uniform)}).model_config['shift'] == 3.0
+    assert 'shift' not in MiniMaxH3ImagePipeline({'model': {**uniform, 'image_shift': 2.0}}).model_config
+    assert MiniMaxH3ImagePipeline({'model': {**uniform, 'shift': 1.0}}).model_config['shift'] == 1.0
+    # a continuous-sampling key without a method is the continuous sampling, with the default shift
+    pipe = MiniMaxH3ImagePipeline({'model': {'text_encoders': text_encoders, 'sigmoid_scale': 1.0}})
+    assert not pipe.grid_by_default and pipe.model_config['shift'] == 3.0
+    assert MiniMaxH3ImagePipeline({'model': {'text_encoders': text_encoders, 'shift': 2.0}}).grid_by_default is False
+
+
+def test_without_a_method_the_checkpoints_grid_is_trained_on(tmp_path, monkeypatch):
+    """No timestep_sample_method: pdd_grid for a checkpoint with the PDD bank; logit_normal with the default shift for
+    one with a single head (it has no sampling grid)."""
+    import models.minimax_h3
+    from models.minimax_h3_image import MiniMaxH3ImagePipeline
+
+    def base_init(self, config):
+        self.config, self.model_config = config, config['model']
+
+    monkeypatch.setattr(models.minimax_h3.MinimaxH3Pipeline, '__init__', base_init)
+    text_encoders = [{'path': 'x', 'type': 'minimax'}]
+    for heads, method in ((1, None), (3, 'pdd_grid')):
+        model, _ = tiny_pair(heads)
+        write_comfy(tmp_path, model, heads)
+        pipe = MiniMaxH3ImagePipeline({'model': {'text_encoders': text_encoders, 'diffusion_model': str(tmp_path / 'comfy.safetensors')}})
+        pipe.refuse_unsupported_checkpoint()
+        assert pipe.model_config.get('timestep_sample_method') == method
+        assert ('shift' in pipe.model_config) == (method is None)
+    # an explicit method stays; so does a continuous key's choice with a PDD bank
+    for extra, method in (({'timestep_sample_method': 'uniform'}, 'uniform'), ({'shift': 2.0}, None)):
+        pipe = MiniMaxH3ImagePipeline({'model': {'text_encoders': text_encoders, 'diffusion_model': str(tmp_path / 'comfy.safetensors'), **extra}})
+        pipe.refuse_unsupported_checkpoint()
+        assert pipe.model_config.get('timestep_sample_method') == method
 
 
 @pytest.mark.parametrize('dataset, match', [

@@ -794,7 +794,7 @@ text_encoders = [
     {path = '/data/models/MiniMax-H3-Image/text_encoder', type = 'minimax'}
 ]
 dtype = 'bfloat16'
-timestep_sample_method = 'pdd_grid'
+#timestep_sample_method = 'pdd_grid'
 #train_pdd_head = 'sigma'
 #diffusion_model_format = 'official'
 #pdd_heads = '/data/models/pdd_fused_heads.safetensors'
@@ -818,10 +818,13 @@ See [examples/minimax_h3_image.toml](../examples/minimax_h3_image.toml) and its 
   is what fine-tuning any distilled model does, so check the previews.
 - Noise levels: `timestep_sample_method = 'pdd_grid'` trains on the six sigmas the sampler runs (the grid of
   `pdd_config.json`: 1, .9675, .8875, .75, .5328, .232), each equally often and through its own head, and nothing in
-  between, as the model only ever runs at those levels. It replaces `shift` (refused with it) and needs the PDD bank
-  (refused for a checkpoint with one head). `logit_normal` (the default) and `uniform` draw any noise level, shifted by
-  `shift`; a sample then trains through the head of the grid interval its noise level falls in (`train_pdd_head = 0`
-  trains through head 0 alone; refused for a checkpoint with one head). AI Toolkit trains on the six sigmas only.
+  between, as the model only ever runs at those levels. It is the default when `timestep_sample_method` is not set and
+  the checkpoint has the PDD bank; it replaces `shift` (refused with it) and is refused, when set, for a checkpoint with
+  one head (which without a method trains `logit_normal`). A config that sets `shift`, `image_shift`, `flux_shift` or
+  `sigmoid_scale` without a method keeps the continuous sampling. `logit_normal` and `uniform` draw any noise level,
+  shifted by `shift`; a sample then trains through the head of the grid interval its noise level falls in
+  (`train_pdd_head = 0` trains through head 0 alone; refused for a checkpoint with one head). AI Toolkit trains on the
+  six sigmas only.
 - `shift` (for `logit_normal` / `uniform`): 3 when none of `shift`, `image_shift` and `flux_shift` is set. The
   checkpoint's grid is flow shift 3 applied to a base grid symmetric about 1/2 (`base[k] + base[6 - k] = 1`); shift 3 is
   not a measured training optimum, try 1 to 3.

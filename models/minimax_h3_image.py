@@ -61,6 +61,11 @@ REFUSED_MODEL_KEYS = {
 }
 
 
+def set_default_shift(model_config):
+    if not any(k in model_config for k in ('shift', 'image_shift', 'flux_shift')):
+        model_config['shift'] = DEFAULT_SHIFT
+
+
 def size_short_edge(width, height, low, high):
     """ComfyUI's _size_short_edge: aspect-preserving scale putting the short edge in [low, high], sides /32."""
     scale = min(max(min(width, height), low), high) / min(width, height)
@@ -105,15 +110,18 @@ class MiniMaxH3ImagePipeline(MinimaxH3Pipeline):
         if 'adapter' in config and (keys := [k for k in HEAD_LR_KEYS if k in model_config]):
             raise ValueError(f'[model] {", ".join(keys)} do not apply to adapter training: they set the learning rate of '
                              'weights an adapter leaves frozen. Remove them (blocks_lr and token_refiner_lr do apply).')
-        method = model_config.get('timestep_sample_method', 'logit_normal')
-        if method not in SAMPLE_METHODS:
+        method = model_config.get('timestep_sample_method')
+        if method is not None and method not in SAMPLE_METHODS:
             raise ValueError(f'[model] timestep_sample_method must be one of {SAMPLE_METHODS}, got {method!r}')
         if method == 'pdd_grid':
             if keys := [k for k in CONTINUOUS_SAMPLING_KEYS if k in model_config]:
                 raise ValueError(f"[model] {', '.join(keys)} do not apply with timestep_sample_method = 'pdd_grid': it trains "
                                  "on the sigmas of the checkpoint's sampling grid only. Remove them.")
-        elif not any(k in model_config for k in ('shift', 'image_shift', 'flux_shift')):
-            model_config['shift'] = DEFAULT_SHIFT
+        # Without a method the grid is trained on when the checkpoint has one (refuse_unsupported_checkpoint decides, it
+        # reads the checkpoint); a config that sets a continuous-sampling key chose the continuous sampling.
+        self.grid_by_default = method is None and not any(k in model_config for k in CONTINUOUS_SAMPLING_KEYS)
+        if method != 'pdd_grid' and not self.grid_by_default:
+            set_default_shift(model_config)
         super().__init__(config)
         self.is_video_vae = False
         self.pdd_offsets = None
@@ -121,6 +129,11 @@ class MiniMaxH3ImagePipeline(MinimaxH3Pipeline):
     def refuse_unsupported_checkpoint(self):
         layout, heads = weights.inspect_checkpoint(self.model_config['diffusion_model'], self.model_config.get('diffusion_model_format'),
                                                    self.model_config.get('pdd_heads'))
+        if getattr(self, 'grid_by_default', False):
+            if heads > 1:
+                self.model_config['timestep_sample_method'] = 'pdd_grid'
+            else:
+                set_default_shift(self.model_config)
         if heads == 1 and self.model_config.get('timestep_sample_method') == 'pdd_grid':
             raise ValueError("[model] timestep_sample_method = 'pdd_grid' needs the PDD bank: this diffusion_model has one output "
                              'head and no sampling grid. For an official transformer/ give its pdd_fused_heads.safetensors '
