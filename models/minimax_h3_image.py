@@ -88,28 +88,32 @@ def control_key(n):
 CONTROL_KEYS = tuple(control_key(n) for n in range(MAX_REFERENCES))
 
 
-class ImagePreprocess(PreprocessMediaFile):
-    def preprocess_control(self, path, size_bucket=None):
-        """A reference at its own size (the target's size bucket does not matter), as ComfyUI sizes it for the VAE: the
-        short edge into REFERENCE_SHORT_EDGE, the aspect ratio kept, the sides a multiple of 32. [3, H, W] in 0..1."""
-        with Image.open(path) as img:
-            width, height = img.size
-        size = size_short_edge(width, height, *REFERENCE_SHORT_EDGE)
-        return self((None, path), None, (*size, 1))[0][0]
-
-
-def load_vision_image(path):
-    """The control image ([1, H, W, 3] in 0..1) at the size MiniMaxH3ImageConditioning shows it to the text encoder.
-    Decoded as the dataset decodes the same file into the reference latent (convert_to_rgb: no EXIF rotation,
-    transparency onto white), so the encoder and the latent see one image."""
+def load_scaled_image(path, low, high):
+    """The image ([1, H, W, 3] in 0..1) scaled as ComfyUI's _resize_to scales it: the short edge into [low, high], the
+    sides a multiple of 32, the whole image stretched with lanczos (nothing is cropped), untouched when already there.
+    Decoded as the dataset decodes the same file (convert_to_rgb: no EXIF rotation, transparency onto white), so the
+    encoder's picture and the reference latent see one image."""
     with Image.open(path) as img:
         img = convert_to_rgb(img)
         image = torch.from_numpy(np.array(img).astype(np.float32) / 255.0)[None]
-    size = size_short_edge(image.shape[2], image.shape[1], VISION_SHORT_EDGE, VISION_SHORT_EDGE)
+    size = size_short_edge(image.shape[2], image.shape[1], low, high)
     if (image.shape[2], image.shape[1]) == size:
         return image
     samples = comfy.utils.common_upscale(image.movedim(-1, 1), size[0], size[1], 'lanczos', 'disabled')
     return samples.movedim(1, -1)
+
+
+class ImagePreprocess(PreprocessMediaFile):
+    def preprocess_control(self, path, size_bucket=None):
+        """A reference at its own size (the target's size bucket does not matter), as ComfyUI sizes it for the VAE: the
+        short edge into REFERENCE_SHORT_EDGE, the aspect ratio kept (up to the multiple of 32), the sides a multiple of 32.
+        [3, H, W] in 0..1."""
+        return load_scaled_image(path, *REFERENCE_SHORT_EDGE)[0].movedim(-1, 0)
+
+
+def load_vision_image(path):
+    """The control image ([1, H, W, 3] in 0..1) at the size MiniMaxH3ImageConditioning shows it to the text encoder."""
+    return load_scaled_image(path, VISION_SHORT_EDGE, VISION_SHORT_EDGE)
 
 
 class MiniMaxH3ImagePipeline(MinimaxH3Pipeline):
@@ -117,6 +121,9 @@ class MiniMaxH3ImagePipeline(MinimaxH3Pipeline):
     is_video_vae = False
     vae_latent_keys = ('latents',) + CONTROL_KEYS
     max_control_images = MAX_REFERENCES
+    # the latent cache of a directory with references records how they are sized (a cache made with the references
+    # at the target's size is rebuilt)
+    control_sizing = 'own_size'
     # fp32 islands of the checkpoint: save_dtype leaves them unrounded (rounding head 0 moves all six heads)
     save_float32_prefixes = ('final_layer.video_out.', 'video_patch_proj.', 'time_embedder.')
 
@@ -267,10 +274,6 @@ class MiniMaxH3ImagePipeline(MinimaxH3Pipeline):
     def get_preprocess_media_file_fn(self):
         return ImagePreprocess(self.config, support_video=False, round_height=32, round_width=32)
 
-    def vae_cache_key(self):
-        # references are encoded at their own size since this; a cache from before holds them at the target's
-        return super().vae_cache_key() + '|references=own_size'
-
     def encode_images(self, images, vae=None):
         """[B, C, H, W] (or [B, C, 1, H, W]) pixels in 0..1 -> [B, 24, 1, h, w] latents. One image per call: the VAE's
         posterior sample draws its noise from seed 42 for the shape it is given, so in a batch every image but the
@@ -384,19 +387,22 @@ class MiniMaxH3ImagePipeline(MinimaxH3Pipeline):
     @staticmethod
     def pack_references(references, bs):
         """The references of a batch (a [B, 24, 1, h, w] tensor, or a list of B such latents of their own sizes, for each
-        reference) -> ([B, N, 24, 1, H, W] noise-augmented latents zero-padded to the largest size, [B, N, 2] their
-        latent heights and widths)."""
+        reference) -> ([B, R, 96] their noise-augmented patch rows one after the other, zero-padded to the longest sample,
+        [B, N, 2] their latent heights and widths)."""
         samples = [[reference[i].float() for reference in references] for i in range(bs)]
-        height = max(latent.shape[-2] for sample in samples for latent in sample)
-        width = max(latent.shape[-1] for sample in samples for latent in sample)
-        packed = samples[0][0].new_zeros(bs, len(references), *samples[0][0].shape[:2], height, width)
-        shapes = torch.zeros(bs, len(references), 2, dtype=torch.long, device=packed.device)
+        rows = []
+        shapes = torch.zeros(bs, len(references), 2, dtype=torch.long, device=samples[0][0].device)
         for i, sample in enumerate(samples):
+            parts = []
             for n, latent in enumerate(sample):
                 # ComfyUI's visual condition noise augmentation.
                 latent = VISUAL_COND_TIMESTEP * latent + (1.0 - VISUAL_COND_TIMESTEP) * torch.randn_like(latent)
-                packed[i, n, :, :, :latent.shape[-2], :latent.shape[-1]] = latent
-                shapes[i, n] = torch.tensor(latent.shape[-2:], device=packed.device)
+                parts.append(patchify_video(latent[None]))
+                shapes[i, n] = torch.tensor(latent.shape[-2:], device=latent.device)
+            rows.append(torch.cat(parts))
+        packed = rows[0].new_zeros(bs, max(r.shape[0] for r in rows), rows[0].shape[1])
+        for i, r in enumerate(rows):
+            packed[i, :r.shape[0]] = r
         return packed, shapes
 
     def get_loss_fn(self):
@@ -526,16 +532,16 @@ class ImageInitialLayer(nn.Module):
         return getattr(self.model[0], name)
 
     def make_packed_sequence(self, video_x, t, context, context_mask, token_tags, ref_latents=None, ref_shapes=None):
-        """ref_latents [1, N, 24, 1, H, W] zero-padded to the largest reference, ref_shapes [1, N, 2] the latent size of
-        each (the padding is cut off here)."""
+        """ref_latents [1, R, 96]: the patch rows of the N references one after the other (zero-padded at the end),
+        ref_shapes [1, N, 2] the latent size of each; the padding is cut off here."""
         assert video_x.shape[0] == 1  # one sample, with a batch dimension
         device = video_x.device
         dtype = context.dtype  # compute dtype
         refs = None
         if ref_latents is not None:
             sizes = ref_shapes[0].tolist()
-            ref_latents = [ref_latents[:, n, :, :, :h, :w] for n, (h, w) in enumerate(sizes)]
             refs = [{'kind': 'image', 'latent_h': h, 'latent_w': w} for h, w in sizes]
+            ref_rows = ref_latents[0, :sum(h // 2 * (w // 2) for h, w in sizes)].detach()
         latent_t, lat_h, lat_w = video_x.shape[2], video_x.shape[3], video_x.shape[4]
         text_len = context.shape[1]
         # The captions of a batch are padded to the longest. ComfyUI never pads a prompt, so the sample is built as
@@ -573,7 +579,6 @@ class ImageInitialLayer(nn.Module):
         all_rows = video_rows
         if refs:
             # already noise-augmented by the pipeline (prepare_inputs); in the order of the pictures
-            ref_rows = torch.cat([patchify_video(latent.to(torch.float32), self.patch_size) for latent in ref_latents])
             img_update = layout.img_update.to(device)
             all_rows = torch.empty(img_update.shape[0], video_rows.shape[1], dtype=torch.float32, device=device)
             all_rows[~img_update] = ref_rows
@@ -682,7 +687,7 @@ class ImageInitialLayer(nn.Module):
     @torch.autocast('cuda', dtype=AUTOCAST_DTYPE)
     @torch.compiler.disable
     def forward(self, inputs):
-        # (video, t, text, text mask, token tags[, reference latents, their latent sizes])
+        # (video, t, text, text mask, token tags[, reference patch rows, their latent sizes])
         video_x, t, context, context_mask, token_tags, *ref = inputs
         return self.make_layer_inputs(video_x, t, context, context_mask, token_tags, *ref)
 

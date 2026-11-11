@@ -143,6 +143,8 @@ def extra_control_paths(directory_config):
     for key in directory_config:
         match = re.fullmatch(r'control_path_(\d+)', key)
         if match:
+            if str(int(match.group(1))) != match.group(1):
+                raise ValueError(f'{key}: write the number without leading zeros (control_path_{int(match.group(1))})')
             numbered[int(match.group(1))] = Path(directory_config[key])
     if not numbered:
         return []
@@ -154,6 +156,21 @@ def extra_control_paths(directory_config):
         raise ValueError('the reference images are control_path, control_path_2, control_path_3, ... without gaps '
                          f'(and no control_path_0 or control_path_1); this directory has control_path_{sorted(numbered)}')
     return [numbered[n] for n in range(2, max(numbered) + 1)]
+
+
+def check_control_columns(metadata_dataset, directory_dataset):
+    """The metadata a directory loads must say what its config says about further reference images: a metadata cache
+    from before control_path_2 was added (or removed), reused under --trust_cache, would train with the wrong number."""
+    paths = getattr(directory_dataset, 'control_extra_paths', None)
+    if paths is None or 'control_file' not in metadata_dataset.column_names:
+        return
+    has_column = 'control_extra_file' in metadata_dataset.column_names
+    # every row of a directory was written by one scan: the first says how many
+    found = len(metadata_dataset[0]['control_extra_file']) if has_column and len(metadata_dataset) else 0
+    if has_column != bool(paths) or (has_column and found != len(paths)):
+        raise RuntimeError(f"The metadata cache of {directory_dataset.path} has {found} further reference image(s) per "
+                           f"sample but its config has {len(paths)} (control_path_2, ...). Run once without "
+                           "--trust_cache (or with --regenerate_cache) so the metadata is scanned again.")
 
 
 def text_encoder_control_files(row):
@@ -1190,6 +1207,7 @@ class SizeBucketDataset:
         # Kept so the cache identity can be reached without threading it through both
         # SizeBucketDataset construction sites.
         self.directory_dataset = directory_dataset
+        check_control_columns(metadata_dataset, directory_dataset)
 
         if len(size_bucket) == 4:
             # rename old folder name to the new one for convenience
@@ -1252,12 +1270,16 @@ class SizeBucketDataset:
         # on the caption, which is only carried alongside them. Fingerprinting the caption
         # column too meant every caption setting change wiped the whole VAE cache.
         latent_columns = [c for c in self.metadata_dataset.column_names if c != 'caption']
+        sizing = getattr(self.directory_dataset, 'control_sizing', None)
+        # Control images sized by the model differ from the ones an older cache holds: only a directory with control
+        # images gets this, whatever else is in the cache identity.
+        sizing_args = [f'control_sizing={sizing}'] if sizing else None
         if getattr(self.directory_dataset, 'reuse_metadata_cache', False):
             self.latent_dataset = tensor_profile(
                 self.metadata_dataset, None if cached_only else map_fn,
-                self.cache_dir / f'latent_profile_{Hasher.hash(self.vae_identity)}',
+                self.cache_dir / f'latent_profile_{Hasher.hash([self.vae_identity, sizing] if sizing else self.vae_identity)}',
                 sorted(latent_columns), self.vae_identity,
-                lambda: self.directory_dataset.legacy_tensor_sources(self.size_bucket, 'latents'),
+                (lambda: []) if sizing else (lambda: self.directory_dataset.legacy_tensor_sources(self.size_bucket, 'latents')),
                 _map_and_cache, caching_batch_size=caching_batch_size,
                 regenerate_cache=regenerate_cache,
                 lookup_dir=self.directory_dataset.snapshot_dir / 'tensor_lookups',
@@ -1266,7 +1288,7 @@ class SizeBucketDataset:
         elif cached_only:
             self.latent_dataset = _open_cached_prefix(
                 self.metadata_dataset, self.cache_dir, cache_file_prefix='latents_',
-                fingerprint_columns=latent_columns,
+                new_fingerprint_args=sizing_args, fingerprint_columns=latent_columns,
                 keep_on_fingerprint_change=self.directory_config.get('keep_latent_cache', False),
                 identity=self.vae_identity, require_identity=self.vae_identity_required,
                 content_column=('image_spec' if self.directory_config.get('require_non_latin_caption') is not None
@@ -1274,6 +1296,7 @@ class SizeBucketDataset:
         else:
             self.latent_dataset = _map_and_cache(
                 self.metadata_dataset, map_fn, self.cache_dir, cache_file_prefix='latents_',
+                new_fingerprint_args=sizing_args,
                 regenerate_cache=regenerate_cache, caching_batch_size=caching_batch_size,
                 fingerprint_columns=latent_columns,
                 keep_on_fingerprint_change=self.directory_config.get('keep_latent_cache', False),
@@ -2050,7 +2073,7 @@ class DirectoryDataset:
     def __init__(self, directory_config, dataset_config, model_name, framerate=None,
                  round_to_multiple=32, skip_dataset_validation=False,
                  caches_text_embeddings=True, vae_identity='', vae_identity_required=False, on_the_fly_media=None,
-                 layout_caption_format=None, encode_text_in_loader=False):
+                 layout_caption_format=None, encode_text_in_loader=False, control_sizing=None):
         self._set_defaults(directory_config, dataset_config)
         self.directory_config = directory_config
         # Each sample then carries what utils/text_encoding.py needs to encode its caption.
@@ -2099,6 +2122,9 @@ class DirectoryDataset:
         self.mask_path = Path(self.directory_config['mask_path']) if 'mask_path' in self.directory_config else None
         self.control_path = Path(self.directory_config['control_path']) if 'control_path' in self.directory_config else None
         self.control_extra_paths = extra_control_paths(self.directory_config)
+        # How the model sizes the control images it encodes (a name, e.g. 'own_size'); None: at the size bucket. It is part
+        # of the latent fingerprint of a directory with control images, so a cache made with another sizing is rebuilt.
+        self.control_sizing = control_sizing if self.control_path is not None else None
         # For testing. Default if a mask is missing.
         self.default_mask_file = Path(self.directory_config['default_mask_file']) if 'default_mask_file' in self.directory_config else None
         self.cache_dir = self.path / 'cache' / self.model_name
@@ -3297,6 +3323,9 @@ class Dataset:
                 if extras and max_controls == 1:
                     raise ValueError(f"{', '.join(sorted(extras))} in the directory {directory_config.get('path')}: "
                                      f"{self.model_name} takes one control image per sample (control_path)")
+                if 1 + len(extras) > max_controls:
+                    raise ValueError(f"{', '.join(sorted(extras))} in the directory {directory_config.get('path')}: "
+                                     f"{self.model_name} takes at most {max_controls} control images per sample")
                 extra_control_paths(directory_config)
 
         on_the_fly_media = None
@@ -3331,6 +3360,7 @@ class Dataset:
                 vae_identity_required=model.vae_identity_required(),
                 on_the_fly_media=on_the_fly_media,
                 layout_caption_format=getattr(model, 'layout_caption_format', None),
+                control_sizing=getattr(model, 'control_sizing', None),
             )
             self.directory_datasets.append(directory_dataset)
         if 'max_ar_crop' in dataset_config and not any(

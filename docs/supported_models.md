@@ -816,8 +816,12 @@ See [examples/minimax_h3_image.toml](../examples/minimax_h3_image.toml) and its 
   sequences are padded at the end and the padding is masked, which changes nothing in the others' output. A directory
   has the same number of references for all its samples (a file missing from `control_path_N` is an error naming it), and
   directories with another number of references are batched separately.
-- The latent cache of an edit directory holds the references at their own size (identity `references=own_size`): a cache
-  made before this, with references at the target's size, is rebuilt.
+- The latent fingerprint of a directory with `control_path` records that the references are encoded at their own size
+  (`control_sizing = own_size`; a text-to-image directory is not affected): the latent cache of an edit directory made
+  before this, with references at the target's size, is rebuilt on the next run (kept, as with any fingerprint change,
+  by `keep_latent_cache = true`, which keeps those rows by your choice). `--trust_cache` with a metadata cache that
+  was scanned before `control_path_2` was added or removed is refused with a message to scan again, and so are
+  `control_path_N` written with a leading zero, or more references than the model takes.
 - Heads: head 0 of the bank is the trainable weight; every other head of a checkpoint is head 0 plus a fixed offset
   (measured on the released heads: the offsets are 2% of head 0's norm for the weight, 8% for the bias), so a full
   fine-tune moves all six together and the export stacks them again. A LoRA leaves the heads alone. `--test_sample`

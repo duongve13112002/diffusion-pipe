@@ -79,10 +79,21 @@ def reference_forward(reference, video, t, text, tags=None, ref=None, sample_sig
     return reference(video, t * 1000, text, transformer_options=options, minimax_payload=payload)
 
 
+def pad_refs(samples):
+    """[[ref latent [24, 1, h, w], ...] per sample] as the layers take them: the patch rows of each sample's references one
+    after the other, zero-padded to the longest, and the references' latent sizes."""
+    from comfy.ldm.minimax.model import patchify_video
+    rows = [torch.cat([patchify_video(r[None]) for r in sample]) for sample in samples]
+    packed = torch.zeros(len(samples), max(r.shape[0] for r in rows), rows[0].shape[1])
+    for i, r in enumerate(rows):
+        packed[i, :r.shape[0]] = r
+    shapes = torch.tensor([[list(r.shape[-2:]) for r in sample] for sample in samples])
+    return packed, shapes
+
+
 def pack_refs(latents):
-    """[B, 24, 1, h, w] reference latents (one reference per sample) as the layers take them: [B, 1, 24, 1, h, w] and
-    their latent sizes."""
-    return latents[:, None], torch.tensor([latents.shape[-2:]] * latents.shape[0])[:, None]
+    """[B, 24, 1, h, w] reference latents (one reference per sample) as the layers take them."""
+    return pad_refs([[latent] for latent in latents])
 
 
 def image_inputs(lengths, vision, t, seed=1):
@@ -140,19 +151,6 @@ def test_edit_layers_match_comfyui(t):
     for name, p in model.blocks.named_parameters():
         assert p.grad is not None and torch.isfinite(p.grad).all(), name
     assert model.final_layer.video_out.weight.grad is not None
-
-
-def pad_refs(samples):
-    """[[ref latent [24, 1, h, w], ...] per sample] as the layers take them: zero-padded to the largest, and their sizes."""
-    height = max(r.shape[-2] for sample in samples for r in sample)
-    width = max(r.shape[-1] for sample in samples for r in sample)
-    packed = torch.zeros(len(samples), len(samples[0]), 24, 1, height, width)
-    shapes = torch.zeros(len(samples), len(samples[0]), 2, dtype=torch.long)
-    for i, sample in enumerate(samples):
-        for n, r in enumerate(sample):
-            packed[i, n, :, :, :r.shape[-2], :r.shape[-1]] = r
-            shapes[i, n] = torch.tensor(r.shape[-2:])
-    return packed, shapes
 
 
 @pytest.mark.parametrize('t', [[0.3, 0.7], [0.3, 0.0005]], ids=['ordinary', 'sigma-below-ref-pin'])
@@ -681,8 +679,9 @@ def test_prepare_inputs():
               'attention_mask_0': [torch.ones(n, dtype=torch.int64) for n in lengths],
               'token_tags_0': [tags_with_vision(n, 1, 1) for n in lengths]}
     (noisy, t, text_embeds, attention_mask, token_tags, refs, ref_shapes), (target, mask) = pipe.prepare_inputs(inputs)
-    ref = refs[:, 0]
-    assert refs.shape == (bs, 1, 24, 1, LATENT_H, LATENT_W) and ref_shapes.tolist() == [[[LATENT_H, LATENT_W]]] * bs
+    from comfy.ldm.minimax.model import patchify_video, unpatchify_video
+    assert refs.shape == (bs, LATENT_H // 2 * (LATENT_W // 2), 96) and ref_shapes.tolist() == [[[LATENT_H, LATENT_W]]] * bs
+    ref = torch.cat([unpatchify_video(refs[i], 1, LATENT_H // 2, LATENT_W // 2) for i in range(bs)])
     assert noisy.shape == latents.shape and target.shape == latents.shape and t.shape == (bs,)
     assert torch.allclose(noisy, (1 - t.view(-1, 1, 1, 1, 1)) * latents + t.view(-1, 1, 1, 1, 1) * (target + latents))
     assert text_embeds.shape == (bs, 7, 40) and attention_mask.dtype == torch.bool
@@ -701,6 +700,7 @@ def test_prepare_inputs():
 
 
 def test_prepare_inputs_packs_references_of_other_sizes():
+    from comfy.ldm.minimax.model import patchify_video
     torch.manual_seed(0)
     pipe = image_pipeline(None, {'timestep_sample_method': 'uniform'})
     bs = 2
@@ -712,13 +712,13 @@ def test_prepare_inputs_packs_references_of_other_sizes():
               'attention_mask_0': [torch.ones(n, dtype=torch.int64) for n in lengths]}
     model_inputs, _ = pipe.prepare_inputs(inputs)
     refs, shapes = model_inputs[5:]
-    assert refs.shape == (bs, 2, 24, 1, 4, 8)
     assert shapes.tolist() == [[[4, 6], [4, 4]], [[2, 8], [4, 4]]]
-    # noise-augmented, inside the size of each reference; zero outside
-    assert (refs[0, 0, :, :, :4, :6] - 0.999 * first[0]).abs().max() < 0.01
-    assert (refs[1, 0, :, :, :2, :8] - 0.999 * first[1]).abs().max() < 0.01
-    assert refs[0, 0, :, :, :, 6:].eq(0).all() and refs[1, 0, :, :, 2:, :].eq(0).all()
-    assert (refs[0, 1, :, :, :, :4] - 0.999 * second[0]).abs().max() < 0.01 and refs[0, 1, :, :, :, 4:].eq(0).all()
+    # the rows of each sample's references one after the other: 6 + 4 for the first, 4 + 4 for the second, the
+    # shorter padded with zeros
+    assert refs.shape == (bs, 10, 96) and refs[1, 8:].eq(0).all() and not refs[1, :8].eq(0).any()
+    close = lambda rows, latent: (rows - 0.999 * patchify_video(latent[None])).abs().max() < 0.01
+    assert close(refs[0, :6], first[0]) and close(refs[0, 6:], second[0])
+    assert close(refs[1, :4], first[1]) and close(refs[1, 4:8], second[1])
 
 
 def test_references_are_encoded_at_the_size_they_are_given(monkeypatch):
@@ -736,16 +736,22 @@ def test_references_are_encoded_at_the_size_they_are_given(monkeypatch):
 
 
 def test_the_preprocessing_gives_a_reference_its_own_size(tmp_path):
+    """The size and the pixels of ComfyUI's reference: the whole image stretched with lanczos to the size the node gives
+    it (nothing cropped), the same copy the vision input is made from at another short edge."""
     from models.minimax_h3_image import ImagePreprocess, size_short_edge
+    ns = _node_namespace('MiniMaxH3ImageConditioning')
     preprocess = ImagePreprocess({}, support_video=False, round_height=32, round_width=32)
-    for size in ((600, 400), (3000, 2000), (1200, 1500), (5000, 3000), (1024, 1024)):
+    rng = np.random.default_rng(0)
+    for size in ((600, 400), (3000, 1999), (1200, 1500), (1024, 1024), (2400, 2048)):
         path = tmp_path / f'{size[0]}x{size[1]}.png'
-        Image.new('RGB', size, (10, 20, 30)).save(path)
+        Image.fromarray(rng.integers(0, 256, (size[1], size[0], 3), dtype=np.uint8)).save(path)
         # the size bucket of the target is not the reference's
         tensor = preprocess.preprocess_control(str(path), (320, 320, 1))
         width, height = size_short_edge(*size, 1024, 2048)
         assert tensor.shape == (3, height, width), size
-        assert min(width, height) >= 1000 and min(width, height) <= 2048
+        expected = ns['_resize_to'](load_comfy_image(path), (width, height)) if '_resize_to' in ns else None
+        if expected is not None:
+            assert_close(tensor.movedim(0, -1), expected[0], atol=1e-5)
 
 
 def test_the_loss():

@@ -3,8 +3,10 @@
 by file name; models that take one refuse them."""
 
 import sys
+import types
 from pathlib import Path
 
+import datasets
 import numpy as np
 import pytest
 import torch
@@ -17,7 +19,7 @@ sys.path.insert(0, str(REPO / 'test'))
 import utils.dataset as dataset_util  # noqa: E402
 from models.base import PreprocessMediaFile  # noqa: E402
 from test_text_encoding_on_the_fly import (  # noqa: E402,F401
-    CAPTIONS, Model, batches, dataset_config, encode_text, local_workers, make_images,
+    CAPTIONS, Model, batches, dataset_config, encode_text, local_workers, make_images, run_caching,
 )
 
 
@@ -98,6 +100,7 @@ def test_a_missing_reference_file_is_named(tmp_path):
     ({'control_path_2': 'x'}, 'control_path_2 needs control_path'),
     ({'control_path': 'x', 'control_path_3': 'y'}, 'without gaps'),
     ({'control_path': 'x', 'control_path_1': 'y'}, 'without gaps'),
+    ({'control_path': 'x', 'control_path_02': 'y'}, 'without leading zeros'),
 ])
 def test_the_numbering_has_no_gaps(directory, match):
     with pytest.raises(ValueError, match=match):
@@ -110,9 +113,12 @@ def test_a_model_that_takes_one_control_image_refuses_the_others(tmp_path):
     config = dataset_config(images, control_path=str(first), control_path_2=str(first))
     with pytest.raises(ValueError, match='control_path_2 in the directory .*: fake takes one control image'):
         dataset_util.Dataset(config, Model(control=True))
-    # one more than the model takes
-    config = dataset_config(images, control_path=str(first), **{f'control_path_{n}': str(first) for n in (2, 3, 4)})
+    # a model that takes several still has its limit: ReferenceModel takes 3
+    config = dataset_config(images, control_path=str(first), **{f'control_path_{n}': str(first) for n in (2, 3)})
     dataset_util.Dataset(config, ReferenceModel())
+    config = dataset_config(images, control_path=str(first), **{f'control_path_{n}': str(first) for n in (2, 3, 4)})
+    with pytest.raises(ValueError, match='control_path_2, control_path_3, control_path_4 in the directory .*: fake takes at most 3'):
+        dataset_util.Dataset(config, ReferenceModel())
 
 
 def test_directories_with_another_number_of_references_do_not_share_a_batch(tmp_path):
@@ -128,3 +134,71 @@ def test_directories_with_another_number_of_references_do_not_share_a_batch(tmp_
         directories = {Path(spec[1]).parent.name for spec in batch['image_spec']}
         assert len(directories) == 1
         assert ('control_latents_2' in batch) == (directories == {'two'})
+
+
+
+class CountingModel(ReferenceModel):
+    """Counts the batches its VAE function encodes."""
+
+    def __init__(self, sizing=None):
+        super().__init__()
+        self.control_sizing = sizing
+        self.vae_calls = 0
+
+    def get_call_vae_fn(self, vae):
+        inner = super().get_call_vae_fn(vae)
+
+        def fn(images, control_images=None):
+            self.vae_calls += 1
+            return inner(images, control_images) if control_images is not None else {'latents': images.mean(dim=1, keepdim=True)}
+        return fn
+
+
+def encoded_batches(model, config):
+    ds = dataset_util.Dataset(config, model)
+    run_caching(model, ds, config)
+    return model.vae_calls
+
+
+@pytest.mark.parametrize('reuse_metadata_cache', [False, True])
+def test_a_cache_made_with_another_control_sizing_is_rebuilt(tmp_path, reuse_metadata_cache):
+    """A directory with control images records how the model sizes them in its latent fingerprint: latents made with
+    references at another size are not reused. A directory without control images keeps its cache."""
+    edit = make_images(tmp_path / 'edit', CAPTIONS[:3])
+    plain = make_images(tmp_path / 'plain', CAPTIONS[:3])
+    control = make_controls(tmp_path / 'ref1', 3, (32, 32))
+    edit_config = dataset_config(edit, control_path=str(control), reuse_metadata_cache=reuse_metadata_cache)
+    plain_config = dataset_config(plain, reuse_metadata_cache=reuse_metadata_cache)
+
+    assert encoded_batches(CountingModel(), edit_config) > 0
+    assert encoded_batches(CountingModel(), plain_config) > 0
+    assert encoded_batches(CountingModel(), edit_config) == 0, 'the same sizing reuses its cache'
+    assert encoded_batches(CountingModel('own_size'), edit_config) > 0, 'another sizing rebuilds the edit cache'
+    assert encoded_batches(CountingModel('own_size'), edit_config) == 0
+    assert encoded_batches(CountingModel('own_size'), plain_config) == 0, 'a directory without control images is kept'
+
+
+def directory_dataset(paths):
+    return types.SimpleNamespace(path='dir', control_extra_paths=paths)
+
+
+def metadata(extra=None):
+    columns = {'control_file': ['a', 'b'], 'image_file': ['a', 'b']}
+    if extra is not None:
+        columns['control_extra_file'] = extra
+    return datasets.Dataset.from_dict(columns)
+
+
+def test_metadata_with_another_number_of_references_than_the_config_is_refused():
+    check = dataset_util.check_control_columns
+    check(metadata(), directory_dataset([]))
+    check(metadata([['x'], ['y']]), directory_dataset([Path('r2')]))
+    check(metadata([['x', 'z'], ['y', 'w']]), directory_dataset([Path('r2'), Path('r3')]))
+    with pytest.raises(RuntimeError, match='has 0 further reference image'):
+        check(metadata(), directory_dataset([Path('r2')]))
+    with pytest.raises(RuntimeError, match='has 1 further reference image.*config has 0'):
+        check(metadata([['x'], ['y']]), directory_dataset([]))
+    with pytest.raises(RuntimeError, match='has 1 further reference image'):
+        check(metadata([['x'], ['y']]), directory_dataset([Path('r2'), Path('r3')]))
+    # a directory without control images has nothing to check
+    check(datasets.Dataset.from_dict({'image_file': ['a']}), directory_dataset([]))
