@@ -52,6 +52,8 @@ def fold_pipeline(fold=None, compute=torch.float32, spec=None, state_edit=None, 
     if distill is not None:
         pipe.distill = distill
         pipe.config = {}
+        # what load_diffusion_model keeps (after the fold) for a full fine-tune's teacher
+        pipe.teacher_snapshot = copy.deepcopy(pipe.diffusion_model)
         names = names + ['distill_loss', 'distill_lambda']
     if spec is not None or distill is not None:
         pipe.stream_metrics = StreamMetrics(names)
