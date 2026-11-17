@@ -67,6 +67,16 @@ class TeacherConfig:
 DISABLED = TeacherConfig(0.0, None, None, 'sigmoid', 0.5, 0.15, 'none', 0)
 
 
+ANIMA_KEYS = ('transformer_path', 'llm_path')
+
+
+def is_anima_teacher(table):
+    """Whether a [teacher] table asks for a stock Anima as the teacher (it names its transformer or its text
+    encoder). Without either key the table is the generic one: distillation toward the model's own starting
+    weights (utils/model_teacher.py)."""
+    return isinstance(table, dict) and any(key in table for key in ANIMA_KEYS)
+
+
 def validate_teacher_config(config, use_context_refiner, cache_text_embeddings):
     """Read and check the [teacher] table, failing at startup rather than mid-run.
 
@@ -87,6 +97,13 @@ def validate_teacher_config(config, use_context_refiner, cache_text_embeddings):
         # The refiner's teacher term compares two text frontends, and only anima_refiner has a second one. Any other
         # type reads [teacher] as distillation toward a frozen copy of the model (utils/model_teacher.py).
         return DISABLED
+    if not is_anima_teacher(table):
+        # anima_refiner with no Anima named: the generic teacher, the refiner's own starting weights.
+        return DISABLED
+    if 'path' in table:
+        raise ValueError('[teacher] path is the teacher of the generic distillation, the model\'s own weights or '
+                         'another checkpoint of it. With transformer_path / llm_path the teacher is a stock Anima: '
+                         'remove path, or remove transformer_path and llm_path to distill from the refiner itself.')
     if cache_text_embeddings:
         # The teacher and the student have to read one augmentation draw of one caption. Caching
         # freezes the draw, and a mismatch there changes no shape and no magnitude -- the loss

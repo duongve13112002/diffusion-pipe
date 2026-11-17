@@ -29,10 +29,24 @@ def test_absent_zero_and_own_implementations_are_off():
     # An off table is not validated further.
     assert mt.parse_model_teacher_config({'model': {'type': 'flux'},
                                           'teacher': {'loss_weight': 0, 'decay': 'bogus'}}) is None
-    # MOSS-Image and anima_refiner read their own [teacher].
-    for model_type in ('moss_image', 'anima_refiner'):
-        assert mt.parse_model_teacher_config({'model': {'type': model_type}, 'teacher': {'loss_weight': 1,
-                                                                                         'decay': 'bogus'}}) is None
+    # MOSS-Image reads its own [teacher].
+    assert mt.parse_model_teacher_config({'model': {'type': 'moss_image'},
+                                          'teacher': {'loss_weight': 1, 'decay': 'bogus'}}) is None
+
+
+def test_anima_refiner_has_two_forms():
+    # Naming a stock Anima (its transformer or its text encoder) is the refiner's own teacher, which mixes the target.
+    for key in ('transformer_path', 'llm_path'):
+        table = {'loss_weight': 1, key: '/anima'}
+        assert mt.parse_model_teacher_config({'model': {'type': 'anima_refiner'}, 'teacher': table}) is None
+    # Naming neither is this one: the refiner's own starting weights, validated like any other model's table.
+    config = mt.parse_model_teacher_config({'model': {'type': 'anima_refiner'},
+                                            'teacher': {'loss_weight': 0.5, 'decay': 'linear', 'decay_steps': 10}})
+    assert config is not None and config.decay == 'linear'
+    with pytest.raises(ValueError, match='decay'):
+        mt.parse_model_teacher_config({'model': {'type': 'anima_refiner'}, 'teacher': {'loss_weight': 1, 'decay': 'x'}})
+    # Plain Anima has no second form: the table is always this one.
+    assert mt.parse_model_teacher_config({'model': {'type': 'anima'}, 'teacher': {'loss_weight': 1}}) is not None
 
 
 def test_defaults_and_fields():
@@ -649,3 +663,20 @@ def test_models_whose_layers_return_more_than_the_prediction_say_which_part_is_t
     defining = {name for name, node in classes.items() if 'teacher_targets_of' in node['methods']}
     assert defining - {'CommonPipeline'} == {'CosmosPipeline', 'SDXLPipeline', 'MinimaxH3Pipeline', 'PH3ImagePipeline',
                                               'MiniMaxH3ImagePipeline'}
+
+
+def test_a_fresh_refiner_cannot_be_its_own_teacher(monkeypatch):
+    from models import base
+    from models import cosmos_predict2 as cp2
+    monkeypatch.setattr(base.CommonPipeline, 'make_teacher_layers', lambda self, path=None: 'layers')
+    pipe = cp2.CosmosPredict2Pipeline.__new__(cp2.CosmosPredict2Pipeline)
+    pipe.use_context_refiner = True
+    pipe._refiner_is_fresh = True
+    with pytest.raises(ValueError, match='freshly initialised context_refiner'):
+        pipe.make_teacher_layers()
+    pipe._refiner_is_fresh = False
+    assert pipe.make_teacher_layers() == 'layers'
+    # Plain Anima has no refiner to be fresh.
+    pipe.use_context_refiner = False
+    pipe._refiner_is_fresh = True
+    assert pipe.make_teacher_layers() == 'layers'

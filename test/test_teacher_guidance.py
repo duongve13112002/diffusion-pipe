@@ -208,6 +208,15 @@ class TestValidation:
         with pytest.raises(ValueError, match='blocks_to_swap'):
             validate_teacher_config(self.base_config(blocks_to_swap=4), True, False)
 
+    def test_a_table_naming_no_anima_is_the_generic_teacher(self):
+        config = self.base_config()
+        del config['teacher']['transformer_path'], config['teacher']['llm_path']
+        assert validate_teacher_config(config, True, False) is DISABLED
+
+    def test_path_cannot_come_with_an_anima_teacher(self):
+        with pytest.raises(ValueError, match='path is the teacher of the generic distillation'):
+            validate_teacher_config(self.base_config(teacher={'path': '/m'}), True, False)
+
     @pytest.mark.parametrize('missing', ['transformer_path', 'llm_path'])
     def test_it_requires_both_teacher_paths(self, missing):
         config = self.base_config()

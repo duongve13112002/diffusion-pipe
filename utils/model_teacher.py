@@ -24,7 +24,9 @@ Any number of pipeline stages therefore works, and no layer has to pass an extra
 ranks hold the whole teacher on their GPU; the others hold none.
 
 MOSS-Image has its own implementation (utils/distillation.py: noise-level dependent lambda, the teacher inside
-the first layer); anima_refiner mixes the target instead (models/teacher_guidance.py). Both keep their tables.
+the first layer). anima_refiner has two forms: a [teacher] that names transformer_path / llm_path distills from a
+stock Anima by mixing the target (models/teacher_guidance.py); one that names neither is this teacher, toward the
+refiner's own starting weights like any other model.
 
 Kept free of training-stack imports so it can be unit-tested on CPU.
 """
@@ -33,13 +35,11 @@ import math
 
 import torch
 
-from models.teacher_guidance import DECAYS, decay_at
+from models.teacher_guidance import DECAYS, decay_at, is_anima_teacher
 from utils.distillation import DistillConfig, distill_warnings
 
 KEY = 'teacher'
 _KEYS = ('loss_weight', 'decay', 'decay_steps', 'path')
-# Model types whose [teacher] is read by their own pipeline.
-OWN_IMPLEMENTATION = ('moss_image', 'anima_refiner')
 _NOISE_LEVEL_KEYS = ('shape', 't_mid', 'width')
 
 
@@ -64,7 +64,10 @@ def parse_model_teacher_config(config):
     if table is None:
         return None
     model_type = config.get('model', {}).get('type')
-    if model_type in OWN_IMPLEMENTATION:
+    if model_type == 'moss_image':
+        return None
+    if model_type == 'anima_refiner' and is_anima_teacher(table):
+        # A stock Anima as the teacher: the refiner's own [teacher], which mixes the target.
         return None
     if not isinstance(table, dict):
         raise ValueError(f'[{KEY}] must be a table, got {table!r}')

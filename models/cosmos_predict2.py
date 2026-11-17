@@ -1216,6 +1216,15 @@ class CosmosPredict2Pipeline(BasePipeline):
         self.teacher.device = torch.device(device)
         self.teacher._placed = True
 
+    def make_teacher_layers(self, path=None):
+        # [teacher] without transformer_path / llm_path (utils/model_teacher.py): a frozen copy of the model as
+        # loaded. A refiner that was just initialised is random weights, and distilling toward them teaches nothing.
+        if self.use_context_refiner and getattr(self, '_refiner_is_fresh', False):
+            raise ValueError('[teacher] without transformer_path / llm_path distills toward the refiner the run starts '
+                             'from, which here is a freshly initialised context_refiner (random weights). Start from '
+                             'a trained refiner, or name a stock Anima (transformer_path, llm_path) as the teacher.')
+        return super().make_teacher_layers(path)
+
     def to_layers(self):
         transformer = self.transformer
         text_encoder = None if self.cache_text_embeddings else self.text_encoder
