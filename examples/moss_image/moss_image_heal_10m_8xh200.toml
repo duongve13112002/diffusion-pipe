@@ -14,9 +14,10 @@
 # learning speed (0.3 learned about as fast as no teacher, 1.0 about 14% slower there). Watch train/flow_loss
 # against train/distill_loss, train/stream_rms, train/write_share_*, train/outlier_over and train/outlier_max.
 #
-# Memory: one pipeline stage means every GPU holds the whole model: bf16 weights and gradients (~20 GB), the optimizer
-# state, the frozen teacher copy (~10 GB) and the Qwen3.5-9B text encoder (~18 GB, captions are encoded on the fly),
-# which should fit 141 GB with activation checkpointing (not measured here); lower micro_batch_size_per_gpu if it does not.
+# Memory: one pipeline stage means every GPU holds the whole model: bf16 weights and gradients (~20 GB), the 8-bit
+# optimizer state and Kahan buffer, and the frozen teacher copy (~10 GB); the text encoder is not loaded (embeddings
+# are cached). It should fit 141 GB with activation checkpointing (not measured here); lower
+# micro_batch_size_per_gpu if it does not.
 output_dir = '/pvc/runs/moss_image_heal_10m'
 dataset = 'examples/moss_image/moss_image_dataset.toml'
 
@@ -58,6 +59,16 @@ dtype = 'bfloat16'
 #compute_dtype = 'float16'
 #fp16_fix = 'online'
 timestep_sample_method = 'logit_normal'
+# The VAE encodes the images in float16 and the latents are cached in float16 (both are MOSS-Image's default; set
+# here so that the cache does not depend on it).
+vae_dtype = 'float16'
+latent_cache_dtype = 'float16'
+# Text embeddings are cached once, in float8 (e4m3 with a scale per token, about half the size of bfloat16: roughly
+# 4 KB per token, so a caption of ~150 tokens is ~600 KB and 10M captions are ~6 TB: check the volume), and read back
+# in the encoder's dtype. The Qwen3.5-9B encoder is freed before training. A cached caption is fixed: caption
+# shuffling, tag dropout and caption dropout in the dataset config then act when the cache is built, not every step.
+cache_text_embeddings = true
+text_embedding_dtype = 'float8'
 # differs: the card froze the text refiner (text_embedder) to keep the text interface at its base values. With
 # 10M captions of new concepts it can learn them too, so it trains here; uncomment to freeze it as the card did.
 #text_refiner_lr = 0
@@ -94,8 +105,10 @@ cap_start = 64.0
 cap_anneal = 20000
 warmup = 1000
 
+# differs: the card used AdamW; the moments are 8-bit (bitsandbytes, 2 bytes per parameter) and Kahan summation keeps the small
+# updates of bfloat16 weights (its 'shift' buffer is one more bfloat16 copy of the weights, 2 bytes per parameter).
 [optimizer]
-type = 'adamw_optimi'
+type = 'adamw8bitkahan'
 lr = 1e-5
 betas = [0.9, 0.95]
 weight_decay = 0.01

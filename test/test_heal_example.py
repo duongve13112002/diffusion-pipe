@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 
 import toml
+import torch
 
 from models.moss_image import LearningRates
 from utils.distillation import parse_distill_config
@@ -81,3 +82,17 @@ def test_the_10m_example_keeps_the_stream_terms_and_fades_the_teacher():
     # the text refiner trains unless the commented line is enabled
     assert LearningRates(config['model'], config['optimizer']).part_lrs == {}
     assert 'compute_dtype' not in config['model'] and config['model']['dtype'] == 'bfloat16'
+
+
+def test_the_10m_example_caches_in_float16_and_float8_and_uses_the_8bit_kahan_optimizer():
+    from utils.embedding_dtype import check_text_embedding_dtype
+    from utils.outlier_decay import optimizer_needs_lr
+    config = toml.load(BIG)
+    model = config['model']
+    assert model['vae_dtype'] == 'float16' and model['latent_cache_dtype'] == 'float16'
+    assert model['cache_text_embeddings'] is True
+    assert check_text_embedding_dtype(model, True) == torch.float8_e4m3fn
+    assert config['optimizer']['type'] == 'adamw8bitkahan'
+    # the decay takes the group's learning rate for this optimizer: no lr of its own needed
+    apply_outlier_decay_config_defaults(json.loads(json.dumps(config)))
+    assert not optimizer_needs_lr(config['optimizer'])
