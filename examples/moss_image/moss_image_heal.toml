@@ -1,0 +1,100 @@
+# MOSS-Image full fine-tune that "heals" the residual stream and the weights, following the recipe in the model
+# card of KBlueLeaf/MOSS-Image-heal (https://huggingface.co/KBlueLeaf/MOSS-Image-heal): a full fine-tune of
+# MOSS-Image-Base with flow matching, distillation toward the frozen base, the stream write-concentration and
+# RMS penalties, and the outlier decay of the weights. The card reports a stream peak of 3,083 (base 58,411),
+# a stream RMS 7.5x lower and no weight element above 64x its tensor's RMS, at a velocity cosine of 0.9983 to
+# the base. Concepts: docs/supported_models.md#moss-image and docs/note/stream-healing-implementation-plan.md.
+#   deepspeed --num_gpus=4 train.py --deepspeed --config examples/moss_image/moss_image_heal.toml
+#
+# From the card: AdamW at lr 1e-5 with a cosine to 1e-7, 64 images per step (4 GPUs x batch 4 x 4 accumulation),
+# 50,000 steps (3.2M images, about 3.2 passes over ~1M images), 1024^2 area at each image's own aspect ratio,
+# every transformer weight trained except the text refiner, flow matching + distillation toward the frozen base
+# at weight 1.0, write concentration 5e-3 at target share 0.5, stream RMS 5e-5, outlier decay at rate 12 with a
+# cap falling from 64 to 16 times the starting RMS over the first 10k steps. The card names no value for the
+# things below, so they are the defaults of KohakuMossTrainer's notes: the write anneal (2000 steps), the RMS
+# target (1.0), the decay warmup (1000 steps), the LR warmup (500 steps), the weight decay (0.01), the
+# logit-normal timestep sampler.
+# What differs: the card's run computed in fp16 with a residual-stream fold on fp32 master weights (about 200 GPU
+# hours on B300); this repo trains in bfloat16, so the numbers need not match. The captions are your own: the
+# card's data is ~1M danbooru posts with graph captions in several prompt formats.
+#
+# Memory: a full fine-tune of the 5B model, AdamW states and the frozen teacher copy (about 10 GB, kept on the
+# first stage) fit a 141 GB or larger GPU with one pipeline stage; with 80 GB GPUs use pipeline_stages = 2.
+# Checkpoints and saves are written under a temporary name and renamed into place; resume with
+# --resume_from_checkpoint.
+#
+# Saves are diffusers transformer directories (config.json + diffusion_pytorch_model.safetensors): a
+# transformer_path for this trainer, a diffusers MOSSImageTransformer, and a diffusion model for ComfyUI's
+# Load Diffusion Model node.
+output_dir = '/pvc/runs/moss_image_heal'
+dataset = 'examples/moss_image/moss_image_dataset.toml'
+
+# ~1M images x 3 passes / 64 per step = ~47k steps (the card's run is 50k).
+epochs = 3
+micro_batch_size_per_gpu = 4
+pipeline_stages = 1
+gradient_accumulation_steps = 4
+gradient_clipping = 1.0
+warmup_steps = 500
+lr_scheduler = 'cosine'
+# Cosine from 1e-5 to 1e-7.
+lr_scheduler_min_ratio = 0.01
+
+skip_nonfinite_steps = true
+
+eval_every_n_steps = 1000
+eval_before_first_step = true
+eval_micro_batch_size_per_gpu = 1
+eval_gradient_accumulation_steps = 1
+
+save_every_n_steps = 5000
+checkpoint_every_n_minutes = 60
+keep_last_n_checkpoints = 3
+activation_checkpointing = true
+save_dtype = 'bfloat16'
+caching_batch_size = 4
+steps_per_print = 10
+
+[model]
+type = 'moss_image'
+diffusers_path = '/pvc/models/MOSS-Image-Base'
+dtype = 'bfloat16'
+timestep_sample_method = 'logit_normal'
+# The text refiner (text_embedder) stays at its base values.
+text_refiner_lr = 0
+
+# The stream penalties tap every block and need compile = false (the default) and, with
+# activation_checkpointing, keep a small per-sublayer vector, not the activations.
+[model.stream_loss.write]
+weight = 5e-3
+target = 0.5
+anneal = 2000
+
+[model.stream_loss.rms]
+weight = 5e-5
+
+# Distillation toward the frozen base. The starting weights are the teacher, so a run that starts from a
+# previous save distills toward the file named in diffusers_path / transformer_path, not toward that save.
+# The teacher forward adds about a quarter of a checkpointed step. decay = 'none' keeps it for the whole run.
+[teacher]
+loss_weight = 1.0
+
+# Rate scales with 1/lr: KohakuMoss's notes use 6 at lr 2e-5 (a time constant of ~8.3k steps) and ~12 at 1e-5.
+# `exclude = '^(time_embedding|shared_block_modulation|video_head_modulation)\.'` leaves the conditioning to the
+# task if train/outlier_over at step 1 shows those tensors dominate.
+[outlier_decay]
+rate = 12.0
+cap = 16.0
+cap_start = 64.0
+cap_anneal = 10000
+warmup = 1000
+
+[optimizer]
+type = 'adamw_optimi'
+lr = 1e-5
+betas = [0.9, 0.95]
+weight_decay = 0.01
+eps = 1e-8
+
+[monitoring]
+enable_wandb = false

@@ -1086,6 +1086,11 @@ rather than loaded with layers' weights in their neighbours.
   describe it); these port its remedies. Nothing here has been tuned or shown to improve images:
   the weights below are KohakuMoss's for a 10k-step full fine-tune at lr 2e-5, and a LoRA at a
   higher lr may want other values. [Notes](note/stream-healing-implementation-plan.md).
+  `examples/moss_image/moss_image_heal.toml` is the full recipe of the
+  [MOSS-Image-heal](https://huggingface.co/KBlueLeaf/MOSS-Image-heal) model card (flow matching + `[teacher]`
+  at weight 1.0 + the write and rms terms + `[outlier_decay]` at rate 12, cap 64 -> 16, text refiner frozen,
+  AdamW 1e-5): on its probe rows the card reports a stream peak of 3,083 against the base's 58,411, no weight
+  element above 64x its tensor's RMS, and a velocity cosine of 0.9983 to the base.
 
   ```toml
   [model.stream_loss.write]          # the main term
@@ -1107,7 +1112,7 @@ rather than loaded with layers' weights in their neighbours.
   dilute = true
 
   [outlier_decay]                    # full fine-tune only: refused next to [adapter]
-  rate = 6.0                         # lambda; 0 turns it off
+  rate = 6.0                         # lambda; 0 turns it off. Scales with 1/lr: 6 at lr 2e-5, ~12 at 1e-5
   cap = 16.0                         # threshold, in units of each tensor's RMS when the run started
   cap_start = 64.0                   # 0 = cap; else the cap falls geometrically to `cap` ...
   cap_anneal = 10000                 # ... over this many steps
