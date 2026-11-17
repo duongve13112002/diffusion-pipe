@@ -1091,6 +1091,14 @@ rather than loaded with layers' weights in their neighbours.
   at weight 1.0 + the write and rms terms + `[outlier_decay]` at rate 12, cap 64 -> 16, text refiner frozen,
   AdamW 1e-5): on its probe rows the card reports a stream peak of 3,083 against the base's 58,411, no weight
   element above 64x its tensor's RMS, and a velocity cosine of 0.9983 to the base.
+  `python tools/check_moss_heal.py --model <transformer dir or file> [--reference <unhealed model>]` tells you
+  whether a MOSS-Image model is healed: it measures the stream peak (and float16's headroom over it), the share
+  of the attention and FFN writes held by their 32 largest channels, and the largest weight over its tensor's
+  RMS, prints each next to its limit and a verdict (healed / partly healed / not healed; exit status 0 only for
+  healed). `--weights-only` skips the forward pass; `--inputs` (a safetensors with `latents`, `context`, optional
+  `sigmas`) runs real latents and encoded prompts instead of random ones, which is what a verdict should rest
+  on. The limits are rules of thumb from the recipe and the card's numbers (`--peak-limit`,
+  `--write-share-limit`, `--weight-ratio-limit`), not measured on many models.
 
   ```toml
   [model.stream_loss.write]          # the main term
