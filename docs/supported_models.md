@@ -1113,6 +1113,7 @@ rather than loaded with layers' weights in their neighbours.
 
   [outlier_decay]                    # full fine-tune only: refused next to [adapter]
   rate = 6.0                         # lambda; 0 turns it off. Scales with 1/lr: 6 at lr 2e-5, ~12 at 1e-5
+  #lr = 1e-5                       # the step size the rate refers to; required unless the optimizer steps at its group's lr
   cap = 16.0                         # threshold, in units of each tensor's RMS when the run started
   cap_start = 64.0                   # 0 = cap; else the cap falls geometrically to `cap` ...
   cap_anneal = 10000                 # ... over this many steps
@@ -1143,9 +1144,19 @@ rather than loaded with layers' weights in their neighbours.
   in fp32; an element the decay does not touch stays bit-identical), seeded by `seed` and the step
   so that data-parallel replicas stay identical. It logs `train/outlier_over` (elements above the
   cap) and `train/outlier_max` (the largest `|w| / (cap * r0)`).
-  It needs an optimizer that steps at its group's learning rate (`adamw`, `adamw8bit`, `adamw_optimi`,
-  `stableadamw`, `sgd`, `adamw8bitkahan`, or `genericoptim` without `automagic`), refuses a step with
-  `lr * rate` above 1, and stops at startup if `targets` / `exclude` match no trained parameter on any stage.
+  It works with every optimizer of the project. `lr` in the formula is the learning rate of the weight's
+  group (the size of the optimizer's own step) for `adamw`, `adamw8bit`, `adamw_optimi`, `stableadamw`,
+  `sgd`, `adamw8bitkahan`, `offload` and `genericoptim` without `automagic`. Any other optimizer (Prodigy,
+  Automagic, `genericoptim` with `automagic`, and every `pytorch_optimizer` class such as Lion, Adan or SOAP)
+  steps by something else, so set `[outlier_decay] lr`: the decay then uses
+  `lr * (the group's learning rate now / its learning rate at the start of the schedule)`, so warmup and
+  the cosine or linear decay still shape it and only the size comes from `lr`; give it the learning rate you
+  would give AdamW for the run (rate 12 at lr 1e-5 is a time constant of 8.3k steps). The CPU-offload
+  optimizer's host copy of each weight is decayed along with the weight. Refused by name: optimizers that
+  keep a second copy of the weights the decay cannot reach (schedule-free, Lookahead, Ranger, Ranger21, TRAC,
+  SafeFP16Optimizer), optimizers that take two gradient passes (SAM and its variants) or update during backward
+  (LOMO, AdaLOMO), and `gradient_release`. A step with `lr * rate` above 1 is refused, and the run stops at
+  startup if `targets` / `exclude` match no trained parameter on any stage.
 - Settings from KohakuMossTrainer's recipes. `examples/moss_image/moss_image_lora_kohakumoss.toml` and
   `moss_image_full_kohakumoss.toml` write its base LoRA (rank 32, AdamW 1e-4, cosine to 10%) and full
   fine-tune (Muon + Adam 5e-5, cosine to 10%, EMA 0.9999, the last block's q/k norm decaying toward 1)

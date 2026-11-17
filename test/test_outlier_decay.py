@@ -7,8 +7,8 @@ import pytest
 import torch
 from torch import nn
 
-from utils.outlier_decay import (OutlierDecay, apply_outlier_decay_config_defaults, cap_at, rate_at,
-                                 round_to_bfloat16, targeted)
+from utils.outlier_decay import (SECOND_COPY_OPTIMIZERS, OutlierDecay, apply_outlier_decay_config_defaults, cap_at,
+                                 rate_at, round_to_bfloat16, targeted)
 
 
 def make_spec(**overrides):
@@ -250,20 +250,134 @@ def test_r0_is_taken_at_build_time():
     assert decay.r0 == r0
 
 
-@pytest.mark.parametrize('optimizer, ok', [
+@pytest.mark.parametrize('optimizer, steps_at_group_lr', [
     ({'type': 'adamw'}, True), ({'type': 'AdamW_Optimi'}, True), ({'type': 'genericoptim'}, True),
+    ({'type': 'offload'}, True),
     ({'type': 'genericoptim', 'automagic': True}, False), ({'type': 'prodigy'}, False),
-    ({'type': 'automagic'}, False), ({'type': 'offload'}, False), ({'type': 'Lion'}, False),
+    ({'type': 'automagic'}, False), ({'type': 'Lion'}, False), ({'type': 'SOAP'}, False),
 ])
-def test_only_optimizers_that_step_at_the_group_lr_are_accepted(optimizer, ok):
+def test_an_optimizer_whose_step_is_not_its_group_lr_needs_an_lr_of_the_decay_own(optimizer, steps_at_group_lr):
     config = {'outlier_decay': {'rate': 6.0}, 'optimizer': optimizer}
-    if ok:
+    if steps_at_group_lr:
         apply_outlier_decay_config_defaults(config)
     else:
-        with pytest.raises(ValueError, match='steps at its group'):
+        with pytest.raises(ValueError, match='needs lr'):
             apply_outlier_decay_config_defaults(config)
-    # Rate 0 is off: no optimizer is refused.
+    # With an lr of its own every one of them is accepted, and so is rate 0 (off) without one.
+    apply_outlier_decay_config_defaults({'outlier_decay': {'rate': 6.0, 'lr': 1e-5}, 'optimizer': optimizer})
     apply_outlier_decay_config_defaults({'outlier_decay': {'rate': 0}, 'optimizer': optimizer})
+
+
+@pytest.mark.parametrize('name', sorted(SECOND_COPY_OPTIMIZERS))
+def test_an_optimizer_that_keeps_a_second_copy_of_the_weights_is_refused_even_with_an_lr(name):
+    config = {'outlier_decay': {'rate': 6.0, 'lr': 1e-5}, 'optimizer': {'type': name}}
+    with pytest.raises(ValueError, match='cannot work with optimizer'):
+        apply_outlier_decay_config_defaults(config)
+    apply_outlier_decay_config_defaults({'outlier_decay': {'rate': 0}, 'optimizer': {'type': name}})
+
+
+def test_the_refused_names_are_real_pytorch_optimizer_classes():
+    pytorch_optimizer = pytest.importorskip('pytorch_optimizer')
+    known = {name.lower() for name in dir(pytorch_optimizer)}
+    assert set(SECOND_COPY_OPTIMIZERS) <= known
+
+
+@pytest.mark.parametrize('value', [0, -1e-5, True, 'x', float('nan'), float('inf')])
+def test_lr_must_be_a_positive_number(value):
+    with pytest.raises(ValueError, match='lr'):
+        apply_outlier_decay_config_defaults({'outlier_decay': {'rate': 6.0, 'lr': value}})
+
+
+def test_gradient_release_is_refused():
+    config = {'outlier_decay': {'rate': 6.0}, 'optimizer': {'type': 'adamw', 'gradient_release': True}}
+    with pytest.raises(ValueError, match='gradient_release'):
+        apply_outlier_decay_config_defaults(config)
+
+
+def test_with_an_lr_the_step_size_is_that_lr_shaped_by_the_schedule():
+    module = Stub()
+    optimizer = optimizer_for(module, lr=1.0)
+    group = optimizer.param_groups[0]
+    decay = OutlierDecay.build(module.named_parameters(), optimizer, make_spec(lr=1e-3))
+    # The scheduler's start is initial_lr; the group has fallen to a quarter of it.
+    group['initial_lr'], group['lr'] = 1.0, 0.25
+    decay.before_step()
+    assert decay._lrs[0] == pytest.approx(0.25e-3)
+    # Without initial_lr the highest rate seen so far stands for the start.
+    del group['initial_lr']
+    group['lr'] = 0.5
+    decay.before_step()
+    assert decay._lrs[0] == pytest.approx(1e-3)
+    group['lr'] = 0.125
+    decay.before_step()
+    assert decay._lrs[0] == pytest.approx(0.25e-3)
+    group['lr'] = 0.0
+    decay.before_step()
+    assert decay._lrs[0] == 0.0
+    # The startup check is on the lr of the decay, not on the group's.
+    assert decay.peak_pull() == pytest.approx(1e-3 * 6.0)
+
+
+def test_prodigy_decays_at_the_lr_of_the_decay_and_not_at_its_own_multiplier():
+    pytorch_optimizer = pytest.importorskip('pytorch_optimizer')
+    module = Stub()
+    optimizer = pytorch_optimizer.Prodigy(list(module.parameters()), lr=1.0)
+    decay = OutlierDecay.build(module.named_parameters(), optimizer, make_spec(rate=10.0, cap=1.0, lr=1e-3))
+    r0 = decay.r0[decay.names.index('a.weight')]
+    with torch.no_grad():
+        module.a.weight[0, 0] = 20 * r0
+    before = module.a.weight[0, 0].item()
+    decay.require_match()
+    decay.before_step()
+    decay.apply(1)
+    assert module.a.weight[0, 0].item() == pytest.approx(before - 1e-3 * 10.0 * (before - r0), rel=1e-5)
+
+
+class FakeOffloadOptimizer:
+    """The part of torchao's CPUOffloadOptimizer the decay sees: groups that hold host copies of the large
+    weights next to the device weights of the small ones, and param_d2h_map from device to host."""
+
+    def __init__(self, module, lr):
+        self.param_d2h_map = {}
+        host_groups, small = [], []
+        for p in module.parameters():
+            if p.numel() >= 32:
+                host = p.detach().clone()
+                self.param_d2h_map[p] = host
+                host_groups.append({'params': [host], 'lr': lr})
+            else:
+                small.append(p)
+        self.param_groups = [{'params': small, 'lr': lr}] + host_groups if small else host_groups
+
+
+def test_the_cpu_offload_optimizers_host_copy_is_decayed_along_with_the_weight():
+    module = Stub()
+    optimizer = FakeOffloadOptimizer(module, lr=0.01)
+    assert module.a.weight in optimizer.param_d2h_map and module.a.bias not in optimizer.param_d2h_map
+    decay = OutlierDecay.build(module.named_parameters(), optimizer, make_spec(cap=10.0, include_1d=True))
+    # norm.bias starts at zero, which has no scale to measure outliers against.
+    assert set(decay.names) == {'a.weight', 'a.bias', 'b.weight', 'norm.weight'}
+    i = decay.names.index('a.weight')
+    r0 = decay.r0[i]
+    host = optimizer.param_d2h_map[module.a.weight]
+    with torch.no_grad():
+        module.a.weight[0, 0] = 20 * r0
+        host[0, 0] = 20 * r0
+    before = module.a.weight[0, 0].item()
+    decay.before_step()
+    decay.apply(1)
+    expected = before - 0.01 * 6.0 * (before - 10 * r0)
+    assert module.a.weight[0, 0].item() == pytest.approx(expected, rel=1e-5)
+    assert host[0, 0].item() == pytest.approx(expected, rel=1e-5)
+    assert decay.log_scalars()['train/outlier_over'] == 1.0
+
+
+def test_a_weight_the_cpu_offload_optimizer_does_not_step_is_not_decayed():
+    module = Stub()
+    optimizer = FakeOffloadOptimizer(module, lr=0.01)
+    other = nn.Linear(8, 8)
+    decay = OutlierDecay.build(list(module.named_parameters()) + [('other.weight', other.weight)], optimizer, make_spec())
+    assert 'other.weight' not in decay.names
 
 
 def test_lr_times_rate_above_one_is_refused():

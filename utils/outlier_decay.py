@@ -2,6 +2,7 @@
 
     [outlier_decay]
     rate = 6.0          # lambda: an excess shrinks with a time constant of 1 / (lambda * lr) steps
+    lr = 1e-5           # optional: the step size `rate` refers to, see "Which learning rate" below
     cap = 16.0          # the threshold, in units of each tensor's RMS at the start of the run
     cap_start = 64.0    # 0 = cap; else the cap falls geometrically from here to `cap`
     cap_anneal = 10000  # steps that fall takes
@@ -23,6 +24,17 @@ the whole model and leaves the concentration where it was; the threshold is what
 outlier decay. It acts on the weights a full fine-tune inherits, which a stream penalty alone
 does not reach (docs/note/kohakumoss-vs-diffusion-pipe-moss-training.md).
 
+Which learning rate. By default `lr` in the formula is the learning rate of the weight's parameter group
+at that step, which is the size of the optimizer's own step for AdamW, StableAdamW, SGD, 8-bit AdamW,
+the CPU-offload AdamW and GenericOptim (Muon included). Any other optimizer steps by something else (Prodigy
+by d * lr, Automagic by a rate per element, Lion, Adan, SOAP, ... each by its own rule), so the decay needs
+a step size of its own: set `lr`. The decay then uses lr * (the group's learning rate now / the group's
+learning rate at the start of the schedule), so warmup and the cosine or linear decay still shape it and
+only the size comes from `lr`. A good `lr` is the learning rate you would give AdamW for this run; rate 12
+at lr 1e-5 is a time constant of 8.3k steps. Optimizers that keep a second copy of the weights the decay
+cannot reach (schedule-free, Lookahead and Ranger, SAM and its variants, LOMO, SafeFP16) are refused;
+the CPU-offload optimizer's host copy is decayed along with the weight.
+
 bf16 weights. lr * rate * excess is about 1e-4 of the excess, below one bf16 step, so rounding to
 nearest would never move anything. The update is computed in fp32 and rounded back at random, up
 or down with the probabilities that keep its expectation exact; an element the update leaves
@@ -42,6 +54,7 @@ import torch.distributed as dist
 KEY = 'outlier_decay'
 DEFAULTS = {
     'rate': None,
+    'lr': None,
     'cap': 16.0,
     'cap_start': 0.0,
     'cap_anneal': 0,
@@ -52,17 +65,46 @@ DEFAULTS = {
     'seed': 0,
 }
 SUPPORTED_DTYPES = (torch.float32, torch.bfloat16)
-# Optimizers that step the weights in place at the learning rate of their parameter group, which is
-# what the decay's lr * rate assumes. Left out: Prodigy and the pytorch_optimizer family (they step
-# with d * lr or other internal scales), Automagic (a learning rate per parameter), GenericOptim
-# with automagic on, and the torchao offload optimizer (not checked to leave an in-place edit alone).
-STEP_LR_OPTIMIZERS = ('adamw', 'adamw8bit', 'adamw_optimi', 'stableadamw', 'sgd', 'adamw8bitkahan', 'genericoptim')
+# Optimizers that step the weights in place at the learning rate of their parameter group, which is what
+# the decay's lr * rate assumes when [outlier_decay] sets no lr. Every other optimizer needs that lr.
+# 'offload' is torchao's CPUOffloadOptimizer around AdamW (OffloadedParams below).
+STEP_LR_OPTIMIZERS = ('adamw', 'adamw8bit', 'adamw_optimi', 'stableadamw', 'sgd', 'adamw8bitkahan', 'genericoptim',
+                      'offload')
+# Optimizers (pytorch_optimizer class names, lower case) that keep a second copy of the weights and
+# rebuild the live ones from it, so an in-place decay of the live weights is undone or fought by the next
+# step; or that have no gradient to step on at the point the decay runs.
+SECOND_COPY_OPTIMIZERS = {
+    'lookahead': 'keeps slow weights that the fast weights are pulled back to',
+    'ranger': 'contains Lookahead, whose slow weights the live ones are pulled back to',
+    'ranger21': 'contains Lookahead, whose slow weights the live ones are pulled back to',
+    'schedulefreeadamw': 'keeps the base iterate z and rebuilds the live weights from it',
+    'schedulefreesgd': 'keeps the base iterate z and rebuilds the live weights from it',
+    'schedulefreeradam': 'keeps the base iterate z and rebuilds the live weights from it',
+    'schedulefreewrapper': 'keeps the base iterate z and rebuilds the live weights from it',
+    'sam': 'takes two gradient passes per step, which the pipeline engine cannot run',
+    'gsam': 'takes two gradient passes per step, which the pipeline engine cannot run',
+    'wsam': 'takes two gradient passes per step, which the pipeline engine cannot run',
+    'looksam': 'takes two gradient passes per step, which the pipeline engine cannot run',
+    'bsam': 'takes two gradient passes per step, which the pipeline engine cannot run',
+    'friendlysam': 'takes two gradient passes per step, which the pipeline engine cannot run',
+    'safefp16optimizer': 'keeps fp32 master copies and writes them back to the live fp16 weights',
+    'lomo': 'updates each weight during backward, so there is no step to decay after',
+    'adalomo': 'updates each weight during backward, so there is no step to decay after',
+    'trac': 'wraps the optimizer and keeps a reference copy of the weights it pulls them back to',
+}
+
+
+def optimizer_needs_lr(optimizer):
+    """Whether the decay cannot take its step size from the optimizer's learning rate, so [outlier_decay]
+    must set lr."""
+    kind = str(optimizer['type']).lower()
+    return kind not in STEP_LR_OPTIMIZERS or (kind == 'genericoptim' and optimizer.get('automagic', False))
 
 
 def _number(table, name, low, strict=False):
     value = table[name]
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise ValueError(f'{KEY}.{name} must be a number, got {value!r}')
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+        raise ValueError(f'{KEY}.{name} must be a finite number, got {value!r}')
     if value < low or (strict and value == low):
         raise ValueError(f"{KEY}.{name} must be {'>' if strict else '>='} {low}, got {value!r}")
 
@@ -91,6 +133,8 @@ def apply_outlier_decay_config_defaults(config):
         raise ValueError(f'{KEY} needs rate (the decay strength lambda; 0 turns it off)')
     table = {**DEFAULTS, **table}
     _number(table, 'rate', 0.0)
+    if table['lr'] is not None:
+        _number(table, 'lr', 0.0, strict=True)
     _number(table, 'cap', 0.0, strict=True)
     _number(table, 'cap_start', 0.0)
     if 0 < table['cap_start'] < table['cap']:
@@ -114,10 +158,17 @@ def apply_outlier_decay_config_defaults(config):
     optimizer = config.get('optimizer')
     if table['rate'] > 0 and isinstance(optimizer, dict) and optimizer.get('type'):
         kind = str(optimizer['type']).lower()
-        if kind not in STEP_LR_OPTIMIZERS or (kind == 'genericoptim' and optimizer.get('automagic', False)):
-            raise ValueError(f"{KEY} needs an optimizer that steps at its group's learning rate; "
-                             f"{optimizer['type']!r} {'with automagic ' if kind == 'genericoptim' else ''}is not one. "
-                             f'Supported: {", ".join(STEP_LR_OPTIMIZERS)} (genericoptim without automagic)')
+        if kind in SECOND_COPY_OPTIMIZERS:
+            raise ValueError(f"{KEY} cannot work with optimizer {optimizer['type']!r}: it "
+                             f'{SECOND_COPY_OPTIMIZERS[kind]}. Use another optimizer, or remove [{KEY}].')
+        if optimizer.get('gradient_release', False):
+            raise ValueError(f'{KEY} acts once per optimizer step, and gradient_release steps the optimizer '
+                             'during backward for every micro-batch. Turn one of them off.')
+        if table['lr'] is None and optimizer_needs_lr(optimizer):
+            raise ValueError(f"{KEY} needs lr with optimizer {optimizer['type']!r}"
+                             f"{' with automagic' if kind == 'genericoptim' else ''}: its step is not its group's "
+                             f'learning rate, so set [{KEY}] lr to the step size the rate refers to '
+                             '(the learning rate you would give AdamW; the schedule still shapes it).')
     config[KEY] = table
 
 
@@ -158,17 +209,23 @@ class OutlierDecay:
     """The decay over the targeted trained parameters of this process (one pipeline stage's).
 
     `params` and `names` are parallel lists, `r0` each tensor's RMS at the start of the run.
+    `held` is the tensor the optimizer's param groups hold for each parameter (the parameter itself,
+    except for the CPU-offload optimizer, whose groups hold the host copies); `mirrors` is, for each
+    parameter, the other tensors that have to receive the same decay (that host copy).
     `contributes`: whether this process reports the metrics (one data-parallel replica per stage,
     since the replicas hold the same weights).
     """
 
-    def __init__(self, spec, optimizer, names, params, r0, contributes=True):
+    def __init__(self, spec, optimizer, names, params, r0, contributes=True, held=None, mirrors=None):
         self.spec = spec
         self.optimizer = optimizer
         self.names = names
         self.params = params
         self.r0 = r0
         self.contributes = contributes
+        self.held = list(params) if held is None else held
+        self.mirrors = [[] for _ in params] if mirrors is None else mirrors
+        self._peaks = {}
         self._lrs = [0.0] * len(params)
         self._generators = {}
         self._over = None
@@ -181,9 +238,15 @@ class OutlierDecay:
         and `spec` targets, with their RMS taken from the weights as they are now: call it before
         a resume replaces them. Names are the `original_name` the saver and the EMA use."""
         stepped = {id(p) for group in optimizer.param_groups for p in group['params']}
-        names, params, seen = [], [], set()
+        # torchao's CPUOffloadOptimizer steps a host copy of each large weight (its groups hold those)
+        # and copies it back to the device weight; the small weights stay on the device optimizer.
+        host_of = getattr(optimizer, 'param_d2h_map', None) or {}
+        names, params, held, mirrors, seen = [], [], [], [], set()
         for name, p in named_parameters:
-            if not p.requires_grad or id(p) in seen or id(p) not in stepped:
+            if not p.requires_grad or id(p) in seen:
+                continue
+            host = host_of.get(p)
+            if id(host if host is not None else p) not in stepped:
                 continue
             key = getattr(p, 'original_name', name)
             if not targeted(spec, key, p):
@@ -193,6 +256,8 @@ class OutlierDecay:
             seen.add(id(p))
             names.append(key)
             params.append(p)
+            held.append(p if host is None else host)
+            mirrors.append([] if host is None else [host])
         rms = []
         for p in params:
             rms.append(torch.linalg.vector_norm(p.detach(), dtype=torch.float32) / math.sqrt(p.numel()))
@@ -200,7 +265,7 @@ class OutlierDecay:
         # An all-zero tensor has no scale to measure outliers against.
         keep = [i for i, value in enumerate(r0) if value > 0]
         return cls(spec, optimizer, [names[i] for i in keep], [params[i] for i in keep],
-                   [r0[i] for i in keep], contributes)
+                   [r0[i] for i in keep], contributes, [held[i] for i in keep], [mirrors[i] for i in keep])
 
     def __len__(self):
         return len(self.params)
@@ -230,15 +295,20 @@ class OutlierDecay:
         if not self.params:
             return f'{KEY}: no trained parameter of this process matches the targets'
         elements = sum(p.numel() for p in self.params)
+        step = f'lr {spec["lr"]:g} (shaped by the schedule)' if spec['lr'] is not None else "the group's lr"
         return (f'{KEY}: {len(self.params)} tensors ({elements / 1e6:.1f}M elements), rate {spec["rate"]:g}, '
+                f'step size {step}, '
                 f'cap {spec["cap_start"] or spec["cap"]:g} -> {spec["cap"]:g} over {spec["cap_anneal"]} steps, '
                 f'warmup {spec["warmup"]} steps')
 
     def peak_pull(self):
-        """The largest lr * rate over the parameters, at the highest learning rate the schedule reaches."""
+        """The largest step size * rate over the parameters, at the highest learning rate the schedule
+        reaches (with an lr of its own, that lr: the schedule only lowers it)."""
+        if self.spec['lr'] is not None:
+            return float(self.spec['lr']) * float(self.spec['rate']) if self.params else 0.0
         peak = {id(p): max(float(group.get('initial_lr', group['lr'])), float(group['lr']))
                 for group in self.optimizer.param_groups for p in group['params']}
-        return max((peak.get(id(p), 0.0) for p in self.params), default=0.0) * float(self.spec['rate'])
+        return max((peak.get(id(p), 0.0) for p in self.held), default=0.0) * float(self.spec['rate'])
 
     def reset_metrics(self):
         """Forget the last step's numbers: after a step that was dropped there are none, and the logged
@@ -248,8 +318,21 @@ class OutlierDecay:
     def before_step(self):
         """Record each parameter's learning rate for the step about to run: DeepSpeed advances the
         scheduler inside train_batch, so after it the groups hold the next step's."""
-        lr = {id(p): float(group['lr']) for group in self.optimizer.param_groups for p in group['params']}
-        self._lrs = [lr.get(id(p), 0.0) for p in self.params]
+        lr = {id(p): self._step_size(group) for group in self.optimizer.param_groups for p in group['params']}
+        self._lrs = [lr.get(id(p), 0.0) for p in self.held]
+
+    def _step_size(self, group):
+        """The `lr` of the formula for a parameter group now: the group's learning rate, or with [outlier_decay]
+        lr, that lr times how far the schedule has taken the group's rate from where it started."""
+        now = float(group['lr'])
+        reference = self.spec['lr']
+        if reference is None:
+            return now
+        # initial_lr is set by the scheduler; without it, the highest rate seen so far stands for the start.
+        peak = float(group.get('initial_lr') or 0.0)
+        if peak <= 0:
+            peak = self._peaks[id(group)] = max(self._peaks.get(id(group), 0.0), now)
+        return float(reference) * now / peak if peak > 0 else 0.0
 
     def _generator(self, device, step):
         generator = self._generators.get(device)
@@ -285,6 +368,10 @@ class OutlierDecay:
             if p.device not in generators:
                 generators[p.device] = self._generator(p.device, step)
             counts.append(self._shrink(p, limit, self._lrs[i] * rate, generators[p.device]))
+            for mirror in self.mirrors[i]:
+                if mirror.device not in generators:
+                    generators[mirror.device] = self._generator(mirror.device, step)
+                self._shrink(mirror, limit, self._lrs[i] * rate, generators[mirror.device])
         if counts:
             self._over = torch.stack(counts).sum()
 
