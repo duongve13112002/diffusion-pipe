@@ -576,3 +576,76 @@ def test_a_teacher_audio_output_shorter_than_the_padded_audio_target_is_padded_f
     # The teacher output is (B, 3) against a (B, 5) target: padded, not an error.
     _, label = next(loader)
     assert label[2].shape == label[0].shape and not label[2][:, 3:].any()
+
+
+# every pipeline in the repo, read from the source (several cannot be imported without a GPU or flash_attn)
+
+import ast
+from pathlib import Path
+
+MODELS = Path(__file__).resolve().parent.parent / 'models'
+
+
+def pipeline_classes():
+    classes = {}
+    for path in sorted([*MODELS.glob('*.py'), *MODELS.glob('wan/*.py')]):
+        tree = ast.parse(path.read_text())
+        source = path.read_text()
+        for node in tree.body:
+            if isinstance(node, ast.ClassDef) and node.name.endswith('Pipeline'):
+                methods = {n.name: ast.get_source_segment(source, n) for n in node.body
+                           if isinstance(n, ast.FunctionDef)}
+                attrs = None
+                for n in node.body:
+                    if (isinstance(n, ast.Assign) and any(getattr(t, 'id', None) == 'teacher_denoiser_attrs'
+                                                          for t in n.targets)):
+                        attrs = ast.literal_eval(n.value)
+                bases = [b.id for b in node.bases if isinstance(b, ast.Name)]
+                classes[node.name] = {'bases': bases, 'methods': methods, 'attrs': attrs, 'file': path.name}
+    return classes
+
+
+def resolve(classes, name, field):
+    """The nearest definition of a method, or of teacher_denoiser_attrs, up the base classes."""
+    node = classes.get(name)
+    if node is None:
+        return None
+    if field == 'attrs':
+        if node['attrs'] is not None:
+            return node['attrs']
+    elif field in node['methods']:
+        return node['methods'][field]
+    for base in node['bases']:
+        found = resolve(classes, base, field)
+        if found is not None:
+            return found
+    return None
+
+
+MODEL_PIPELINES = sorted(name for name in pipeline_classes()
+                         if name not in ('CommonPipeline', 'BasePipeline', 'ComfyPipeline', 'MossImagePipeline'))
+
+
+def test_every_pipeline_was_found():
+    assert len(MODEL_PIPELINES) >= 25
+    assert {'FluxPipeline', 'WanPipeline', 'SDXLPipeline', 'QwenImage21Pipeline', 'PH3ImagePipeline'} <= set(MODEL_PIPELINES)
+
+
+@pytest.mark.parametrize('name', MODEL_PIPELINES)
+def test_to_layers_wraps_what_the_teacher_copies(name):
+    classes = pipeline_classes()
+    classes['BasePipeline'] = {'bases': [], 'methods': {}, 'attrs': ('transformer',), 'file': 'base.py'}
+    classes['ComfyPipeline'] = {'bases': [], 'methods': {}, 'attrs': ('diffusion_model',), 'file': 'base.py'}
+    attrs = resolve(classes, name, 'attrs')
+    to_layers = resolve(classes, name, 'to_layers')
+    assert attrs, f'{name} has no teacher_denoiser_attrs'
+    assert to_layers, f'{name} has no to_layers'
+    for attr in attrs:
+        assert f'self.{attr}' in to_layers, f'{name}.to_layers() does not read self.{attr}, which the teacher copies'
+
+
+def test_models_whose_layers_return_more_than_the_prediction_say_which_part_is_the_target():
+    classes = pipeline_classes()
+    defining = {name for name, node in classes.items() if 'teacher_targets_of' in node['methods']}
+    assert defining - {'CommonPipeline'} == {'CosmosPipeline', 'SDXLPipeline', 'MinimaxH3Pipeline', 'PH3ImagePipeline',
+                                              'MiniMaxH3ImagePipeline'}

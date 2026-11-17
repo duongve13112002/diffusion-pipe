@@ -363,6 +363,13 @@ class SDXLPipeline(BasePipeline):
     encodes_text_on_the_fly = True
     # Unique name, used to make the cache_dir path.
     name = 'sdxl'
+    # The first layer encodes the captions with the pipeline's own (trainable) text encoders, so a teacher copies
+    # the whole diffusers pipeline: UNet and both text encoders as loaded.
+    teacher_denoiser_attrs = ('diffusers_pipeline',)
+
+    def teacher_targets_of(self, output):
+        # The layers return (the prediction, the timesteps the min-SNR and debiased weights read).
+        return (output[0],)
     vae_config_keys = ('checkpoint_path',)
 
     # layers that will participate in activation checkpointing

@@ -23,6 +23,10 @@ adapter it is the same blocks with the adapter switched off, for a full fine-tun
 the model as loaded. Both are read from the model file the config names, so a resumed run distills
 toward that file's weights, not toward the checkpoint it resumed.
 
+`path` names another MOSS-Image transformer (a file or directory, as [model] transformer_path takes)
+as the teacher instead: its own frozen copy on the GPU, for an adapter too, and with any number of
+pipeline stages. It has to be the same architecture, or the two velocities do not match.
+
 Kept free of training-stack imports so the rules and the loss can be unit-tested on CPU.
 """
 
@@ -34,14 +38,15 @@ import torch.nn.functional as F
 from models.teacher_guidance import DECAYS, SHAPES, lambda_at
 
 KEY = 'teacher'
-_KEYS = ('loss_weight', 'shape', 't_mid', 'width', 'decay', 'decay_steps')
+_KEYS = ('loss_weight', 'shape', 't_mid', 'width', 'decay', 'decay_steps', 'path')
 
 
 class DistillConfig:
     """The validated [teacher] table. Attribute names are the ones models/teacher_guidance.py's
     schedule helpers read."""
 
-    def __init__(self, loss_weight, shape, t_mid, width, decay, decay_steps):
+    def __init__(self, loss_weight, shape, t_mid, width, decay, decay_steps, path=None):
+        self.path = path
         self.loss_weight = loss_weight
         self.shape = shape
         self.t_mid = t_mid
@@ -72,8 +77,7 @@ def parse_distill_config(config):
         raise ValueError(f'[{KEY}] must be a table, got {table!r}')
     unknown = sorted(set(table) - set(_KEYS))
     if unknown:
-        raise ValueError(f'[{KEY}] has unknown keys {unknown}; known keys: {", ".join(_KEYS)}. '
-                         'The teacher is always the model the run starts from, so there is no path to set.')
+        raise ValueError(f'[{KEY}] has unknown keys {unknown}; known keys: {", ".join(_KEYS)}')
     loss_weight = _number(table, 'loss_weight', 0.0)
     if loss_weight < 0:
         raise ValueError(f'[{KEY}] loss_weight must be >= 0, got {loss_weight}')
@@ -99,23 +103,27 @@ def parse_distill_config(config):
         raise ValueError(f'[{KEY}] decay = {decay!r} needs decay_steps > 0 (the optimizer steps over which '
                          "lambda falls to 0); use decay = 'none' to keep the term on for the whole run")
 
+    path = table.get('path')
+    if path is not None and (not isinstance(path, str) or not path.strip()):
+        raise ValueError(f'[{KEY}] path must be a non-empty string, got {path!r}')
+
     if config.get('compile'):
         raise ValueError(f'[{KEY}] does not work with compile = true: the teacher runs the model\'s layers outside '
                          'the compiled pipeline. Set compile = false, or remove [teacher].')
     if config.get('blocks_to_swap', 0):
         raise ValueError(f'[{KEY}] cannot be combined with blocks_to_swap: block swapping already moves the '
                          'blocks between CPU and GPU every step, and the teacher is a second full forward.')
-    if isinstance(config.get('adapter'), dict) and config['adapter'].get('init_from_existing'):
+    if path is None and isinstance(config.get('adapter'), dict) and config['adapter'].get('init_from_existing'):
         raise ValueError(f'[{KEY}] cannot be combined with [adapter] init_from_existing: the teacher is the model with '
                          'the adapter switched off, which is the base model, not the base plus the adapter the run '
                          'starts from, so the term would pull the first steps away from the starting adapter. '
-                         'Remove one of them.')
-    if 'adapter' in config and int(config.get('pipeline_stages', 1)) != 1:
+                         'Remove one of them, or set [teacher] path.')
+    if path is None and 'adapter' in config and int(config.get('pipeline_stages', 1)) != 1:
         raise ValueError(f'[{KEY}] with an [adapter] needs pipeline_stages = 1: the teacher is the same blocks '
                          'with the adapter switched off, which only a stage that holds the whole model can run. '
                          'Use data parallelism across the GPUs, or train a full fine-tune (which keeps a frozen '
                          'copy on the first stage).')
-    return DistillConfig(loss_weight, shape, t_mid, width, decay, int(decay_steps))
+    return DistillConfig(loss_weight, shape, t_mid, width, decay, int(decay_steps), path)
 
 
 def distill_warnings(distill, config):

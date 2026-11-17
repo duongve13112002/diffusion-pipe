@@ -119,6 +119,10 @@ def load_vision_image(path):
 class MiniMaxH3ImagePipeline(MinimaxH3Pipeline):
     name = 'minimax_h3_image'
     is_video_vae = False
+
+    def teacher_targets_of(self, output):
+        # One prediction tensor, against the label's one target.
+        return (output,)
     vae_latent_keys = ('latents',) + CONTROL_KEYS
     max_control_images = MAX_REFERENCES
     # the latent cache of a directory with references records how they are sized (a cache made with the references

@@ -452,6 +452,13 @@ class IrisPipeline(BasePipeline):
     vae_dtype_refusal = 'Iris caches pixels, not VAE latents'
     encodes_text_on_the_fly = True
     name = 'iris'
+
+    def teacher_unsupported(self):
+        if self.repa_weight > 0:
+            return ('repa_weight > 0: the REPA layer of the layer chain records its loss on the pipeline and returns '
+                    'a second output, which a teacher chain has no use for. Set repa_weight = 0.')
+        return None
+
     framerate = None
     checkpointable_layers = ['InitialLayer', 'TransformerLayer', 'PiTLayer']
     adapter_target_modules = ['MMDiTBlock', 'SingleStreamBlock']

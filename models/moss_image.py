@@ -1551,16 +1551,27 @@ class MossImagePipeline(ComfyPipeline):
         model = self.diffusion_model
         # Its own state: no stream vector and never sampling, so the layers it builds are the plain forward.
         state = LayerState(model.rope, self.compute_dtype, self.fp16_fold)
-        if 'adapter' in self.config:
+        path = self.distill.path
+        if path is None and 'adapter' in self.config:
             return TeacherForward(model, state, lambda: adapter_switched_off(self.lora_model))
-        copy_of_model = copy.deepcopy(model).requires_grad_(False).eval()
+        copy_of_model = (copy.deepcopy(model) if path is None else self.load_teacher_model(path))
+        copy_of_model.requires_grad_(False).eval()
         copy_of_model.to(comfy.model_management.get_torch_device())
         state.rope_fn = copy_of_model.rope
         if is_main_process():
             size = sum(p.numel() * p.element_size() for p in copy_of_model.parameters()) / 2**30
-            print(f'MOSS-Image: [teacher] keeps a frozen copy of the starting model ({size:.1f} GiB) on the GPU '
-                  'of every rank of the first pipeline stage')
+            print(f'MOSS-Image: [teacher] keeps a frozen copy of {"the starting model" if path is None else path} '
+                  f'({size:.1f} GiB) on the GPU of every rank of the first pipeline stage')
         return TeacherForward(copy_of_model, state)
+
+    def load_teacher_model(self, path):
+        """The transformer at `path`, loaded the way the starting one is (dtype, fp16 fold, merged adapters) on a copy
+        of the pipeline, so the student's diffusion_model and layer state stay as they are."""
+        teacher = object.__new__(type(self))
+        teacher.__dict__.update(self.__dict__)
+        teacher.transformer_path = path
+        teacher.load_diffusion_model()
+        return teacher.diffusion_model
 
     def enable_block_swap(self, blocks_to_swap):
         model = self.diffusion_model

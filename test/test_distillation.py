@@ -420,3 +420,49 @@ def test_a_teacher_cannot_follow_an_adapter_started_from_existing_weights():
     assert parse_distill_config(base) is not None
     with pytest.raises(ValueError, match='init_from_existing'):
         parse_distill_config({**base, 'adapter': {'type': 'lora', 'init_from_existing': 'some_lora'}})
+
+
+# a teacher from another checkpoint ([teacher] path)
+
+def test_path_is_a_known_key_and_loosens_the_adapter_rules():
+    assert cfg().path is None
+    assert cfg(path='/m/other').path == '/m/other'
+    for bad in ('', '  ', 3):
+        with pytest.raises(ValueError, match='path'):
+            cfg(path=bad)
+    teacher = {'loss_weight': 1}
+    starting_adapter = {'adapter': {'type': 'lora', 'init_from_existing': '/a'}}
+    with pytest.raises(ValueError, match='init_from_existing'):
+        parse_distill_config({'teacher': teacher, **starting_adapter})
+    with pytest.raises(ValueError, match='pipeline_stages = 1'):
+        parse_distill_config({'teacher': teacher, 'adapter': {'type': 'lora'}, 'pipeline_stages': 2})
+    # With a path the teacher is a copy of its own, so neither applies.
+    both = {**starting_adapter, 'pipeline_stages': 2}
+    assert parse_distill_config({'teacher': {**teacher, 'path': '/m'}, **both}).path == '/m'
+
+
+def with_teacher_checkpoints(monkeypatch, checkpoints):
+    """MossImagePipeline.load_diffusion_model reading the tiny reference named by transformer_path."""
+    def load(self):
+        self.diffusion_model = loaded_pipeline(checkpoints[str(self.transformer_path)]).diffusion_model
+    monkeypatch.setattr(mi.MossImagePipeline, 'load_diffusion_model', load)
+
+
+@pytest.mark.parametrize('lora', [False, True], ids=['full fine-tune', 'adapter'])
+def test_the_teacher_can_be_another_checkpoint(monkeypatch, lora):
+    student, other = tiny_reference(seed=0), tiny_reference(seed=7)
+    with_teacher_checkpoints(monkeypatch, {'other': other})
+    pipe, reference = distilling_pipeline(lora=lora, distill=cfg(loss_weight=1.0, path='other'), reference=student)
+    x, t, text, mask = forward_inputs()
+    with torch.no_grad():
+        expected = reference_forward(other, x, t, text, mask).float()
+        starting = reference_forward(student, x, t, text, mask).float()
+    out, teacher = pipe.pipeline_model((x, t, text, mask))
+    torch.testing.assert_close(teacher, expected, rtol=1e-5, atol=1e-5)
+    assert not torch.allclose(teacher, starting, atol=1e-3), 'the teacher must not be the starting model'
+    # The teacher is its own copy: moving the student leaves it alone.
+    with torch.no_grad():
+        for p in pipe.diffusion_model.parameters():
+            p.add_(0.05 * torch.randn_like(p))
+    _, again = pipe.pipeline_model((x, t, text, mask))
+    torch.testing.assert_close(again, expected, rtol=1e-5, atol=1e-5)

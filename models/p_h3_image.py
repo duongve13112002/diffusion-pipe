@@ -117,6 +117,10 @@ class PH3ImagePipeline(MinimaxH3Pipeline):
     name = 'p_h3_image'
     is_video_vae = False
 
+    def teacher_targets_of(self, output):
+        # The audio output is not trained, and the label has no audio target.
+        return (output[0],)
+
     def __init__(self, config):
         model_config = config['model']
         for key, reason in REFUSED_MODEL_KEYS.items():

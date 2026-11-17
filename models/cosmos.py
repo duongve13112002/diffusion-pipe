@@ -141,6 +141,10 @@ class CosmosPipeline(BasePipeline):
     checkpointable_layers = ['InitialLayer', 'TransformerLayer', 'FinalLayer']
     adapter_target_modules = ['GeneralDITTransformerBlock']
 
+    def teacher_targets_of(self, output):
+        # The layers return (the x0 prediction, the loss weight of each sigma); the target is the x0 the data gives.
+        return (output[0],)
+
     def __init__(self, config):
         self.config = config
         self.model_config = self.config['model']

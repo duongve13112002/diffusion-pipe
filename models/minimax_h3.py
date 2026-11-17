@@ -227,6 +227,11 @@ class PreprocessMediaFileMinimax(PreprocessMediaFile):
 
 class MinimaxH3Pipeline(ComfyPipeline):
     name = 'minimax_h3'
+
+    def teacher_targets_of(self, output):
+        # (video prediction, audio prediction), against the label's (target, audio_target).
+        return tuple(output)
+
     checkpointable_layers = ['TransformerLayer']
     adapter_target_modules = ['DiTBlock', 'RefinerBlock']
     # [fp8_training] leaves the adaLN projections alone: ComfyUI runs them in the checkpoint's
