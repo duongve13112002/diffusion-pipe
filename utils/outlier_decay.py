@@ -90,6 +90,10 @@ SECOND_COPY_OPTIMIZERS = {
     'safefp16optimizer': 'keeps fp32 master copies and writes them back to the live fp16 weights',
     'lomo': 'updates each weight during backward, so there is no step to decay after',
     'adalomo': 'updates each weight during backward, so there is no step to decay after',
+    'madgrad': 'rebuilds the weights from the starting point it stores, which pulls a decayed weight back',
+    'dadaptadagrad': 'rebuilds the weights from the starting point it stores, which pulls a decayed weight back',
+    'dadaptsgd': 'rebuilds the weights from the starting point it stores, which pulls a decayed weight back',
+    'ftrl': 'rebuilds the weights from its accumulated sums every step, which pulls a decayed weight back',
     'trac': 'wraps the optimizer and keeps a reference copy of the weights it pulls them back to',
 }
 
@@ -318,21 +322,37 @@ class OutlierDecay:
     def before_step(self):
         """Record each parameter's learning rate for the step about to run: DeepSpeed advances the
         scheduler inside train_batch, so after it the groups hold the next step's."""
-        lr = {id(p): self._step_size(group) for group in self.optimizer.param_groups for p in group['params']}
+        base = self._base_peak()
+        lr = {id(p): self._step_size(group, base) for group in self.optimizer.param_groups for p in group['params']}
         self._lrs = [lr.get(id(p), 0.0) for p in self.held]
 
-    def _step_size(self, group):
+    def _peak(self, group):
+        """Where the group's learning rate started: initial_lr, which the scheduler sets; without it, the
+        highest rate seen so far."""
+        peak = float(group.get('initial_lr') or 0.0)
+        if peak <= 0:
+            peak = self._peaks[id(group)] = max(self._peaks.get(id(group), 0.0), float(group['lr']))
+        return peak
+
+    def _base_peak(self):
+        # Over the groups that hold a decayed parameter: a group the decay does not touch says nothing about
+        # the rate its parameters are measured against.
+        held = {id(p) for p in self.held}
+        return max((self._peak(group) for group in self.optimizer.param_groups
+                    if any(id(p) in held for p in group['params'])), default=0.0)
+
+    def _step_size(self, group, base=None):
         """The `lr` of the formula for a parameter group now: the group's learning rate, or with [outlier_decay]
-        lr, that lr times how far the schedule has taken the group's rate from where it started."""
+        lr, that lr times the group's rate now over the largest rate any group started at (`base`): the
+        schedule shapes it, and a part trained at a tenth of the base rate (a per-part lr) decays at a tenth,
+        as it would with an optimizer whose step is the group's rate. A frozen group (rate 0) does not decay."""
         now = float(group['lr'])
         reference = self.spec['lr']
         if reference is None:
             return now
-        # initial_lr is set by the scheduler; without it, the highest rate seen so far stands for the start.
-        peak = float(group.get('initial_lr') or 0.0)
-        if peak <= 0:
-            peak = self._peaks[id(group)] = max(self._peaks.get(id(group), 0.0), now)
-        return float(reference) * now / peak if peak > 0 else 0.0
+        if base is None:
+            base = self._base_peak()
+        return float(reference) * now / base if base > 0 else 0.0
 
     def _generator(self, device, step):
         generator = self._generators.get(device)
@@ -367,11 +387,17 @@ class OutlierDecay:
             self._largest = max(self._largest, biggest / limit)
             if p.device not in generators:
                 generators[p.device] = self._generator(p.device, step)
-            counts.append(self._shrink(p, limit, self._lrs[i] * rate, generators[p.device]))
+            if not self.mirrors[i]:
+                counts.append(self._shrink(p, limit, self._lrs[i] * rate, generators[p.device]))
+                continue
+            # The optimizer steps the host copy and writes it back to the device weight: decay the host copy
+            # and copy it over, so that both hold the same rounding (each device's generator would differ).
             for mirror in self.mirrors[i]:
                 if mirror.device not in generators:
                     generators[mirror.device] = self._generator(mirror.device, step)
-                self._shrink(mirror, limit, self._lrs[i] * rate, generators[mirror.device])
+                count = self._shrink(mirror, limit, self._lrs[i] * rate, generators[mirror.device])
+            counts.append(count.to(p.device))
+            p.copy_(self.mirrors[i][0])
         if counts:
             self._over = torch.stack(counts).sum()
 

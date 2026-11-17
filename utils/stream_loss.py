@@ -100,7 +100,8 @@ def parse_stream_loss(model_config):
     unknown = sorted(set(table) - set(TERMS))
     if unknown:
         raise ValueError(f'model.{KEY} has unknown terms {unknown}; valid: {sorted(TERMS)}. '
-                         '(KohakuMoss\'s peak term guards fp16 headroom and does not apply to bf16 / fp32 training.)')
+                         '(KohakuMoss\'s peak term, which guards the headroom of a float16 stream, is not ported: [model] '
+                         "fp16_fix = 'online' keeps a float16 stream in range instead.)")
     spec = {}
     for name, term in table.items():
         where = f'model.{KEY}.{name}'

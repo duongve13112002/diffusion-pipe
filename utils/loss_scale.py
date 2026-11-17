@@ -37,7 +37,18 @@ DEFAULTS = {
     'growth_interval': 2000,
     'min_scale': 1.0,
 }
-FLOAT16_NAMES = ('float16', 'fp16', 'half')
+FLOAT16_NAMES = ('float16', 'fp16')
+# The names [model] compute_dtype takes (models/moss_image.py DTYPE_NAMES), as torch dtypes.
+COMPUTE_DTYPES = {'bfloat16': torch.bfloat16, 'bf16': torch.bfloat16, 'float16': torch.float16,
+                  'fp16': torch.float16, 'float32': torch.float32, 'fp32': torch.float32}
+
+
+def compute_dtype_of(model_config):
+    """[model] compute_dtype as a torch dtype, or None when it is absent or not a dtype name."""
+    value = model_config.get('compute_dtype')
+    if isinstance(value, torch.dtype):
+        return value
+    return COMPUTE_DTYPES.get(str(value).lower()) if value is not None else None
 
 
 def computes_in_float16(model_config):
@@ -102,6 +113,16 @@ def apply_loss_scale_config_defaults(config):
     if isinstance(optimizer, dict) and optimizer.get('gradient_release', False):
         raise ValueError('compute_dtype = "float16" needs the gradients at the end of the step to unscale them, '
                          'and gradient_release frees them during backward. Turn one of them off.')
+    if isinstance(optimizer, dict) and str(optimizer.get('type', '')).lower() == 'offload':
+        raise ValueError("compute_dtype = 'float16' scales the gradients until the engine step, but the CPU-offload "
+                         "optimizer (type = 'offload') copies each gradient to the host during backward, before it "
+                         'is unscaled, and would step on the scaled one. Use another optimizer.')
+    adapter = config.get('adapter')
+    if isinstance(adapter, dict) and (adapter.get('dtype') == torch.float16
+                                      or str(adapter.get('dtype', '')).lower() in FLOAT16_NAMES):
+        raise ValueError("[adapter] dtype = 'float16' with compute_dtype = 'float16': the gradients of float16 "
+                         'parameters are unscaled in float16, where the small ones the loss scale protected '
+                         "flush to zero. Leave the adapter dtype unset (float32 over a float16 base) or use 'float32'.")
     if config.get('skip_nonfinite_steps') is False:
         raise ValueError("compute_dtype = 'float16' scales the loss and drops the steps whose gradient overflows, "
                          'which is what skip_nonfinite_steps does: remove skip_nonfinite_steps = false.')
@@ -110,11 +131,15 @@ def apply_loss_scale_config_defaults(config):
     return table
 
 
-def default_adapter_dtype(model_dtype):
-    """The dtype an [adapter] trains in unless it says: the weights' own, except over a float16 base, where
-    float16 holds the optimizer's small updates badly and the adapter trains in float32 (the layer casts it
-    per call)."""
-    return 'float32' if str(model_dtype).lower() in FLOAT16_NAMES else model_dtype
+def default_adapter_dtype(model_config):
+    """The dtype an [adapter] trains in unless it says: the weights' own, except over a float16 MOSS-Image
+    base, where float16 holds the optimizer's small updates badly (and its gradients cannot be unscaled in
+    float16) and the adapter trains in float32, the layer casting it per call. Other models keep the weights'
+    dtype."""
+    dtype = model_config['dtype']
+    if model_config.get('type') == 'moss_image' and str(dtype).lower() in FLOAT16_NAMES:
+        return 'float32'
+    return dtype
 
 
 class _ScaleGradient(torch.autograd.Function):

@@ -36,7 +36,7 @@ from utils.dora import apply_dora_config_defaults, check_model_dtypes as check_d
 from utils.oplora import OPLoRAProjector, apply_oplora_config_defaults
 from utils.outlier_decay import OutlierDecay, apply_outlier_decay_config_defaults
 from utils.step_guard import NonFiniteGuard, apply_step_guard_config_defaults
-from utils.loss_scale import (LossScaler, apply_loss_scale_config_defaults, default_adapter_dtype,
+from utils.loss_scale import (LossScaler, apply_loss_scale_config_defaults, compute_dtype_of, default_adapter_dtype,
                               refuse_compute_dtype_off_moss)
 from utils.weight_decay_target import (WeightDecayTarget, apply_weight_decay_target_config_defaults,
                                        restore_optimizer_decay, weight_decay_target_active)
@@ -140,7 +140,7 @@ def set_config_defaults(config):
                 'This script forces alpha=rank to make the saved adapter format simpler and more predictable with downstream inference programs. Please remove alpha from the config.'
             )
         adapter_config['alpha'] = adapter_config['rank']
-        adapter_config.setdefault('dtype', default_adapter_dtype(model_dtype_str))
+        adapter_config.setdefault('dtype', default_adapter_dtype(model_config | {'dtype': model_dtype_str}))
         adapter_config['dtype'] = DTYPE_MAP[adapter_config['dtype']]
 
         apply_dora_config_defaults(adapter_config)
@@ -370,6 +370,9 @@ if __name__ == '__main__':
         raise SystemExit(0)
 
     set_config_defaults(config)
+    if args.nan_check and config.get('loss_scale') is not None:
+        raise SystemExit("--nan_check stops at the first inf in a gradient, which with compute_dtype = 'float16' is "
+                         "the loss scale's normal back-off signal, not an error. Debug in bfloat16 or float32.")
     # Fail now rather than after the dataset and model have loaded.
     common.ensure_writable_dir(config['output_dir'], 'output_dir')
     local_world_size = int(os.environ.get('LOCAL_WORLD_SIZE') or os.environ.get('LOCAL_SIZE')
@@ -377,8 +380,7 @@ if __name__ == '__main__':
     if (cpu_threads := common.limit_cpu_threads(local_world_size)) is not None and \
             int(os.environ.get('LOCAL_RANK', max(args.local_rank, 0))) == 0:
         print(f'CPU threads per GPU process: {cpu_threads} (set OMP_NUM_THREADS to override)')
-    compute_dtype = config['model'].get('compute_dtype')
-    common.AUTOCAST_DTYPE = DTYPE_MAP[compute_dtype] if isinstance(compute_dtype, str) else config['model']['dtype']
+    common.AUTOCAST_DTYPE = compute_dtype_of(config['model']) or config['model']['dtype']
     dataset_util.UNCOND_FRACTION = config.get('uncond_fraction', 0.0)
     if map_num_proc := config.get('map_num_proc', None):
         dataset_util.NUM_PROC = map_num_proc

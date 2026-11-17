@@ -3,8 +3,8 @@
 import pytest
 import torch
 
-from utils.loss_scale import (DEFAULTS, LossScaler, apply_loss_scale_config_defaults, computes_in_float16,
-                              default_adapter_dtype, refuse_compute_dtype_off_moss)
+from utils.loss_scale import (DEFAULTS, LossScaler, apply_loss_scale_config_defaults, compute_dtype_of,
+                              computes_in_float16, default_adapter_dtype, refuse_compute_dtype_off_moss)
 
 
 def config_with(**table):
@@ -272,7 +272,86 @@ def test_float16_compute_switches_the_step_guard_on_and_refuses_it_off():
     assert 'skip_nonfinite_steps' not in other
 
 
-@pytest.mark.parametrize('dtype,expected', [('float16', 'float32'), ('fp16', 'float32'), ('bfloat16', 'bfloat16'),
-                                            ('float32', 'float32')])
-def test_an_adapter_over_a_float16_base_trains_in_float32(dtype, expected):
-    assert default_adapter_dtype(dtype) == expected
+@pytest.mark.parametrize('model,expected', [
+    ({'type': 'moss_image', 'dtype': 'float16'}, 'float32'), ({'type': 'moss_image', 'dtype': 'fp16'}, 'float32'),
+    ({'type': 'moss_image', 'dtype': 'bfloat16'}, 'bfloat16'), ({'type': 'moss_image', 'dtype': 'float32'}, 'float32'),
+    ({'type': 'sdxl', 'dtype': 'float16'}, 'float16'), ({'type': 'flux', 'dtype': 'bfloat16'}, 'bfloat16'),
+])
+def test_an_adapter_over_a_float16_moss_image_base_trains_in_float32_and_other_models_are_unchanged(model, expected):
+    assert default_adapter_dtype(model) == expected
+
+
+@pytest.mark.parametrize('name,expected', [('float16', torch.float16), ('fp16', torch.float16),
+                                           ('BF16', torch.bfloat16), ('fp32', torch.float32),
+                                           (torch.float16, torch.float16), ('half', None), (None, None)])
+def test_the_compute_dtype_aliases_the_model_takes_resolve_to_torch_dtypes(name, expected):
+    assert compute_dtype_of({} if name is None else {'compute_dtype': name}) == expected
+
+
+@pytest.mark.parametrize('dtype', ['float16', 'fp16', torch.float16])
+def test_a_float16_adapter_is_refused_with_float16_compute(dtype):
+    config = config_with()
+    config['adapter'] = {'type': 'lora', 'dtype': dtype}
+    with pytest.raises(ValueError, match=r'\[adapter\] dtype'):
+        apply_loss_scale_config_defaults(config)
+    config['adapter']['dtype'] = 'float32'
+    apply_loss_scale_config_defaults(config)
+
+
+def test_the_cpu_offload_optimizer_is_refused_with_float16_compute():
+    config = config_with()
+    config['optimizer'] = {'type': 'offload'}
+    with pytest.raises(ValueError, match='CPU-offload'):
+        apply_loss_scale_config_defaults(config)
+
+
+def _two_rank_worker(rank, init_file, out_dir):
+    import json
+    import os
+    os.environ.setdefault('DS_ACCELERATOR', 'cpu')
+    os.environ['LOCAL_RANK'] = str(rank)
+    import deepspeed
+    deepspeed.init_distributed('gloo', auto_mpi_discovery=False, init_method=f'file://{init_file}',
+                               rank=rank, world_size=2, verbose=False)
+    from deepspeed.runtime.engine import DeepSpeedEngine
+    import utils.patches as patches
+    from utils.step_guard import NonFiniteGuard
+
+    DeepSpeedEngine._take_model_step = patches._take_model_step_measured
+    DeepSpeedEngine.clip_fp32_gradients = patches._clip_fp32_gradients
+    torch.manual_seed(0)
+    model = torch.nn.Linear(4, 2)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+    engine, optimizer, _, _ = deepspeed.initialize(
+        model=model, optimizer=optimizer,
+        config={'train_micro_batch_size_per_gpu': 1, 'gradient_accumulation_steps': 1,
+                'gradient_clipping': 1.0, 'steps_per_print': 1000})
+    engine._support_torch_style_backward = True
+    guard = NonFiniteGuard(patience=2)
+    scaler = LossScaler(init_scale=1024.0, min_scale=1.0)
+    engine.nonfinite_guard, engine.loss_scaler = guard, scaler
+
+    def step(poison_rank=None):
+        engine.zero_grad()
+        scaler.scale_loss(engine(torch.ones(1, 4) * (rank + 1)).pow(2).sum()).backward()
+        if poison_rank == rank:
+            model.weight.grad[0, 0] = float('inf')
+        before = model.weight.detach().clone()
+        engine._take_model_step(None)
+        return {'moved': not torch.equal(before, model.weight.detach()), 'scale': scaler.scale,
+                'skipped': guard.step_skipped, 'scale_overflow': guard.scale_overflow}
+
+    results = [step(), step(poison_rank=1), step(), step(poison_rank=0)]
+    with open(os.path.join(out_dir, f'{rank}.json'), 'w') as f:
+        json.dump(results, f)
+
+
+def test_every_rank_takes_the_same_overflow_decision_when_only_one_has_a_non_finite_gradient(tmp_path):
+    import json
+    import torch.multiprocessing as mp
+    mp.spawn(_two_rank_worker, args=(str(tmp_path / 'init'), str(tmp_path)), nprocs=2, join=True)
+    per_rank = [json.loads((tmp_path / f'{rank}.json').read_text()) for rank in (0, 1)]
+    expected = [(True, 1024.0, False), (False, 512.0, True), (True, 512.0, False), (False, 256.0, True)]
+    for results in per_rank:
+        assert [(r['moved'], r['scale'], r['skipped']) for r in results] == expected
+        assert all(r['scale_overflow'] == r['skipped'] for r in results)

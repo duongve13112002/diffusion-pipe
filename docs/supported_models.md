@@ -1149,12 +1149,13 @@ rather than loaded with layers' weights in their neighbours.
   `sgd`, `adamw8bitkahan`, `offload` and `genericoptim` without `automagic`. Any other optimizer (Prodigy,
   Automagic, `genericoptim` with `automagic`, and every `pytorch_optimizer` class such as Lion, Adan or SOAP)
   steps by something else, so set `[outlier_decay] lr`: the decay then uses
-  `lr * (the group's learning rate now / its learning rate at the start of the schedule)`, so warmup and
-  the cosine or linear decay still shape it and only the size comes from `lr`; give it the learning rate you
+  `lr * (the group's learning rate now / the largest learning rate any decayed group started at)`, so warmup
+  and the cosine or linear decay still shape it, a part with a per-part learning rate (`attn_lr` and the like)
+  decays in proportion to it, a frozen part (rate 0) does not decay, and only the size comes from `lr`; give it the learning rate you
   would give AdamW for the run (rate 12 at lr 1e-5 is a time constant of 8.3k steps). The CPU-offload
-  optimizer's host copy of each weight is decayed along with the weight. Refused by name: optimizers that
-  keep a second copy of the weights the decay cannot reach (schedule-free, Lookahead, Ranger, Ranger21, TRAC,
-  SafeFP16Optimizer), optimizers that take two gradient passes (SAM and its variants) or update during backward
+  optimizer's host copy of each weight is decayed and copied over the device weight, so both hold the same bits. Refused by name: optimizers that
+  keep a second copy of the weights the decay cannot reach or rebuild the weights from a stored starting point
+  (schedule-free, Lookahead, Ranger, Ranger21, TRAC, SafeFP16Optimizer, MADGRAD, DAdaptAdaGrad, DAdaptSGD, FTRL), optimizers that take two gradient passes (SAM and its variants) or update during backward
   (LOMO, AdaLOMO), and `gradient_release`. A step with `lr * rate` above 1 is refused, and the run stops at
   startup if `targets` / `exclude` match no trained parameter on any stage.
 - Settings from KohakuMossTrainer's recipes. `examples/moss_image/moss_image_lora_kohakumoss.toml` and
@@ -1222,8 +1223,10 @@ rather than loaded with layers' weights in their neighbours.
   needs `fp16_fix = 'online'` again, as does sampling it in float16 elsewhere. float16 *storage* (`dtype =
   'float16'`) is only for an `[adapter]` over a frozen base, whose own weights then train in float32 by
   default; a full fine-tune refuses it, since float16 holds the small updates badly. `[fp8_training]` is
-  refused with float16 compute, `gradient_release` is refused (the gradients must exist at the step to
-  unscale them), and `compute_dtype`, `fp16_fix` and `[loss_scale]` are refused on every other model.
+  refused with float16 compute, as are `gradient_release` (the gradients must exist at the step to unscale
+  them), `type = 'offload'` (the host optimizer copies each gradient during backward, before it is unscaled),
+  an explicit `[adapter] dtype = 'float16'` (float16 gradients cannot be unscaled without flushing the small
+  ones), and `--nan_check` (it would stop at an overflow the scale handles). And `compute_dtype`, `fp16_fix` and `[loss_scale]` are refused on every other model.
   Not measured against bfloat16 on image quality or speed.
 - `merge_adapters` also takes ai-toolkit's MOSS-Image LoRAs, which adapt the fused `proj.qkv`
   (ComfyUI, diffusers `transformer.` and kohya `lora_unet_` names): each of q, k and v gets the

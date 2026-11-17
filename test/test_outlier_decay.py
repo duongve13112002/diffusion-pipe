@@ -318,6 +318,42 @@ def test_with_an_lr_the_step_size_is_that_lr_shaped_by_the_schedule():
     assert decay.peak_pull() == pytest.approx(1e-3 * 6.0)
 
 
+def test_with_an_lr_each_group_keeps_its_ratio_to_the_largest_starting_rate():
+    """A part trained at a tenth of the base rate decays at a tenth, as with AdamW; a frozen part does not
+    decay; a group the decay does not touch does not set the base."""
+    module = Stub()
+    optimizer = torch.optim.SGD([
+        {'params': [module.a.weight], 'lr': 1.0, 'initial_lr': 1.0},
+        {'params': [module.b.weight], 'lr': 0.05, 'initial_lr': 0.1},
+        {'params': [module.norm.weight], 'lr': 0.0, 'initial_lr': 0.0},
+        {'params': [module.a.bias], 'lr': 50.0, 'initial_lr': 50.0},
+    ])
+    named = [('a.weight', module.a.weight), ('b.weight', module.b.weight), ('norm.weight', module.norm.weight)]
+    decay = OutlierDecay.build(named, optimizer, make_spec(lr=1e-3, include_1d=True))
+    decay.before_step()
+    steps = dict(zip(decay.names, decay._lrs))
+    assert steps['a.weight'] == pytest.approx(1e-3)
+    # the second group is at half of its own start, which is a tenth of the base
+    assert steps['b.weight'] == pytest.approx(0.05e-3)
+    assert steps['norm.weight'] == 0.0
+
+
+def test_the_cpu_offload_optimizers_host_and_device_weights_hold_the_same_bits_after_the_decay():
+    module = Stub().bfloat16()
+    optimizer = FakeOffloadOptimizer(module, lr=0.01)
+    decay = OutlierDecay.build(module.named_parameters(), optimizer, make_spec(cap=1.0, rate=20.0, include_1d=True))
+    with torch.no_grad():
+        for p in module.parameters():
+            if p in optimizer.param_d2h_map:
+                p.mul_(1.0 + torch.rand_like(p))
+                optimizer.param_d2h_map[p].copy_(p)
+    decay.before_step()
+    decay.apply(1)
+    for p, host in optimizer.param_d2h_map.items():
+        assert torch.equal(p, host)
+    assert decay.log_scalars()['train/outlier_over'] > 0
+
+
 def test_prodigy_decays_at_the_lr_of_the_decay_and_not_at_its_own_multiplier():
     pytorch_optimizer = pytest.importorskip('pytorch_optimizer')
     module = Stub()
