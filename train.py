@@ -42,6 +42,7 @@ from utils.weight_decay_target import (WeightDecayTarget, apply_weight_decay_tar
                                        restore_optimizer_decay, weight_decay_target_active)
 from utils.lr_schedule import create_lr_scheduler, validate_min_ratio
 from utils.stream_loss import refuse_stream_loss_off_moss
+from utils import model_teacher
 from utils.checkpoint_layout import check_checkpoint_files, check_checkpoint_layers, shift_checkpoint_layers
 from utils.lora_plus import NAME as LORA_PLUS, apply_lora_plus_config_defaults, lora_plus_active, split_lora_plus_groups
 from utils.param_groups import check_resumed_param_groups, group_names, split_2d_param_groups
@@ -172,6 +173,13 @@ def set_config_defaults(config):
     # Float16 compute (MOSS-Image compute_dtype = 'float16'): the loss scale, which needs the non-finite step
     # guard to drop the steps whose gradient overflows (utils/loss_scale.py).
     apply_loss_scale_config_defaults(config)
+
+    # Distillation toward a frozen teacher for every model but MOSS-Image and anima_refiner, which read their own
+    # [teacher] (utils/model_teacher.py).
+    teacher_config = model_teacher.parse_model_teacher_config(config)
+    if teacher_config is not None and is_main_process():
+        for message in model_teacher.warnings_for(teacher_config, config):
+            print('WARNING:', message)
 
     # Skipping optimizer steps whose gradient is NaN or inf (utils/step_guard.py); off by default.
     apply_step_guard_config_defaults(config)
@@ -531,6 +539,8 @@ if __name__ == '__main__':
         raise NotImplementedError(f'Model type {model_type} is not implemented')
     # vae_dtype / latent_cache_dtype: a wrong value, or a model they do not apply to, stops here.
     model.vae_dtypes
+    if teacher_config is not None and (reason := model.teacher_unsupported()):
+        raise ValueError(f'[teacher] cannot be used with this model: {reason}')
     startup_timing.mark('model setup')
 
     # import sys, PIL
@@ -729,6 +739,17 @@ if __name__ == '__main__':
         model.prepare_sample_test('a golden retriever running through a grassy field', cfg=1)
 
     model.load_diffusion_model()
+    # The teacher is a copy of the model as loaded, so it is made before fp8 training and the adapter change the
+    # student's modules; on the first pipeline stage only, which is where it runs.
+    teacher = None
+    if teacher_config is not None:
+        teacher = model_teacher.build_teacher(
+            model, teacher_config, torch.device('cuda', torch.cuda.current_device()),
+            runs_teacher=model_teacher.on_first_stage(config.get('pipeline_stages', 1)))
+        if is_main_process():
+            source = teacher_config.path or 'the model the run started from'
+            print(f'[teacher] on: a frozen copy of {source} runs on the first pipeline stage of every data-parallel '
+                  f'replica (lambda = {teacher_config.loss_weight} x decay {teacher_config.decay!r})')
     # Before the adapter, which then wraps the fp8 layers like any Linear.
     fp8_training.prepare_model(model)
 
@@ -836,7 +857,7 @@ if __name__ == '__main__':
         num_stages=num_stages,
         partition_method=partition_method,
         manual_partition_split=partition_split,
-        loss_fn=model.get_loss_fn(),
+        loss_fn=model_teacher.wrap_loss_fn(model.get_loss_fn(), teacher) if teacher is not None else model.get_loss_fn(),
         dynamic_shape=True,
         **additional_pipeline_module_kwargs
     )
@@ -1083,6 +1104,7 @@ if __name__ == '__main__':
         # (models with load_media_on_the_fly, e.g. iris); cached latents need only the default.
         num_dataloader_workers=config.get('dataloader_workers', 1),
         text_encoding=text_encoding,
+        teacher=teacher,
     )
     steps_per_epoch = len(train_dataloader) // model_engine.gradient_accumulation_steps()
     startup_timing.mark('batching (post_init) and dataloader')
@@ -1274,6 +1296,8 @@ if __name__ == '__main__':
         # rank, as each pipeline stage's layers may read it.
         if hasattr(model, 'set_training_step'):
             model.set_training_step(step)
+        if teacher is not None:
+            teacher.set_step(step)
         if outlier_decay is not None:
             # DeepSpeed advances the scheduler inside train_batch, so the lr is read before it.
             outlier_decay.before_step()

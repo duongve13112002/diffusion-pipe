@@ -84,11 +84,9 @@ def validate_teacher_config(config, use_context_refiner, cache_text_embeddings):
         return DISABLED
 
     if not use_context_refiner:
-        raise ValueError(
-            '[teacher] requires model type = \'anima_refiner\'. The teacher term compares two '
-            'text frontends through one DiT, and only anima_refiner has a second frontend to '
-            'compare against.'
-        )
+        # The refiner's teacher term compares two text frontends, and only anima_refiner has a second one. Any other
+        # type reads [teacher] as distillation toward a frozen copy of the model (utils/model_teacher.py).
+        return DISABLED
     if cache_text_embeddings:
         # The teacher and the student have to read one augmentation draw of one caption. Caching
         # freezes the draw, and a mismatch there changes no shape and no magnitude -- the loss

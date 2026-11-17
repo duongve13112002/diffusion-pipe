@@ -191,9 +191,10 @@ class TestValidation:
         for use_refiner in (True, False):
             assert validate_teacher_config({'model': {}}, use_refiner, True) is DISABLED
 
-    def test_it_refuses_a_model_without_a_second_text_frontend(self):
-        with pytest.raises(ValueError, match='anima_refiner'):
-            validate_teacher_config(self.base_config(), False, False)
+    def test_a_model_without_a_second_text_frontend_leaves_the_table_to_the_generic_teacher(self):
+        # Any other cosmos_predict2 type reads [teacher] as distillation toward a frozen copy
+        # (utils/model_teacher.py), so the refiner's validation steps aside instead of refusing.
+        assert validate_teacher_config(self.base_config(), False, False) is DISABLED
 
     def test_it_refuses_cached_text_embeddings(self):
         with pytest.raises(ValueError, match='cache_text_embeddings = false'):

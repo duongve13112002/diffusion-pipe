@@ -6,6 +6,7 @@ import os
 import sys
 from collections import defaultdict
 import types
+import copy
 
 # Import diffusion-pipe's own utils package before ComfyUI joins sys.path below. utils/ has no
 # __init__.py (it's a namespace package), while submodules/ComfyUI/utils/ is a regular package
@@ -555,8 +556,47 @@ class CommonPipeline:
     def free_vae_and_te(self):
         pass
 
+    # [teacher] (utils/model_teacher.py). The pipeline attributes that hold the denoiser to_layers() wraps: a
+    # teacher built from the model as loaded deep-copies them, so its layers share nothing the student trains.
+    teacher_denoiser_attrs = ()
+
+    def teacher_unsupported(self):
+        """Why [teacher] cannot run with this configuration of the model, or None."""
+        return None
+
+    def teacher_targets_of(self, output):
+        """The tensors of a layer chain's output that stand in for the label's targets, in the label's order.
+        A model whose last layer returns more than the prediction says which part is."""
+        if torch.is_tensor(output):
+            return (output,)
+        raise NotImplementedError(f'{self.name}: its layers return {type(output).__name__}, so teacher_targets_of '
+                                  'has to say which of the tensors stand in for the targets')
+
+    def load_teacher_denoiser(self, path):
+        """On a copy of the pipeline (see make_teacher_layers): load the denoiser from `path` instead."""
+        raise NotImplementedError(f'[teacher] path is not available for {self.name} yet: its checkpoint is read by '
+                                  'the pipeline\'s constructor, which a teacher cannot reuse. Remove path to '
+                                  'distill toward the starting model.')
+
+    def make_teacher_layers(self, path=None):
+        """The layers of a frozen teacher: the model's to_layers() over a copy of the denoiser as loaded, or over
+        the denoiser read from `path`. Built on a shallow copy of the pipeline, so what to_layers() and the loader
+        assign (final_layer_module, a reloaded diffusion_model) never reaches the student's pipeline."""
+        # Not copy.copy: several pipelines forward unknown attributes to diffusers_pipeline in __getattr__, which
+        # copy's lookup of __setstate__ on the blank copy turns into endless recursion.
+        teacher = object.__new__(type(self))
+        teacher.__dict__.update(self.__dict__)
+        if path is None:
+            for attr in self.teacher_denoiser_attrs:
+                setattr(teacher, attr, copy.deepcopy(getattr(self, attr)))
+        else:
+            teacher.load_teacher_denoiser(path)
+        return teacher.to_layers()
+
 
 class BasePipeline(CommonPipeline):
+    teacher_denoiser_attrs = ('transformer',)
+
     def __init__(self, *args, **kwargs):
         super().__init__()
 
@@ -758,6 +798,15 @@ def checkpoint_transformer_config(metadata):
 
 
 class ComfyPipeline(CommonPipeline):
+    teacher_denoiser_attrs = ('diffusion_model',)
+
+    def load_teacher_denoiser(self, path):
+        # Runs on a copy of the pipeline, so the student's diffusion_model is untouched; the pipeline's own
+        # loading (format detection, dtype, merge_adapters, whatever a subclass adds) reads the other checkpoint.
+        self.model_config = {**self.model_config, 'diffusion_model': path}
+        self.config = {**self.config, 'model': self.model_config}
+        self.load_diffusion_model()
+
     def refuse_unsupported_checkpoint(self):
         """Refuse a diffusion model this pipeline cannot train before the dataset is cached
         (train.py caches first and loads the model after), rather than once caching is done.

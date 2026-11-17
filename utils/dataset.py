@@ -27,6 +27,7 @@ import torch
 from torch import nn
 from deepspeed.utils.logging import logger
 from deepspeed import comm as dist
+from utils.model_teacher import fit_trailing_dim
 import datasets
 from datasets.fingerprint import Hasher
 from PIL import Image
@@ -4691,6 +4692,10 @@ class _RecentTextEncodings:
         return {name: [found[key][name] for key in keys] for name in names}
 
 
+def _broadcast_device():
+    return 'cuda' if torch.cuda.is_available() else 'cpu'
+
+
 def split_batch(batch, pieces):
     # Each of features, label is a tuple of tensors.
     features, label = batch
@@ -4722,7 +4727,7 @@ def split_batch(batch, pieces):
 # Updates epoch as soon as the final batch is returned (notably different from qlora-pipe).
 class PipelineDataLoader:
     def __init__(self, dataset, model_engine, gradient_accumulation_steps, model, num_dataloader_workers=1,
-                 text_encoding=None):
+                 text_encoding=None, teacher=None):
         if len(dataset) == 0:
             raise RuntimeError(
                 'Processed dataset was empty. Probably caused by rounding down for each size bucket.\n'
@@ -4732,6 +4737,8 @@ class PipelineDataLoader:
         self.model = model
         # A utils.text_encoding.TextEncodingOnTheFly when the captions are encoded per batch.
         self.text_encoding = text_encoding
+        # A utils.model_teacher.ModelTeacher on the training loader of a run with [teacher]; its output joins the label.
+        self.teacher = teacher
         self.dataset = dataset
         self.model_engine = model_engine
         self.gradient_accumulation_steps = gradient_accumulation_steps
@@ -4833,7 +4840,8 @@ class PipelineDataLoader:
             broadcasted_targets = []
             for t in target_list:
                 broadcasted_targets.append(self._broadcast_target(t))
-            label = (*broadcasted_targets, mask)
+            teacher_targets = self._teacher_targets(features, label, target_list) if self.teacher is not None else ()
+            label = (*broadcasted_targets, mask, *teacher_targets)
             self.num_batches_pulled += 1
             for micro_batch in split_batch((features, label), self.gradient_accumulation_steps):
                 yield micro_batch
@@ -4850,13 +4858,40 @@ class PipelineDataLoader:
         dest_rank = grid.stage_to_global(model_engine.num_stages - 1)
         assert src_rank in grid.pp_group
         assert dest_rank in grid.pp_group
-        target = target.to('cuda')  # must be on GPU to broadcast
+        target = target.to(_broadcast_device())  # must be on GPU to broadcast
 
         if model_engine.is_first_stage():
             dist.send(target, dest_rank)
         else:
             dist.recv(target, src_rank)
         return target
+
+    def _teacher_targets(self, features, label, target_list):
+        """The teacher's output for this batch, one tensor per target, shaped and typed like the target it stands
+        in for. The first stage computes it from the features, micro batch by micro batch, and sends it to the last
+        stage, which allocates the buffers from its own targets (the same way _broadcast_target pairs them); with no
+        pipeline parallelism the one process does both."""
+        engine = self.model_engine
+        if engine.is_pipe_parallel and not engine.is_first_stage():
+            return [self._broadcast_target(torch.empty_like(t)) for t in target_list]
+        columns = None
+        for micro_features, _ in split_batch((features, label), self.gradient_accumulation_steps):
+            outputs = self.teacher.run(micro_features)
+            if len(outputs) != len(target_list):
+                raise RuntimeError(f'[teacher]: the teacher gives {len(outputs)} output tensors and the label has '
+                                   f'{len(target_list)} targets')
+            outputs = [fit_trailing_dim(o, t) for o, t in zip(outputs, target_list)]
+            columns = [[o] for o in outputs] if columns is None else [c + [o] for c, o in zip(columns, outputs)]
+        teacher_targets = []
+        for column, target in zip(columns, target_list):
+            teacher_target = torch.cat(column).to(target.device, target.dtype)
+            if teacher_target.shape != target.shape:
+                raise RuntimeError(f'[teacher]: the teacher output {tuple(teacher_target.shape)} does not match the '
+                                   f'target {tuple(target.shape)} it stands in for')
+            teacher_targets.append(teacher_target)
+        if engine.is_pipe_parallel:
+            teacher_targets = [self._broadcast_target(t) for t in teacher_targets]
+        return teacher_targets
 
     # Only the first and last stages in the pipeline pull from the dataloader. Parts of the code need
     # to know the epoch, so we synchronize the epoch so the processes that don't use the dataloader
