@@ -12,6 +12,7 @@ exactly as before. Where each came from, and what was decided along the way, is 
 | [`lora_plus_ratio`](#lora) | `[adapter]` | all | LoRA, OPLoRA, DoRA (not LoKr) |
 | [`lr_scheduler_min_ratio`](#cosine-and-linear-floor) | top level | all | all |
 | [`[teacher]`](#distillation-toward-the-starting-model-moss-image) | top level table | MOSS-Image | LoRA, LoKr, OPLoRA, full fine-tune |
+| [`[teacher]`](#distillation-toward-a-teacher-every-other-model) | top level table | every other model | LoRA, LoKr, DoRA, OPLoRA, full fine-tune |
 
 Each setting is written to run the same on one GPU, several GPUs and several nodes, and the CPU tests
 cover the single-process and the data-parallel cases with a real DeepSpeed engine. None of it has been run
@@ -156,3 +157,51 @@ before fine-tuning, which limits how far a small dataset can drag it. The step l
   run, which is the point of a regulariser but caps how far the fine-tune can move.
 - Not part of KohakuMoss's default recipes, and no measured image-quality benefit was found; judge it from
   your own samples.
+
+MOSS-Image also takes `path` (see below): the teacher can be another transformer instead of the starting model. With a
+`path` the teacher is always a full copy of that transformer (also under an `[adapter]`), and any number of
+pipeline stages works; the `init_from_existing` and adapter-with-stages refusals above apply only without it.
+
+## Distillation toward a teacher (every other model)
+
+```toml
+[teacher]
+loss_weight = 0.5      # 0 or absent: off
+decay = 'cosine'       # 'none' (default), 'linear' or 'cosine'
+decay_steps = 20000    # optimizer steps over which lambda falls to 0
+path = '/models/other_checkpoint'   # optional: another checkpoint of the same model
+```
+
+    loss = L(student, target) + lambda(step) * L(student, teacher)
+
+`L` is the model's own loss function, so its masking, `huber_delta` / `smooth_l1_beta` and weights apply to the
+second term as they do to the first, and `lambda = loss_weight * decay(step)`. This is for every model but
+MOSS-Image (which has its own table above) and works with LoRA, LoKr, DoRA, OPLoRA and full fine-tuning,
+with one GPU, several, several nodes and any `pipeline_stages`.
+
+- Without `path` the teacher is the model the run starts from, as loaded (before an adapter, `[fp8_training]`
+  or any training touches it). With `path` it is another checkpoint of the *same architecture*, read the way
+  `[model]` reads its own weights: the same key (`transformer_path`, `diffusion_model`, `diffusers_path` for
+  SD3 / OmniGen2 / HiDream, `single_file_path` for LTX-Video, `checkpoint_path` for SDXL, ...), format and dtype
+  handling. Adapters the student's base is merged with (`merge_adapters`, `fuse_adapters`) are not applied to a
+  `path` teacher: it is the finished model. The text encoders, the VAE and the latent space are the student's
+  (SDXL aside: its text encoders train with the UNet, so its teacher is a whole second pipeline).
+- The teacher is a second chain of the model's own layers on the first pipeline stage, no gradients, eval mode.
+  It runs on the same inputs as the student (the noisy latents, timesteps and text embeddings the batch
+  carries) and its output travels to the last stage with the targets, so no layer needs to pass anything on. A
+  full copy of the transformer sits on the GPU of every first-stage rank on top of the student: that stage
+  needs the memory (about the size of the weights in `dtype`), and the loading peaks the CPU RAM of every
+  rank on it by the same amount. Neither has been measured on a GPU.
+- Evaluation batches (`[eval_datasets]`) report the plain loss, without the distillation term. The step log has
+  the combined `train/loss`.
+- `[teacher] path` and an anima_refiner: a table that names `transformer_path` or `llm_path` is the older
+  form, a stock Anima mixed into the target (`docs/anima_refiner/teacher-guided-training.md`). One that names
+  neither is this teacher, toward the refiner's own starting weights; a freshly initialised refiner cannot be
+  its own teacher (random weights), and `path` cannot be combined with the Anima keys.
+- Refused, naming the key: `shape`, `t_mid` and `width` (a loss weight that follows the noise level needs the
+  noise level of each sample, which only MOSS-Image hands to its loss), unknown keys, `blocks_to_swap`, an
+  `[adapter]` with `init_from_existing` unless `path` is set, `decay` other than `none` without `decay_steps`,
+  and Iris with `repa_weight > 0`. `decay = 'none'` is warned about: the term then never fades.
+- Not run on a GPU or with real weights yet. Not measured: the speed cost of the extra forward, the memory, whether
+  distillation helps image quality on your data. Judge it from your samples.
+

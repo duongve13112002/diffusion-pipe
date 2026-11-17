@@ -210,6 +210,12 @@ class WanPipeline(BasePipeline):
                 tokenizer_path=ckpt_dir / wan_config.clip_tokenizer,
             )
 
+    def load_teacher_denoiser(self, path):
+        # load_diffusion_model reads self.transformer_path (a safetensors file or a directory of them); the
+        # architecture (json_config) is the student's, a teacher being another checkpoint of the same model.
+        self.transformer_path = Path(path)
+        super().load_teacher_denoiser(path)
+
     # delay loading transformer to save RAM
     def load_diffusion_model(self):
         dtype = self.model_config['dtype']

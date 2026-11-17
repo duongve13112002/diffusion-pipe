@@ -56,6 +56,19 @@ warmup_steps = 100
 #weight_decay_target = 'start'
 #weight_decay_to_one = '^layers\.41\.(q_norm|k_norm)\.weight$'
 
+# Distillation toward a frozen teacher, every model but MOSS-Image (which has its own, see its example). The
+# loss becomes: the model's loss toward the target + lambda * the same loss toward the teacher's output, with
+# lambda = loss_weight * decay(step). With no path the teacher is the model the run starts from, as loaded;
+# with a path it is another checkpoint of the same architecture, read with the same key and format [model]
+# uses for its own weights (transformer_path, diffusion_model, diffusers_path, ...). The teacher runs on the
+# first pipeline stage (a full copy of the transformer on that stage's GPUs). Evaluation reports the plain loss.
+# See docs/training-options.md.
+#[teacher]
+#loss_weight = 0.5
+#decay = 'cosine'          # 'none' (default), 'linear' or 'cosine'
+#decay_steps = 20000
+#path = '/models/other_checkpoint.safetensors'
+
 # Block swapping is supported for Wan, HunyuanVideo, Flux, and Chroma. This value controls the number
 # of blocks kept offloaded to RAM. Increasing it lowers VRAM use, but has a performance penalty. The
 # exactly performance penalty depends on the model and the type of training you are doing (e.g. images vs video).

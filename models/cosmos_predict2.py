@@ -1219,11 +1219,20 @@ class CosmosPredict2Pipeline(BasePipeline):
     def make_teacher_layers(self, path=None):
         # [teacher] without transformer_path / llm_path (utils/model_teacher.py): a frozen copy of the model as
         # loaded. A refiner that was just initialised is random weights, and distilling toward them teaches nothing.
-        if self.use_context_refiner and getattr(self, '_refiner_is_fresh', False):
+        if path is None and self.use_context_refiner and getattr(self, '_refiner_is_fresh', False):
             raise ValueError('[teacher] without transformer_path / llm_path distills toward the refiner the run starts '
                              'from, which here is a freshly initialised context_refiner (random weights). Start from '
                              'a trained refiner, or name a stock Anima (transformer_path, llm_path) as the teacher.')
         return super().make_teacher_layers(path)
+
+    def load_teacher_denoiser(self, path):
+        # Set again by the load when it initialises one; the student's is not the teacher's.
+        self._refiner_is_fresh = False
+        super().load_teacher_denoiser(path)
+        if self.use_context_refiner and getattr(self, '_refiner_is_fresh', False):
+            raise ValueError(f'[teacher] path {path} has no trained context_refiner (a freshly initialised one is random '
+                             'weights, and distilling toward them teaches nothing). Name a checkpoint a refiner run saved, '
+                             'or set [model] context_refiner_path.')
 
     def to_layers(self):
         transformer = self.transformer

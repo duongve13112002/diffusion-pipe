@@ -2,7 +2,9 @@
 teacher chain built from a model's own to_layers(), the loss, and the way the teacher's output reaches the last
 pipeline stage inside the label (utils/dataset.py PipelineDataLoader). CPU, a toy model."""
 
+import ast
 import copy
+import textwrap
 import types
 
 import pytest
@@ -238,8 +240,127 @@ def test_a_path_goes_to_the_models_own_loader_on_a_copy():
 
 
 def test_a_model_without_a_loader_refuses_a_path():
-    with pytest.raises(NotImplementedError, match='path is not available for toy'):
-        ToyPipeline().make_teacher_layers('/some/path')
+    from models.base import CommonPipeline
+
+    class Bare(CommonPipeline):
+        name = 'bare'
+        teacher_denoiser_attrs = ('transformer',)
+
+        def __init__(self):
+            self.transformer = Denoiser()
+
+        def to_layers(self):
+            return [self.transformer.lin]
+
+    with pytest.raises(NotImplementedError, match='path is not available for bare'):
+        Bare().make_teacher_layers('/some/path')
+
+
+class Shell:
+    """Stands for a diffusers pipeline, which load_diffusion_model assigns the transformer on."""
+
+    def __init__(self, transformer):
+        self.transformer = transformer
+        self.vae = 'the student vae'
+
+
+class ShellPipeline(BasePipeline):
+    name = 'shell'
+    teacher_path_key = 'weights'
+
+    def __init__(self, seed=0):
+        self.model_config = {'weights': '0', 'merge_adapters': ['/a'], 'dtype': torch.float32}
+        self.config = {'model': self.model_config, 'adapter': {'rank': 4, 'fuse_adapters': [{'path': '/b'}]}}
+        self.diffusers_pipeline = Shell(Denoiser(seed=seed))
+        self.loads = []
+
+    def __getattr__(self, name):
+        if name == 'diffusers_pipeline':
+            raise AttributeError(name)
+        return getattr(self.diffusers_pipeline, name)
+
+    def load_diffusion_model(self):
+        self.loads.append((self.model_config['weights'], 'merge_adapters' in self.model_config,
+                           dict(self.config['adapter'])))
+        self.diffusers_pipeline.transformer = Denoiser(seed=int(self.model_config['weights']))
+
+    def to_layers(self):
+        t = self.transformer
+        return [Embed(t.proj), Block(t.lin), Head(t.out)]
+
+
+def test_a_base_pipeline_reads_the_teacher_with_its_own_loader_and_leaves_the_student_alone():
+    pipeline = ShellPipeline(seed=0)
+    student_shell, student = pipeline.diffusers_pipeline, pipeline.transformer
+    layers = pipeline.make_teacher_layers('7')
+    features = make_features()
+    with torch.no_grad():
+        got = features
+        for layer in layers:
+            got = layer(got)
+        expected = student_forward(ShellPipeline(seed=7), features)
+        assert torch.equal(got, expected)
+    # Nothing of the student moved: not its shell, its transformer, its config, nor the loads it did.
+    assert pipeline.diffusers_pipeline is student_shell and pipeline.transformer is student
+    assert student_shell.transformer is student
+    assert pipeline.model_config == {'weights': '0', 'merge_adapters': ['/a'], 'dtype': torch.float32}
+    assert pipeline.config['adapter'] == {'rank': 4, 'fuse_adapters': [{'path': '/b'}]}
+    # `loads` is shared with the copy: it records the teacher's load only (the path, no merges, no fuse_adapters).
+    assert pipeline.loads == [('7', False, {'rank': 4})]
+    # The teacher's loader read the path under the model's own key, without the adapters the student merges.
+    teacher_params = {id(p) for layer in layers for p in layer.parameters()}
+    assert not teacher_params & {id(p) for p in student.parameters()}
+    # Another call, another teacher; the student is still what it was.
+    again = pipeline.make_teacher_layers('9')
+    assert again[0] is not layers[0] and [load[0] for load in pipeline.loads] == ['7', '9']
+    assert pipeline.transformer is student
+
+
+def test_the_teacher_loader_gets_the_path_the_key_and_no_adapter_merges():
+    seen = []
+
+    class Recording(ShellPipeline):
+        def load_diffusion_model(self):
+            seen.append((self.model_config['weights'], 'merge_adapters' in self.model_config,
+                         dict(self.config['adapter']), self.config['model'] is self.model_config))
+            super().load_diffusion_model()
+
+    Recording().make_teacher_layers('3')
+    assert seen == [('3', False, {'rank': 4}, True)]
+
+
+def test_the_default_key_and_shell_are_transformer_path_and_diffusers_pipeline():
+    assert BasePipeline.teacher_path_key == 'transformer_path'
+    assert BasePipeline.teacher_shell_attrs == ('diffusers_pipeline',)
+
+
+def test_a_loader_that_assigns_on_a_shell_needs_it_named():
+    class Inner:
+        net = None
+
+    class OnModel(BasePipeline):
+        name = 'on_model'
+        teacher_shell_attrs = ('model',)
+
+        def __init__(self):
+            self.model = Inner()
+            self.model.net = Denoiser(seed=0)
+            self.model_config = {'transformer_path': 'x'}
+            self.config = {'model': self.model_config}
+            self.transformer = self.model.net
+
+        def load_diffusion_model(self):
+            self.model.net = Denoiser(seed=int(self.model_config['transformer_path']))
+            self.transformer = self.model.net
+
+        def to_layers(self):
+            t = self.transformer
+            return [Embed(t.proj), Block(t.lin), Head(t.out)]
+
+    pipeline = OnModel()
+    student = pipeline.model.net
+    pipeline.make_teacher_layers('5')
+    assert pipeline.model.net is student and pipeline.transformer is student
 
 
 def test_comfy_pipelines_load_the_teacher_with_their_own_loader():
@@ -594,7 +715,6 @@ def test_a_teacher_audio_output_shorter_than_the_padded_audio_target_is_padded_f
 
 # every pipeline in the repo, read from the source (several cannot be imported without a GPU or flash_attn)
 
-import ast
 from pathlib import Path
 
 MODELS = Path(__file__).resolve().parent.parent / 'models'
@@ -614,8 +734,16 @@ def pipeline_classes():
                     if (isinstance(n, ast.Assign) and any(getattr(t, 'id', None) == 'teacher_denoiser_attrs'
                                                           for t in n.targets)):
                         attrs = ast.literal_eval(n.value)
+                consts = {}
+                for n in node.body:
+                    if isinstance(n, ast.Assign) and len(n.targets) == 1 and isinstance(n.targets[0], ast.Name):
+                        try:
+                            consts[n.targets[0].id] = ast.literal_eval(n.value)
+                        except ValueError:
+                            pass
                 bases = [b.id for b in node.bases if isinstance(b, ast.Name)]
-                classes[node.name] = {'bases': bases, 'methods': methods, 'attrs': attrs, 'file': path.name}
+                classes[node.name] = {'bases': bases, 'methods': methods, 'attrs': attrs, 'consts': consts,
+                                      'file': path.name}
     return classes
 
 
@@ -663,6 +791,183 @@ def test_models_whose_layers_return_more_than_the_prediction_say_which_part_is_t
     defining = {name for name, node in classes.items() if 'teacher_targets_of' in node['methods']}
     assert defining - {'CommonPipeline'} == {'CosmosPipeline', 'SDXLPipeline', 'MinimaxH3Pipeline', 'PH3ImagePipeline',
                                               'MiniMaxH3ImagePipeline'}
+
+
+def own_definition(classes, name, field):
+    """The method as the nearest class below the base pipelines defines it, or None."""
+    node = classes.get(name)
+    if node is None or name in ('BasePipeline', 'CommonPipeline', 'ComfyPipeline'):
+        return None
+    if field in node['methods']:
+        return node['methods'][field]
+    for base in node['bases']:
+        found = own_definition(classes, base, field)
+        if found is not None:
+            return found
+    return None
+
+
+def class_constant(classes, name, field, default):
+    """A class attribute set to a literal, from the nearest class that sets it (the base pipelines' too)."""
+    node = classes.get(name)
+    if node is None:
+        return default
+    if field in node['consts']:
+        return node['consts'][field]
+    for base in node['bases']:
+        value = class_constant(classes, base, field, None)
+        if value is not None:
+            return value
+    return default
+
+
+def is_base_pipeline(classes, name):
+    node = classes.get(name)
+    return node is not None and ('BasePipeline' in node['bases'] or any(is_base_pipeline(classes, b) for b in node['bases']))
+
+
+BASE_MODELS = [n for n in MODEL_PIPELINES if is_base_pipeline(pipeline_classes(), n)]
+
+
+def test_the_base_pipeline_models_were_found():
+    assert {'FluxPipeline', 'WanPipeline', 'SDXLPipeline', 'IrisPipeline', 'HiDreamPipeline', 'Lumina2Pipeline',
+            'CosmosPipeline', 'CosmosPredict2Pipeline', 'ChromaPipeline'} <= set(BASE_MODELS)
+    assert 'QwenImage21Pipeline' not in BASE_MODELS and 'MossImagePipeline' not in BASE_MODELS
+
+
+@pytest.mark.parametrize('name', BASE_MODELS)
+def test_every_base_pipeline_model_can_read_a_teacher_path(name):
+    classes = pipeline_classes()
+    if own_definition(classes, name, 'load_teacher_denoiser'):
+        return
+    # Otherwise the generic loader runs the model's load_diffusion_model on a copy: that has to read the key
+    # the model names, and every object it assigns the denoiser on has to be one the copy replaces.
+    loader = own_definition(classes, name, 'load_diffusion_model')
+    assert loader, f'{name} defines neither load_teacher_denoiser nor load_diffusion_model'
+    key = class_constant(classes, name, 'teacher_path_key', 'transformer_path')
+    shells = class_constant(classes, name, 'teacher_shell_attrs', ('diffusers_pipeline',))
+    assert f"'{key}'" in loader, f'{name}.load_diffusion_model does not read [model] {key}'
+    tree = ast.parse(textwrap.dedent(loader))
+    for node in ast.walk(tree):
+        for target in getattr(node, 'targets', []):
+            if (isinstance(target, ast.Attribute) and isinstance(target.value, ast.Attribute)
+                    and isinstance(target.value.value, ast.Name) and target.value.value.id == 'self'):
+                assert target.value.attr in shells, (
+                    f'{name}.load_diffusion_model assigns self.{target.value.attr}.{target.attr}, so '
+                    f'{target.value.attr} has to be in teacher_shell_attrs (the teacher would change the student\'s)')
+
+
+def test_models_that_cannot_reuse_load_diffusion_model_have_their_own_teacher_loader():
+    classes = pipeline_classes()
+    own = {n for n in BASE_MODELS if own_definition(classes, n, 'load_teacher_denoiser')}
+    assert own == {'FluxPipeline', 'HiDreamPipeline', 'Lumina2Pipeline', 'SDXLPipeline', 'IrisPipeline',
+                   'WanPipeline', 'CosmosPredict2Pipeline'}
+    # The ones that read another attribute than the config's key set it first, then use the generic loader.
+    for name in ('IrisPipeline', 'WanPipeline', 'CosmosPredict2Pipeline'):
+        assert 'super().load_teacher_denoiser(path)' in own_definition(classes, name, 'load_teacher_denoiser')
+    # The ones whose denoiser is read in the constructor, or next to a text encoder, build a clone of the shell
+    # (or a whole pipeline) before assigning on it.
+    for name in ('FluxPipeline', 'HiDreamPipeline'):
+        assert 'shallow_clone(self.diffusers_pipeline)' in own_definition(classes, name, 'load_teacher_denoiser')
+    # Their modules cannot be imported without a GPU: the lines that matter, read from the source.
+    assert 'self.transformer_path = Path(path)' in own_definition(classes, 'WanPipeline', 'load_teacher_denoiser')
+    lumina = own_definition(classes, 'Lumina2Pipeline', 'load_teacher_denoiser')
+    assert 'self.transformer = self.load_transformer(path, self.text_encoder.config.hidden_size)' in lumina
+
+
+def test_the_keys_that_are_not_transformer_path():
+    classes = pipeline_classes()
+    keys = {n: class_constant(classes, n, 'teacher_path_key', 'transformer_path') for n in BASE_MODELS}
+    assert {n: k for n, k in keys.items() if k != 'transformer_path'} == {
+        'OmniGen2Pipeline': 'diffusers_path', 'SD3Pipeline': 'diffusers_path', 'LTXVideoPipeline': 'single_file_path'}
+    assert class_constant(classes, 'CosmosPipeline', 'teacher_shell_attrs', None) == ('model',)
+
+
+def test_flux_reads_the_teacher_transformer_from_the_path_on_a_clone_of_the_pipeline(monkeypatch):
+    from models import flux
+    pipe = flux.FluxPipeline.__new__(flux.FluxPipeline)
+    pipe.model_config = {'dtype': torch.float32, 'transformer_dtype': torch.bfloat16}
+    student = nn.Sequential(nn.Linear(2, 2))
+    shell = Shell(student)
+    pipe.diffusers_pipeline = shell
+    read = []
+
+    def fake_load(self, path):
+        read.append(path)
+        return nn.Sequential(nn.Linear(2, 2), nn.LayerNorm(2))
+
+    monkeypatch.setattr(flux.FluxPipeline, 'load_transformer', fake_load)
+    teacher = flux.shallow_clone(pipe)
+    teacher.load_teacher_denoiser('/other.safetensors')
+    assert read == ['/other.safetensors']
+    assert pipe.diffusers_pipeline is shell and shell.transformer is student
+    assert teacher.diffusers_pipeline is not shell and teacher.diffusers_pipeline.transformer is not student
+    # The same dtype handling as the student's: the weights go to transformer_dtype, 1-D tensors stay as loaded.
+    new = teacher.diffusers_pipeline.transformer
+    assert new[0].weight.dtype == torch.bfloat16 and new[1].weight.dtype == torch.float32
+
+
+def test_sdxl_reads_a_whole_second_pipeline_and_keeps_the_students_vae_and_scheduler(monkeypatch):
+    from models import sdxl
+    pipe = sdxl.SDXLPipeline.__new__(sdxl.SDXLPipeline)
+    pipe.model_config = {'dtype': torch.float16}
+    student = types.SimpleNamespace(vae='student vae', scheduler='student scheduler', unet='student unet')
+    pipe.diffusers_pipeline = student
+    calls = []
+
+    class Loaded(types.SimpleNamespace):
+        pass
+
+    def fake_from_single_file(path, **kwargs):
+        calls.append((path, kwargs))
+        return Loaded(vae='teacher vae', scheduler='teacher scheduler', unet='teacher unet', tokenizer='tok',
+                      tokenizer_2='tok2')
+
+    monkeypatch.setattr(sdxl.diffusers.StableDiffusionXLPipeline, 'from_single_file', staticmethod(fake_from_single_file))
+    teacher = pipe.__class__.__new__(pipe.__class__)
+    teacher.__dict__.update(pipe.__dict__)
+    teacher.load_teacher_denoiser('/other.safetensors')
+    assert calls == [('/other.safetensors', {'torch_dtype': torch.float16, 'add_watermarker': False})]
+    loaded = teacher.diffusers_pipeline
+    assert loaded.unet == 'teacher unet' and loaded.vae == 'student vae' and loaded.scheduler == 'student scheduler'
+    assert loaded.tokenizer_2 == loaded.tokenizer == 'tok'
+    assert pipe.diffusers_pipeline is student and student.unet == 'student unet'
+
+
+def test_iris_points_the_attribute_its_loader_reads_at_the_path(monkeypatch):
+    # (Wan does the same with transformer_path; its module cannot be imported without a GPU, so the structural
+    # test above checks it.)
+    from models import base, iris
+    seen = []
+    monkeypatch.setattr(base.BasePipeline, 'load_teacher_denoiser', lambda self, path: seen.append(path))
+    pipe = iris.IrisPipeline.__new__(iris.IrisPipeline)
+    pipe.transformer_path = '/student'
+    teacher = base.shallow_clone(pipe)
+    teacher.load_teacher_denoiser('/other')
+    assert teacher.transformer_path == '/other' and pipe.transformer_path == '/student' and seen == ['/other']
+
+
+def test_a_teacher_path_without_a_trained_refiner_is_refused(monkeypatch):
+    from models import base
+    from models import cosmos_predict2 as cp2
+
+    def fake_load(self, path):
+        self._refiner_is_fresh = True
+
+    monkeypatch.setattr(base.BasePipeline, 'load_teacher_denoiser', fake_load)
+    pipe = cp2.CosmosPredict2Pipeline.__new__(cp2.CosmosPredict2Pipeline)
+    pipe.use_context_refiner = True
+    pipe._refiner_is_fresh = False
+    with pytest.raises(ValueError, match='no trained context_refiner'):
+        pipe.load_teacher_denoiser('/other')
+    # The student's own fresh refiner does not matter to a teacher read from a path.
+    monkeypatch.setattr(base.BasePipeline, 'load_teacher_denoiser', lambda self, path: None)
+    pipe._refiner_is_fresh = True
+    pipe.load_teacher_denoiser('/other')
+    assert pipe._refiner_is_fresh is False
+    monkeypatch.setattr(base.CommonPipeline, 'make_teacher_layers', lambda self, path=None: 'layers')
+    pipe._refiner_is_fresh = True
+    assert pipe.make_teacher_layers('/other') == 'layers'
 
 
 def test_a_fresh_refiner_cannot_be_its_own_teacher(monkeypatch):

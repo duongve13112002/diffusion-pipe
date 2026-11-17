@@ -427,6 +427,17 @@ class SDXLPipeline(BasePipeline):
     def __getattr__(self, name):
         return getattr(self.diffusers_pipeline, name)
 
+    def load_teacher_denoiser(self, path):
+        # The teacher is a whole second pipeline: the UNet and both text encoders of the checkpoint at `path`
+        # (the captions are encoded by the teacher's own, as the student's are by the student's). The VAE
+        # and the scheduler are the student's.
+        pipeline = diffusers.StableDiffusionXLPipeline.from_single_file(
+            path, torch_dtype=self.model_config['dtype'], add_watermarker=False)
+        pipeline.tokenizer_2 = pipeline.tokenizer
+        pipeline.scheduler = self.diffusers_pipeline.scheduler
+        pipeline.vae = self.diffusers_pipeline.vae
+        self.diffusers_pipeline = pipeline
+
     def load_vae(self, dtype):
         """The checkpoint's VAE, converted from the original (ldm) key names in dtype from the
         file's own precision. The VAE's config is the one the pipeline was built with."""

@@ -92,15 +92,19 @@ class Lumina2Pipeline(BasePipeline):
         self.text_encoder.eval()
         cap_feat_dim = self.text_encoder.config.hidden_size
 
+        self.transformer = self.load_transformer(self.model_config['transformer_path'], cap_feat_dim)
+
+    def load_transformer(self, transformer_path, cap_feat_dim):
+        dtype = self.model_config['dtype']
         with init_empty_weights():
-            self.transformer = NextDiT_2B_GQA_patch2_Adaln_Refiner(
+            transformer = NextDiT_2B_GQA_patch2_Adaln_Refiner(
                 in_channels=16,
                 qk_norm=True,
                 cap_feat_dim=cap_feat_dim,
             )
 
         state_dict = {}
-        with safetensors.safe_open(self.model_config['transformer_path'], framework="pt", device="cpu") as f:
+        with safetensors.safe_open(transformer_path, framework="pt", device="cpu") as f:
             if 'model.diffusion_model.x_embedder.weight' in f.keys():
                 # Checkpoint format. Also contains VAE and text encoder.
                 for k in f.keys():
@@ -111,12 +115,17 @@ class Lumina2Pipeline(BasePipeline):
                 for k in f.keys():
                     state_dict[k] = f.get_tensor(k)
 
-        for name, param in self.transformer.named_parameters():
-            set_module_tensor_to_device(self.transformer, name, device='cpu', dtype=dtype, value=state_dict[name])
+        for name, param in transformer.named_parameters():
+            set_module_tensor_to_device(transformer, name, device='cpu', dtype=dtype, value=state_dict[name])
 
-        self.transformer.train()
-        for name, p in self.transformer.named_parameters():
+        transformer.train()
+        for name, p in transformer.named_parameters():
             p.original_name = name
+        return transformer
+
+    def load_teacher_denoiser(self, path):
+        # The transformer is read by the constructor, next to the text encoder the teacher shares with the student.
+        self.transformer = self.load_transformer(path, self.text_encoder.config.hidden_size)
 
     def get_vae(self):
         return self.vae

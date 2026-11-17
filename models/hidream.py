@@ -13,7 +13,7 @@ from transformers import LlamaForCausalLM, PreTrainedTokenizerFast
 from einops import repeat
 import diffusers
 
-from models.base import BasePipeline, make_contiguous
+from models.base import BasePipeline, make_contiguous, shallow_clone
 from utils.common import AUTOCAST_DTYPE, empty_cuda_cache
 from utils.offloading import ModelOffloader
 from hi_diffusers import HiDreamImagePipeline, HiDreamImageTransformer2DModel
@@ -112,7 +112,6 @@ class HiDreamPipeline(BasePipeline):
 
     def load_diffusion_model(self):
         dtype = self.model_config['dtype']
-        transformer_dtype = self.model_config.get('transformer_dtype', dtype)
 
         llama3_path = self.model_config['llama3_path']
         if self.model_config.get('llama3_4bit', False):
@@ -135,6 +134,12 @@ class HiDreamPipeline(BasePipeline):
         empty_cuda_cache()
         self.diffusers_pipeline.text_encoder_4 = text_encoder_4
 
+        self.diffusers_pipeline.transformer = self.load_transformer(self.model_config['diffusers_path'])
+
+    def load_transformer(self, diffusers_path):
+        """The transformer folder of a diffusers directory, cast, set up for training."""
+        dtype = self.model_config['dtype']
+        transformer_dtype = self.model_config.get('transformer_dtype', dtype)
         if transformer_dtype == 'nf4':
             quantization_config = diffusers.BitsAndBytesConfig(
                 load_in_4bit=True,
@@ -144,26 +149,34 @@ class HiDreamPipeline(BasePipeline):
             )
         else:
             quantization_config = None
-        self.diffusers_pipeline.transformer = HiDreamImageTransformer2DModel.from_pretrained(
-            self.model_config['diffusers_path'],
+        transformer = HiDreamImageTransformer2DModel.from_pretrained(
+            diffusers_path,
             subfolder='transformer',
             torch_dtype=dtype,
             quantization_config=quantization_config,
         )
         if transformer_dtype != 'nf4':
-            for name, p in self.transformer.named_parameters():
+            for name, p in transformer.named_parameters():
                 if not (any(x in name for x in KEEP_IN_HIGH_PRECISION)):
                     p.data = p.data.to(transformer_dtype)
 
-        self.transformer.train()
-        for name, p in self.transformer.named_parameters():
+        transformer.train()
+        for name, p in transformer.named_parameters():
             p.original_name = name
 
         # Critically important! Official code saves MoE aux losses in global state if alpha > 0. Without special handling of
         # this, it causes massive memory leak during backward pass and immediately OOMs you.
-        for module in self.transformer.modules():
+        for module in transformer.modules():
             if isinstance(module, MoEGate):
                 module.alpha = 0
+        return transformer
+
+    def load_teacher_denoiser(self, path):
+        # load_diffusion_model also loads the Llama text encoder, which the teacher shares with the student, so
+        # only the transformer folder of the other diffusers directory is read here.
+        transformer = self.load_transformer(path)
+        self.diffusers_pipeline = shallow_clone(self.diffusers_pipeline)
+        self.diffusers_pipeline.transformer = transformer
 
     def get_vae(self):
         return self.vae

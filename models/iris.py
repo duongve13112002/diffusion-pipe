@@ -629,6 +629,12 @@ class IrisPipeline(BasePipeline):
             raise RuntimeError(f'The Iris checkpoint is missing {len(missing)} parameters, e.g. {missing[:5]}')
         return transformer
 
+    def load_teacher_denoiser(self, path):
+        # load_diffusion_model reads the weights from self.transformer_path (the architecture's config.json
+        # is the student's: a teacher is another checkpoint of the same model).
+        self.transformer_path = path
+        super().load_teacher_denoiser(path)
+
     def load_diffusion_model(self):
         dtype = self.model_config['dtype']
         transformer_dtype = self.model_config.get('transformer_dtype', dtype)

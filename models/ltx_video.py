@@ -22,6 +22,7 @@ KEEP_IN_HIGH_PRECISION = ['norm', 'bias', 'scale_shift_table', 'patchify_proj', 
 
 
 class LTXVideoPipeline(BasePipeline):
+    teacher_path_key = 'single_file_path'
     name = 'ltx-video'
     vae_config_keys = ('diffusers_path',)
     framerate = 25

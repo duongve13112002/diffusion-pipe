@@ -60,6 +60,8 @@ def time_shift(mu: float, sigma: float, t: torch.Tensor):
 
 
 class OmniGen2Pipeline(BasePipeline):
+    # [teacher] path: another diffusers directory (its transformer folder).
+    teacher_path_key = 'diffusers_path'
     name = 'omnigen2'
     vae_config_keys = ('diffusers_path',)
     checkpointable_layers = ['TransformerLayer']

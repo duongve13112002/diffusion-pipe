@@ -140,6 +140,8 @@ class CosmosPipeline(BasePipeline):
     framerate = FRAMERATE
     checkpointable_layers = ['InitialLayer', 'TransformerLayer', 'FinalLayer']
     adapter_target_modules = ['GeneralDITTransformerBlock']
+    # load_diffusion_model builds the net inside self.model, which a teacher's copy replaces.
+    teacher_shell_attrs = ('model',)
 
     def teacher_targets_of(self, output):
         # The layers return (the x0 prediction, the loss weight of each sigma); the target is the x0 the data gives.

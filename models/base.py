@@ -594,8 +594,36 @@ class CommonPipeline:
         return teacher.to_layers()
 
 
+def shallow_clone(obj):
+    """A new object of the same class with the same attributes (not copy.copy: see make_teacher_layers)."""
+    clone = object.__new__(type(obj))
+    clone.__dict__.update(obj.__dict__)
+    return clone
+
+
 class BasePipeline(CommonPipeline):
     teacher_denoiser_attrs = ('transformer',)
+    # [teacher] path: the [model] key that names the denoiser's weights (the pipeline's own
+    # load_diffusion_model reads it), and the attributes whose objects that method assigns the denoiser on (a
+    # diffusers pipeline, say), which the teacher gets a shallow clone of so the student's are left alone.
+    teacher_path_key = 'transformer_path'
+    teacher_shell_attrs = ('diffusers_pipeline',)
+
+    def load_teacher_denoiser(self, path):
+        # Runs on the teacher's shallow copy of the pipeline (make_teacher_layers). The pipeline's own
+        # load_diffusion_model then reads `path` where it reads its checkpoint, so the format, dtype handling and
+        # post-load steps are the ones the student's weights went through; text encoders and the VAE stay the
+        # student's.
+        for attr in self.teacher_shell_attrs:
+            if attr in self.__dict__:
+                self.__dict__[attr] = shallow_clone(self.__dict__[attr])
+        # `path` is the finished teacher: the adapters the student's base is merged with are not applied to it.
+        self.model_config = {**{k: v for k, v in self.model_config.items() if k != 'merge_adapters'},
+                             self.teacher_path_key: path}
+        self.config = {**self.config, 'model': self.model_config}
+        if isinstance(self.config.get('adapter'), dict):
+            self.config['adapter'] = {k: v for k, v in self.config['adapter'].items() if k != 'fuse_adapters'}
+        self.load_diffusion_model()
 
     def __init__(self, *args, **kwargs):
         super().__init__()

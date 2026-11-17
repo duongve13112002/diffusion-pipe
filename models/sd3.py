@@ -23,6 +23,8 @@ def get_lin_function(x1: float = 256, y1: float = 0.5, x2: float = 4096, y2: flo
 
 
 class SD3Pipeline(BasePipeline):
+    # [teacher] path: another diffusers directory (its transformer folder).
+    teacher_path_key = 'diffusers_path'
     name = 'sd3'
     vae_config_keys = ('diffusers_path',)
     checkpointable_layers = ['TransformerLayer']

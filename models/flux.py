@@ -12,7 +12,7 @@ from deepspeed.utils.logging import logger
 from safetensors import safe_open
 from safetensors.torch import save_file
 
-from models.base import BasePipeline, make_contiguous
+from models.base import BasePipeline, make_contiguous, shallow_clone
 from utils.dora import check_init_matches, has_dora_scale
 from utils.common import AUTOCAST_DTYPE, is_main_process, load_state_dict
 from utils.offloading import ModelOffloader
@@ -172,9 +172,34 @@ class FluxPipeline(BasePipeline):
         self.offloader_single = ModelOffloader('dummy', [], 0, 0, True, torch.device('cuda'), False, debug=False)
 
         dtype = self.model_config['dtype']
-        transformer_dtype = self.model_config.get('transformer_dtype', dtype)
 
-        if transformer_path := self.model_config.get('transformer_path', None):
+        transformer = self.load_transformer(self.model_config.get('transformer_path', None))
+
+        self.diffusers_pipeline = diffusers.FluxPipeline.from_pretrained(self.model_config['diffusers_path'], torch_dtype=dtype, transformer=transformer)
+        if self.vae_dtypes.encode is not None:
+            self.diffusers_pipeline.vae = self.load_vae(self.vae_dtypes.encode)
+
+        if 'adapter' in self.config:
+            if fuse_adapters := self.config['adapter'].get('fuse_adapters', None):
+                print(f'Fusing adapters: {fuse_adapters}')
+                for fuse_adapter in fuse_adapters:
+                    self.load_adapter_weights(fuse_adapter['path'], fuse=True, fuse_weight=fuse_adapter.get('weight', 1.0))
+                    self.unload_lora_weights()
+
+        self.cast_transformer(transformer)
+
+        self.is_flex2 = (self.transformer.x_embedder.weight.size(1) == 196)
+
+        self.transformer.train()
+        # We'll need the original parameter name for saving, and the name changes once we wrap modules for pipeline parallelism,
+        # so store it in an attribute here. Same thing below if we're training a lora and creating lora weights.
+        for name, p in self.transformer.named_parameters():
+            p.original_name = name
+
+    def load_transformer(self, transformer_path):
+        """The transformer from a single file (transformer_path), else from the transformer folder of diffusers_path."""
+        dtype = self.model_config['dtype']
+        if transformer_path:
             if is_main_process():
                 print(f'Overriding transformer using {transformer_path}')
             transformer_config = 'configs/flux_dev_config.json' if is_dev(transformer_path) else 'configs/flux_schnell_config.json'
@@ -193,29 +218,21 @@ class FluxPipeline(BasePipeline):
             if is_main_process():
                 print('Bypassing Flux guidance')
             bypass_flux_guidance(transformer)
+        return transformer
 
-        self.diffusers_pipeline = diffusers.FluxPipeline.from_pretrained(self.model_config['diffusers_path'], torch_dtype=dtype, transformer=transformer)
-        if self.vae_dtypes.encode is not None:
-            self.diffusers_pipeline.vae = self.load_vae(self.vae_dtypes.encode)
-
-        if 'adapter' in self.config:
-            if fuse_adapters := self.config['adapter'].get('fuse_adapters', None):
-                print(f'Fusing adapters: {fuse_adapters}')
-                for fuse_adapter in fuse_adapters:
-                    self.load_adapter_weights(fuse_adapter['path'], fuse=True, fuse_weight=fuse_adapter.get('weight', 1.0))
-                    self.unload_lora_weights()
-
+    def cast_transformer(self, transformer):
+        transformer_dtype = self.model_config.get('transformer_dtype', self.model_config['dtype'])
         for name, p in transformer.named_parameters():
             if not (any(x in name for x in KEEP_IN_HIGH_PRECISION) or name.startswith('proj_out') or name.startswith('norm_out') or p.ndim == 1):
                 p.data = p.data.to(transformer_dtype)
 
-        self.is_flex2 = (self.transformer.x_embedder.weight.size(1) == 196)
-
-        self.transformer.train()
-        # We'll need the original parameter name for saving, and the name changes once we wrap modules for pipeline parallelism,
-        # so store it in an attribute here. Same thing below if we're training a lora and creating lora weights.
-        for name, p in self.transformer.named_parameters():
-            p.original_name = name
+    def load_teacher_denoiser(self, path):
+        # The constructor loads Flux's transformer; a teacher reads `path` the same way (a single file, as
+        # transformer_path does). The diffusers pipeline is cloned so the student's keeps its own.
+        transformer = self.load_transformer(path)
+        self.cast_transformer(transformer)
+        self.diffusers_pipeline = shallow_clone(self.diffusers_pipeline)
+        self.diffusers_pipeline.transformer = transformer
 
     def load_vae(self, dtype):
         return diffusers.AutoencoderKL.from_pretrained(
