@@ -62,3 +62,22 @@ def test_the_cards_float16_precision_is_valid_for_this_recipe():
     config['model'].update({'dtype': 'float32', 'compute_dtype': 'float16', 'fp16_fix': 'online'})
     spec = apply_loss_scale_config_defaults(config)
     assert spec['init_scale'] == 65536.0 and config['skip_nonfinite_steps'] is True
+
+
+BIG = EXAMPLE.with_name('moss_image_heal_10m_8xh200.toml')
+
+
+def test_the_10m_example_keeps_the_stream_terms_and_fades_the_teacher():
+    config = json.loads(json.dumps(toml.load(BIG)))
+    spec = parse_stream_loss(config['model'])
+    assert spec['write']['weight'] == 5e-3 and spec['rms']['weight'] == 5e-5
+    apply_outlier_decay_config_defaults(config)
+    assert config['outlier_decay']['rate'] == 12.0 and cap_at(config['outlier_decay'], 20000) == 16.0
+    distill = parse_distill_config(config)
+    assert distill.loss_weight == 0.5 and distill.decay == 'cosine' and distill.decay_steps == 100000
+    # 8 GPUs x 4 x 2 = 64 images per step, one pipeline stage (every GPU holds the model)
+    assert config['pipeline_stages'] == 1
+    assert config['micro_batch_size_per_gpu'] * config['gradient_accumulation_steps'] * 8 == 64
+    # the text refiner trains unless the commented line is enabled
+    assert LearningRates(config['model'], config['optimizer']).part_lrs == {}
+    assert 'compute_dtype' not in config['model'] and config['model']['dtype'] == 'bfloat16'

@@ -1790,7 +1790,8 @@ def test_a_half_precision_vae_encodes_close_to_float32(vaes, dtype):
     assert 10 * math.log10(1 / mse) > 45
 
 
-@pytest.mark.parametrize('name', ['moss_image_lora.toml', 'moss_image_full_8gpu.toml'])
+@pytest.mark.parametrize('name', ['moss_image_lora.toml', 'moss_image_full_8gpu.toml', 'moss_image_heal.toml',
+                                  'moss_image_heal_10m_8xh200.toml'])
 def test_example_configs_are_accepted(name):
     import toml
     root = Path(__file__).resolve().parent.parent
