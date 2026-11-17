@@ -322,16 +322,25 @@ def _take_model_step_measured(self, *args, **kwargs):
     # With the non-finite step guard (utils/step_guard.py, set on the engine by train.py) the norm
     # is needed on every step; it is kept for the clipping that follows, which would repeat it.
     guard = getattr(self, 'nonfinite_guard', None)
+    # With float16 compute (utils/loss_scale.py) the gradients carry the loss scale: they are divided by it
+    # before anything reads them, and a non-finite norm first lowers the scale (the step is dropped).
+    scaler = getattr(self, 'loss_scaler', None)
+    if scaler is not None and guard is None:
+        raise RuntimeError('The loss scaler needs the non-finite step guard on the engine (train.py sets both)')
     measure = self.gradient_clipping() <= 0.0 and getattr(self, 'measure_grad_norm', False)
     norm = None
+    if scaler is not None:
+        scaler.unscale_(self.module.parameters())
     if guard is not None or measure:
         norm = grad_norm([p for p in self.module.parameters() if p.grad is not None], mpu=self.mpu)
         self.last_grad_norm = norm
     if guard is None:
         return _take_model_step(self, *args, **kwargs)
+    scale_overflow = scaler is not None and scaler.update(not guard.is_finite(norm))
     self._known_grad_norm = norm
     try:
-        return guard.run_step(self.optimizer, norm, lambda: _take_model_step(self, *args, **kwargs))
+        return guard.run_step(self.optimizer, norm, lambda: _take_model_step(self, *args, **kwargs),
+                              scale_overflow=scale_overflow)
     finally:
         self.__dict__.pop('_known_grad_norm', None)
 

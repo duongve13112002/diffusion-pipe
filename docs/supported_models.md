@@ -1178,6 +1178,53 @@ rather than loaded with layers' weights in their neighbours.
   runs in the text-encoder layer so activation checkpointing does not repeat it, for training batches only;
   refused with `compile`, `blocks_to_swap` and unknown keys. The step log gets `train/distill_loss` and
   `train/distill_lambda`. No image-quality benefit has been measured.
+- float16 compute, as in the MOSS-Image-heal card's run (fp32 master weights, fp16 compute). `dtype` is how the
+  weights are stored and `compute_dtype` what the layers compute in (default: `dtype`); every layer casts its
+  weight to the compute dtype per call, so a full fine-tune stores `dtype = 'float32'` and computes in
+  float16 (or bfloat16):
+
+  ```toml
+  [model]
+  dtype = 'float32'                  # full fine-tune: the master weights; the optimizer state is float32 too
+  compute_dtype = 'float16'          # 'bfloat16' | 'float16' | 'float32'
+  fp16_fix = 'online'                # 'none' (default) | 'online'
+  #fp16_fix_scale = 0.0625           # the factor c the residual stream is carried at, in (0, 1]
+
+  [loss_scale]                       # optional with compute_dtype = 'float16'; these are the defaults
+  init_scale = 65536.0
+  growth_factor = 2.0
+  backoff_factor = 0.5
+  growth_interval = 2000             # clean steps in a row before the scale grows
+  min_scale = 1.0
+  ```
+
+  float16 has less range than bfloat16, which costs two things, and each has its remedy. The gradient of a
+  diffusion loss underflows in a float16 backward pass, so the loss is scaled up before `backward()` and the
+  gradients are divided by the same dynamic scale before the clipping, the norm and the optimizer step
+  (`[loss_scale]`, `utils/loss_scale.py`). The logged loss is the loss itself. A step whose gradient has a
+  NaN or inf drops, the scale is halved, and after `growth_interval` clean steps it doubles again; the
+  dropped step changes no weight, optimizer state or learning-rate-schedule step, and counts towards
+  `nonfinite_patience` only once the scale is down to `min_scale` (the step guard, `skip_nonfinite_steps`,
+  is switched on for you; `skip_nonfinite_steps = false` is refused). The log gets `train/loss_scale` and
+  `train/loss_scale_overflows`, the scale is kept in the checkpoint, and every rank decides from the same
+  gradient norm, so the scales never differ. The second cost is the residual stream: the Base and SFT weights
+  carry values up to about 62,000 in it, against float16's 65,504. `fp16_fix = 'online'` carries the stream
+  at `fp16_fix_scale` (1/16) of its size without touching a weight: the stream's only readers are RMSNorms,
+  which do not see the scale of their input except through their eps, so the embedders' outputs and the
+  gates of every block's attention and FFN write are multiplied by `c` and every stream norm's eps by `c^2`
+  ([KohakuMoss's `FP16_FIX = "online"`](https://github.com/KohakuBlueleaf/KohakuMossTrainer)). The function,
+  the loss and every gradient are unchanged (the tests check this in float32 to rounding, and the stream
+  penalties see the stream at its true size); the weights and the optimizer steps keep their scale, which is
+  why this is the online fold rather than a fold written into the weights. A healed model (the
+  stream peak far below 65,504, such as MOSS-Image-heal) needs no fold: leave `fp16_fix = 'none'`, which
+  prints a reminder about the Base and SFT weights. The fold is applied each time the model loads (never
+  written to a save, which holds the original weights), so a run that loads a save of a fold-trained model
+  needs `fp16_fix = 'online'` again, as does sampling it in float16 elsewhere. float16 *storage* (`dtype =
+  'float16'`) is only for an `[adapter]` over a frozen base, whose own weights then train in float32 by
+  default; a full fine-tune refuses it, since float16 holds the small updates badly. `[fp8_training]` is
+  refused with float16 compute, `gradient_release` is refused (the gradients must exist at the step to
+  unscale them), and `compute_dtype`, `fp16_fix` and `[loss_scale]` are refused on every other model.
+  Not measured against bfloat16 on image quality or speed.
 - `merge_adapters` also takes ai-toolkit's MOSS-Image LoRAs, which adapt the fused `proj.qkv`
   (ComfyUI, diffusers `transformer.` and kohya `lora_unet_` names): each of q, k and v gets the
   LoRA's A and its third of B, which is exact. Fused LoKr/LoHa/DoRA cannot be split and are

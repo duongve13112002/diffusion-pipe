@@ -113,6 +113,7 @@ REQUIRED_TRANSFORMER_KEYS = (
 )
 DTYPE_NAMES = {
     'bfloat16': torch.bfloat16, 'bf16': torch.bfloat16, 'float32': torch.float32, 'fp32': torch.float32,
+    'float16': torch.float16, 'fp16': torch.float16,
     'float8_e4m3fn': torch.float8_e4m3fn, 'float8': torch.float8_e4m3fn, 'float8_e5m2': torch.float8_e5m2,
 }
 
@@ -951,9 +952,11 @@ class LayerState:
     rope is the model's rope method; its fp32 tables stay fp32, as in ComfyUI's forward.
     """
 
-    def __init__(self, rope, compute_dtype):
+    def __init__(self, rope, compute_dtype, fold=None):
         self.rope_fn = rope
         self.compute_dtype = compute_dtype
+        # fp16_fix = 'online': the factor c the residual stream is carried at (see fold_stream), else None.
+        self.fold = fold
         self.skip_layers = frozenset()
         # True while sample() runs: the stream penalties are for training batches only.
         self.sampling = False
@@ -970,6 +973,23 @@ class LayerState:
             while len(self._rope) > 8:
                 self._rope.popitem(last=False)
         return self._rope[key]
+
+
+def fold_stream(model, c):
+    """Carry the residual stream of `model` (a MOSSImage) at c times its size, so a float16 stream stays in range.
+
+    Every reader of the stream is an RMSNorm, which does not see the scale of its input except through its
+    eps: rms(c x) with eps c^2 eps equals rms(x) with eps. The layers multiply what the embedders write by c
+    and the gates of the attention and FFN writes by c (LayerState.fold), and this scales the eps of the 84
+    block norms and the final norm by c^2, which leaves every output as it was while the stream is c times
+    smaller. The weights are not touched, so no gradient or update changes size (KohakuMoss's FP16_FIX
+    'online'). Done once per model.
+    """
+    if getattr(model, '_stream_fold', None) is not None:
+        raise RuntimeError('This MOSS-Image model is already folded')
+    for norm in [*(n for block in model.layers for n in (block.norm1, block.norm2)), model.final_norm_video]:
+        norm.eps = norm.eps * c * c
+    model._stream_fold = c
 
 
 class MossImagePipeline(ComfyPipeline):
@@ -997,6 +1017,10 @@ class MossImagePipeline(ComfyPipeline):
     layout_caption_format = 'moss_image'
     # utils.distillation.DistillConfig when [teacher] has a loss_weight, else None.
     distill = None
+    # utils.loss_scale.LossScaler when compute_dtype is float16 (train.py sets it), else None.
+    loss_scaler = None
+    # The factor the residual stream is carried at with fp16_fix = 'online', else None (fold_stream).
+    fp16_fold = None
 
     def __init__(self, config):
         # ComfyPipeline.__init__ is not called: it expects `vae` and `text_encoders` entries, and
@@ -1004,9 +1028,8 @@ class MossImagePipeline(ComfyPipeline):
         self.config = config
         self.model_config = config['model']
         self.dtype = _dtype(self.model_config.get('dtype', 'bfloat16'), 'dtype')
-        if self.dtype not in (torch.bfloat16, torch.float32):
-            raise ValueError('MOSS-Image runs in bfloat16 or float32; set dtype to one of them')
         self.model_config['dtype'] = self.dtype
+        self._check_precision()
         self._check_keys()
         # Residual-stream penalties (utils/stream_loss.py): None unless a term has a weight.
         self.stream_spec = parse_stream_loss(self.model_config)
@@ -1159,6 +1182,50 @@ class MossImagePipeline(ComfyPipeline):
                 raise ValueError('diffusion_model_dtype is fp8, which needs an [adapter]: a full fine-tune '
                                  'cannot update fp8 weights.')
 
+    def _check_precision(self):
+        """dtype is how the weights are stored, compute_dtype what the layers compute in (default: dtype).
+        compute_dtype = 'float16' also takes a loss scale (utils/loss_scale.py, set by train.py) and
+        optionally fp16_fix = 'online' (fold_stream) for weights whose residual stream passes float16's range."""
+        mc = self.model_config
+        raw = mc.get('compute_dtype')
+        self.compute_dtype = _dtype(raw, 'compute_dtype') if raw is not None else self.dtype
+        mc['compute_dtype'] = self.compute_dtype
+        if self.compute_dtype not in (torch.bfloat16, torch.float16, torch.float32):
+            raise ValueError('MOSS-Image computes in bfloat16, float16 or float32; set compute_dtype to one of them')
+        fp16 = self.compute_dtype == torch.float16
+        adapter = 'adapter' in self.config
+        if self.dtype == torch.float16:
+            if not fp16 or not adapter:
+                raise ValueError("dtype = 'float16' stores the weights in float16, which holds the small updates of "
+                                 "a full fine-tune badly: use dtype = 'float32' (or 'bfloat16') with "
+                                 "compute_dtype = 'float16'. float16 storage is for an [adapter] over a frozen base.")
+        elif self.dtype not in (torch.bfloat16, torch.float32):
+            raise ValueError('MOSS-Image stores its weights in bfloat16 or float32 (or float16 for an adapter over '
+                             'a float16-compute base); set dtype to one of them')
+        fix = mc.get('fp16_fix', 'none')
+        if fix not in ('none', 'online'):
+            raise ValueError(f"fp16_fix must be 'none' or 'online', got {fix!r}")
+        if fix == 'none' and 'fp16_fix_scale' in mc:
+            raise ValueError("fp16_fix_scale only applies with fp16_fix = 'online'")
+        self.fp16_fold = None
+        if fix == 'online':
+            if not fp16:
+                raise ValueError("fp16_fix = 'online' only applies with compute_dtype = 'float16': it keeps the "
+                                 'residual stream inside float16\'s range')
+            scale = mc.setdefault('fp16_fix_scale', 1 / 16)
+            if isinstance(scale, bool) or not isinstance(scale, (int, float)) or not 0 < scale <= 1:
+                raise ValueError(f'fp16_fix_scale must be a number in (0, 1], got {scale!r}')
+            self.fp16_fold = float(scale)
+        if fp16:
+            if 'fp8_training' in self.config:
+                raise ValueError('[fp8_training] is not supported with compute_dtype = "float16" (not tested with '
+                                 'the loss scale); compute in bfloat16 for fp8 training.')
+            if fix == 'none' and is_main_process():
+                print('MOSS-Image: compute_dtype float16 without fp16_fix. That is right for weights whose residual '
+                      'stream stays below 65504 (a healed model such as MOSS-Image-heal); the Base and SFT weights '
+                      "peak near 62k and need fp16_fix = 'online'. A step whose gradient overflows is skipped "
+                      '(train/loss_scale_overflows).')
+
     def _component(self, key, subfolder):
         if path := self.model_config.get(key):
             return str(path)
@@ -1198,7 +1265,7 @@ class MossImagePipeline(ComfyPipeline):
 
         # Every ComfyUI layer then casts its weight to the compute dtype per call (differentiably;
         # the weights of a diffusion_model_dtype fp8 model stay fp8 in memory).
-        patcher.set_model_compute_dtype(self.dtype)
+        patcher.set_model_compute_dtype(self.compute_dtype)
         with torch.no_grad():
             # Patched where the weights are, on the CPU: merging on the GPU in lowvram mode, as
             # ComfyPipeline does, would leave LowVramPatch weight functions on the layers it
@@ -1218,7 +1285,9 @@ class MossImagePipeline(ComfyPipeline):
             raise ValueError(f'{self.transformer_path} is a quantized checkpoint: you are trying to full finetune '
                              'a quantized model, which will not work. Train an [adapter], or load an unquantized checkpoint.')
         self.learning_rates.check_blocks(len(self.diffusion_model.layers))
-        self.layer_state = LayerState(self.diffusion_model.rope, self.dtype)
+        if self.fp16_fold is not None:
+            fold_stream(self.diffusion_model, self.fp16_fold)
+        self.layer_state = LayerState(self.diffusion_model.rope, self.compute_dtype, self.fp16_fold)
         if self.stream_spec is not None:
             check_width(self.stream_spec, self.diffusion_model.layers[0].norm1.weight.shape[0])
             self.layer_state.stream = StreamLayout(self.stream_spec, len(self.diffusion_model.layers))
@@ -1359,7 +1428,18 @@ class MossImagePipeline(ComfyPipeline):
 
     def get_loss_fn(self):
         flow_loss = super().get_loss_fn()
+        loss_fn = self._loss_fn(flow_loss)
 
+        def scaled_loss_fn(output, label):
+            loss = loss_fn(output, label)
+            # float16 compute: the gradient of the loss is scaled up (utils/loss_scale.py); the value, which is
+            # what is logged and evaluated, is the loss itself (and a loss without a graph stays one).
+            if self.loss_scaler is not None:
+                loss = self.loss_scaler.scale_loss(loss)
+            return loss
+        return scaled_loss_fn
+
+    def _loss_fn(self, flow_loss):
         def loss_fn(output, label):
             # (target, mask), or (target, sigma, mask) when [teacher] is on.
             target, *rest, mask = label
@@ -1470,7 +1550,7 @@ class MossImagePipeline(ComfyPipeline):
             return None
         model = self.diffusion_model
         # Its own state: no stream vector and never sampling, so the layers it builds are the plain forward.
-        state = LayerState(model.rope, self.dtype)
+        state = LayerState(model.rope, self.compute_dtype, self.fp16_fold)
         if 'adapter' in self.config:
             return TeacherForward(model, state, lambda: adapter_switched_off(self.lora_model))
         copy_of_model = copy.deepcopy(model).requires_grad_(False).eval()
@@ -1860,10 +1940,15 @@ class InitialLayer(nn.Module):
         hw = height * width
         video = self.video_embedder(x.to(dtype).flatten(2).transpose(1, 2))
         text = text.to(dtype)
+        fold = self.state.fold
+        if fold is not None:
+            video = video * fold
         pieces = []
         for n, indices in _length_groups(lengths_list).items():
             pe = self.state.rope(height, width, n, device)
             refined = self.text_embedder(text[indices, :n], pe[:, hw:])
+            if fold is not None:
+                refined = refined * fold
             pieces.append((indices, torch.cat((video[indices], refined), 1)))
         hidden = _assemble(pieces, batch, hw + max(lengths_list))
         sizes = torch.tensor([height, width], device=device)
@@ -1926,7 +2011,11 @@ class TransformerLayer(nn.Module):
                     rows = hidden[:, :hw + n] if len(indices) == batch else hidden[indices, :hw + n]
                     rows_mod = mod if len(indices) == batch else mod[indices]
                     # MOSSImage._forward's mod: six (batch, 1, dim) tensors.
-                    self._gates = rows_mod.unsqueeze(2).unbind(1)
+                    gates = rows_mod.unsqueeze(2).unbind(1)
+                    if self.state.fold is not None:
+                        # The stream is carried at `fold` times its size: so is what the writes add to it.
+                        gates = (*gates[:2], gates[2] * self.state.fold, *gates[3:5], gates[5] * self.state.fold)
+                    self._gates = gates
                     out = self.block(rows, self._gates, pe, self.transformer_options)
                     pieces.append((indices, out))
                 writes = self._writes
@@ -1937,7 +2026,7 @@ class TransformerLayer(nn.Module):
             else:
                 hidden = _assemble(pieces, batch, total)
             if penalized:
-                values = layout.block_values(self.block_idx, hidden, lengths + hw, writes)
+                values = layout.block_values(self.block_idx, hidden, lengths + hw, writes, self.state.fold or 1.0)
                 extra = [layout.add(extra[0], self.block_idx, values), *extra[1:]]
         self.offloader.submit_move_blocks_forward(self.block_idx)
         kept = 0 if layout is None else 1

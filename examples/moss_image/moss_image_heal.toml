@@ -14,9 +14,11 @@
 # things below, so they are the defaults of KohakuMossTrainer's notes: the write anneal (2000 steps), the RMS
 # target (1.0), the decay warmup (1000 steps), the LR warmup (500 steps), the weight decay (0.01), the
 # logit-normal timestep sampler.
-# What differs: the card's run computed in fp16 with a residual-stream fold on fp32 master weights (about 200 GPU
-# hours on B300); this repo trains in bfloat16, so the numbers need not match. The captions are your own: the
-# card's data is ~1M danbooru posts with graph captions in several prompt formats.
+# What differs: the card's run computed in fp16 on fp32 master weights (about 200 GPU hours on B300); this file
+# trains in bfloat16, so the numbers need not match. The card's setup is the commented `dtype = 'float32'` and
+# `compute_dtype = 'float16'` below (with a loss scale; a starting model whose residual stream is already below
+# 65,504 needs no fold, but the Base weights do: add `fp16_fix = 'online'`, docs/supported_models.md). The captions
+# are your own: the card's data is ~1M danbooru posts with graph captions in several prompt formats.
 #
 # Memory: a full fine-tune of the 5B model, AdamW states and the frozen teacher copy (about 10 GB, kept on the
 # first stage) fit a 141 GB or larger GPU with one pipeline stage; with 80 GB GPUs use pipeline_stages = 2.
@@ -59,6 +61,11 @@ steps_per_print = 10
 type = 'moss_image'
 diffusers_path = '/pvc/models/MOSS-Image-Base'
 dtype = 'bfloat16'
+# The card's precision: float32 master weights (20 GB for the 5B model, and float32 optimizer state) computed in
+# float16 with a dynamic loss scale. From the Base weights it also needs fp16_fix = 'online'.
+#dtype = 'float32'
+#compute_dtype = 'float16'
+#fp16_fix = 'online'
 timestep_sample_method = 'logit_normal'
 # The text refiner (text_embedder) stays at its base values.
 text_refiner_lr = 0

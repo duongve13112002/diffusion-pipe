@@ -400,6 +400,8 @@ class Saver:
                     'examples': examples,
                     'custom_loader': self.train_dataloader.state_dict(),
                     **({'loss_average': self.loss_average.state_dict()} if self.loss_average is not None else {}),
+                    **({'loss_scaler': scaler.state_dict()}
+                       if (scaler := getattr(self.model_engine, 'loss_scaler', None)) is not None else {}),
                 },
                 save_latest=False,
                 exclude_frozen_parameters=True

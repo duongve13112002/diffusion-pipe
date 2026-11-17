@@ -51,3 +51,14 @@ def test_only_the_text_refiner_is_frozen():
     assert config['lr_scheduler'] == 'cosine' and config['lr_scheduler_min_ratio'] == 0.01
     # 4 GPUs x batch 4 x 4 accumulation = 64 images per step.
     assert config['micro_batch_size_per_gpu'] * config['gradient_accumulation_steps'] * 4 == 64
+
+
+def test_the_cards_float16_precision_is_valid_for_this_recipe():
+    from utils.loss_scale import apply_loss_scale_config_defaults
+    text = EXAMPLE.read_text()
+    for line in ("#dtype = 'float32'", "#compute_dtype = 'float16'", "#fp16_fix = 'online'"):
+        assert line in text
+    config = load()
+    config['model'].update({'dtype': 'float32', 'compute_dtype': 'float16', 'fp16_fix': 'online'})
+    spec = apply_loss_scale_config_defaults(config)
+    assert spec['init_scale'] == 65536.0 and config['skip_nonfinite_steps'] is True

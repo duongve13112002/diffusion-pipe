@@ -177,12 +177,14 @@ class StreamLayout:
     def new(self, like):
         return like.new_zeros(self.size, dtype=torch.float32)
 
-    def block_values(self, block, hidden, tokens, write_energy):
+    def block_values(self, block, hidden, tokens, write_energy, stream_scale=1.0):
         """The GROUPS numbers of one block, as a [GROUPS] fp32 tensor.
 
         hidden [batch, total, D]: the block's output, rows past a sample's tokens are zero.
         tokens [batch]: each sample's valid token count. write_energy {part: channel energy [D]}
         of the sublayer writes, summed over the micro-batch's length groups.
+        stream_scale: the factor the stream is carried at (a float16 fold, models/moss_image.py fold_stream);
+        the RMS term reads the stream at its true size. The shares are ratios and do not see it.
         """
         spec = self.spec
         zero = hidden.new_zeros((), dtype=torch.float32)
@@ -192,7 +194,7 @@ class StreamLayout:
             values[CONCENTRATION] = top_shares(channel_energy(hidden)[None], term['k'], term['dilute'])[0]
         if 'rms' in spec:
             squares = torch.linalg.vector_norm(hidden, dim=(1, 2), dtype=torch.float32).square()
-            rms = (squares / (tokens.float() * hidden.shape[-1])).clamp_min(1e-30).sqrt()
+            rms = (squares / (tokens.float() * hidden.shape[-1])).clamp_min(1e-30).sqrt() / stream_scale
             values[RMS_TERM] = (rms / spec['rms']['target'] - 1.0).square().mean()
             values[RMS_VALUE] = rms.detach().mean()
         if 'write' in spec:

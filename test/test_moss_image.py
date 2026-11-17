@@ -90,7 +90,7 @@ def bare_pipeline(model_config=None, config=None):
     pipe = mi.MossImagePipeline.__new__(mi.MossImagePipeline)
     pipe.config = config or {}
     pipe.model_config = model_config or {}
-    pipe.dtype = torch.float32
+    pipe.dtype = pipe.compute_dtype = torch.float32
     pipe.text_dim = TEXT_DIM
     pipe.offloader = mi.ModelOffloader('dummy', [], 0, 0, True, torch.device('cpu'), False, debug=False)
     pipe.learning_rates = mi.LearningRates(pipe.model_config, pipe.config.get('optimizer', {}))
@@ -110,7 +110,7 @@ def bare_pipeline(model_config=None, config=None):
 def loaded_pipeline(reference, dtype=torch.float32):
     patcher = mi.load_transformer_patcher(tiny_state(reference), None, dtype)
     pipe = bare_pipeline()
-    pipe.dtype = dtype
+    pipe.dtype = pipe.compute_dtype = dtype
     pipe.diffusion_model = patcher.model.diffusion_model
     pipe.layer_state = mi.LayerState(pipe.diffusion_model.rope, dtype)
     pipe.pipeline_model = Runner(pipe.to_layers())
@@ -1416,7 +1416,7 @@ def test_layout_bbox_space_selects_the_layout_caption_format():
     ({'clean_end_share_refresh_every': 2}, 'needs clean_end_share as a list'),
     ({'clean_end_share': [[7, 60]], 'clean_end_share_refresh_every': 0}, 'whole number of epochs'),
     ({'timestep_sample_method': 'gamma'}, 'timestep_sample_method'),
-    ({'dtype': torch.float16}, 'bfloat16 or float32'),
+    ({'dtype': torch.float16}, 'stores the weights in float16'),
     ({'vae_dtype': 'float8'}, 'vae_dtype must be one of'),
     ({'vae_dtype': ['bfloat16']}, 'vae_dtype must be one of'),
     ({'diffusion_model_dtype': 'float8'}, r'\[adapter\]'),

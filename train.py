@@ -36,6 +36,8 @@ from utils.dora import apply_dora_config_defaults, check_model_dtypes as check_d
 from utils.oplora import OPLoRAProjector, apply_oplora_config_defaults
 from utils.outlier_decay import OutlierDecay, apply_outlier_decay_config_defaults
 from utils.step_guard import NonFiniteGuard, apply_step_guard_config_defaults
+from utils.loss_scale import (LossScaler, apply_loss_scale_config_defaults, default_adapter_dtype,
+                              refuse_compute_dtype_off_moss)
 from utils.weight_decay_target import (WeightDecayTarget, apply_weight_decay_target_config_defaults,
                                        restore_optimizer_decay, weight_decay_target_active)
 from utils.lr_schedule import create_lr_scheduler, validate_min_ratio
@@ -121,6 +123,7 @@ def set_config_defaults(config):
         config['save_dtype'] = DTYPE_MAP[config['save_dtype']]
 
     model_config = config['model']
+    refuse_compute_dtype_off_moss(model_config)
     model_dtype_str = model_config['dtype']
     model_config['dtype'] = DTYPE_MAP[model_dtype_str]
     if transformer_dtype := model_config.get('transformer_dtype', None):
@@ -137,7 +140,7 @@ def set_config_defaults(config):
                 'This script forces alpha=rank to make the saved adapter format simpler and more predictable with downstream inference programs. Please remove alpha from the config.'
             )
         adapter_config['alpha'] = adapter_config['rank']
-        adapter_config.setdefault('dtype', model_dtype_str)
+        adapter_config.setdefault('dtype', default_adapter_dtype(model_dtype_str))
         adapter_config['dtype'] = DTYPE_MAP[adapter_config['dtype']]
 
         apply_dora_config_defaults(adapter_config)
@@ -165,6 +168,10 @@ def set_config_defaults(config):
     # Outlier decay of the base weights of a full fine-tune (utils/outlier_decay.py); refused
     # next to an [adapter].
     apply_outlier_decay_config_defaults(config)
+
+    # Float16 compute (MOSS-Image compute_dtype = 'float16'): the loss scale, which needs the non-finite step
+    # guard to drop the steps whose gradient overflows (utils/loss_scale.py).
+    apply_loss_scale_config_defaults(config)
 
     # Skipping optimizer steps whose gradient is NaN or inf (utils/step_guard.py); off by default.
     apply_step_guard_config_defaults(config)
@@ -370,7 +377,8 @@ if __name__ == '__main__':
     if (cpu_threads := common.limit_cpu_threads(local_world_size)) is not None and \
             int(os.environ.get('LOCAL_RANK', max(args.local_rank, 0))) == 0:
         print(f'CPU threads per GPU process: {cpu_threads} (set OMP_NUM_THREADS to override)')
-    common.AUTOCAST_DTYPE = config['model']['dtype']
+    compute_dtype = config['model'].get('compute_dtype')
+    common.AUTOCAST_DTYPE = DTYPE_MAP[compute_dtype] if isinstance(compute_dtype, str) else config['model']['dtype']
     dataset_util.UNCOND_FRACTION = config.get('uncond_fraction', 0.0)
     if map_num_proc := config.get('map_num_proc', None):
         dataset_util.NUM_PROC = map_num_proc
@@ -859,6 +867,15 @@ if __name__ == '__main__':
         if is_main_process():
             print(f'Non-finite step guard on: a step with a NaN or inf gradient is skipped; the run stops after '
                   f'{config["nonfinite_patience"] or "no limit of"} in a row')
+    loss_scaler = None
+    if config.get('loss_scale') is not None:
+        loss_scaler = LossScaler.from_spec(config['loss_scale'])
+        model_engine.loss_scaler = loss_scaler
+        # The loss function runs on the last stage, which every rank holds a pipeline object for.
+        model.loss_scaler = loss_scaler
+        if is_main_process():
+            print(f'Loss scale on (float16 compute): starts at {loss_scaler.scale:g}, halves on a gradient that '
+                  f'overflows, doubles after {loss_scaler.growth_interval} clean steps')
     startup_timing.mark('pipeline layers and DeepSpeed engine')
     global_batch_size = model_engine.train_micro_batch_size_per_gpu() * model_engine.gradient_accumulation_steps() * model_engine.grid.get_data_parallel_world_size()
     print(f'Global batch size = {global_batch_size}')
@@ -1160,6 +1177,8 @@ if __name__ == '__main__':
         # Checkpoints from before it start the averages afresh.
         if 'loss_average' in client_state:
             loss_average.load_state_dict(client_state['loss_average'])
+        if loss_scaler is not None and 'loss_scaler' in client_state:
+            loss_scaler.load_state_dict(client_state['loss_scaler'])
         del client_state
         if is_main_process():
             print(f'Resuming training from checkpoint. Resuming at epoch: {train_dataloader.epoch}, step: {step}')
@@ -1271,8 +1290,12 @@ if __name__ == '__main__':
         step_skipped = nonfinite_guard is not None and nonfinite_guard.step_skipped
         if step_skipped:
             if is_main_process():
-                print(f'step {step}: skipped, the gradient is not finite (loss {loss:.4g}); '
-                      f'{nonfinite_guard.consecutive} in a row, {nonfinite_guard.skipped} in all')
+                if nonfinite_guard.scale_overflow:
+                    print(f'step {step}: skipped, the gradient overflowed at loss scale {loss_scaler.last_overflow_scale:g}; '
+                          f'the scale is now {loss_scaler.scale:g} ({loss_scaler.overflows} overflows in all)')
+                else:
+                    print(f'step {step}: skipped, the gradient is not finite (loss {loss:.4g}); '
+                          f'{nonfinite_guard.consecutive} in a row, {nonfinite_guard.skipped} in all')
             if outlier_decay is not None:
                 outlier_decay.reset_metrics()
             nonfinite_guard.check_patience()
@@ -1307,6 +1330,8 @@ if __name__ == '__main__':
         extra_scalars = getattr(model, 'get_extra_log_scalars', lambda: {})()
         if nonfinite_guard is not None:
             extra_scalars = {**extra_scalars, **nonfinite_guard.log_scalars()}
+        if loss_scaler is not None:
+            extra_scalars = {**extra_scalars, **loss_scaler.log_scalars()}
         if outlier_decay is not None and logged_step:
             # A collective: every rank reaches it on the same steps.
             extra_scalars = {**extra_scalars, **outlier_decay.log_scalars()}

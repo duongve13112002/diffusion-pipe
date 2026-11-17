@@ -62,6 +62,8 @@ class NonFiniteGuard:
         self.consecutive = 0
         self.skipped = 0
         self.step_skipped = False
+        # The last skipped step was the loss scale's doing (see run_step).
+        self.scale_overflow = False
 
     @staticmethod
     def is_finite(norm):
@@ -89,9 +91,20 @@ class NonFiniteGuard:
             else:
                 del optimizer.overflow
 
-    def run_step(self, optimizer, norm, take_step):
+    def run_step(self, optimizer, norm, take_step, scale_overflow=False):
         """Call take_step() (the engine's own step) as it is when `norm` is finite, and with the
-        optimizer's step suppressed when it is not. Returns what take_step returns."""
+        optimizer's step suppressed when it is not. Returns what take_step returns.
+
+        scale_overflow: the loss scaler (utils/loss_scale.py) has already judged `norm` non-finite and cut
+        its scale. The step is dropped and reported as skipped (step_skipped), but it is not counted
+        towards the patience: the scale is what gave way, not the run.
+        """
+        if scale_overflow:
+            self.step_skipped = True
+            self.scale_overflow = True
+            with self._no_step(optimizer):
+                return take_step()
+        self.scale_overflow = False
         if self.is_finite(norm):
             self.step_skipped = False
             self.consecutive = 0
