@@ -468,6 +468,9 @@ class InitialLayer(nn.Module):
 
         if self.text_encoder is not None:
             assert not torch.is_floating_point(text_embeddings_or_ids)
+            # Frozen, so never in train mode: DeepSpeed's train() would turn its dropout on (the cached embeddings
+            # are made in eval), and the student and a [teacher], which share this module, would draw different masks.
+            self.text_encoder.eval()
             with torch.no_grad():
                 context = self.text_encoder(text_embeddings_or_ids, seq_lens_or_text_mask)
             context.requires_grad_(True)

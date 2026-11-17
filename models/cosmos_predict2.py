@@ -1228,7 +1228,17 @@ class CosmosPredict2Pipeline(BasePipeline):
     def load_teacher_denoiser(self, path):
         # Set again by the load when it initialises one; the student's is not the teacher's.
         self._refiner_is_fresh = False
+        # context_refiner_path / llm_adapter_path name the student's own refiner and adapter files; the teacher
+        # checkpoint carries its own (or none: then it is refused below).
+        self.model_config = {**{k: v for k, v in self.model_config.items()
+                                if k not in ('context_refiner_path', 'llm_adapter_path')}}
+        self.config = {**self.config, 'model': self.model_config}
+        student_adapter = self.use_llm_adapter
         super().load_teacher_denoiser(path)
+        if not self.use_context_refiner and self.use_llm_adapter != student_adapter:
+            raise ValueError(f'[teacher] path {path} {"has" if self.use_llm_adapter else "has no"} llm_adapter, but the '
+                             f'student {"has" if student_adapter else "has none"}: the teacher would read the text '
+                             'embeddings differently from the student. Name a checkpoint with the same llm_adapter setup.')
         if self.use_context_refiner and getattr(self, '_refiner_is_fresh', False):
             raise ValueError(f'[teacher] path {path} has no trained context_refiner (a freshly initialised one is random '
                              'weights, and distilling toward them teaches nothing). Name a checkpoint a refiner run saved, '

@@ -743,9 +743,17 @@ if __name__ == '__main__':
     # student's modules; on the first pipeline stage only, which is where it runs.
     teacher = None
     if teacher_config is not None:
-        teacher = model_teacher.build_teacher(
-            model, teacher_config, torch.device('cuda', torch.cuda.current_device()),
-            runs_teacher=model_teacher.on_first_stage(config.get('pipeline_stages', 1)))
+        # Only the first pipeline stage builds it, and building can fail there alone (a missing file, a mismatching
+        # checkpoint): every rank hears of it before the next collective rather than waiting out the timeout.
+        error = None
+        try:
+            teacher = model_teacher.build_teacher(
+                model, teacher_config, torch.device('cuda', torch.cuda.current_device()),
+                runs_teacher=model_teacher.on_first_stage(config.get('pipeline_stages', 1)),
+                all_ranks_run=config.get('pipeline_stages', 1) == 1)
+        except Exception as e:
+            error = e
+        all_ok(error)
         if is_main_process():
             source = teacher_config.path or 'the model the run started from'
             print(f'[teacher] on: a frozen copy of {source} runs on the first pipeline stage of every data-parallel '

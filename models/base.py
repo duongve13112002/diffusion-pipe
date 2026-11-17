@@ -595,9 +595,14 @@ class CommonPipeline:
 
 
 def shallow_clone(obj):
-    """A new object of the same class with the same attributes (not copy.copy: see make_teacher_layers)."""
+    """A new object of the same class with the same attributes (not copy.copy: see make_teacher_layers).
+    An nn.Module's own containers of children, parameters and buffers are copied too, so assigning a submodule on
+    the clone does not write into the original's."""
     clone = object.__new__(type(obj))
     clone.__dict__.update(obj.__dict__)
+    for name in ('_modules', '_parameters', '_buffers'):
+        if name in clone.__dict__:
+            clone.__dict__[name] = type(clone.__dict__[name])(clone.__dict__[name])
     return clone
 
 
@@ -830,9 +835,15 @@ class ComfyPipeline(CommonPipeline):
 
     def load_teacher_denoiser(self, path):
         # Runs on a copy of the pipeline, so the student's diffusion_model is untouched; the pipeline's own
-        # loading (format detection, dtype, merge_adapters, whatever a subclass adds) reads the other checkpoint.
-        self.model_config = {**self.model_config, 'diffusion_model': path}
+        # loading (format detection, dtype, whatever a subclass adds) reads the other checkpoint. What belongs to
+        # the student's checkpoint is left out: the adapters its base is merged with and the explicit layout and
+        # heads of a MiniMax-H3 transformer (`path` is a finished model).
+        own = ('merge_adapters', 'pdd_heads', 'diffusion_model_format')
+        self.model_config = {**{k: v for k, v in self.model_config.items() if k not in own}, 'diffusion_model': path}
         self.config = {**self.config, 'model': self.model_config}
+        header = read_diffusion_model_header(path)
+        if header is not None and (reason := self.unsupported_checkpoint(*header)):
+            raise NotImplementedError(f'[teacher] path {path}: {reason}')
         self.load_diffusion_model()
 
     def refuse_unsupported_checkpoint(self):

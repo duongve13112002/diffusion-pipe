@@ -36,6 +36,7 @@ import math
 import torch
 
 from models.teacher_guidance import DECAYS, decay_at, is_anima_teacher
+from utils import fp8_training
 from utils.distillation import DistillConfig, distill_warnings
 
 KEY = 'teacher'
@@ -90,6 +91,9 @@ def parse_model_teacher_config(config):
     decay_steps = table.get('decay_steps', 0)
     if isinstance(decay_steps, bool) or not isinstance(decay_steps, int) or decay_steps < 0:
         raise ValueError(f'[{KEY}] decay_steps must be a whole number >= 0, got {decay_steps!r}')
+    if decay == 'none' and decay_steps > 0:
+        raise ValueError(f"[{KEY}] decay_steps does not apply with decay = 'none' (nothing falls): set decay = 'linear' "
+                         "or 'cosine', or remove decay_steps")
     if decay != 'none' and decay_steps <= 0:
         raise ValueError(f'[{KEY}] decay = {decay!r} needs decay_steps > 0 (the optimizer steps over which '
                          "lambda falls to 0); use decay = 'none' to keep the term on for the whole run")
@@ -131,14 +135,20 @@ class ModelTeacher:
     def lam(self):
         return self.config.loss_weight * decay_at(self.step, self.config)
 
+    def finished(self):
+        """Whether the decay has reached zero for good: the teacher's output no longer reaches the loss."""
+        return self.config.decay != 'none' and self.step >= self.config.decay_steps
+
     @torch.no_grad()
     def run(self, features):
         """The teacher's output for one micro batch of features: a list of tensors, one per target."""
         if self.layers is None:
             raise RuntimeError('This rank holds no teacher layers: only the first pipeline stage runs the teacher')
         x = tuple(t.to(self.device) if torch.is_tensor(t) and self.device is not None else t for t in features)
-        for layer in self.layers:
-            x = layer(x)
+        # The student's fp8 attention sites count the calls of its own blocks; the teacher is plain bf16.
+        with fp8_training.disabled():
+            for layer in self.layers:
+                x = layer(x)
         outputs = self.select(x)
         return [t.detach() for t in outputs]
 
@@ -163,13 +173,18 @@ def fit_trailing_dim(output, target):
     return torch.nn.functional.pad(output, (0, target.shape[-1] - output.shape[-1]))
 
 
-def build_teacher(model, config, device, runs_teacher):
+def build_teacher(model, config, device, runs_teacher, all_ranks_run=True):
     """The ModelTeacher of this rank. On a rank that runs it (the first pipeline stage) the layers are built
-    from a frozen copy of the model's denoiser (CommonPipeline.make_teacher_layers) and placed on `device`."""
+    from a frozen copy of the model's denoiser (CommonPipeline.make_teacher_layers) and placed on `device`.
+    When only some ranks run it (all_ranks_run False) the loaders do not wait for the others (one_at_a_time):
+    the ranks that do not run it never reach them."""
     teacher = ModelTeacher(config, select=model.teacher_targets_of, device=device)
     if not runs_teacher:
         return teacher
-    layers = model.make_teacher_layers(config.path)
+    import contextlib
+    from utils.common import barriers_off
+    with contextlib.nullcontext() if all_ranks_run else barriers_off():
+        layers = model.make_teacher_layers(config.path)
     for layer in layers:
         # A layer can be a plain function (AuraFlow's concat_hidden_states).
         if isinstance(layer, torch.nn.Module):

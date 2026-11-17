@@ -4874,6 +4874,13 @@ class PipelineDataLoader:
         engine = self.model_engine
         if engine.is_pipe_parallel and not engine.is_first_stage():
             return [self._broadcast_target(torch.empty_like(t)) for t in target_list]
+        if self.teacher.finished():
+            # lambda is 0 from here on, so the loss never reads these; they keep the label's shape and the send/recv
+            # pairing with the last stage, which allocates its buffers the same way.
+            teacher_targets = [torch.zeros_like(t) for t in target_list]
+            if engine.is_pipe_parallel:
+                teacher_targets = [self._broadcast_target(t) for t in teacher_targets]
+            return teacher_targets
         columns = None
         for micro_features, _ in split_batch((features, label), self.gradient_accumulation_steps):
             outputs = self.teacher.run(micro_features)

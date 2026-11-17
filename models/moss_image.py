@@ -1017,6 +1017,8 @@ class MossImagePipeline(ComfyPipeline):
     layout_caption_format = 'moss_image'
     # utils.distillation.DistillConfig when [teacher] has a loss_weight, else None.
     distill = None
+    # The frozen starting model of a full fine-tune's [teacher] without path, copied by load_diffusion_model.
+    teacher_snapshot = None
     # utils.loss_scale.LossScaler when compute_dtype is float16 (train.py sets it), else None.
     loss_scaler = None
     # The factor the residual stream is carried at with fp16_fix = 'online', else None (fold_stream).
@@ -1306,6 +1308,11 @@ class MossImagePipeline(ComfyPipeline):
             # Straight onto the GPU, freeing its copy in RAM while the transformer is still there
             # too (eight ranks per node each hold both otherwise).
             comfy.model_management.load_models_gpu([te.patcher], force_full_load=True)
+        # The starting model of a full fine-tune's [teacher], taken here: to_layers() runs after fp8_training has
+        # swapped the student's Linears and attention for fp8 ones, which a later copy would carry along.
+        if (self.distill is not None and self.distill.path is None and 'adapter' not in self.config
+                and self.on_first_stage()):
+            self.teacher_snapshot = copy.deepcopy(self.diffusion_model)
 
     def on_first_stage(self):
         """Whether this rank is on the first pipeline stage (DeepSpeed numbers ranks stage-major)."""
@@ -1554,7 +1561,10 @@ class MossImagePipeline(ComfyPipeline):
         path = self.distill.path
         if path is None and 'adapter' in self.config:
             return TeacherForward(model, state, lambda: adapter_switched_off(self.lora_model))
-        copy_of_model = (copy.deepcopy(model) if path is None else self.load_teacher_model(path))
+        if path is None and self.teacher_snapshot is None:
+            raise RuntimeError('[teacher]: the starting model was not copied by load_diffusion_model (a full fine-tune '
+                               'copies it there, before fp8 training changes the student)')
+        copy_of_model = (self.teacher_snapshot if path is None else self.load_teacher_model(path))
         copy_of_model.requires_grad_(False).eval()
         copy_of_model.to(comfy.model_management.get_torch_device())
         state.rope_fn = copy_of_model.rope
@@ -1565,11 +1575,13 @@ class MossImagePipeline(ComfyPipeline):
         return TeacherForward(copy_of_model, state)
 
     def load_teacher_model(self, path):
-        """The transformer at `path`, loaded the way the starting one is (dtype, fp16 fold, merged adapters) on a copy
+        """The transformer at `path`, loaded the way the starting one is (dtype, fp16 fold) on a copy
         of the pipeline, so the student's diffusion_model and layer state stay as they are."""
         teacher = object.__new__(type(self))
         teacher.__dict__.update(self.__dict__)
         teacher.transformer_path = path
+        # the adapters merged into the student's base are not part of this checkpoint
+        teacher.model_config = {k: v for k, v in self.model_config.items() if k != 'merge_adapters'}
         teacher.load_diffusion_model()
         return teacher.diffusion_model
 

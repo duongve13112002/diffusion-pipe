@@ -127,8 +127,26 @@ def resolve_local_rank(local_rank_arg=-1, environ=None):
     return local_rank
 
 
+_barriers_off = 0
+
+
+@contextmanager
+def barriers_off():
+    """one_at_a_time() just runs its body inside. For work that only some ranks do (the [teacher] of the first
+    pipeline stage), where the ranks that do not would never join the barriers."""
+    global _barriers_off
+    _barriers_off += 1
+    try:
+        yield
+    finally:
+        _barriers_off -= 1
+
+
 @contextmanager
 def one_at_a_time():
+    if _barriers_off:
+        yield
+        return
     for i in range(int(os.environ['LOCAL_SIZE'])):
         if i == int(os.environ['LOCAL_RANK']):
             yield

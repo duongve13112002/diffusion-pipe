@@ -14,6 +14,7 @@ import torch.multiprocessing as mp
 import torch.nn.functional as F
 from torch import nn
 
+import models.base as base_module
 from models.base import BasePipeline, ComfyPipeline
 from utils import dataset as dataset_util
 from utils import model_teacher as mt
@@ -67,6 +68,7 @@ def test_defaults_and_fields():
     ({'decay': 'linear'}, 'decay_steps'),
     ({'decay_steps': -1}, 'decay_steps'),
     ({'decay_steps': 1.5}, 'decay_steps'),
+    ({'decay_steps': 100}, "does not apply with decay = 'none'"),
     ({'path': ''}, 'path'),
     ({'path': 3}, 'path'),
     ({'transformer_path': 'x'}, 'unknown keys'),
@@ -363,36 +365,82 @@ def test_a_loader_that_assigns_on_a_shell_needs_it_named():
     assert pipeline.model.net is student and pipeline.transformer is student
 
 
-def test_comfy_pipelines_load_the_teacher_with_their_own_loader():
-    calls = []
+class FakeComfy(ComfyPipeline):
+    name = 'fake'
+    calls = None
 
-    class Fake(ComfyPipeline):
-        name = 'fake'
+    def __init__(self, **model_config):
+        self.model_config = {'diffusion_model': '/student.safetensors', 'dtype': torch.float32, **model_config}
+        self.config = {'model': self.model_config}
+        self.diffusion_model = nn.Linear(2, 2)
+        self.calls = []
 
-        def __init__(self):
-            self.model_config = {'diffusion_model': '/student.safetensors', 'dtype': torch.float32}
-            self.config = {'model': self.model_config}
-            self.diffusion_model = nn.Linear(2, 2)
+    def load_diffusion_model(self):
+        assert self.config['model'] is self.model_config  # what the loader reads through either name
+        self.calls.append(dict(self.model_config))
+        self.diffusion_model = nn.Linear(2, 2)
 
-        def load_diffusion_model(self):
-            calls.append(self.model_config['diffusion_model'])
-            self.diffusion_model = nn.Linear(2, 2)
+    def to_layers(self):
+        return [self.diffusion_model]
 
-        def to_layers(self):
-            return [self.diffusion_model]
 
-    pipeline = Fake()
+def test_comfy_pipelines_load_the_teacher_with_their_own_loader(monkeypatch):
+    monkeypatch.setattr(base_module, 'read_diffusion_model_header', lambda path: None)
+    pipeline = FakeComfy()
+    calls = pipeline.calls
     student = pipeline.diffusion_model
     layers = pipeline.make_teacher_layers('/teacher.safetensors')
-    assert calls == ['/teacher.safetensors']
+    assert [c['diffusion_model'] for c in calls] == ['/teacher.safetensors']
     assert layers[0] is not student
     assert pipeline.diffusion_model is student
     assert pipeline.model_config['diffusion_model'] == '/student.safetensors'
     assert pipeline.config['model']['diffusion_model'] == '/student.safetensors'
     # Without a path it is a deep copy of the student, not a second load.
     layers = pipeline.make_teacher_layers()
-    assert calls == ['/teacher.safetensors']
+    assert len(calls) == 1
     assert layers[0] is not student and torch.equal(layers[0].weight, student.weight)
+
+
+def test_a_comfy_teacher_is_not_given_what_belongs_to_the_students_checkpoint(monkeypatch):
+    monkeypatch.setattr(base_module, 'read_diffusion_model_header', lambda path: None)
+    pipeline = FakeComfy(merge_adapters=['/lora'], pdd_heads='/heads.safetensors', diffusion_model_format='official',
+                         vae='/vae')
+    pipeline.make_teacher_layers('/teacher.safetensors')
+    assert pipeline.calls == [{'diffusion_model': '/teacher.safetensors', 'dtype': torch.float32, 'vae': '/vae'}]
+    assert pipeline.model_config['merge_adapters'] == ['/lora']
+    assert pipeline.model_config['pdd_heads'] == '/heads.safetensors'
+
+
+def test_a_comfy_teacher_checkpoint_the_model_cannot_train_is_refused(monkeypatch):
+    seen = []
+    monkeypatch.setattr(base_module, 'read_diffusion_model_header', lambda path: ({'w': (1,)}, {'meta': 1}))
+
+    class Picky(FakeComfy):
+        def unsupported_checkpoint(self, shapes, metadata):
+            seen.append((shapes, metadata, self.model_config['diffusion_model']))
+            return 'too many heads'
+
+    pipeline = Picky()
+    with pytest.raises(NotImplementedError, match=r'\[teacher\] path /teacher.safetensors: too many heads'):
+        pipeline.make_teacher_layers('/teacher.safetensors')
+    assert seen == [({'w': (1,)}, {'meta': 1}, '/teacher.safetensors')] and pipeline.calls == []
+    assert pipeline.model_config['diffusion_model'] == '/student.safetensors'
+
+
+def test_a_shallow_clone_of_a_module_has_its_own_children_parameters_and_buffers():
+    module = nn.Sequential(nn.Linear(2, 2))
+    module.register_buffer('buf', torch.zeros(1))
+    clone = base_module.shallow_clone(module)
+    assert clone.__class__ is nn.Sequential and clone[0] is module[0]
+    clone.add_module('extra', nn.Linear(1, 1))
+    clone.register_buffer('other', torch.ones(1))
+    clone.register_parameter('p', nn.Parameter(torch.ones(1)))
+    clone[0] = nn.Identity()
+    assert list(module._modules) == ['0'] and isinstance(module[0], nn.Linear)
+    assert 'other' not in module._buffers and 'p' not in module._parameters
+    # A plain object is cloned as before.
+    shell = Shell(object())
+    assert base_module.shallow_clone(shell).vae == shell.vae
 
 
 def test_default_selection_and_tuple_outputs():
@@ -947,6 +995,58 @@ def test_iris_points_the_attribute_its_loader_reads_at_the_path(monkeypatch):
     assert teacher.transformer_path == '/other' and pipe.transformer_path == '/student' and seen == ['/other']
 
 
+def cp2_pipeline(use_context_refiner=False, use_llm_adapter=False, **model_config):
+    from models import cosmos_predict2 as cp2
+    pipe = cp2.CosmosPredict2Pipeline.__new__(cp2.CosmosPredict2Pipeline)
+    pipe.use_context_refiner = use_context_refiner
+    pipe.use_llm_adapter = use_llm_adapter
+    pipe.model_config = dict(model_config)
+    pipe.config = {'model': pipe.model_config}
+    return pipe
+
+
+def test_a_teacher_path_does_not_inherit_the_students_refiner_or_adapter_files(monkeypatch):
+    from models import base
+    seen = []
+
+    def fake_load(self, path):
+        seen.append(dict(self.model_config))
+        assert self.config['model'] is self.model_config
+
+    monkeypatch.setattr(base.BasePipeline, 'load_teacher_denoiser', fake_load)
+    pipe = cp2_pipeline(transformer_path='/student', context_refiner_path='/refiner', llm_adapter_path='/adapter',
+                        dtype='bf16')
+    student_config = pipe.model_config
+    pipe.load_teacher_denoiser('/other')
+    assert seen == [{'transformer_path': '/student', 'dtype': 'bf16'}]
+    # The student's table itself is not edited (the loader runs on a clone of the pipeline, which gets a new one).
+    assert student_config == {'transformer_path': '/student', 'context_refiner_path': '/refiner',
+                              'llm_adapter_path': '/adapter', 'dtype': 'bf16'}
+
+
+def test_a_teacher_with_another_llm_adapter_setup_than_the_student_is_refused(monkeypatch):
+    from models import base
+
+    def load_with(adapter):
+        def fake_load(self, path):
+            self.use_llm_adapter = adapter
+        return fake_load
+
+    pipe = cp2_pipeline(use_llm_adapter=True)
+    monkeypatch.setattr(base.BasePipeline, 'load_teacher_denoiser', load_with(False))
+    with pytest.raises(ValueError, match='has no llm_adapter, but the student has'):
+        pipe.load_teacher_denoiser('/other')
+    pipe = cp2_pipeline(use_llm_adapter=False)
+    monkeypatch.setattr(base.BasePipeline, 'load_teacher_denoiser', load_with(True))
+    with pytest.raises(ValueError, match='has llm_adapter, but the student has none'):
+        pipe.load_teacher_denoiser('/other')
+    monkeypatch.setattr(base.BasePipeline, 'load_teacher_denoiser', load_with(True))
+    cp2_pipeline(use_llm_adapter=True).load_teacher_denoiser('/other')
+    # With a refiner the adapter is never built, on either side.
+    monkeypatch.setattr(base.BasePipeline, 'load_teacher_denoiser', load_with(False))
+    cp2_pipeline(use_context_refiner=True, use_llm_adapter=True).load_teacher_denoiser('/other')
+
+
 def test_a_teacher_path_without_a_trained_refiner_is_refused(monkeypatch):
     from models import base
     from models import cosmos_predict2 as cp2
@@ -955,8 +1055,7 @@ def test_a_teacher_path_without_a_trained_refiner_is_refused(monkeypatch):
         self._refiner_is_fresh = True
 
     monkeypatch.setattr(base.BasePipeline, 'load_teacher_denoiser', fake_load)
-    pipe = cp2.CosmosPredict2Pipeline.__new__(cp2.CosmosPredict2Pipeline)
-    pipe.use_context_refiner = True
+    pipe = cp2_pipeline(use_context_refiner=True)
     pipe._refiner_is_fresh = False
     with pytest.raises(ValueError, match='no trained context_refiner'):
         pipe.load_teacher_denoiser('/other')
@@ -985,3 +1084,207 @@ def test_a_fresh_refiner_cannot_be_its_own_teacher(monkeypatch):
     pipe.use_context_refiner = False
     pipe._refiner_is_fresh = True
     assert pipe.make_teacher_layers() == 'layers'
+
+
+# loaders that wait for every rank, a teacher on some ranks only
+
+class WaitingPipeline(ToyPipeline):
+    """Its loader is one of the several (LTX-2, MiniMax-H3, Flux.2) that load one rank at a time."""
+
+    def make_teacher_layers(self, path=None):
+        from utils.common import one_at_a_time
+        with one_at_a_time():
+            return super().make_teacher_layers(path)
+
+
+def _one_stage_builds_worker(rank, init_file, all_ranks_run):
+    import os
+    os.environ.setdefault('DS_ACCELERATOR', 'cpu')
+    os.environ['LOCAL_RANK'] = str(rank)
+    os.environ['LOCAL_SIZE'] = '2'
+    import deepspeed
+    deepspeed.init_distributed('gloo', auto_mpi_discovery=False, init_method=f'file://{init_file}',
+                               rank=rank, world_size=2, verbose=False)
+    teacher = mt.build_teacher(WaitingPipeline(), parse(), torch.device('cpu'), runs_teacher=(rank == 0),
+                               all_ranks_run=all_ranks_run)
+    assert (teacher.layers is not None) == (rank == 0)
+    dist.barrier()
+    dist.destroy_process_group()
+
+
+def run_workers(worker, args, nprocs, timeout=90):
+    import time
+    context = mp.spawn(worker, args=args, nprocs=nprocs, join=False)
+    deadline = time.monotonic() + timeout
+    finished = False
+    # join() returns as soon as one process has exited, finished or not
+    while not finished and time.monotonic() < deadline:
+        finished = context.join(5)
+    if not finished:
+        for process in context.processes:
+            process.terminate()
+        pytest.fail('the ranks are still waiting on each other: a collective only some of them reach')
+
+
+def test_a_teacher_built_on_the_first_stage_only_does_not_wait_for_the_other_ranks(tmp_path):
+    run_workers(_one_stage_builds_worker, (str(tmp_path / 'init'), False), nprocs=2)
+
+
+def test_one_at_a_time_runs_its_body_without_barriers_inside_barriers_off(monkeypatch):
+    from utils import common
+    barriers = []
+    monkeypatch.setattr(common.dist, 'barrier', lambda *a, **k: barriers.append(1), raising=False)
+    monkeypatch.setenv('LOCAL_SIZE', '3')
+    monkeypatch.setenv('LOCAL_RANK', '1')
+    ran = []
+    with common.barriers_off():
+        with common.one_at_a_time():
+            ran.append('inside')
+            with common.barriers_off():
+                pass
+            with common.one_at_a_time():
+                ran.append('nested')
+    assert ran == ['inside', 'nested'] and barriers == []
+    # Back to normal outside: one barrier per local rank, the body once, on this rank's turn.
+    with common.one_at_a_time():
+        ran.append('turn')
+    assert ran[-1] == 'turn' and len(barriers) == 3
+
+
+def test_barriers_off_is_undone_when_the_body_fails():
+    from utils import common
+    with pytest.raises(KeyError):
+        with common.barriers_off():
+            raise KeyError('x')
+    assert common._barriers_off == 0
+
+
+def test_build_teacher_keeps_the_barriers_when_every_rank_runs_it(monkeypatch):
+    from utils import common
+    states = []
+
+    class Probe(ToyPipeline):
+        def make_teacher_layers(self, path=None):
+            states.append(common._barriers_off)
+            return super().make_teacher_layers(path)
+
+    mt.build_teacher(Probe(), parse(), torch.device('cpu'), runs_teacher=True)
+    mt.build_teacher(Probe(), parse(), torch.device('cpu'), runs_teacher=True, all_ranks_run=False)
+    assert states == [0, 1] and common._barriers_off == 0
+
+
+def test_train_py_shares_a_teacher_build_failure_with_every_rank():
+    import re
+    from pathlib import Path
+    source = (Path(__file__).resolve().parent.parent / 'train.py').read_text()
+    start = source.index('teacher = model_teacher.build_teacher(')
+    block = source[start - 300:start + 700]
+    assert re.search(r'try:\s+teacher = model_teacher\.build_teacher\(', block)
+    assert 'all_ranks_run=config.get(\'pipeline_stages\', 1) == 1' in block
+    assert block.index('except Exception as e:') < block.index('all_ok(error)')
+
+
+# a teacher that has faded out, and one that must not count as the student's fp8 attention
+
+def test_finished_is_the_step_the_decay_reaches_zero():
+    teacher = mt.ModelTeacher(parse(decay='linear', decay_steps=10))
+    for step, finished in [(1, False), (9, False), (10, True), (11, True), (10_000, True)]:
+        teacher.set_step(step)
+        assert teacher.finished() is finished, step
+        assert (teacher.lam() == 0) is finished
+    for decay in ('cosine',):
+        teacher = mt.ModelTeacher(parse(decay=decay, decay_steps=5))
+        teacher.set_step(4)
+        assert not teacher.finished()
+        teacher.set_step(5)
+        assert teacher.finished() and teacher.lam() == 0
+    # Without a decay the term never fades.
+    teacher = mt.ModelTeacher(parse())
+    teacher.set_step(10 ** 9)
+    assert not teacher.finished() and teacher.lam() == 0.5
+
+
+class CountingTeacher(mt.ModelTeacher):
+    runs = 0
+
+    def run(self, features):
+        type(self).runs += 1
+        return super().run(features)
+
+
+def test_a_finished_teacher_stops_running_and_the_label_keeps_its_shape():
+    pipeline = ToyPipeline()
+    teacher = CountingTeacher(parse(decay='linear', decay_steps=4), select=pipeline.teacher_targets_of)
+    layers = mt.build_teacher(pipeline, parse(), torch.device('cpu'), runs_teacher=True).layers
+    teacher.layers = layers
+    CountingTeacher.runs = 0
+    loader = make_loader([batch_of(4, seed=3), batch_of(4, seed=4)], gas=1, teacher=teacher)
+    teacher.set_step(3)
+    _, label = next(loader)
+    # The loader keeps one batch ahead: this one and the next went through the teacher.
+    assert CountingTeacher.runs == 2 and len(label) == 3 and label[2].abs().sum() > 0
+    teacher.set_step(4)
+    _, label = next(loader)
+    assert label[2].abs().sum() > 0, 'the batch that was already prefetched keeps the teacher output it was given'
+    assert CountingTeacher.runs == 2, 'the teacher ran after its lambda reached 0'
+    _, label = next(loader)
+    assert CountingTeacher.runs == 2
+    target, mask, zeros = label
+    assert zeros.shape == target.shape and zeros.dtype == target.dtype and not zeros.any()
+    # The loss for such a batch is the plain data loss (lambda is 0).
+    loss = mt.wrap_loss_fn(lambda output, lbl: F.mse_loss(output, lbl[0]), teacher)(torch.zeros_like(target).requires_grad_(), label)
+    assert torch.equal(loss, F.mse_loss(torch.zeros_like(target), target))
+
+
+def _finished_two_stage_worker(rank, init_file, out_dir):
+    import os
+    os.environ.setdefault('DS_ACCELERATOR', 'cpu')
+    os.environ['LOCAL_RANK'] = str(rank)
+    import deepspeed
+    deepspeed.init_distributed('gloo', auto_mpi_discovery=False, init_method=f'file://{init_file}',
+                               rank=rank, world_size=2, verbose=False)
+    dataset_util._broadcast_device = lambda: 'cpu'
+    grid = types.SimpleNamespace(pp_group=[0, 1], stage_to_global=lambda stage: stage)
+    engine = types.SimpleNamespace(is_pipe_parallel=True, num_stages=2, grid=grid,
+                                   is_first_stage=lambda: rank == 0, is_last_stage=lambda: rank == 1)
+    pipeline = ToyPipeline()
+    teacher = mt.build_teacher(pipeline, parse(decay='linear', decay_steps=2), torch.device('cpu'),
+                               runs_teacher=(rank == 0))
+    teacher.set_step(2)
+    loader = make_loader([batch_of(4, seed=8)], gas=2, teacher=teacher, engine=engine)
+    labels = [next(loader)[1] for _ in range(2)]
+    torch.save({'labels': labels}, f'{out_dir}/rank{rank}.pt')
+    dist.barrier()
+    dist.destroy_process_group()
+
+
+def test_a_finished_teacher_still_pairs_the_sends_with_the_last_stage(tmp_path):
+    run_workers(_finished_two_stage_worker, (str(tmp_path / 'init'), str(tmp_path)), nprocs=2)
+    first = torch.load(tmp_path / 'rank0.pt')['labels']
+    last = torch.load(tmp_path / 'rank1.pt')['labels']
+    for (t0, m0, z0), (t1, m1, z1) in zip(first, last):
+        assert torch.equal(t0, t1) and not z0.any() and not z1.any() and z1.shape == t1.shape
+
+
+def test_the_teacher_runs_in_bf16_whatever_the_students_fp8_attention_is_doing():
+    from utils import fp8_training
+    seen = []
+
+    class Spy(nn.Module):
+        def forward(self, x):
+            seen.append(fp8_training._disabled)
+            return x
+
+    teacher = mt.ModelTeacher(parse(), layers=[Spy()], select=lambda x: x)
+    teacher.run(torch.zeros(1))
+    assert seen == [1] and fp8_training._disabled == 0
+    with fp8_training.disabled():
+        teacher.run(torch.zeros(1))
+    assert seen == [1, 2] and fp8_training._disabled == 0
+
+
+def test_wan_encodes_text_in_eval_mode_so_the_teacher_and_the_student_see_the_same_embeddings():
+    import re
+    from pathlib import Path
+    source = (Path(__file__).resolve().parent.parent / 'models' / 'wan' / 'wan.py').read_text()
+    assert re.search(r'self\.text_encoder\.eval\(\)\s+with torch\.no_grad\(\):\s+context = self\.text_encoder\(', source)

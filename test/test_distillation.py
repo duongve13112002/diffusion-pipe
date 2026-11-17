@@ -1,6 +1,8 @@
 """[teacher] distillation for MOSS-Image: utils/distillation.py (config and loss) and the teacher forward
 that rides the pipeline layers of models/moss_image.py (CPU, a tiny model)."""
 
+import copy
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -9,7 +11,7 @@ from torch.utils.checkpoint import checkpoint
 from models import moss_image as mi
 from test.test_moss_image import (LORA, Runner, bare_pipeline, caption_batch, forward_inputs,  # noqa: F401
                                   loaded_pipeline, on_the_fly_pipelines, reference_forward, single_process,
-                                  tiny_reference, trained_lora_pipeline)
+                                  tiny_reference, tiny_state, trained_lora_pipeline, write_transformer_dir)
 from test.test_stream_loss import ALL, spec_of
 from utils.distillation import (DistillConfig, distill_loss, distill_warnings, elementwise_loss,
                                 parse_distill_config)
@@ -53,6 +55,7 @@ def test_defaults():
     ({'decay': 'cosine', 'decay_steps': 0}, 'decay_steps'),
     ({'decay_steps': -3}, 'decay_steps'),
     ({'decay_steps': 2.5}, 'decay_steps'),
+    ({'decay_steps': 100}, "does not apply with decay = 'none'"),
 ])
 def test_bad_tables_are_refused(table, match):
     with pytest.raises(ValueError, match=match):
@@ -160,6 +163,9 @@ def distilling_pipeline(lora=False, distill=None, stream=None, reference=None):
         for p in pipe.diffusion_model.parameters():
             p.requires_grad_(True)
     pipe.distill = distill or cfg(loss_weight=1.0)
+    if not lora:
+        # what load_diffusion_model keeps for a full fine-tune
+        pipe.teacher_snapshot = copy.deepcopy(pipe.diffusion_model)
     pipe.config = {'adapter': dict(LORA)} if lora else {}
     pipe.training_step = 1
     if stream is not None:
@@ -406,6 +412,7 @@ def test_the_teacher_reads_the_embeddings_the_text_layer_encodes_on_the_fly(monk
     with torch.no_grad():
         expected = on_the_fly.pipeline_model(tuple(t.clone() for t in inputs))
     on_the_fly.distill = cfg(loss_weight=1.0)
+    on_the_fly.teacher_snapshot = copy.deepcopy(on_the_fly.diffusion_model)
     on_the_fly.config = {}
     on_the_fly.pipeline_model = Runner(on_the_fly.to_layers())
     for p in on_the_fly.diffusion_model.parameters():
@@ -466,3 +473,73 @@ def test_the_teacher_can_be_another_checkpoint(monkeypatch, lora):
             p.add_(0.05 * torch.randn_like(p))
     _, again = pipe.pipeline_model((x, t, text, mask))
     torch.testing.assert_close(again, expected, rtol=1e-5, atol=1e-5)
+
+
+def loading_pipeline(tmp_path, model_config=None, config=None, distill=None):
+    path = write_transformer_dir(tiny_state(tiny_reference()), tmp_path / 'transformer')
+    pipe = bare_pipeline(dict(model_config or {}), dict(config or {}))
+    pipe.transformer_path = str(path)
+    pipe.distill = distill
+    return pipe
+
+
+def test_a_full_fine_tune_copies_the_starting_model_when_it_loads_not_when_the_layers_are_built(tmp_path):
+    # fp8 training swaps the student's modules between load_diffusion_model and to_layers(): a copy made in
+    # to_layers() would carry the swap, so the one made at load time is the teacher.
+    pipe = loading_pipeline(tmp_path, distill=cfg())
+    pipe.load_diffusion_model()
+    snapshot = pipe.teacher_snapshot
+    assert snapshot is not None and snapshot is not pipe.diffusion_model
+    assert not any(p.requires_grad and p is q for p in snapshot.parameters() for q in pipe.diffusion_model.parameters())
+    before = {n: p.detach().clone() for n, p in snapshot.named_parameters()}
+    with torch.no_grad():
+        for p in pipe.diffusion_model.parameters():
+            p.add_(1.0)
+    pipe.diffusion_model.layers[0].norm1 = torch.nn.Identity()  # what fp8_training.prepare_model stands for
+    forward = pipe.build_teacher()
+    assert forward is not None
+    block = forward.layers[1].block
+    assert not isinstance(block.norm1, torch.nn.Identity)
+    for name, p in block.named_parameters():
+        assert torch.equal(before[f'layers.0.{name}'], p.detach().cpu()), name
+
+
+@pytest.mark.parametrize('name, kwargs', [
+    ('no teacher', {}),
+    ('an adapter', {'config': {'adapter': dict(LORA)}, 'distill': True}),
+    ('a path', {'distill': 'path'}),
+])
+def test_only_a_full_fine_tune_without_path_copies_the_model_at_load(tmp_path, name, kwargs):
+    distill = {None: None, True: cfg(), 'path': cfg(path='/elsewhere')}[kwargs.get('distill')]
+    pipe = loading_pipeline(tmp_path, config=kwargs.get('config'), distill=distill)
+    pipe.load_diffusion_model()
+    assert pipe.teacher_snapshot is None
+
+
+def test_another_stage_does_not_copy_the_model(monkeypatch, tmp_path):
+    monkeypatch.setattr(mi, 'rank_and_world_size', lambda: (1, 2))
+    pipe = loading_pipeline(tmp_path, config={'pipeline_stages': 2}, distill=cfg())
+    pipe.load_diffusion_model()
+    assert pipe.teacher_snapshot is None
+
+
+def test_a_teacher_that_was_not_copied_at_load_is_an_error():
+    pipe = loaded_pipeline(tiny_reference())
+    pipe.distill = cfg()
+    pipe.config = {}
+    with pytest.raises(RuntimeError, match='not copied by load_diffusion_model'):
+        pipe.build_teacher()
+
+
+def test_the_path_teacher_does_not_merge_the_students_adapters(monkeypatch, tmp_path):
+    pipe = loading_pipeline(tmp_path, model_config={'merge_adapters': ['/student/adapter']}, distill=cfg(path='/other'))
+    seen = []
+
+    def record(self):
+        seen.append((self.transformer_path, dict(self.model_config)))
+        self.diffusion_model = 'loaded'
+
+    monkeypatch.setattr(mi.MossImagePipeline, 'load_diffusion_model', record)
+    assert pipe.load_teacher_model('/other') == 'loaded'
+    assert seen == [('/other', {})]
+    assert pipe.model_config == {'merge_adapters': ['/student/adapter']} and pipe.transformer_path != '/other'

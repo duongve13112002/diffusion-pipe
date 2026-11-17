@@ -99,6 +99,9 @@ def parse_distill_config(config):
     decay_steps = table.get('decay_steps', 0)
     if isinstance(decay_steps, bool) or not isinstance(decay_steps, int) or decay_steps < 0:
         raise ValueError(f'[{KEY}] decay_steps must be a whole number >= 0, got {decay_steps!r}')
+    if decay == 'none' and decay_steps > 0:
+        raise ValueError(f"[{KEY}] decay_steps does not apply with decay = 'none' (nothing falls): set decay = 'linear' "
+                         "or 'cosine', or remove decay_steps")
     if decay != 'none' and decay_steps <= 0:
         raise ValueError(f'[{KEY}] decay = {decay!r} needs decay_steps > 0 (the optimizer steps over which '
                          "lambda falls to 0); use decay = 'none' to keep the term on for the whole run")

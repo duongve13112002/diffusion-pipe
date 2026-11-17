@@ -184,14 +184,18 @@ with one GPU, several, several nodes and any `pipeline_stages`.
   `[model]` reads its own weights: the same key (`transformer_path`, `diffusion_model`, `diffusers_path` for
   SD3 / OmniGen2 / HiDream, `single_file_path` for LTX-Video, `checkpoint_path` for SDXL, ...), format and dtype
   handling. Adapters the student's base is merged with (`merge_adapters`, `fuse_adapters`) are not applied to a
-  `path` teacher: it is the finished model. The text encoders, the VAE and the latent space are the student's
+  `path` teacher: it is the finished model (nor the student's `context_refiner_path` / `llm_adapter_path` of
+  an anima, nor the `pdd_heads` / `diffusion_model_format` of a MiniMax-H3 transformer). The text encoders, the VAE and the latent space are the student's
   (SDXL aside: its text encoders train with the UNet, so its teacher is a whole second pipeline).
 - The teacher is a second chain of the model's own layers on the first pipeline stage, no gradients, eval mode.
   It runs on the same inputs as the student (the noisy latents, timesteps and text embeddings the batch
   carries) and its output travels to the last stage with the targets, so no layer needs to pass anything on. A
   full copy of the transformer sits on the GPU of every first-stage rank on top of the student: that stage
   needs the memory (about the size of the weights in `dtype`), and the loading peaks the CPU RAM of every
-  rank on it by the same amount. Neither has been measured on a GPU.
+  rank on it by the same amount. Neither has been measured on a GPU. Once `decay` has brought lambda to 0 (step
+  `decay_steps`) the teacher no longer runs: the loss ignores it from there on, and the label carries zeros.
+  Under `[fp8_training]` the teacher runs in bf16, and MOSS-Image's full fine-tune teacher (without `path`) is
+  copied from the model before fp8 touches it.
 - Evaluation batches (`[eval_datasets]`) report the plain loss, without the distillation term. The step log has
   the combined `train/loss`.
 - `[teacher] path` and an anima_refiner: a table that names `transformer_path` or `llm_path` is the older
@@ -200,8 +204,11 @@ with one GPU, several, several nodes and any `pipeline_stages`.
   its own teacher (random weights), and `path` cannot be combined with the Anima keys.
 - Refused, naming the key: `shape`, `t_mid` and `width` (a loss weight that follows the noise level needs the
   noise level of each sample, which only MOSS-Image hands to its loss), unknown keys, `blocks_to_swap`, an
-  `[adapter]` with `init_from_existing` unless `path` is set, `decay` other than `none` without `decay_steps`,
+  `[adapter]` with `init_from_existing` unless `path` is set, `decay` other than `none` without `decay_steps`, `decay_steps` with `decay = 'none'`,
   and Iris with `repa_weight > 0`. `decay = 'none'` is warned about: the term then never fades.
+- Wan with `cache_text_embeddings = false`: the umt5 encoder now always encodes in eval mode. DeepSpeed's `train()`
+  had left its dropout on, so the student trained on dropout-noised embeddings (and a teacher sharing the encoder
+  would have drawn other masks). This changes Wan runs with on-the-fly text whether or not `[teacher]` is on.
 - Not run on a GPU or with real weights yet. Not measured: the speed cost of the extra forward, the memory, whether
   distillation helps image quality on your data. Judge it from your samples.
 
