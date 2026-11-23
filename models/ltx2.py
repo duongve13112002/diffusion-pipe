@@ -11,7 +11,7 @@ from torch import nn
 import torch.nn.functional as F
 import safetensors
 
-from models.base import ComfyPipeline, make_contiguous, ModelWrapper, PreprocessMediaFile
+from models.base import ComfyPipeline, make_contiguous, ModelWrapper, PreprocessMediaFile, tie_unused
 from utils.common import AUTOCAST_DTYPE, get_lin_function, time_shift, is_main_process, one_at_a_time
 from utils.offloading import ModelOffloader
 import comfy.ldm.common_dit
@@ -630,9 +630,14 @@ class FinalLayer(nn.Module):
             av_ca_video_scale_shift_timestep, av_ca_audio_scale_shift_timestep, av_ca_a2v_gate_noise_timestep, av_ca_v2a_gate_noise_timestep, v_prompt_timestep, a_prompt_timestep, v_embedded_timestep, a_embedded_timestep, orig_shape
         ) = inputs
         # TODO: this will return a list with 2 elements when audio is enabled (currently single tensor)
-        return self._process_output(
+        out = self._process_output(
             [vx, ax],
             [v_embedded_timestep, a_embedded_timestep],
             keyframe_idxs=None,
             orig_shape=orig_shape.tolist(),
         )
+        # With audio off none of the audio entries is read by any block or here, and the last pipeline stage needs a
+        # gradient for every floating tensor it received.
+        return tie_unused(out, ax, a_context, a_timestep, a_freq_cis, av_cross_video_freq_cis, av_cross_audio_freq_cis,
+                          av_ca_video_scale_shift_timestep, av_ca_audio_scale_shift_timestep,
+                          av_ca_a2v_gate_noise_timestep, av_ca_v2a_gate_noise_timestep, a_prompt_timestep)

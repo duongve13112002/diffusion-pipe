@@ -71,6 +71,22 @@ def make_contiguous(*values):
     return tuple(x.contiguous() if torch.is_tensor(x) else x for x in values)
 
 
+def tie_unused(out, *unused):
+    """`out` (a tensor, or a list or tuple whose first element is one) with a zero-weight dependency on the floating
+    tensors a layer receives and never reads.
+
+    DeepSpeed's last pipeline stage asserts that every floating tensor it received got a gradient to send back
+    (engine.py, _exec_send_grads), so a tuple entry that nothing in the stage uses (LTX-2's audio tensors when audio
+    is off) would stop the first backward. The zero term gives it a zero gradient and changes nothing else."""
+    first = out if torch.is_tensor(out) else out[0]
+    for t in unused:
+        if torch.is_tensor(t) and torch.is_floating_point(t) and t.requires_grad:
+            first = first + t.reshape(-1)[:1].sum().to(first.dtype) * 0
+    if torch.is_tensor(out):
+        return first
+    return type(out)([first, *out[1:]]) if isinstance(out, (list, tuple)) else out
+
+
 def convert_to_rgb(pil_img):
     """RGB as the dataset reads every image: transparency composited onto white."""
     if pil_img.mode not in ['RGB', 'RGBA'] and 'transparency' in pil_img.info:

@@ -8,7 +8,7 @@ from torch import nn
 import torch.nn.functional as F
 from torch.nn.utils.rnn import pad_sequence
 
-from models.base import ComfyPipeline, make_contiguous, checkpoint_transformer_config
+from models.base import ComfyPipeline, make_contiguous, checkpoint_transformer_config, tie_unused
 from utils.common import AUTOCAST_DTYPE, get_lin_function, time_shift
 from utils.offloading import ModelOffloader
 import comfy.ldm.common_dit
@@ -277,4 +277,4 @@ class FinalLayer(nn.Module):
         x = self.final_layer(x, adaln_input)
         h, w = img_size[0]  # same for all items in batch
         x = self.unpatchify(x, img_size, cap_size, return_tensor=True)[:,:,:h,:w]
-        return x
+        return tie_unused(x, freqs_cis)

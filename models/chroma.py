@@ -13,7 +13,7 @@ from safetensors.torch import save_file
 from accelerate import init_empty_weights
 import peft
 
-from models.base import BasePipeline, make_contiguous
+from models.base import BasePipeline, make_contiguous, tie_unused
 from utils.common import AUTOCAST_DTYPE, load_state_dict
 from utils.offloading import ModelOffloader
 from src.models.chroma.model import Chroma, chroma_params, modify_mask_to_attend_padding
@@ -516,4 +516,5 @@ class FinalLayer(nn.Module):
         img = self.final_layer(
             img, distill_vec=final_mod
         )  # (N, T, patch_size ** 2 * out_channels)
-        return img
+        # txt and pe are only read by the blocks; a last stage needs a gradient for every floating tensor it received.
+        return tie_unused(img, txt, pe)

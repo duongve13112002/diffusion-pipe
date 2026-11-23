@@ -11,7 +11,7 @@ import safetensors
 from accelerate import init_empty_weights
 from safetensors.torch import save_file
 
-from models.base import BasePipeline, make_contiguous
+from models.base import BasePipeline, make_contiguous, tie_unused
 from utils.dora import DORA_SCALE, check_init_matches, has_dora_scale, kohya_module_name, saved_key
 from utils.common import AUTOCAST_DTYPE, is_main_process
 
@@ -1073,4 +1073,6 @@ class FinalLayer(nn.Module):
         if self.conv_norm_out:
             sample = self.conv_norm_out(sample)
             sample = self.conv_act(sample)
-        return self.conv_out(sample), timesteps
+        # a last stage made only of attention-free up blocks never reads emb or encoder_hidden_states, and it needs a
+        # gradient for every floating tensor it received
+        return tie_unused(self.conv_out(sample), emb, encoder_hidden_states), timesteps

@@ -11,7 +11,7 @@ import accelerate
 from einops import rearrange
 import safetensors
 
-from models.base import BasePipeline, PreprocessMediaFile, make_contiguous
+from models.base import BasePipeline, PreprocessMediaFile, make_contiguous, tie_unused
 from utils.common import load_state_dict, AUTOCAST_DTYPE, is_main_process
 from cosmos1.models.diffusion.inference.inference_utils import load_model_by_config
 from cosmos1.models.autoregressive.tokenizer.modules import EncoderFactorized, DecoderFactorized, CausalConv3d
@@ -368,6 +368,12 @@ class InitialLayer(nn.Module):
                 x.shape == extra_pos_emb_B_T_H_W_D_or_T_H_W_B_D.shape
             ), f"{x.shape} != {extra_pos_emb_B_T_H_W_D_or_T_H_W_B_D.shape} {original_shape}"
 
+        # Built from buffers and parameters only (and a frozen base has no graph at all under an adapter): a stage
+        # boundary's backward needs every floating output to require grad.
+        rope_emb_L_1_1_D.requires_grad_(True)
+        if extra_pos_emb_B_T_H_W_D_or_T_H_W_B_D is not None:
+            extra_pos_emb_B_T_H_W_D_or_T_H_W_B_D.requires_grad_(True)
+
         original_shape = torch.tensor(original_shape)
         return make_contiguous(
             x,
@@ -442,4 +448,6 @@ class FinalLayer(nn.Module):
         sigma = sigma.view(-1, 1, 1, 1, 1)
         x0_pred = c_skip*x_t + c_out*output
         weights_per_sigma = get_per_sigma_loss_weights(sigma)
+        # the fused rope kernel gives rope_emb no gradient, and a last stage needs one for every floating tensor it received
+        x0_pred = tie_unused(x0_pred, rope_emb_L_1_1_D, extra_pos_emb_B_T_H_W_D_or_T_H_W_B_D, crossattn_emb)
         return x0_pred, weights_per_sigma

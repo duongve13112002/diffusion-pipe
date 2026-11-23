@@ -11,7 +11,7 @@ import safetensors
 from accelerate import init_empty_weights
 from accelerate.utils import set_module_tensor_to_device
 
-from models.base import BasePipeline, PreprocessMediaFile, make_contiguous
+from models.base import BasePipeline, PreprocessMediaFile, make_contiguous, tie_unused
 from utils.common import AUTOCAST_DTYPE, get_lin_function, time_shift, get_t_distribution, slice_t_distribution, sample_t, load_state_dict
 from utils.offloading import ModelOffloader
 from .t5 import T5EncoderModel
@@ -572,4 +572,4 @@ class FinalLayer(nn.Module):
         x, e, e0, seq_lens, grid_sizes, freqs, context = inputs
         x = self.head(x, e)
         x = self.unpatchify(x, grid_sizes)
-        return torch.stack(x, dim=0)
+        return tie_unused(torch.stack(x, dim=0), e0, context)
