@@ -222,8 +222,9 @@ class InitialLayer(nn.Module):
         # (cos, sin, -sin) tuple precompute_freqs_cis returns).
         freqs_cis = _split_half_rope_matrix(freqs_cis)
 
-        if attn_mask.dtype == torch.bool:
-            attn_mask = torch.zeros_like(attn_mask, dtype=h.dtype).masked_fill_(~attn_mask, -torch.finfo(h.dtype).max)
+        # The mask travels as bool (no gradient, half the memory); every TransformerLayer turns it into the additive
+        # float mask. A float constant in the tuple would reach a stage's backward without a graph (pipeline_stages > 1).
+        freqs_cis.requires_grad_(True)
 
         sizes = torch.tensor([L_text, gh, gw], device=h.device)
 
@@ -242,7 +243,10 @@ class TransformerLayer(nn.Module):
         h, attn_mask, adaln_input, sizes, freqs_cis = inputs
 
         self.offloader.wait_for_block(self.block_idx)
-        h = self.layer(h, attn_mask, freqs_cis, adaln_input)
+        additive_mask = attn_mask
+        if attn_mask.dtype == torch.bool:
+            additive_mask = torch.zeros_like(attn_mask, dtype=h.dtype).masked_fill_(~attn_mask, -torch.finfo(h.dtype).max)
+        h = self.layer(h, additive_mask, freqs_cis, adaln_input)
         self.offloader.submit_move_blocks_forward(self.block_idx)
 
         return make_contiguous(h, attn_mask, adaln_input, sizes, freqs_cis)
