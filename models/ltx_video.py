@@ -242,13 +242,6 @@ class InitialLayer(nn.Module):
     def forward(self, inputs):
         (hidden_states, encoder_hidden_states, encoder_attention_mask, timestep, indices_grid) = inputs
 
-        # convert encoder_attention_mask to a bias the same way we do for attention_mask
-        if encoder_attention_mask is not None and encoder_attention_mask.ndim == 2:
-            encoder_attention_mask = (
-                1 - encoder_attention_mask.to(hidden_states.dtype)
-            ) * -10000.0
-            encoder_attention_mask = encoder_attention_mask.unsqueeze(1)
-
         hidden_states = self.patchify_proj(hidden_states)
 
         if self.timestep_scale_multiplier:
@@ -283,6 +276,15 @@ class InitialLayer(nn.Module):
         return outputs
 
 
+def encoder_attention_bias(encoder_attention_mask, dtype):
+    """A 0/1 prompt mask of shape (B, S) as the additive bias (B, 1, S) the blocks take. The mask crosses the
+    pipeline stages as it is and this runs in each block: a float bias would be marked as requiring grad by every
+    stage that receives it, which turns off FlashAttention and fp8 attention."""
+    if encoder_attention_mask is not None and encoder_attention_mask.ndim == 2:
+        return ((1 - encoder_attention_mask.to(dtype)) * -10000.0).unsqueeze(1)
+    return encoder_attention_mask
+
+
 class TransformerLayer(nn.Module):
     def __init__(self, block):
         super().__init__()
@@ -296,7 +298,7 @@ class TransformerLayer(nn.Module):
             freqs_cis=(freqs_cos, freqs_sin),
             attention_mask=None,
             encoder_hidden_states=encoder_hidden_states,
-            encoder_attention_mask=encoder_attention_mask,
+            encoder_attention_mask=encoder_attention_bias(encoder_attention_mask, hidden_states.dtype),
             timestep=timestep,
         )
         return make_contiguous(hidden_states, encoder_hidden_states, timestep, embedded_timestep, freqs_cos, freqs_sin, encoder_attention_mask)

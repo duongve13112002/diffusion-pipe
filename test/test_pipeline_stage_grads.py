@@ -184,3 +184,38 @@ def test_a_stage_returning_one_tensor_is_tied_too(monkeypatch):
     assert torch.is_tensor(out)
     out.sum().backward()
     assert received[1].grad is not None
+
+
+def test_ltx2_carries_its_text_mask_as_integers_and_builds_the_additive_mask_in_each_block():
+    from comfy.ldm.lightricks.model import LTXVModel
+    from models.ltx2 import additive_attention_mask
+
+    mask = torch.tensor([[1, 1, 0, 1], [1, 0, 0, 0]], dtype=torch.int32)
+    for dtype in (torch.float32, torch.bfloat16):
+        expected = LTXVModel._prepare_attention_mask(object(), mask, dtype)
+        got = additive_attention_mask(mask, dtype)
+        assert got.dtype == dtype and got.shape == (2, 1, 1, 4)
+        assert torch.equal(got, expected)
+    already = torch.zeros(2, 1, 1, 4)
+    assert additive_attention_mask(already, torch.float32) is already
+    assert additive_attention_mask(None, torch.float32) is None
+    initial = method_source('ltx2.py', 'InitialLayer', 'forward')
+    assert 'self._prepare_attention_mask(' not in initial and 'attention_mask.int()' in initial
+    block = method_source('ltx2.py', 'TransformerLayer', 'forward')
+    assert 'attention_mask=additive_attention_mask(attention_mask, vx.dtype)' in block
+    assert 'return (\n            vx, ax, v_context, a_context, attention_mask,' in block
+
+
+def test_ltx_video_carries_its_prompt_mask_as_it_is_and_builds_the_bias_in_each_block():
+    from models.ltx_video import encoder_attention_bias
+
+    mask = torch.tensor([[1, 0, 1], [1, 1, 0]])
+    got = encoder_attention_bias(mask, torch.bfloat16)
+    assert got.dtype == torch.bfloat16 and got.shape == (2, 1, 3)
+    assert torch.equal(got, ((1 - mask.to(torch.bfloat16)) * -10000.0).unsqueeze(1))
+    bias = torch.zeros(2, 1, 3)
+    assert encoder_attention_bias(bias, torch.float32) is bias
+    assert encoder_attention_bias(None, torch.float32) is None
+    assert '-10000' not in method_source('ltx_video.py', 'InitialLayer', 'forward')
+    block = method_source('ltx_video.py', 'TransformerLayer', 'forward')
+    assert 'encoder_attention_bias(encoder_attention_mask, hidden_states.dtype)' in block

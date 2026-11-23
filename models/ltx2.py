@@ -45,6 +45,15 @@ def encode_token_weights(self, token_weight_pairs):
 comfy.text_encoders.lt.LTXAVTEModel.encode_token_weights = encode_token_weights
 
 
+def additive_attention_mask(attention_mask, dtype):
+    """ComfyUI's LTXVModel._prepare_attention_mask: a 0/1 key mask as an additive mask of shape (B, 1, 1, S). The
+    mask crosses the pipeline stages as integers and is turned into this in each block: a float mask would be
+    marked as requiring grad by every stage that receives it, which turns off FlashAttention and fp8 attention."""
+    if attention_mask is not None and not torch.is_floating_point(attention_mask):
+        return (attention_mask - 1).to(dtype).reshape((attention_mask.shape[0], 1, -1, attention_mask.shape[-1])) * torch.finfo(dtype).max
+    return attention_mask
+
+
 # patch to remove in-place operations (doesn't work with training)
 def forward(
     self, x: Tuple[torch.Tensor, torch.Tensor], v_context=None, a_context=None, attention_mask=None, v_timestep=None, a_timestep=None,
@@ -493,7 +502,7 @@ class InitialLayer(nn.Module):
         assert attention_mask.dtype == torch.bool and attention_mask.ndim == 2
 
         context, attention_mask = self.preprocess_text_embeds(context, attention_mask)
-        # convert attention_mask bool -> int so _prepare_attention_mask() works
+        # bool -> int: the mask travels between the stages as integers (see additive_attention_mask)
         attention_mask = attention_mask.int()
 
         x = [vx]
@@ -513,7 +522,6 @@ class InitialLayer(nn.Module):
         merged_args["prompt_timestep"] = prompt_timestep
         context, attention_mask = self._prepare_context(context, batch_size, x, attention_mask)
 
-        attention_mask = self._prepare_attention_mask(attention_mask, input_dtype)
         pe = self._prepare_positional_embeddings(pixel_coords, self.framerate, input_dtype)
 
         # Always None
@@ -584,7 +592,7 @@ class TransformerLayer(nn.Module):
             (vx, ax),
             v_context=v_context,
             a_context=a_context,
-            attention_mask=attention_mask,
+            attention_mask=additive_attention_mask(attention_mask, vx.dtype),
             v_timestep=v_timestep,
             a_timestep=a_timestep,
             v_pe=(v_freq_cis, self.split_mode),
