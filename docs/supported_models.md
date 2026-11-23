@@ -39,6 +39,7 @@ See [source snapshots and cache profiles](caption-processing.md#source-snapshots
 |Qwen-Image-2.1  |✅    |✅              |✅                |
 |Iris-3B         |✅    |✅              |❌                |
 |MOSS-Image      |✅    |✅              |✅                |
+|MiniMax-H3-Image|✅    |✅              |✅                |
 
 The models loaded from ComfyUI files (Z-Image, HunyuanVideo-1.5, Flux 2, Ernie-Image, LTX 2.3,
 Ideogram4, Krea 2, MiniMax H3, MiniMax-H3-Image, P-H3-Image, Qwen-Image-2.1, MOSS-Image) encode captions as ComfyUI encodes a
@@ -785,6 +786,11 @@ The official layout's six heads are in `pdd_fused_heads.safetensors` at the repo
 it is elsewhere); without it only the base head is there and previews are not available as the six-step sampler.
 Whatever the input, the saved full fine-tune is ComfyUI's single file (the heads stacked as ComfyUI reads them, the
 sigma grid in its metadata) and LoRAs load in ComfyUI's own loaders.
+
+This is the fork's own implementation, `type = 'minimax_h3_image'`. Upstream diffusion-pipe trains the same checkpoint
+as `type = 'minimax_h3'` (its transformer carries the audio-less head layout and blends the PDD heads itself); here
+`type = 'minimax_h3'` with a PDD checkpoint is refused with a message naming `minimax_h3_image`. Upstream's recipe also
+merges circlestone-labs' undistill LoRA (MiniMax-H3-Image-Undistill-Lora); it has not been tried with this implementation.
 ```
 [model]
 type = 'minimax_h3_image'

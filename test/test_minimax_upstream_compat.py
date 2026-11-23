@@ -65,7 +65,7 @@ def test_block_uses_an_attention_passed_by_comfyui():
     assert not torch.allclose(patched_out, block(x, t_emb, [(0, 3, 0)], None))
 
 
-def test_attention_hands_comfyui_its_own_attention_object(monkeypatch):
+def test_attention_uses_the_regular_attention_not_the_checkpoints_choice(monkeypatch):
     import models.minimax_h3 as minimax_h3
     from comfy.ldm.modules.attention import AttentionTensorContainer
     attention = Attention(8, 2, 4, 1e-6, dtype=torch.float32, device='cpu', operations=disable_weight_init)
@@ -77,5 +77,16 @@ def test_attention_hands_comfyui_its_own_attention_object(monkeypatch):
 
     monkeypatch.setattr(minimax_h3, 'optimized_attention', spy)
     attention(torch.randn(2, 3, 8))
-    assert seen['preferred_attention'] is attention.comfy_attention
+    # an int8 convrot checkpoint's ComfyAttention config would pick an int8 attention kernel, which cannot train
+    assert 'preferred_attention' not in seen
     assert seen['containers'] == [AttentionTensorContainer] * 3
+
+
+def test_timestep_rows_are_per_kind_not_per_distinct_value():
+    # t_v and t_a coincide at some sigmas (1.0). Rows deduplicated by value then number 2 in one sample and 3 in
+    # another, and the batch's t_emb could not be stacked.
+    import inspect
+    import models.minimax_h3 as minimax_h3
+    source = inspect.getsource(minimax_h3.InitialLayer.make_packed_sequence)
+    assert 'unique_t' not in source
+    assert 'kind_row = {kind: i for i, kind in enumerate(seg_t)}' in source

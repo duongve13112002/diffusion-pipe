@@ -105,8 +105,6 @@ Models supported: SDXL, Flux, LTX-Video, HunyuanVideo (t2v), Cosmos, Lumina Imag
   - Initial LTX 2.3 support. Only T2I and T2V training for now, and no audio.
 - 2026-04-23
   - Support Ernie-Image.
-- 2026-02-04
-  - Support Anima.
 
 ## Windows support
 It will be difficult or impossible to make training work on native Windows. This is because Deepspeed only has [partial Windows support](https://github.com/microsoft/DeepSpeed/blob/master/blogs/windows/08-2024/README.md). Deepspeed is a hard requirement because the entire training script is built around Deepspeed pipeline parallelism. However, it will work on Windows Subsystem for Linux, specifically WSL 2. If you must use Windows I recommend trying WSL 2.
@@ -159,15 +157,6 @@ pip install flash-attn
 pip install --no-build-isolation 'transformer_engine[pytorch]'
 python tools/check_fp8_training.py
 ```
-
-### Cosmos requirements
-NVIDIA Cosmos (the original Cosmos video model, not Cosmos-Predict2) additionally requires TransformerEngine.
-
-This dependency isn't in the requirements file. You probably need to set some environment variables for it to install correctly. The following command worked for me:
-```
-C_INCLUDE_PATH=/home/anon/miniconda3/envs/diffusion-pipe/lib/python3.12/site-packages/nvidia/cudnn/include:$C_INCLUDE_PATH CPLUS_INCLUDE_PATH=/home/anon/miniconda3/envs/diffusion-pipe/lib/python3.12/site-packages/nvidia/cudnn/include:$CPLUS_INCLUDE_PATH pip install --no-build-isolation transformer_engine[pytorch]
-```
-Edit the paths above for your conda environment.
 
 ## Updating
 ```

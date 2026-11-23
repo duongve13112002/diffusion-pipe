@@ -108,11 +108,13 @@ class Attention(nn.Module):
         else:
             q = self.q_norm(q.view(b, s, self.heads, self.head_dim))
             k = self.k_norm(k.view(b, s, self.heads, self.head_dim))
+        q = q.to(v.dtype)
+        k = k.to(v.dtype)
 
         q = AttentionTensorContainer(q.transpose(1, 2))
         k = AttentionTensorContainer(k.transpose(1, 2))
         v = AttentionTensorContainer(v.transpose(1, 2))
-        out = optimized_attention(q, k, v, self.heads, preferred_attention=self.comfy_attention, mask=attention_mask, skip_reshape=True, transformer_options=transformer_options)
+        out = optimized_attention(q, k, v, self.heads, mask=attention_mask, skip_reshape=True, transformer_options=transformer_options)
         return self.out_proj(out)
 
 # Patch to force eager rms_rope_split_half so backward works. Even using offical methods to set 'eager' in comfy kitchen doesn't work.
@@ -282,18 +284,20 @@ class MinimaxH3Pipeline(ComfyPipeline):
         vae.vae_encode_crop_pixels = types.MethodType(vae_encode_crop_pixels, vae)
         vae_list = [vae]
 
-        # audio VAE
-        sd = comfy.utils.load_torch_file(self.model_config['audio_vae'])
-        vae = comfy.sd.VAE(sd=sd, dtype=dtype)
-        vae.throw_exception_if_invalid()
-        vae_list.append(vae)
+        # audio VAE (the image checkpoints have no audio stream)
+        if audio_vae_path := self.model_config.get('audio_vae'):
+            sd = comfy.utils.load_torch_file(audio_vae_path)
+            vae = comfy.sd.VAE(sd=sd, dtype=dtype)
+            vae.throw_exception_if_invalid()
+            vae_list.append(vae)
 
         return vae_list
 
     def unsupported_checkpoint(self, shapes, metadata):
         pdd_steps = checkpoint_transformer_config(metadata).get('pdd_steps', 1)
         if pdd_steps != 1:
-            return f'MiniMax H3 PDD checkpoints (pdd_steps = {pdd_steps}) cannot be trained; use the base model'
+            return (f'MiniMax H3 PDD checkpoints (pdd_steps = {pdd_steps}) cannot be trained with type = \'minimax_h3\'; use the base model, '
+                    f'or type = \'minimax_h3_image\' for MiniMax-H3-Image')
         return None
 
     def load_diffusion_model(self):
@@ -321,7 +325,9 @@ class MinimaxH3Pipeline(ComfyPipeline):
 
     def vae_encode(self, img: torch.Tensor, audio: list, vae=None):
         vae = self.vae if vae is None else vae
-        video_vae, audio_vae = vae._model if isinstance(vae, ModelWrapper) else vae
+        vaes = vae._model if isinstance(vae, ModelWrapper) else vae
+        video_vae = vaes[0]
+        audio_vae = vaes[1] if len(vaes) == 2 else None
         # move channel dim to end
         # works for both images (b c h w) and video (b c f h w)
         img = img.movedim(1, -1)
@@ -330,14 +336,17 @@ class MinimaxH3Pipeline(ComfyPipeline):
             # some older models do this in prepare_inputs() so it can be None
             latents = self.latent_format.process_in(latents)
 
-        audio_latents = []
-        for a in audio:
-            if a is not None:
-                assert a.shape[0] == 1
-                a_latents = audio_vae.encode(a.movedim(1, -1))
-            else:
-                a_latents = None
-            audio_latents.append(a_latents)
+        if audio_vae is not None:
+            audio_latents = []
+            for a in audio:
+                if a is not None:
+                    assert a.shape[0] == 1
+                    a_latents = audio_vae.encode(a.movedim(1, -1))
+                else:
+                    a_latents = None
+                audio_latents.append(a_latents)
+        else:
+            audio_latents = [None] * len(audio)
 
         return latents, audio_latents
 
@@ -612,7 +621,7 @@ class InitialLayer(nn.Module):
             self.adaln_t_table = model.adaln_t_table
         else:
             self.time_embedder = model.time_embedder
-        self.audio_patch_proj = model.audio_patch_proj
+        self.audio_patch_proj = getattr(model, 'audio_patch_proj', None)
         self.video_patch_proj = model.video_patch_proj
         self.condition_proj = model.condition_proj
         self.rope = model.rope
@@ -675,26 +684,28 @@ class InitialLayer(nn.Module):
         shift_v = float(transformer_options.get("minimax_h3_sigma_shift_video", self.sigma_shift_video))
         shift_a = float(transformer_options.get("minimax_h3_sigma_shift_audio", self.sigma_shift_audio))
         sigma_v = (t.flatten()[0]).float().clamp(min=1e-6)  # I removed the 1000 from original comfy code since our t is [0, 1]
-        t_v = float(1.0 - sigma_v)
-        t_a = float(1.0 - time_shift_sigma(sigma_v, shift_v, shift_a))
+        t_v = float(1.0 - sigma_v.item())
+        t_a = float(1.0 - time_shift_sigma(sigma_v.item(), shift_v, shift_a))
 
         # distinct timesteps are known analytically: text/pad follow video, cond rows pin near 1
         vis_aug = float(payload.get("visual_cond_noise_aug", VISUAL_COND_TIMESTEP))
         aud_aug = float(payload.get("audio_cond_noise_aug", AUDIO_COND_TIMESTEP))
         has_vis_cond = any(k in ("cond", "ref_img") for _, _, k in layout.segments)
         has_aud_cond = any(k == "ref_audio" for _, _, k in layout.segments)
-        seg_t = {"text": t_v, "video": t_v, "audio": t_a,
-                 "cond": max(t_v, vis_aug), "ref_img": max(t_v, vis_aug),
-                 "ref_audio": max(t_a, aud_aug)}
+        seg_t = {"text": t_v, "video": t_v, "audio": t_a}
+        if has_vis_cond:
+            seg_t.update({"cond": max(t_v, vis_aug), "ref_img": max(t_v, vis_aug)})
+        if has_aud_cond:
+            seg_t.update({"ref_audio": max(t_a, aud_aug)})
         if self.fixed_timestep_rows:
             assert not has_aud_cond and not any(k == "cond" for _, _, k in layout.segments)
-            unique_t = [t_v, t_a] + ([seg_t["ref_img"]] if has_vis_cond else [])
+            all_t = [t_v, t_a] + ([seg_t["ref_img"]] if has_vis_cond else [])
             kind_row = {"text": 0, "video": 0, "audio": 1, "ref_img": 2}
         else:
-            unique_t = sorted({t_v, t_a} | ({seg_t["cond"]} if has_vis_cond else set())
-                              | ({seg_t["ref_audio"]} if has_aud_cond else set()))
-            t_row = {t: i for i, t in enumerate(unique_t)}
-            kind_row = {kind: t_row[value] for kind, value in seg_t.items() if value in t_row}
+            # One row per kind, not per distinct value: t_v and t_a coincide at some sigmas (sigma 1), and
+            # samples of one batch with a different number of rows could not be stacked.
+            all_t = list(seg_t.values())
+            kind_row = {kind: i for i, kind in enumerate(seg_t)}
         seg_tag = {"text": 1, "video": 0, "audio": 2, "cond": 0, "ref_img": 0, "ref_audio": 2}
 
         text_tags = payload.get("text_token_tags")
@@ -737,7 +748,10 @@ class InitialLayer(nn.Module):
             all_audio_rows[audio_update] = audio_rows
 
         video_embed = self.video_patch_proj(all_video_rows).to(dtype)
-        audio_embed = self.audio_patch_proj(all_audio_rows).to(dtype)
+        if self.audio_patch_proj is not None:
+            audio_embed = self.audio_patch_proj(all_audio_rows).to(dtype)
+        else:
+            audio_embed = torch.empty([0, video_embed.shape[-1]], dtype=dtype, device=video_embed.device)
 
         text_states = context[:, real_text]
         if text_states.shape[-1] != self.hidden_size:
@@ -763,7 +777,7 @@ class InitialLayer(nn.Module):
                 h[a:b] = audio_embed[aoff:aoff + n]
                 aoff += n
 
-        t_vals = torch.tensor(unique_t, dtype=torch.float32, device=device)
+        t_vals = torch.tensor(all_t, dtype=torch.float32, device=device)
         if self.use_adaln_curves:
             # adaln projections consume interpolated coordinates of the time-embedding curve
             table = comfy.model_management.cast_to(self.adaln_t_table, device=device)
