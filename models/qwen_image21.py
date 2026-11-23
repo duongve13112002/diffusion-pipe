@@ -260,6 +260,9 @@ class InitialLayer(nn.Module):
         mod_scale2_a, mod_scale2_b = _split_rows(scale2)
         mod_gate2_a, mod_gate2_b = _split_rows(gate2.tanh())
         mod_zeros = torch.zeros_like(scale1[:1, None])
+        # Constants without a graph would reach a pipeline stage's backward as outputs that do not require grad.
+        pe.requires_grad_(True)
+        mod_zeros.requires_grad_(True)
 
         endpoints, masks = pack_segments(segments)
 
