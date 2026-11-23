@@ -5,7 +5,7 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 
-from models.base import BasePipeline, make_contiguous, tie_unused
+from models.base import BasePipeline, make_contiguous
 from utils.common import AUTOCAST_DTYPE
 
 
@@ -257,4 +257,4 @@ class FinalLayer(nn.Module):
         output = hidden_states.reshape(
             shape=(hidden_states.shape[0], self.out_channels, height * patch_size, width * patch_size)
         )
-        return tie_unused(output, *_)
+        return output

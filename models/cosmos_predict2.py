@@ -25,7 +25,7 @@ from transformers import T5TokenizerFast, T5EncoderModel, AutoTokenizer, AutoMod
 from accelerate import init_empty_weights
 from accelerate.utils import set_module_tensor_to_device
 
-from models.base import BasePipeline, PreprocessMediaFile, make_contiguous, tie_unused
+from models.base import BasePipeline, PreprocessMediaFile, make_contiguous
 from models.cosmos_predict2_modeling import MiniTrainDIT
 from models.text_refiner import extract_refiner_state_dict
 from models.teacher_guidance import (
@@ -1566,5 +1566,4 @@ class FinalLayer(nn.Module):
         x_B_T_H_W_D, t_embedding_B_T_D, crossattn_emb, rope_emb_L_1_1_D, adaln_lora_B_T_3D, timesteps_B_T = inputs
         x_B_T_H_W_O = self.final_layer(x_B_T_H_W_D, t_embedding_B_T_D, adaln_lora_B_T_3D=adaln_lora_B_T_3D)
         net_output_B_C_T_H_W = self.unpatchify(x_B_T_H_W_O)
-        # timesteps_B_T is only read by InitialLayer; a last stage needs a gradient for every floating tensor it received
-        return tie_unused(net_output_B_C_T_H_W, timesteps_B_T, rope_emb_L_1_1_D, crossattn_emb)
+        return net_output_B_C_T_H_W

@@ -15,7 +15,7 @@ from accelerate.utils import set_module_tensor_to_device
 import transformers
 from PIL import Image, ImageOps
 
-from models.base import BasePipeline, PreprocessMediaFile, make_contiguous, tie_unused
+from models.base import BasePipeline, PreprocessMediaFile, make_contiguous
 from utils.common import AUTOCAST_DTYPE, get_lin_function, time_shift, iterate_safetensors
 from utils.offloading import ModelOffloader
 
@@ -606,4 +606,4 @@ class FinalLayer(nn.Module):
             assert len(extra) == 1
             img_seq_len = extra[0][0].item()
             output = output[:, :img_seq_len, ...]
-        return tie_unused(output, encoder_hidden_states, vid_freqs, txt_freqs)
+        return output

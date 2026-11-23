@@ -6,7 +6,7 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 
-from models.base import ComfyPipeline, make_contiguous, tie_unused
+from models.base import ComfyPipeline, make_contiguous
 from utils.common import AUTOCAST_DTYPE, get_lin_function, time_shift
 from utils.offloading import ModelOffloader
 import comfy.latent_formats
@@ -314,6 +314,4 @@ class FinalLayer(nn.Module):
         B = hidden_states.shape[0]
         hidden_states = self.norm_out(hidden_states[:, prefix_len:], temb[:-1])
         hidden_states = self.proj_out(hidden_states)
-        out = hidden_states.transpose(1, 2).reshape(B, self.out_channels, H, W)
-        # mod_zeros is only read by the fused modulation kernel; a last stage needs a gradient for every floating tensor it received
-        return tie_unused(out, mod_zeros)
+        return hidden_states.transpose(1, 2).reshape(B, self.out_channels, H, W)

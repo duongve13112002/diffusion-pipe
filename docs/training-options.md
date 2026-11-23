@@ -222,9 +222,13 @@ between layers (a stage can start at any layer):
 - A floating tensor a layer builds (a rope table, a float mask, zeros) and returns without a graph must be marked
   `requires_grad_(True)` where it is made, or travel as a bool or integer tensor and be converted inside the block.
   Complex tensors (some rope tables) are not floating for this purpose and need nothing.
-- A floating tensor that the layers after a cut never read through a differentiable op (an entry only the first
-  blocks read, an entry a layer drops from the tuple, audio entries of a video model with audio off) must be tied to
-  the output: `models.base.tie_unused(out, *unused)` adds `0 * unused[0]` to the output, which changes no value and gives
-  the tensor a zero gradient. The FinalLayer is the usual place.
+- A floating tensor that a stage receives but none of its layers reads through a differentiable op (an entry a
+  layer drops from the tuple, audio entries of a video model with audio off) needs nothing from the model:
+  `ManualPipelineModule.forward` (utils/pipeline.py) ties every received floating tensor that requires grad to the
+  stage's output with `models.base.tie_unused`, a term that is an exact 0 (no value changes, a NaN in the tied tensor
+  stays out) and gives the tensor a zero gradient. It adds no communication, so it holds for any number of stages on
+  one node or several.
 
-`test/test_pipeline_stage_grads.py` pins these for the models that needed them.
+`test/test_pipeline_stage_grads.py` pins the first rule for the models that needed it and the tie itself;
+`test/test_pipeline_engine.py` runs the second in real DeepSpeed process groups (a dropped tensor, a tensor the last stage
+ignores).

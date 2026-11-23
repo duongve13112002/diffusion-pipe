@@ -8,7 +8,7 @@ import torch.nn.functional as F
 from einops import rearrange
 import safetensors
 
-from models.base import ComfyPipeline, make_contiguous, tie_unused
+from models.base import ComfyPipeline, make_contiguous
 from utils.common import AUTOCAST_DTYPE, get_lin_function, time_shift, one_at_a_time
 from utils.offloading import ModelOffloader
 import comfy.ldm.common_dit
@@ -393,8 +393,6 @@ class ConcatenateTxtImg(nn.Module):
         img = torch.cat((txt, img), 1)
         if self.single_stream_modulation is not None:
             mod_out, _ = self.single_stream_modulation(vec_orig)
-            # the double-stream vec entries stop here; a stage that starts at this layer needs a gradient for them
-            img = tie_unused(img, *vec)
             vec = [mod_out.shift, mod_out.scale, mod_out.gate]
 
         return make_contiguous(img, pe, attn_mask, txt_len, img_len, hw, vec_orig, *vec)

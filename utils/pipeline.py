@@ -1,7 +1,10 @@
+import torch
 from torch import nn
 
 from deepspeed.pipe import PipelineModule
 from deepspeed.runtime.pipe import LayerSpec
+
+from models.base import tie_unused
 
 
 # PipelineModule partition_method doesn't support uneven partitioning
@@ -12,6 +15,15 @@ class ManualPipelineModule(PipelineModule):
     def __init__(self, *args, manual_partition_split=None, **kwargs):
         self.manual_partition_split = manual_partition_split
         super().__init__(*args, **kwargs)
+
+    def forward(self, forward_input):
+        # The engine's last stage asserts that every floating tensor it received got a gradient, and a middle one
+        # sends them all back: a received tensor that no layer of this stage reads (an entry a layer drops from the
+        # tuple, one only the first blocks read) is tied to the output with a zero weight. Tensors that do not
+        # require grad (the first stage's inputs without reentrant checkpointing, anything under no_grad) are skipped.
+        out = super().forward(forward_input)
+        received = (forward_input,) if torch.is_tensor(forward_input) else tuple(forward_input)
+        return tie_unused(out, *received)
 
     def _partition_layers(self, method='uniform'):
         if method.lower() == 'manual' and self.manual_partition_split is not None:

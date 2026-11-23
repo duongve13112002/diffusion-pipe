@@ -1,7 +1,8 @@
 """A pipeline stage's backward (deepspeed/runtime/pipe/engine.py, _exec_backward_pass) runs over every floating
-output of the stage's last layer, and the last stage asserts that every floating tensor it received got a gradient
+output of the stage's last layer, and a stage asserts that every floating tensor it received got a gradient
 (_exec_send_grads). A constant a layer builds (rope tables, float masks, zeros) that stays in the tuple therefore has
-to require grad, and a received tensor nothing reads has to be tied to the output (models/base.py tie_unused)."""
+to require grad (checked per model below), and a received tensor nothing reads is tied to the output with a zero
+weight by ManualPipelineModule.forward (models/base.py tie_unused)."""
 
 import ast
 from pathlib import Path
@@ -9,7 +10,10 @@ from pathlib import Path
 import pytest
 import torch
 
+from deepspeed.pipe import PipelineModule
+
 from models.base import tie_unused
+from utils.pipeline import ManualPipelineModule
 
 MODELS = Path(__file__).resolve().parent.parent / 'models'
 
@@ -45,6 +49,58 @@ def test_tie_unused_skips_what_has_no_graph_or_is_not_floating():
     assert tie_unused(out) is out
     plain = torch.randn(2)
     assert tie_unused(plain, no_graph, ints) is plain
+
+
+def test_tie_unused_ties_the_first_floating_element_whatever_its_position():
+    steps = torch.arange(3)
+    video = torch.randn(2, 3, requires_grad=True)
+    unused = torch.randn(4, requires_grad=True)
+    result = tie_unused((steps, video * 1.0), unused)
+    assert result[0] is steps
+    result[1].sum().backward()
+    assert unused.grad is not None and not unused.grad.any()
+    ints = (steps, steps)
+    assert tie_unused(ints, unused) is ints
+
+
+def test_tie_unused_does_nothing_without_a_tensor_that_needs_grad_or_with_grad_disabled():
+    out = (torch.randn(2, requires_grad=True) * 1.0, torch.arange(2))
+    assert tie_unused(out, torch.randn(3), torch.arange(2), None) is out
+    single = torch.randn(2, requires_grad=True) * 1.0
+    assert tie_unused(single, torch.randn(3)) is single
+    with torch.no_grad():
+        assert tie_unused(out, torch.randn(3, requires_grad=True)) is out
+
+
+def test_tie_unused_picks_an_output_that_requires_grad():
+    no_graph = torch.randn(2)
+    graph = torch.randn(3, requires_grad=True) * 1.0
+    unused = torch.randn(4, requires_grad=True)
+    result = tie_unused((no_graph, graph), unused)
+    assert result[0] is no_graph and result[1].grad_fn is not None
+    result[1].sum().backward()
+    assert unused.grad is not None
+
+
+def test_tie_unused_leaves_an_output_that_has_no_graph_alone():
+    out = (torch.randn(2), torch.randn(3))
+    assert tie_unused(out, torch.randn(4, requires_grad=True)) is out
+
+
+def test_tie_unused_does_not_let_a_nan_or_inf_reach_the_output():
+    out = torch.randn(3, requires_grad=True) * 1.0
+    bad = torch.tensor([float('nan'), float('inf')], requires_grad=True)
+    tied = tie_unused(out, bad, torch.tensor(float('inf'), requires_grad=True))
+    assert torch.isfinite(tied).all()
+    tied.sum().backward()
+
+
+def test_tie_unused_reaches_a_scalar_and_a_non_contiguous_tensor():
+    out = torch.randn(3, requires_grad=True) * 1.0
+    scalar = torch.tensor(2.0, requires_grad=True)
+    strided = torch.randn(4, 6, requires_grad=True)
+    tie_unused(out, scalar, strided.t()).sum().backward()
+    assert scalar.grad is not None and strided.grad is not None
 
 
 def test_tie_unused_ties_the_first_element_of_a_list_or_tuple_output():
@@ -91,33 +147,40 @@ def test_cosmos_marks_the_rope_and_the_extra_position_embedding():
     assert initial.index('rope_emb_L_1_1_D.requires_grad_(True)') < initial.index('return make_contiguous')
 
 
-def test_ltx2_ties_the_audio_entries_it_does_not_read_with_audio_off():
-    final = method_source('ltx2.py', 'FinalLayer', 'forward')
-    assert 'tie_unused(out, ax,' in final
-    for name in ('a_context', 'a_timestep', 'a_freq_cis', 'av_cross_video_freq_cis', 'av_cross_audio_freq_cis',
-                 'av_ca_video_scale_shift_timestep', 'av_ca_audio_scale_shift_timestep',
-                 'av_ca_a2v_gate_noise_timestep', 'av_ca_v2a_gate_noise_timestep'):
-        assert name in final.split('tie_unused(out', 1)[1], name
+def stage_output(received):
+    """What a stage whose layers keep only the first of the received tensors returns."""
+    return (received[0] * 2.0, received[3])
 
 
-TIED_IN_FINAL_LAYER = [
-    ('chroma.py', 'FinalLayer', 'tie_unused(img, txt, pe)'),
-    ('cosmos.py', 'FinalLayer', 'tie_unused(x0_pred, rope_emb_L_1_1_D, extra_pos_emb_B_T_H_W_D_or_T_H_W_B_D, crossattn_emb)'),
-    ('cosmos_predict2.py', 'FinalLayer', 'tie_unused(net_output_B_C_T_H_W, timesteps_B_T'),
-    ('qwen_image21.py', 'FinalLayer', 'tie_unused(out, mod_zeros)'),
-    ('sdxl.py', 'FinalLayer', 'tie_unused(self.conv_out(sample), emb, encoder_hidden_states)'),
-    ('qwen_image.py', 'FinalLayer', 'tie_unused(output, encoder_hidden_states'),
-    ('sd3.py', 'FinalLayer', 'tie_unused(output, *_)'),
-    ('z_image.py', 'FinalLayer', 'tie_unused(x, freqs_cis)'),
-    ('wan/wan.py', 'FinalLayer', 'tie_unused(torch.stack(x, dim=0), e0, context)'),
-]
+def run_stage(monkeypatch, inputs, forward=stage_output):
+    stage = object.__new__(ManualPipelineModule)
+    monkeypatch.setattr(PipelineModule, 'forward', lambda self, x: forward(x))
+    return stage.forward(inputs)
 
 
-@pytest.mark.parametrize('file,cls,call', TIED_IN_FINAL_LAYER)
-def test_final_layer_ties_the_floating_entries_no_layer_of_the_last_stage_may_read(file, cls, call):
-    assert call in method_source(file, cls, 'forward')
+def test_a_stage_gives_a_gradient_to_every_floating_tensor_it_received_but_did_not_read(monkeypatch):
+    received = [torch.randn(2, 3, requires_grad=True), torch.randn(5, requires_grad=True),
+                torch.randn(4, 1, requires_grad=True), torch.arange(3), torch.randn(7, requires_grad=True)]
+    out = run_stage(monkeypatch, tuple(received), lambda x: (x[0] * 2.0, x[3]))
+    assert torch.equal(out[0], received[0] * 2.0) and out[1] is received[3]
+    out[0].sum().backward()
+    for i in (1, 2, 4):
+        assert received[i].grad is not None and not received[i].grad.any(), i
+    assert received[0].grad is not None and received[0].grad.eq(2.0).all()
 
 
-def test_flux2_ties_the_double_stream_modulation_that_the_concat_layer_drops():
-    concat = method_source('flux2.py', 'ConcatenateTxtImg', 'forward')
-    assert concat.index('tie_unused(img, *vec)') < concat.index('vec = [mod_out.shift')
+def test_a_stage_that_received_nothing_that_needs_grad_returns_what_its_layers_returned(monkeypatch):
+    received = (torch.randn(2, 3), torch.randn(4))
+    sentinel = (torch.randn(2), torch.arange(2))
+    assert run_stage(monkeypatch, received, lambda x: sentinel) is sentinel
+    with torch.no_grad():
+        grad_inputs = (torch.randn(2, requires_grad=True),)
+        assert run_stage(monkeypatch, grad_inputs, lambda x: sentinel) is sentinel
+
+
+def test_a_stage_returning_one_tensor_is_tied_too(monkeypatch):
+    received = (torch.randn(2, requires_grad=True), torch.randn(3, requires_grad=True))
+    out = run_stage(monkeypatch, received, lambda x: x[0] * 3.0)
+    assert torch.is_tensor(out)
+    out.sum().backward()
+    assert received[1].grad is not None

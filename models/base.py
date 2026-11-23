@@ -72,19 +72,40 @@ def make_contiguous(*values):
 
 
 def tie_unused(out, *unused):
-    """`out` (a tensor, or a list or tuple whose first element is one) with a zero-weight dependency on the floating
-    tensors a layer receives and never reads.
+    """`out` (a tensor, or a list or tuple of them) with a zero-weight dependency on the floating tensors in
+    `unused` that require grad, added to the first floating tensor of `out` that requires grad.
 
-    DeepSpeed's last pipeline stage asserts that every floating tensor it received got a gradient to send back
-    (engine.py, _exec_send_grads), so a tuple entry that nothing in the stage uses (LTX-2's audio tensors when audio
-    is off) would stop the first backward. The zero term gives it a zero gradient and changes nothing else."""
-    first = out if torch.is_tensor(out) else out[0]
-    for t in unused:
-        if torch.is_tensor(t) and torch.is_floating_point(t) and t.requires_grad:
-            first = first + t.reshape(-1)[:1].sum().to(first.dtype) * 0
+    DeepSpeed's pipeline engine asserts that every floating tensor a stage received got a gradient to send back
+    (engine.py, _exec_send_grads), so a tuple entry that no layer of the stage reads (LTX-2's audio entries with audio
+    off, the entries a layer drops from the tuple) would stop the first backward. The empty slice sums to an exact 0,
+    so no value changes (a NaN or inf in `unused` stays out of the result) and the tensor gets a zero gradient."""
+    if not torch.is_grad_enabled():
+        return out
+
+    def floating(t):
+        return torch.is_tensor(t) and torch.is_floating_point(t)
+
     if torch.is_tensor(out):
-        return first
-    return type(out)([first, *out[1:]]) if isinstance(out, (list, tuple)) else out
+        index, first = None, out
+    else:
+        found = [i for i, t in enumerate(out) if floating(t) and t.requires_grad]
+        if not found:
+            return out
+        index, first = found[0], out[found[0]]
+    if not (floating(first) and first.requires_grad):
+        return out
+    tied = first
+    for t in unused:
+        if floating(t) and t.requires_grad:
+            flat = t if t.ndim else t.reshape(1)
+            tied = tied + flat.narrow(0, 0, 0).sum().to(tied.dtype)
+    if tied is first:
+        return out
+    if index is None:
+        return tied
+    result = list(out)
+    result[index] = tied
+    return type(out)(result) if isinstance(out, (list, tuple)) else result
 
 
 def convert_to_rgb(pil_img):

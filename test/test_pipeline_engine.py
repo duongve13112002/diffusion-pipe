@@ -127,3 +127,111 @@ def test_every_rank_logs_the_whole_models_gradient_and_update(num_stages, clippi
     assert clipped == (clipping == 1e-3)
     for result in results:
         assert result == pytest.approx(expected, rel=1e-4)
+
+
+class _First(torch.nn.Module):
+    def __init__(self, lin):
+        super().__init__()
+        self.lin = lin
+
+    def forward(self, x):
+        h = self.lin(x)
+        return h, h * 2.0
+
+
+class _Carry(torch.nn.Module):
+    def __init__(self, lin):
+        super().__init__()
+        self.lin = lin
+
+    def forward(self, inputs):
+        h, extra = inputs
+        return self.lin(h), extra
+
+
+class _Drop(torch.nn.Module):
+    """Drops the tuple's second entry without reading it."""
+
+    def __init__(self, lin):
+        super().__init__()
+        self.lin = lin
+
+    def forward(self, inputs):
+        return self.lin(inputs[0])
+
+
+class _Last(torch.nn.Module):
+    """Reads only the first entry of what it received."""
+
+    def __init__(self, lin):
+        super().__init__()
+        self.lin = lin
+
+    def forward(self, inputs):
+        return self.lin(inputs[0])
+
+
+def _tuple_chain(kind):
+    first, second, third, fourth = _layers()
+    if kind == 'dropped_in_a_middle_stage':
+        return [_First(first), _Carry(second), _Drop(third), _Plain(fourth)]
+    return [_First(first), _Carry(second), _Carry(third), _Last(fourth)]
+
+
+class _Plain(torch.nn.Module):
+    def __init__(self, lin):
+        super().__init__()
+        self.lin = lin
+
+    def forward(self, x):
+        return self.lin(x)
+
+
+def _tuple_worker(rank, num_stages, kind, init_file, out_dir):
+    import os
+    import deepspeed
+    os.environ['LOCAL_RANK'] = str(rank)
+    deepspeed.init_distributed('gloo', auto_mpi_discovery=False, init_method=f'file://{init_file}',
+                               rank=rank, world_size=num_stages, verbose=False)
+    from utils.patches import apply_patches
+    from utils.pipeline import ManualPipelineModule
+    apply_patches()
+
+    pipe = ManualPipelineModule(layers=_tuple_chain(kind), num_stages=num_stages, loss_fn=_loss,
+                                partition_method='uniform')
+    params = [p for p in pipe.parameters()]
+    engine, *_ = deepspeed.initialize(
+        model=pipe,
+        model_parameters=params,
+        optimizer=torch.optim.SGD(params, lr=LR),
+        config={'train_micro_batch_size_per_gpu': 1, 'gradient_accumulation_steps': 2,
+                'gradient_clipping': 0.0, 'steps_per_print': 10**9},
+    )
+    engine._support_torch_style_backward = True
+    engine.train_batch(iter(_micro_batches(2)))
+    weights = {name.split('.')[0]: p.tolist() for name, p in pipe.named_parameters()}
+    with open(f'{out_dir}/{rank}.json', 'w') as f:
+        json.dump(weights, f)
+
+
+@pytest.mark.parametrize('kind', ['dropped_in_a_middle_stage', 'ignored_by_the_last_stage'])
+def test_a_floating_tensor_a_stage_receives_and_does_not_read_does_not_stop_the_step(kind, tmp_path):
+    """The engine asserts every floating tensor a stage received got a gradient (_exec_send_grads). A layer that
+    drops one, or a last stage that never reads one, is tied by ManualPipelineModule.forward; the step is the
+    plain chain's."""
+    import time
+    context = mp.start_processes(_tuple_worker, args=(4, kind, str(tmp_path / 'init'), str(tmp_path)), nprocs=4,
+                                 join=False, start_method='spawn')
+    deadline = time.time() + 240
+    while not context.join(timeout=5):
+        if time.time() > deadline:
+            for process in context.processes:
+                process.kill()
+            pytest.fail('the pipeline hung')
+    trained = {}
+    for rank in range(4):
+        trained.update(json.loads((tmp_path / f'{rank}.json').read_text()))
+    expected = _expected_weights(2)
+    assert sorted(trained) == sorted(expected)
+    for layer in expected:
+        assert trained[layer] == [pytest.approx(row, abs=1e-6) for row in expected[layer]], f'layer {layer}'
