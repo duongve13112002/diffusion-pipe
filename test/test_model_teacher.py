@@ -601,6 +601,30 @@ def test_the_label_of_a_training_batch_carries_the_teacher_output():
         assert teacher_target.dtype == target.dtype
 
 
+def test_the_teacher_reads_what_on_the_fly_text_encoding_makes_of_the_batch():
+    """cache_text_embeddings = false: the loader encodes the captions before prepare_inputs, so the features the
+    teacher is given hold the encoded embeddings, once per batch, exactly as the student's first stage gets them."""
+    pipeline = ToyPipeline()
+    teacher = toy_teacher(pipeline)
+    batch = batch_of(4, seed=8)
+    raw = {'ids': batch['x'] * 0 + 7.0, 't': batch['t'], 'x_source': batch['x']}
+    encoded = []
+
+    def text_encoding(b):
+        encoded.append(1)
+        return {'x': b['x_source'] + b['ids'], 't': b['t']}
+
+    loader = dataset_util.PipelineDataLoader(FakeDataset([raw]), SingleProcessEngine(), 2, FakeModel(),
+                                             num_dataloader_workers=0, teacher=teacher, text_encoding=text_encoding)
+    pulled = [next(loader) for _ in range(2)]
+    assert encoded == [1]
+    for i, (features, label) in enumerate(pulled):
+        rows = slice(2 * i, 2 * i + 2)
+        x = batch['x'][rows] + 7.0
+        assert torch.equal(features[0], x)
+        assert torch.allclose(label[-1], student_forward(pipeline, (x, batch['t'][rows])))
+
+
 def test_the_teacher_sees_micro_batches_not_the_whole_batch():
     pipeline = ToyPipeline()
     teacher = toy_teacher(pipeline)

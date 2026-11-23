@@ -189,7 +189,8 @@ with one GPU, several, several nodes and any `pipeline_stages`.
   (SDXL aside: its text encoders train with the UNet, so its teacher is a whole second pipeline).
 - The teacher is a second chain of the model's own layers on the first pipeline stage, no gradients, eval mode.
   It runs on the same inputs as the student (the noisy latents, timesteps and text embeddings the batch
-  carries) and its output travels to the last stage with the targets, so no layer needs to pass anything on. A
+  carries; `cache_text_embeddings` true or false makes no difference: with false the loader encodes the captions
+  before the batch is prepared, once, and the student and the teacher both read the result) and its output travels to the last stage with the targets, so no layer needs to pass anything on. A
   full copy of the transformer sits on the GPU of every first-stage rank on top of the student: that stage
   needs the memory (about the size of the weights in `dtype`), and the loading peaks the CPU RAM of every
   rank on it by the same amount. Neither has been measured on a GPU. Once `decay` has brought lambda to 0 (step
@@ -212,3 +213,18 @@ with one GPU, several, several nodes and any `pipeline_stages`.
 - Not run on a GPU or with real weights yet. Not measured: the speed cost of the extra forward, the memory, whether
   distillation helps image quality on your data. Judge it from your samples.
 
+## Writing a model's layers for `pipeline_stages > 1`
+
+DeepSpeed's pipeline engine runs backward on every floating tensor a stage sends on, and the last stage asserts that
+every floating tensor it received got a gradient. Two rules follow for the tuples that `to_layers()` passes
+between layers (a stage can start at any layer):
+
+- A floating tensor a layer builds (a rope table, a float mask, zeros) and returns without a graph must be marked
+  `requires_grad_(True)` where it is made, or travel as a bool or integer tensor and be converted inside the block.
+  Complex tensors (some rope tables) are not floating for this purpose and need nothing.
+- A floating tensor that the layers after a cut never read through a differentiable op (an entry only the first
+  blocks read, an entry a layer drops from the tuple, audio entries of a video model with audio off) must be tied to
+  the output: `models.base.tie_unused(out, *unused)` adds `0 * unused[0]` to the output, which changes no value and gives
+  the tensor a zero gradient. The FinalLayer is the usual place.
+
+`test/test_pipeline_stage_grads.py` pins these for the models that needed them.
