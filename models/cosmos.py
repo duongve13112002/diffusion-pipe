@@ -374,7 +374,7 @@ class InitialLayer(nn.Module):
         if extra_pos_emb_B_T_H_W_D_or_T_H_W_B_D is not None:
             extra_pos_emb_B_T_H_W_D_or_T_H_W_B_D.requires_grad_(True)
 
-        original_shape = torch.tensor(original_shape)
+        original_shape = torch.tensor(original_shape, device=x.device)
         return make_contiguous(
             x,
             x_t,

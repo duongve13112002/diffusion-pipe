@@ -9,7 +9,7 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 
-from models.base import BasePipeline, PreprocessMediaFile, make_contiguous
+from models.base import BasePipeline, PreprocessMediaFile, make_contiguous, TensorCache
 from utils.common import AUTOCAST_DTYPE
 from ltx_video.pipelines.pipeline_ltx_video import LTXVideoPipeline as OriginalLTXVideoPipeline
 from ltx_video.models.transformers.symmetric_patchifier import SymmetricPatchifier
@@ -276,12 +276,16 @@ class InitialLayer(nn.Module):
         return outputs
 
 
+_attention_biases = TensorCache()
+
+
 def encoder_attention_bias(encoder_attention_mask, dtype):
     """A 0/1 prompt mask of shape (B, S) as the additive bias (B, 1, S) the blocks take. The mask crosses the
     pipeline stages as it is and this runs in each block: a float bias would be marked as requiring grad by every
     stage that receives it, which turns off FlashAttention and fp8 attention."""
     if encoder_attention_mask is not None and encoder_attention_mask.ndim == 2:
-        return ((1 - encoder_attention_mask.to(dtype)) * -10000.0).unsqueeze(1)
+        return _attention_biases.get(encoder_attention_mask, dtype,
+                                     lambda: ((1 - encoder_attention_mask.to(dtype)) * -10000.0).unsqueeze(1))
     return encoder_attention_mask
 
 

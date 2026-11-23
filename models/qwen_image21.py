@@ -29,10 +29,10 @@ def _split_rows(p):
     return p[-1:].unsqueeze(1), p[:-1].unsqueeze(1)
 
 
-def pack_segments(segments):
-    endpoints = torch.tensor([row[:2] for row in segments])
+def pack_segments(segments, device):
+    endpoints = torch.tensor([row[:2] for row in segments], device=device)
     masks = [row[2] for row in segments]
-    masks = [m if m is not None else torch.tensor([], dtype=bool) for m in masks]
+    masks = [m if m is not None else torch.tensor([], dtype=bool, device=device) for m in masks]
     return endpoints, masks
 
 
@@ -248,7 +248,7 @@ class InitialLayer(nn.Module):
         image_slots = []
 
         hidden_states, pe, segments = self.build_sequence(x, context, context_mask, ref_latents, image_slots)
-        sizes = torch.tensor([hidden_states.shape[1], H, W])
+        sizes = torch.tensor([hidden_states.shape[1], H, W], device=hidden_states.device)
 
         # pipeline rounds t*1000 and t to the compute dtype; text and reference tokens modulate from t = 0
         t = ((timesteps * 1000).to(dtype) / 1000).to(dtype)
@@ -264,7 +264,7 @@ class InitialLayer(nn.Module):
         pe.requires_grad_(True)
         mod_zeros.requires_grad_(True)
 
-        endpoints, masks = pack_segments(segments)
+        endpoints, masks = pack_segments(segments, hidden_states.device)
 
         return make_contiguous(hidden_states, temb, pe, mod_scale1_a, mod_scale1_b, mod_gate1_a, mod_gate1_b, mod_scale2_a, mod_scale2_b, mod_gate2_a, mod_gate2_b, mod_zeros, sizes, endpoints, *masks)
 

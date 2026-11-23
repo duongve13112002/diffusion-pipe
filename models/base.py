@@ -22,6 +22,8 @@ sys.path.insert(0, os.path.join(os.path.abspath(os.path.dirname(__file__)), '../
 
 import peft
 from utils.dora import DORA_SCALE, check_dora_matches_model, saved_key
+import weakref
+
 import torch
 from utils import vae_dtype as vae_dtype_lib
 # torchaudio is required, and not only for the one resample call further down. The vendored
@@ -69,6 +71,36 @@ model_management.EXTRA_RESERVED_VRAM = 2000 * 1024 * 1024
 
 def make_contiguous(*values):
     return tuple(x.contiguous() if torch.is_tensor(x) else x for x in values)
+
+
+class TensorCache:
+    """A value built once per (tensor object, key), for the life of the tensor.
+
+    The blocks of a pipeline stage receive the same tensor object from the layer before, so a value derived from it
+    (an additive mask) is built once per micro-batch and every block gets the same object, which keeps the attention's
+    per-mask caches (utils/attention.py) working. Keyed by id with a weakref that drops the entry when the tensor dies
+    (a WeakKeyDictionary compares tensors with ==, which is elementwise)."""
+
+    def __init__(self):
+        self.entries = {}
+
+    def __len__(self):
+        return len(self.entries)
+
+    def get(self, tensor, key, build):
+        tensor_id = id(tensor)
+        entry = self.entries.get(tensor_id)
+        if entry is None or entry[0]() is not tensor:
+            def forget(ref, tensor_id=tensor_id):
+                current = self.entries.get(tensor_id)
+                if current is not None and current[0] is ref:
+                    del self.entries[tensor_id]
+
+            entry = self.entries[tensor_id] = (weakref.ref(tensor, forget), {})
+        values = entry[1]
+        if key not in values:
+            values[key] = build()
+        return values[key]
 
 
 def tie_unused(out, *unused):

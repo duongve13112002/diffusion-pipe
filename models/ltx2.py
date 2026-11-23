@@ -11,7 +11,7 @@ from torch import nn
 import torch.nn.functional as F
 import safetensors
 
-from models.base import ComfyPipeline, make_contiguous, ModelWrapper, PreprocessMediaFile
+from models.base import ComfyPipeline, TensorCache, make_contiguous, ModelWrapper, PreprocessMediaFile
 from utils.common import AUTOCAST_DTYPE, get_lin_function, time_shift, is_main_process, one_at_a_time
 from utils.offloading import ModelOffloader
 import comfy.ldm.common_dit
@@ -45,12 +45,17 @@ def encode_token_weights(self, token_weight_pairs):
 comfy.text_encoders.lt.LTXAVTEModel.encode_token_weights = encode_token_weights
 
 
+_additive_masks = TensorCache()
+
+
 def additive_attention_mask(attention_mask, dtype):
     """ComfyUI's LTXVModel._prepare_attention_mask: a 0/1 key mask as an additive mask of shape (B, 1, 1, S). The
     mask crosses the pipeline stages as integers and is turned into this in each block: a float mask would be
     marked as requiring grad by every stage that receives it, which turns off FlashAttention and fp8 attention."""
     if attention_mask is not None and not torch.is_floating_point(attention_mask):
-        return (attention_mask - 1).to(dtype).reshape((attention_mask.shape[0], 1, -1, attention_mask.shape[-1])) * torch.finfo(dtype).max
+        return _additive_masks.get(
+            attention_mask, dtype,
+            lambda: (attention_mask - 1).to(dtype).reshape((attention_mask.shape[0], 1, -1, attention_mask.shape[-1])) * torch.finfo(dtype).max)
     return attention_mask
 
 

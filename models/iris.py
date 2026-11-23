@@ -1141,7 +1141,7 @@ def _tie(out, *unused):
     """
     for t in unused:
         if torch.is_floating_point(t) and t.requires_grad:
-            out = out + t.reshape(-1)[:1].sum().to(out.dtype) * 0
+            out = out + t.reshape(-1)[:0].sum().to(out.dtype)
     return out
 
 

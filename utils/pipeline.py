@@ -21,8 +21,17 @@ class ManualPipelineModule(PipelineModule):
         # sends them all back: a received tensor that no layer of this stage reads (an entry a layer drops from the
         # tuple, one only the first blocks read) is tied to the output with a zero weight. Tensors that do not
         # require grad (the first stage's inputs without reentrant checkpointing, anything under no_grad) are skipped.
-        out = super().forward(forward_input)
         received = (forward_input,) if torch.is_tensor(forward_input) else tuple(forward_input)
+        if self.activation_checkpoint_interval > 0 and torch.is_grad_enabled():
+            # A reentrant checkpoint (torch's, or unsloth's) decides at the call whether its outputs get a graph, from
+            # whether an input requires grad, and the first stage's inputs come from the data loader. The engine would
+            # mark them (_exec_load_micro_batch), but only when its own config asks for checkpointing, which this
+            # repo hands to the PipelineModule instead. Without this the first layer's output has no graph, and
+            # with it everything a LoRA trains or a layer before the first non-checkpointed one.
+            for t in received:
+                if torch.is_tensor(t) and torch.is_floating_point(t) and t.is_leaf and not t.requires_grad:
+                    t.requires_grad_(True)
+        out = super().forward(forward_input)
         return tie_unused(out, *received)
 
     def _partition_layers(self, method='uniform'):

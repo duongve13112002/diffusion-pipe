@@ -229,6 +229,12 @@ between layers (a stage can start at any layer):
   stays out) and gives the tensor a zero gradient. It adds no communication, so it holds for any number of stages on
   one node or several.
 
+With `activation_checkpointing` on, `ManualPipelineModule.forward` also marks the first stage's floating inputs as
+requiring grad: a reentrant checkpoint (`reentrant_activation_checkpointing = true`, or `'unsloth'`) gives its outputs a
+graph only when an input requires grad, and DeepSpeed's own marking does not run because this repo hands the
+checkpointing options to the module instead of the DeepSpeed config. Tensors that go between stages are created on
+the model's device, not on the CPU.
+
 `test/test_pipeline_stage_grads.py` pins the first rule for the models that needed it and the tie itself;
 `test/test_pipeline_engine.py` runs the second in real DeepSpeed process groups (a dropped tensor, a tensor the last stage
 ignores).

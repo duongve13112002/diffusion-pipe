@@ -1483,7 +1483,7 @@ class MossImagePipeline(ComfyPipeline):
                 # A zero-weight link to the teacher tensor: the stage that receives it from an earlier one
                 # sends a gradient back for every floating input, and the loss otherwise only reads a
                 # detached copy.
-                total = total + term + teacher.reshape(-1)[:1].sum().to(term.dtype) * 0
+                total = total + term + teacher.reshape(-1)[:0].sum().to(term.dtype)
                 values.update({'distill_loss': term, 'distill_lambda': mean_lambda})
             if self.stream_metrics is not None:
                 self.stream_metrics.record(values)
@@ -1916,7 +1916,7 @@ def _tie(out, *unused):
     """
     for t in unused:
         if torch.is_floating_point(t) and t.requires_grad:
-            out = out + t.reshape(-1)[:1].sum().to(out.dtype) * 0
+            out = out + t.reshape(-1)[:0].sum().to(out.dtype)
     return out
 
 

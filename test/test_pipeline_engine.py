@@ -235,3 +235,54 @@ def test_a_floating_tensor_a_stage_receives_and_does_not_read_does_not_stop_the_
     assert sorted(trained) == sorted(expected)
     for layer in expected:
         assert trained[layer] == [pytest.approx(row, abs=1e-6) for row in expected[layer]], f'layer {layer}'
+
+
+def _checkpointed_worker(rank, num_stages, kind, init_file, out_dir):
+    import os
+    from functools import partial
+    import deepspeed
+    os.environ['LOCAL_RANK'] = str(rank)
+    deepspeed.init_distributed('gloo', auto_mpi_discovery=False, init_method=f'file://{init_file}',
+                               rank=rank, world_size=num_stages, verbose=False)
+    from utils.patches import apply_patches
+    from utils.pipeline import ManualPipelineModule
+    apply_patches()
+
+    # As train.py builds it: the checkpointing options go to the module, and the DeepSpeed config has no pipeline key.
+    pipe = ManualPipelineModule(layers=_layers(), num_stages=num_stages, loss_fn=_loss, partition_method='uniform',
+                                activation_checkpoint_interval=1,
+                                activation_checkpoint_func=partial(torch.utils.checkpoint.checkpoint, use_reentrant=True),
+                                checkpointable_layers=['Linear'])
+    params = [p for p in pipe.parameters()]
+    engine, *_ = deepspeed.initialize(
+        model=pipe,
+        model_parameters=params,
+        optimizer=torch.optim.SGD(params, lr=LR),
+        config={'train_micro_batch_size_per_gpu': 1, 'gradient_accumulation_steps': 2,
+                'gradient_clipping': 0.0, 'steps_per_print': 10**9},
+    )
+    engine._support_torch_style_backward = True
+    engine.train_batch(iter(_micro_batches(2)))
+    weights = {name.split('.')[0]: p.tolist() for name, p in pipe.named_parameters()}
+    with open(f'{out_dir}/{rank}.json', 'w') as f:
+        json.dump(weights, f)
+
+
+@pytest.mark.parametrize('num_stages', [1, 2])
+def test_a_reentrant_checkpoint_of_the_first_layer_still_trains_it(num_stages, tmp_path):
+    import time
+    context = mp.start_processes(_checkpointed_worker, args=(num_stages, 'linear', str(tmp_path / 'init'), str(tmp_path)),
+                                 nprocs=num_stages, join=False, start_method='spawn')
+    deadline = time.time() + 240
+    while not context.join(timeout=5):
+        if time.time() > deadline:
+            for process in context.processes:
+                process.kill()
+            pytest.fail('the pipeline hung')
+    trained = {}
+    for rank in range(num_stages):
+        trained.update(json.loads((tmp_path / f'{rank}.json').read_text()))
+    expected = _expected_weights(2)
+    assert sorted(trained) == sorted(expected)
+    for layer in expected:
+        assert trained[layer] == [pytest.approx(row, abs=1e-6) for row in expected[layer]], f'layer {layer}'
