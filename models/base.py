@@ -77,8 +77,9 @@ class TensorCache:
     """A value built once per (tensor object, key), for the life of the tensor.
 
     The blocks of a pipeline stage receive the same tensor object from the layer before, so a value derived from it
-    (an additive mask) is built once per micro-batch and every block gets the same object, which keeps the attention's
-    per-mask caches (utils/attention.py) working. Keyed by id with a weakref that drops the entry when the tensor dies
+    (an additive mask) is built once per micro-batch and every block gets the same object, which lets the attention's
+    per-mask caches (utils/attention.py) hit where the model passes the mask on as it is. Under a reentrant checkpoint
+    each block gets a new view of the tensor and rebuilds it, as it would without the cache. Keyed by id with a weakref that drops the entry when the tensor dies
     (a WeakKeyDictionary compares tensors with ==, which is elementwise)."""
 
     def __init__(self):

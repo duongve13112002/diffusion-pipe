@@ -282,7 +282,7 @@ class TransformerLayer(nn.Module):
     def forward(self, inputs):
         hidden_states, temb, pe, mod_scale1_a, mod_scale1_b, mod_gate1_a, mod_gate1_b, mod_scale2_a, mod_scale2_b, mod_gate2_a, mod_gate2_b, mod_zeros, sizes, endpoints, *masks = inputs
         mod = ((mod_scale1_a, mod_scale1_b), (mod_gate1_a, mod_gate1_b), (mod_scale2_a, mod_scale2_b), (mod_gate2_a, mod_gate2_b), mod_zeros)
-        seq_len, H, W = sizes
+        seq_len, H, W = sizes.tolist()
         prefix_len = seq_len - H*W
         segments = unpack_segments(endpoints, masks)
 
@@ -309,7 +309,7 @@ class FinalLayer(nn.Module):
     @torch.compiler.disable
     def forward(self, inputs):
         hidden_states, temb, pe, mod_scale1_a, mod_scale1_b, mod_gate1_a, mod_gate1_b, mod_scale2_a, mod_scale2_b, mod_gate2_a, mod_gate2_b, mod_zeros, sizes, endpoints, *masks = inputs
-        seq_len, H, W = sizes
+        seq_len, H, W = sizes.tolist()
         prefix_len = seq_len - H*W
         B = hidden_states.shape[0]
         hidden_states = self.norm_out(hidden_states[:, prefix_len:], temb[:-1])

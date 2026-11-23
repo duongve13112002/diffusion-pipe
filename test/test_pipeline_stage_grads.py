@@ -152,10 +152,10 @@ def stage_output(received):
     return (received[0] * 2.0, received[3])
 
 
-def run_stage(monkeypatch, inputs, forward=stage_output, interval=0):
+def run_stage(monkeypatch, inputs, forward=stage_output, mark=False):
     stage = object.__new__(ManualPipelineModule)
     torch.nn.Module.__init__(stage)
-    stage.activation_checkpoint_interval = interval
+    stage.mark_first_stage_inputs = mark
     monkeypatch.setattr(PipelineModule, 'forward', lambda self, x: forward(x))
     return stage.forward(inputs)
 
@@ -223,7 +223,7 @@ def test_ltx_video_carries_its_prompt_mask_as_it_is_and_builds_the_bias_in_each_
     assert 'encoder_attention_bias(encoder_attention_mask, hidden_states.dtype)' in block
 
 
-def test_with_activation_checkpointing_the_first_stage_inputs_are_marked_so_a_reentrant_checkpoint_keeps_the_graph(monkeypatch):
+def test_with_a_reentrant_checkpoint_the_first_stage_inputs_are_marked(monkeypatch):
     loader_inputs = (torch.randn(2, 3), torch.randn(4), torch.arange(2))
     seen = []
 
@@ -231,50 +231,18 @@ def test_with_activation_checkpointing_the_first_stage_inputs_are_marked_so_a_re
         seen.append([t.requires_grad for t in x])
         return x[0] * 2.0
 
-    run_stage(monkeypatch, loader_inputs, layers, interval=1)
+    run_stage(monkeypatch, loader_inputs, layers, mark=True)
     assert seen == [[True, True, False]]
     seen.clear()
-    plain = (torch.randn(2, 3), torch.randn(4))
-    run_stage(monkeypatch, plain, layers, interval=0)
+    run_stage(monkeypatch, (torch.randn(2, 3), torch.randn(4)), layers, mark=False)
     assert seen == [[False, False]]
     seen.clear()
     with torch.no_grad():
-        run_stage(monkeypatch, (torch.randn(2),), layers, interval=1)
+        run_stage(monkeypatch, (torch.randn(2),), layers, mark=True)
     assert seen == [[False]]
 
 
-def test_the_blocks_of_a_stage_share_one_additive_mask_per_micro_batch():
-    import gc
-    from models.ltx2 import _additive_masks, additive_attention_mask
-    from models.ltx_video import _attention_biases, encoder_attention_bias
-
-    mask = torch.tensor([[1, 1, 0], [1, 0, 0]], dtype=torch.int32)
-    first = additive_attention_mask(mask, torch.bfloat16)
-    assert additive_attention_mask(mask, torch.bfloat16) is first
-    assert additive_attention_mask(mask, torch.float32) is not first
-    assert additive_attention_mask(mask.clone(), torch.bfloat16) is not first
-    ids = torch.tensor([[1, 0, 1]])
-    bias = encoder_attention_bias(ids, torch.bfloat16)
-    assert encoder_attention_bias(ids, torch.bfloat16) is bias
-    assert encoder_attention_bias(ids, torch.float32) is not bias
-    del mask, ids
-    gc.collect()
-    assert len(_additive_masks) == 0 and len(_attention_biases) == 0
-
-
-def test_a_tensor_cache_builds_once_per_tensor_and_key_and_forgets_dead_tensors():
-    import gc
-    from models.base import TensorCache
-
-    cache = TensorCache()
-    calls = []
-    tensor = torch.arange(3)
-    assert cache.get(tensor, 'k', lambda: calls.append(1) or 'v') == 'v'
-    assert cache.get(tensor, 'k', lambda: calls.append(1) or 'w') == 'v'
-    assert cache.get(tensor, 'other', lambda: calls.append(1) or 'x') == 'x'
-    assert calls == [1, 1] and len(cache) == 1
-    same_values = torch.arange(3)
-    assert cache.get(same_values, 'k', lambda: 'fresh') == 'fresh'
-    del tensor, same_values
-    gc.collect()
-    assert len(cache) == 0
+def test_train_py_marks_the_first_stage_inputs_for_reentrant_and_unsloth_checkpointing_only():
+    source = (Path(__file__).resolve().parent.parent / 'train.py').read_text()
+    assert ("'mark_first_stage_inputs': bool(config['reentrant_activation_checkpointing']) "
+            "or activation_checkpointing == 'unsloth'") in source

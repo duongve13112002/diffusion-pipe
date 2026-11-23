@@ -12,8 +12,9 @@ from models.base import tie_unused
 # For example if you have 2 gpus - one with 16GB and other with 24GB normal partitioning would throw OOM
 # With this implementation you can set partition_split in config so that less layers is loaded onto 16GB GPU
 class ManualPipelineModule(PipelineModule):
-    def __init__(self, *args, manual_partition_split=None, **kwargs):
+    def __init__(self, *args, manual_partition_split=None, mark_first_stage_inputs=False, **kwargs):
         self.manual_partition_split = manual_partition_split
+        self.mark_first_stage_inputs = mark_first_stage_inputs
         super().__init__(*args, **kwargs)
 
     def forward(self, forward_input):
@@ -22,7 +23,7 @@ class ManualPipelineModule(PipelineModule):
         # tuple, one only the first blocks read) is tied to the output with a zero weight. Tensors that do not
         # require grad (the first stage's inputs without reentrant checkpointing, anything under no_grad) are skipped.
         received = (forward_input,) if torch.is_tensor(forward_input) else tuple(forward_input)
-        if self.activation_checkpoint_interval > 0 and torch.is_grad_enabled():
+        if self.mark_first_stage_inputs and torch.is_grad_enabled():
             # A reentrant checkpoint (torch's, or unsloth's) decides at the call whether its outputs get a graph, from
             # whether an input requires grad, and the first stage's inputs come from the data loader. The engine would
             # mark them (_exec_load_micro_batch), but only when its own config asks for checkpointing, which this

@@ -237,7 +237,7 @@ def test_a_floating_tensor_a_stage_receives_and_does_not_read_does_not_stop_the_
         assert trained[layer] == [pytest.approx(row, abs=1e-6) for row in expected[layer]], f'layer {layer}'
 
 
-def _checkpointed_worker(rank, num_stages, kind, init_file, out_dir):
+def _checkpointed_worker(rank, num_stages, init_file, out_dir):
     import os
     from functools import partial
     import deepspeed
@@ -252,7 +252,7 @@ def _checkpointed_worker(rank, num_stages, kind, init_file, out_dir):
     pipe = ManualPipelineModule(layers=_layers(), num_stages=num_stages, loss_fn=_loss, partition_method='uniform',
                                 activation_checkpoint_interval=1,
                                 activation_checkpoint_func=partial(torch.utils.checkpoint.checkpoint, use_reentrant=True),
-                                checkpointable_layers=['Linear'])
+                                checkpointable_layers=['Linear'], mark_first_stage_inputs=True)
     params = [p for p in pipe.parameters()]
     engine, *_ = deepspeed.initialize(
         model=pipe,
@@ -271,7 +271,7 @@ def _checkpointed_worker(rank, num_stages, kind, init_file, out_dir):
 @pytest.mark.parametrize('num_stages', [1, 2])
 def test_a_reentrant_checkpoint_of_the_first_layer_still_trains_it(num_stages, tmp_path):
     import time
-    context = mp.start_processes(_checkpointed_worker, args=(num_stages, 'linear', str(tmp_path / 'init'), str(tmp_path)),
+    context = mp.start_processes(_checkpointed_worker, args=(num_stages, str(tmp_path / 'init'), str(tmp_path)),
                                  nprocs=num_stages, join=False, start_method='spawn')
     deadline = time.time() + 240
     while not context.join(timeout=5):

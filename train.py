@@ -855,6 +855,8 @@ if __name__ == '__main__':
             'activation_checkpoint_interval': 1,
             'checkpointable_layers': model.checkpointable_layers,
             'activation_checkpoint_func': checkpoint_func,
+            # a reentrant checkpoint (unsloth's included) gives its outputs a graph only when an input requires grad
+            'mark_first_stage_inputs': bool(config['reentrant_activation_checkpointing']) or activation_checkpointing == 'unsloth',
         })
 
     num_stages = config.get('pipeline_stages', 1)

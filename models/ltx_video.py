@@ -279,6 +279,7 @@ class InitialLayer(nn.Module):
 _attention_biases = TensorCache()
 
 
+@torch.compiler.disable
 def encoder_attention_bias(encoder_attention_mask, dtype):
     """A 0/1 prompt mask of shape (B, S) as the additive bias (B, 1, S) the blocks take. The mask crosses the
     pipeline stages as it is and this runs in each block: a float bias would be marked as requiring grad by every

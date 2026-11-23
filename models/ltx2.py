@@ -48,6 +48,7 @@ comfy.text_encoders.lt.LTXAVTEModel.encode_token_weights = encode_token_weights
 _additive_masks = TensorCache()
 
 
+@torch.compiler.disable
 def additive_attention_mask(attention_mask, dtype):
     """ComfyUI's LTXVModel._prepare_attention_mask: a 0/1 key mask as an additive mask of shape (B, 1, 1, S). The
     mask crosses the pipeline stages as integers and is turned into this in each block: a float mask would be
