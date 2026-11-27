@@ -320,6 +320,12 @@ def evaluate(model, model_engine, eval_dataloaders, tb_writer, step, eval_gradie
     model.prepare_block_swap_training()
 
 
+def training_is_complete(epoch, step, config):
+    """True when a run resumed from the checkpoint written at the end of a finished run has nothing left to train:
+    the loader is past the last epoch, or the step is past max_steps. Resuming then used to train one more step."""
+    return epoch > config['epochs'] or ('max_steps' in config and step > config['max_steps'])
+
+
 def get_prodigy_d(optimizer):
     d = 0
     for group in optimizer.param_groups:
@@ -585,6 +591,9 @@ if __name__ == '__main__':
 
     default_micro_batch_size_per_gpu = list(micro_batch_size_per_gpu.values())[0]
 
+    if 'optimizer' not in config:
+        raise ValueError('a training run needs an [optimizer] table (type, lr, ...); only the caching options '
+                         '(--cache_only, --cache_status, --metadata_only) run without one')
     gradient_release = config['optimizer'].get('gradient_release', False)
     ds_config = {
         'train_micro_batch_size_per_gpu': default_micro_batch_size_per_gpu,
@@ -1045,7 +1054,8 @@ if __name__ == '__main__':
             params_wd = []
             params = pg.pop('params')
             for p in params:
-                if p.ndim == 1 or p.original_name.startswith('llm_adapter.embed'):
+                # original_name: set by the models that name a parameter group's members; the others have no such embeddings
+                if p.ndim == 1 or getattr(p, 'original_name', '').startswith('llm_adapter.embed'):
                     params_no_wd.append(p)
                 else:
                     params_wd.append(p)
@@ -1293,7 +1303,15 @@ if __name__ == '__main__':
     startup_timing.report()
     attention_reported = False
     empty_cuda_cache()
-    while True:
+    final_model_name = None
+    already_complete = training_is_complete(epoch, step, config)
+    # Nothing was trained here, so nothing is saved either.
+    saved = checkpointed = already_complete
+    if already_complete and is_main_process():
+        print(f'The checkpoint is the end of a finished run (epoch {epoch} of {config["epochs"]}, step {step - 1}'
+              + (f', max_steps {config["max_steps"]}' if 'max_steps' in config else '')
+              + '): nothing left to train. Raise epochs or max_steps to continue it.')
+    while not already_complete:
         model_engine.reset_activation_shape()
         iterator = get_data_iterator_for_step(train_dataloader, model_engine)
         if nan_check is not None:

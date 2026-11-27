@@ -65,3 +65,35 @@ def test_flux2_control_latents_use_the_latent_format():
     source = (ROOT / 'models' / 'flux2.py').read_text()
     assert 'model_patcher' not in source
     assert 'self.latent_format.process_in(control_latents)' in source
+
+
+def test_a_finished_runs_checkpoint_has_nothing_left_to_train(train):
+    config = {'epochs': 3}
+    assert not train.training_is_complete(1, 1, config)
+    assert not train.training_is_complete(3, 500, config)
+    # the loader moves to epoch 4 when the last epoch ends, and the final checkpoint keeps that
+    assert train.training_is_complete(4, 500, config)
+    # raising epochs continues the run
+    assert not train.training_is_complete(4, 500, {'epochs': 5})
+    # the final checkpoint of a max_steps run holds step = max_steps, and a resume starts at the next
+    assert not train.training_is_complete(1, 100, {'epochs': 3, 'max_steps': 100})
+    assert train.training_is_complete(1, 101, {'epochs': 3, 'max_steps': 100})
+    assert not train.training_is_complete(1, 101, {'epochs': 3, 'max_steps': 200})
+
+
+def test_the_loop_does_not_start_on_a_finished_checkpoint(train):
+    source = inspect.getsource(train).split("if __name__ == '__main__':", 1)[1]
+    assert 'already_complete = training_is_complete(epoch, step, config)' in source
+    assert 'while not already_complete:' in source
+    assert 'saved = checkpointed = already_complete' in source
+
+
+def test_a_config_without_an_optimizer_table_is_refused_by_name(train):
+    source = inspect.getsource(train)
+    assert source.index("if 'optimizer' not in config:") < source.index("config['optimizer'].get('gradient_release'")
+
+
+def test_parameters_of_a_model_without_original_names_are_grouped(train):
+    source = inspect.getsource(train)
+    assert "getattr(p, 'original_name', '')" in source
+    assert 'p.original_name.startswith' not in source
