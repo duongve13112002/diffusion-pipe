@@ -129,3 +129,30 @@ def test_a_checkpoint_saved_with_one_placement_resumes_with_the_other(tmp_path):
     for key, weights in by_stage(resumed).items():
         assert weights == by_stage(again)[key]
     assert all(r['loss'] == pytest.approx(resumed[0]['loss'], abs=1e-6) for r in resumed)
+
+
+def test_the_gpus_of_a_node_come_from_either_launchers_variable(monkeypatch):
+    monkeypatch.delenv('LOCAL_SIZE', raising=False)
+    monkeypatch.delenv('LOCAL_WORLD_SIZE', raising=False)
+    assert placement.local_world_size() == 0
+    monkeypatch.setenv('LOCAL_SIZE', '8')
+    assert placement.local_world_size() == 8
+    monkeypatch.delenv('LOCAL_SIZE')
+    monkeypatch.setenv('LOCAL_WORLD_SIZE', '4')
+    assert placement.local_world_size() == 4
+
+
+@pytest.mark.parametrize('how', ['keyword', 'positional'])
+def test_the_placement_applies_whether_the_stages_are_given_by_keyword_or_position(how, monkeypatch):
+    import utils.pipeline as pipeline_module
+    seen = {}
+    monkeypatch.setattr(pipeline_module.PipelineModule, '__init__', lambda self, *a, **kw: seen.update(kw))
+    monkeypatch.setattr(torch.distributed, 'get_world_size', lambda *a, **k: 8)
+    if how == 'keyword':
+        pipeline_module.ManualPipelineModule(layers=[], num_stages=4, placement='node_local')
+    else:
+        pipeline_module.ManualPipelineModule([], 4, placement='node_local')
+    assert seen['topology'].get_dim('pipe') == 4 and seen['topology'].axes == ['data', 'pipe']
+    seen.clear()
+    pipeline_module.ManualPipelineModule(layers=[], num_stages=4, placement='stage_major')
+    assert 'topology' not in seen

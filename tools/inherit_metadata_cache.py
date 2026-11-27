@@ -6,7 +6,7 @@
 
 The first run of a model on a dataset enumerates every file, reads every image header and
 every caption, and freezes the result as a source metadata snapshot under
-<path>/cache/<model>/profiles/<geometry>/. For millions of images that scan is the slow part of
+<cache_root>/<model>/profiles/<geometry>/ (cache_root: <path>/cache, or under cache_path). For millions of images that scan is the slow part of
 startup. The snapshot holds nothing model specific -- file paths, masks, raw captions and the
 aspect-ratio bucket of each image -- so a model with the same bucketing can start from another
 model's snapshot instead of scanning again. This tool copies it across (hard links when the

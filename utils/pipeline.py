@@ -17,10 +17,12 @@ class ManualPipelineModule(PipelineModule):
                  placement=DEFAULT_PLACEMENT, **kwargs):
         self.manual_partition_split = manual_partition_split
         self.mark_first_stage_inputs = mark_first_stage_inputs
-        if kwargs.get('topology') is None and kwargs.get('num_stages'):
+        # PipelineModule(layers, num_stages, topology, ...): the stages may come positionally.
+        num_stages = kwargs.get('num_stages') or (args[1] if len(args) > 1 else None)
+        topology_given = kwargs.get('topology') is not None or len(args) > 2
+        if not topology_given and num_stages:
             # See utils/placement.py. The teacher's second pipeline takes the student's placement.
-            topology = pipeline_topology(kwargs['num_stages'], torch.distributed.get_world_size(),
-                                         check_placement(placement))
+            topology = pipeline_topology(num_stages, torch.distributed.get_world_size(), check_placement(placement))
             if topology is not None:
                 kwargs['topology'] = topology
         super().__init__(*args, **kwargs)

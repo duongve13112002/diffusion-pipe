@@ -27,7 +27,7 @@ other models that use it.
 
 ## Caching: latents and text embeddings are separate, keep them that way
 
-`DirectoryDataset.cache_dir` is `<dataset>/cache/<model.name>`, and **both** latents
+`DirectoryDataset.cache_dir` is `<dataset>/cache/<model.name>` (`cache_root / <model.name>`; `cache_root` is `<dataset>/cache` unless `cache_path` is set), and **both** latents
 (`latents_` prefix) and text embeddings (`text_embeddings_{i}_` prefix) live under it.
 
 A `cache_name` config key was added to invalidate stale text embeddings when the text encoder

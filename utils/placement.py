@@ -62,4 +62,5 @@ def straddling_note(stages, world, local_world_size):
 
 
 def local_world_size():
-    return int(os.environ.get('LOCAL_WORLD_SIZE', 0) or 0)
+    # The deepspeed launcher sets LOCAL_SIZE, torchrun LOCAL_WORLD_SIZE.
+    return int(os.environ.get('LOCAL_SIZE') or os.environ.get('LOCAL_WORLD_SIZE') or 0)

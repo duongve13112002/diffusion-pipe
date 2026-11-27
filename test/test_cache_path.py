@@ -57,3 +57,17 @@ def test_every_cache_is_written_under_cache_path_and_none_beside_the_images(tmp_
         return sorted(round(float(row.sum()), 3) for batch in batches_ for row in batch['latents'])
 
     assert rows(result) == rows(default)
+
+
+def test_a_dataset_built_without_a_process_group_announces_the_cache_path(tmp_path, capsys, monkeypatch):
+    """tools/inherit_metadata_cache.py builds datasets with no distributed backend."""
+    images = make_images(tmp_path / 'images', CAPTIONS[:2])
+    config = dataset_config(images, cache_path=str(tmp_path / 'elsewhere'))
+    dataset_util._ANNOUNCED_CACHE_ROOTS.clear()
+
+    def no_backend():
+        raise AssertionError('DeepSpeed backend not set')
+
+    monkeypatch.setattr(dataset_util, 'is_main_process', no_backend)
+    dataset_util.Dataset(config, Model(cache_text_embeddings=False))
+    assert 'caches go to' in capsys.readouterr().out

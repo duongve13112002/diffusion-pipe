@@ -2070,6 +2070,9 @@ def directory_setting(directory_config, dataset_config, key, why):
     raise ValueError(f'{directory_config["path"]}: set {key} in the dataset config or its [[directory]] ({why})')
 
 
+_ANNOUNCED_CACHE_ROOTS = set()
+
+
 def directory_cache_root(path, directory_config, dataset_config):
     """Where the caches of the dataset directory `path` live, before the model's name: `<path>/cache` by default.
 
@@ -2147,8 +2150,11 @@ class DirectoryDataset:
         self.default_mask_file = Path(self.directory_config['default_mask_file']) if 'default_mask_file' in self.directory_config else None
         self.cache_root = directory_cache_root(self.path, directory_config, dataset_config)
         self.cache_dir = self.cache_root / self.model_name
-        if self.cache_root != self.path / 'cache' and is_main_process():
-            print(f'{self.path}: caches go to {self.cache_root} (cache_path)')
+        if self.cache_root != self.path / 'cache' and self.cache_root not in _ANNOUNCED_CACHE_ROOTS:
+            _ANNOUNCED_CACHE_ROOTS.add(self.cache_root)
+            # No process group in the tools that build datasets on their own.
+            if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
+                print(f'{self.path}: caches go to {self.cache_root} (cache_path)')
         self.require_non_latin_caption = directory_config['require_non_latin_caption']
         if self.require_non_latin_caption is not None:
             # Selection changes image rows, so isolate all row-indexed caches, not only captions.

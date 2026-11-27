@@ -497,7 +497,7 @@ the launcher's port.
   number of examples, with a warning: a batch then holds a different number of examples.
 
 ## Pre-caching
-Latents and text embeddings are cached to disk before training happens. This way, the VAE and text encoders don't need to be kept loaded during training. The Huggingface Datasets library is used for all the caching. Cache files are reused between training runs if they exist. All cache files are written into a directory named "cache" inside each dataset directory.
+Latents and text embeddings are cached to disk before training happens. This way, the VAE and text encoders don't need to be kept loaded during training. The Huggingface Datasets library is used for all the caching. Cache files are reused between training runs if they exist. All cache files are written into a directory named "cache" inside each dataset directory, or under `cache_path` when the dataset TOML sets it (see `examples/dataset.toml`).
 
 This caching also means that training LoRAs for text encoders is not currently supported.
 

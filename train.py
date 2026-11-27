@@ -104,6 +104,7 @@ def set_config_defaults(config):
     assert 'save_every_n_epochs' in config or 'save_every_n_steps' in config or 'save_every_n_examples' in config
 
     config.setdefault('pipeline_stages', 1)
+    check_placement(config.get('pipeline_placement', DEFAULT_PLACEMENT))
     if 'optimizer' in config:
         check_pipeline_optimizer(config['optimizer']['type'], config['pipeline_stages'])
     config.setdefault('activation_checkpointing', False)

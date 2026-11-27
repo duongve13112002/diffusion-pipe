@@ -1417,7 +1417,7 @@ Top-level `dataloader_workers` (default 1) sets the training DataLoader worker c
 default on-the-fly pixels, 4 or more keeps image decoding off the critical path. It is per GPU
 process: the machine runs `dataloader_workers` x GPUs workers in total.
 
-Starting from an Anima dataset cache: Iris keeps its own cache in `<path>/cache/iris/`, so its
+Starting from an Anima dataset cache: Iris keeps its own cache in `<path>/cache/iris/` (under `cache_path` when set), so its
 first run scans the dataset again (every file, image header and caption). On a very large
 dataset that Anima or Anima refiner already scanned, the scan can be skipped:
 ```
