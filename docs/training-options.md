@@ -206,7 +206,10 @@ with one GPU, several, several nodes and any `pipeline_stages`.
   Once `decay` has brought lambda to 0 (step `decay_steps`) the teacher no longer runs: the loss ignores it from
   there on, and the label carries zeros; the teacher's weights are freed from the GPU at that point, on every path (the generic
   teacher, MOSS-Image's and anima_refiner's stock Anima, with one stage or several); a layer or module it shares
-  with the student (an adapter run's blocks, a DiT the stock teacher shares) is kept, and the forward does not run. MOSS-Image with `cache_text_embeddings = false` encodes each caption once per
+  with the student (an adapter run's blocks, a DiT the stock teacher shares) is kept, and the forward does not run.
+  A run resumed from a checkpoint whose next step is already at or past `decay_steps` does not load the teacher at
+  all (it is switched off before anything is built). The teacher always runs in bf16, also next to the student's
+  `[fp8_training]`. MOSS-Image with `cache_text_embeddings = false` encodes each caption once per
   step: the teacher's text layer leaves the embedding on stage 0 and the student's takes it. Under `[fp8_training]` the teacher runs in bf16, and MOSS-Image's full
   fine-tune teacher (without `path`) is copied from the model before fp8 touches it.
 - Evaluation batches (`[eval_datasets]`) report the plain loss, without the distillation term. The step log has

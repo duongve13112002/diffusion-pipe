@@ -464,6 +464,8 @@ if __name__ == '__main__':
         if error is not None:
             raise RuntimeError(error)
     startup_timing.mark('distributed setup, attention and resume checks')
+    if resume_tag is not None and model_teacher.skip_finished_teacher(config, resume_tag):
+        teacher_config = None
 
     model_type = config['model']['type']
 

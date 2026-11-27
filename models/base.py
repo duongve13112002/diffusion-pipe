@@ -648,6 +648,11 @@ class CommonPipeline:
                                   'the pipeline\'s constructor, which a teacher cannot reuse. Remove path to '
                                   'distill toward the starting model.')
 
+    def teacher_copy_of(self, attr):
+        """The teacher's copy of the denoiser attribute `attr` (a deep copy; a model overrides it to leave out what
+        the teacher can share with the student)."""
+        return copy.deepcopy(getattr(self, attr))
+
     def make_teacher_layers(self, path=None):
         """The layers of a frozen teacher: the model's to_layers() over a copy of the denoiser as loaded, or over
         the denoiser read from `path`. Built on a shallow copy of the pipeline, so what to_layers() and the loader
@@ -658,7 +663,7 @@ class CommonPipeline:
         teacher.__dict__.update(self.__dict__)
         if path is None:
             for attr in self.teacher_denoiser_attrs:
-                setattr(teacher, attr, copy.deepcopy(getattr(self, attr)))
+                setattr(teacher, attr, self.teacher_copy_of(attr))
         else:
             teacher.load_teacher_denoiser(path)
         return teacher.to_layers()

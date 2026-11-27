@@ -34,10 +34,11 @@ Kept free of training-stack imports so it can be unit-tested on CPU.
 
 import gc
 import math
+import re
 
 import torch
 
-from models.teacher_guidance import DECAYS, decay_at, is_anima_teacher
+from models.teacher_guidance import DECAYS, decay_at, is_anima_teacher, should_announce
 from utils import fp8_training
 from utils.common import all_ok, warn_ignored
 from utils.distillation import DistillConfig, distill_warnings
@@ -395,6 +396,26 @@ def label_hooks_for(model, own_teacher):
         return hooks
     return LabelHooks(label_targets=getattr(model, 'teacher_label_targets', None) if own_teacher else None,
                       keep_float32=getattr(model, 'teacher_output_float32', False) if own_teacher else False)
+
+
+def skip_finished_teacher(config, resume_tag):
+    """A run resumed from a checkpoint after [teacher]'s decay has ended switches the teacher off before anything is
+    built (loss_weight = 0 loads nothing): the teacher would be loaded on every rank only to be freed at the first
+    step. The checkpoint tag is global_step<N>: the next step is N + 1, and from `decay_steps` on lambda is 0."""
+    table = config.get('teacher')
+    match = re.fullmatch(r'global_step(\d+)', str(resume_tag))
+    if not isinstance(table, dict) or match is None or not table.get('loss_weight'):
+        return False
+    decay_steps = table.get('decay_steps', 0)
+    if table.get('decay', 'none') == 'none' or not isinstance(decay_steps, int) or decay_steps <= 0:
+        return False
+    if int(match.group(1)) + 1 < decay_steps:
+        return False
+    table['loss_weight'] = 0
+    if should_announce():
+        print(f'[{KEY}]: resuming at step {int(match.group(1)) + 1}, after the decay ended (decay_steps = '
+              f'{decay_steps}): the teacher is not loaded.')
+    return True
 
 
 def wrap_loss_fn(inner, teacher):

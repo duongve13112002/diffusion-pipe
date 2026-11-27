@@ -1,6 +1,7 @@
 import re
 from pathlib import Path
 
+import copy
 import diffusers
 import torch
 from torch import nn
@@ -426,6 +427,14 @@ class SDXLPipeline(BasePipeline):
 
     def __getattr__(self, name):
         return getattr(self.diffusers_pipeline, name)
+
+    def teacher_copy_of(self, attr):
+        # The UNet and both text encoders are copied; the VAE and the scheduler stay the student's (as with a
+        # [teacher] path), so the copy does not hold a second VAE on every rank.
+        pipeline = getattr(self, attr)
+        memo = {id(part): part for part in (getattr(pipeline, 'vae', None), getattr(pipeline, 'scheduler', None))
+                if part is not None}
+        return copy.deepcopy(pipeline, memo)
 
     def load_teacher_denoiser(self, path):
         # The teacher is a whole second pipeline: the UNet and both text encoders of the checkpoint at `path`

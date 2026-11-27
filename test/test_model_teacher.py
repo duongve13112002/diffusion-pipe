@@ -1001,6 +1001,19 @@ def test_sdxl_reads_a_whole_second_pipeline_and_keeps_the_students_vae_and_sched
     assert pipe.diffusers_pipeline is student and student.unet == 'student unet'
 
 
+def test_the_sdxl_teacher_copy_shares_the_vae_and_the_scheduler_but_not_the_unet_or_text_encoders():
+    from models import sdxl
+    pipe = sdxl.SDXLPipeline.__new__(sdxl.SDXLPipeline)
+    parts = dict(vae=torch.nn.Linear(2, 2), scheduler=types.SimpleNamespace(name='s'), unet=torch.nn.Linear(2, 2),
+                 text_encoder=torch.nn.Linear(2, 2), text_encoder_2=torch.nn.Linear(2, 2))
+    pipe.diffusers_pipeline = types.SimpleNamespace(**parts)
+    copy_of = pipe.teacher_copy_of('diffusers_pipeline')
+    assert copy_of.vae is parts['vae'] and copy_of.scheduler is parts['scheduler']
+    for name in ('unet', 'text_encoder', 'text_encoder_2'):
+        assert getattr(copy_of, name) is not parts[name]
+        torch.testing.assert_close(getattr(copy_of, name).weight, parts[name].weight)
+
+
 def test_iris_points_the_attribute_its_loader_reads_at_the_path(monkeypatch):
     # (Wan does the same with transformer_path; its module cannot be imported without a GPU, so the structural
     # test above checks it.)
@@ -1315,3 +1328,20 @@ def test_decay_steps_without_a_decay_is_ignored_with_a_warning(capsys):
     config = parse(decay_steps=100)
     assert 'decay_steps is ignored with decay = \'none\'' in capsys.readouterr().out
     assert config.decay_steps == 0
+
+
+@pytest.mark.parametrize('table, tag, skipped', [
+    ({'loss_weight': 0.5, 'decay': 'linear', 'decay_steps': 100}, 'global_step99', True),
+    ({'loss_weight': 0.5, 'decay': 'cosine', 'decay_steps': 100}, 'global_step500', True),
+    ({'loss_weight': 0.5, 'decay': 'linear', 'decay_steps': 100}, 'global_step98', False),
+    ({'loss_weight': 0.5}, 'global_step500', False),
+    ({'loss_weight': 0.5, 'decay': 'none', 'decay_steps': 100}, 'global_step500', False),
+    ({'loss_weight': 0.0, 'decay': 'linear', 'decay_steps': 100}, 'global_step500', False),
+    ({'loss_weight': 0.5, 'decay': 'linear', 'decay_steps': 100}, 'something_else', False),
+])
+def test_a_run_resumed_after_the_decay_does_not_load_the_teacher(table, tag, skipped, capsys):
+    config = {'teacher': dict(table)}
+    assert mt.skip_finished_teacher(config, tag) is skipped
+    assert (config['teacher']['loss_weight'] == 0) == (skipped or not table['loss_weight'])
+    assert skipped == ('the teacher is not loaded' in capsys.readouterr().out)
+    assert mt.skip_finished_teacher({}, 'global_step500') is False
