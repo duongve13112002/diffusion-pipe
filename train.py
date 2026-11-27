@@ -761,7 +761,7 @@ if __name__ == '__main__':
     if pipeline_teacher_config is None and hasattr(model, 'own_teacher_config'):
         pipeline_teacher_config = model.own_teacher_config()
     if pipeline_teacher_config is not None:
-            # With one stage the loader runs the teacher on the same GPU as the student. With several, every rank builds
+        # With one stage the loader runs the teacher on the same GPU as the student. With several, every rank builds
         # the teacher's layers (on the CPU) and the second, forward-only pipeline engine below keeps its own
         # stage's share on the GPU. Building can fail on one rank alone (a missing file, a mismatching checkpoint):
         # every rank hears of it before the next collective rather than waiting out the timeout.

@@ -193,14 +193,20 @@ def balanced_split(layers, num_stages):
 def release_foreign_weights(layers, module):
     """Free the weights of the teacher layers that are not `module`'s (the other stages'). Several layers hold a
     hidden reference to the whole copied model (a list, so it is not a parameter of theirs), which keeps the
-    other stages' blocks alive in host memory for the whole run; their storage is emptied instead."""
+    other stages' blocks alive in host memory for the whole run. The modules' entries are replaced by empty ones
+    rather than emptied in place: a tensor subclass (a quantized weight) keeps its payload in attributes that
+    `.data = ...` does not drop."""
     kept = {id(t) for t in (*module.parameters(), *module.buffers())}
     for layer in layers:
         if not isinstance(layer, torch.nn.Module):
             continue
-        for t in (*layer.parameters(), *layer.buffers()):
-            if id(t) not in kept:
-                t.data = torch.empty(0, dtype=t.dtype)
+        for m in layer.modules():
+            for name, p in list(m._parameters.items()):
+                if p is not None and id(p) not in kept:
+                    m._parameters[name] = torch.nn.Parameter(torch.empty(0, dtype=p.dtype), requires_grad=False)
+            for name, b in list(m._buffers.items()):
+                if b is not None and id(b) not in kept:
+                    m._buffers[name] = torch.empty(0, dtype=b.dtype)
 
 
 def _release_engine_buffers(engine):
@@ -272,9 +278,8 @@ class LabelHooks:
 class TeacherPipeline:
     """The teacher as a second, forward-only pipeline engine with the student's number of stages.
 
-    The first-stage teacher (ModelTeacher.run in the data loader) holds the whole teacher on the first stage's
-    GPUs. Here the teacher's layers are split over the stages like the student's, so every GPU holds
-    1/stages of it. Every step, before the student's train_batch, all ranks run the teacher engine over the
+    The teacher's layers are split over the stages like the student's, so every GPU holds 1/stages of it (with
+    one stage ModelTeacher.run in the data loader runs it on the student's GPU). Every step, before the student's train_batch, all ranks run the teacher engine over the
     step's micro batches (a collective: every rank calls attach, in the same order on every rank); the last stage
     then has the teacher's output of each micro batch and puts it in that micro batch's label, which is what
     ModelTeacher.run's output joins in the loader, so the loss function is the same.

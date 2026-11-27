@@ -1344,7 +1344,18 @@ class MossImagePipeline(ComfyPipeline):
         model.requires_grad_(False).eval()
         state = LayerState(model.rope, self.compute_dtype, self.fp16_fold)
         text_encoder = None if self.cache_text_embeddings else self.text_encoders[0]
-        return [TextEncoderLayer(text_encoder, self.dtype, self.text_dim, state), *teacher_chain(model, state)]
+        layer = TextEncoderLayer(text_encoder, self.dtype, self.text_dim, state, share=self.caption_share(),
+                                 publishes=True)
+        return [layer, *teacher_chain(model, state)]
+
+    def caption_share(self):
+        """The captions' embeddings the teacher's text layer leaves for the student's (see TextEncoderLayer); None
+        without the teacher pipeline."""
+        if not self.teacher_in_pipeline():
+            return None
+        if getattr(self, '_caption_share', None) is None:
+            self._caption_share = {}
+        return self._caption_share
 
     def on_first_stage(self):
         """Whether this rank is on the first pipeline stage (DeepSpeed numbers ranks stage-major)."""
@@ -1576,7 +1587,8 @@ class MossImagePipeline(ComfyPipeline):
         # The text encoder layer is there either way (see TextEncoderLayer), a pass-through when
         # embeddings are cached.
         text_encoder = None if self.cache_text_embeddings else self.text_encoders[0]
-        layers = [TextEncoderLayer(text_encoder, self.dtype, self.text_dim, state, self.build_teacher()),
+        layers = [TextEncoderLayer(text_encoder, self.dtype, self.text_dim, state, self.build_teacher(),
+                                   share=self.caption_share()),
                   InitialLayer(model, state)]
         for i, block in enumerate(model.layers):
             layers.append(TransformerLayer(block, i, self.offloader, state, len(model.layers)))
@@ -1587,9 +1599,9 @@ class MossImagePipeline(ComfyPipeline):
         """The frozen starting model for [teacher] (TeacherForward), on the ranks that run the first
         pipeline stage; None when [teacher] is off or on the other stages.
 
-        An adapter: the model's own blocks with the adapter switched off, nothing to copy (parse_distill_config
-        keeps this to one pipeline stage, which holds them all). A full fine-tune: a copy of the model as
-        loaded, frozen, on the GPU of every rank of stage 0; the rest of the stages never run it.
+        An adapter: the model's own blocks with the adapter switched off, nothing to copy (with
+        several pipeline stages the teacher is a pipeline of its own, make_teacher_layers). A full fine-tune: a copy
+        of the model as loaded, frozen, on the GPU of every rank of stage 0; the rest of the stages never run it.
         """
         if self.distill is None or not self.on_first_stage() or self.teacher_in_pipeline():
             return None
@@ -1793,6 +1805,7 @@ def token_batch(token_lists):
 # Eval embeddings kept between eval passes (train.py evaluates the same captions once per timestep
 # quantile), on the CPU, up to this many bytes.
 EVAL_CACHE_BYTES = 2 << 30
+SHARED_CAPTIONS = 1024
 
 
 class TextEncoderLayer(nn.Module):
@@ -1814,7 +1827,8 @@ class TextEncoderLayer(nn.Module):
     micro-batch instead of again in backward. Training batches only; eval and sampling leave it out.
     """
 
-    def __init__(self, text_encoder, dtype, text_dim=TEXT_DIM, state=None, teacher=None):
+    def __init__(self, text_encoder, dtype, text_dim=TEXT_DIM, state=None, teacher=None, share=None,
+                 publishes=False):
         super().__init__()
         self.text_encoder = [] if text_encoder is None else [text_encoder]
         # Held in a list, like the encoder: its weights are not this layer's parameters, so they stay out
@@ -1825,6 +1839,10 @@ class TextEncoderLayer(nn.Module):
         self.text_dim = text_dim
         self.eval_cache = {}
         self.eval_cache_bytes = 0
+        # With the teacher pipeline the teacher's text layer (publishes) and the student's read one dict, so a caption
+        # is encoded once per step: the teacher runs first and leaves its embedding, the student takes it.
+        self.share = share
+        self.publishes = publishes
 
     def encode(self, ids, lengths, device):
         if not self.text_encoder:
@@ -1838,18 +1856,26 @@ class TextEncoderLayer(nn.Module):
         if training and self.eval_cache:
             self.eval_cache.clear()
             self.eval_cache_bytes = 0
+        # The teacher layer runs without grad on training captions: its caption embeddings are not an eval cache.
+        use_eval_cache = not training and not self.publishes
         embeds = []
         with torch.no_grad(), torch.autocast(device.type, enabled=False):
             for row, n in zip(ids.tolist(), lengths):
                 key = tuple(row[:n])
-                embed = None if training else self.eval_cache.get(key)
+                embed = self.eval_cache.get(key) if use_eval_cache else None
+                if embed is None and self.share is not None:
+                    embed = self.share.pop(key, None) if training else self.share.get(key)
                 if embed is None:
                     tokens = {'qwen35_9b': [[(token, 1.0) for token in key]]}
                     embed = encode_tokens(te, tokens, self.dtype, self.text_dim, resident=True)
                     size = embed.numel() * embed.element_size()
-                    if not training and self.eval_cache_bytes + size <= EVAL_CACHE_BYTES:
+                    if use_eval_cache and self.eval_cache_bytes + size <= EVAL_CACHE_BYTES:
                         self.eval_cache[key] = embed.cpu()
                         self.eval_cache_bytes += size
+                if self.publishes:
+                    if len(self.share) >= SHARED_CAPTIONS:
+                        self.share.clear()
+                    self.share[key] = embed
                 embeds.append(embed.to(device))
         return embeds
 

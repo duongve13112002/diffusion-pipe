@@ -8,7 +8,9 @@ import torch
 import torch.multiprocessing as mp
 
 from test.test_distillation import cfg, distilling_pipeline, label_with_sigma
-from test.test_moss_image import forward_inputs, loaded_pipeline, reference_forward, single_process  # noqa: F401
+from models import moss_image as mi
+from test.test_moss_image import (caption_batch, forward_inputs, loaded_pipeline, on_the_fly_pipelines,  # noqa: F401
+                                  reference_forward, single_process)
 
 GAS = 2
 
@@ -63,6 +65,26 @@ def test_the_teacher_layers_give_the_starting_models_velocity_and_the_loss_reads
     torch.testing.assert_close(via_label, carried)
     without = loss_fn(prediction, (target, sigma, mask, torch.zeros_like(prediction)))
     assert not torch.allclose(via_label, without)
+
+
+def test_the_teachers_text_layer_leaves_each_caption_for_the_students_to_take(monkeypatch):
+    _, _, (_, pipe) = on_the_fly_pipelines(monkeypatch)
+    student, encoder = pipe.pipeline_model.layers[0], pipe.text_encoders[0]
+    shared = {}
+    student.share = shared
+    teacher = mi.TextEncoderLayer(encoder, pipe.dtype, pipe.text_dim, student.state, share=shared, publishes=True)
+    inputs = caption_batch(pipe)[0]
+    count = len(inputs[2])
+    with torch.no_grad():
+        theirs = teacher(inputs)[2]
+    # Not an eval cache: no host copies of training captions
+    assert encoder.encodes == count and teacher.eval_cache == {} and len(shared) == count
+    mine = student(inputs)[2]
+    assert encoder.encodes == count and shared == {}
+    torch.testing.assert_close(mine, theirs, rtol=0, atol=0)
+    # Taken once; a step the teacher did not run (finished) encodes as before.
+    student(inputs)
+    assert encoder.encodes == 2 * count
 
 
 def _worker(rank, world_size, num_stages, finished, init_file, out_dir):

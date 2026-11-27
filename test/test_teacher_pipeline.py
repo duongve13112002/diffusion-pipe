@@ -126,3 +126,28 @@ def test_a_finished_teacher_attaches_zeros_and_the_engine_does_not_run(tmp_path)
     last = [r for r in results if r['stage'] == 1][0]
     assert last['label_len'] == [3] * GAS
     assert all(all(v == 0 for row in t[0] for v in row) for t in last['teacher_targets'])
+
+
+def test_release_foreign_weights_frees_payloads_a_hidden_reference_keeps():
+    import gc
+    import weakref
+    from utils import model_teacher
+
+    class Holder(torch.nn.Module):
+        def __init__(self, weight):
+            super().__init__()
+            self.weight = torch.nn.Parameter(weight, requires_grad=False)
+
+    # a quantized weight keeps its data in attributes, which `.data = ...` does not drop
+    payload = torch.randn(64, 64)
+    ref = weakref.ref(payload)
+    foreign = Holder(torch.randn(2, 2))
+    foreign.weight.payload = payload
+    layers = [Holder(torch.randn(2, 2)), foreign]
+    hidden = [foreign]  # what a layer's list keeps alive
+    del payload
+    kept = torch.nn.Sequential(layers[0])
+    model_teacher.release_foreign_weights(layers, kept)
+    gc.collect()
+    assert ref() is None and hidden[0].weight.numel() == 0
+    assert layers[0].weight.numel() == 4
