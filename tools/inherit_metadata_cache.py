@@ -126,7 +126,7 @@ def _resolve_active(geometry_dir):
 def find_donor_snapshot(target, donor, donor_framerates, round_to_multiple):
     """Every source_metadata of `donor` whose geometry equals the target's but for framerate."""
     from datasets.fingerprint import Hasher
-    profiles = target.path / 'cache' / donor / 'profiles'
+    profiles = target.cache_root / donor / 'profiles'
     log(f'{target.path}: looking for the {donor} snapshot under {profiles} '
         f'({len(donor_framerates)} candidate framerate(s))')
     found = []
@@ -274,7 +274,7 @@ def plan_directory(directory_config, dataset_config, donor, target_model, round_
     framerates = CANDIDATE_FRAMERATES if donor_framerate is None else [donor_framerate]
     found = find_donor_snapshot(target, donor, framerates, round_to_multiple)
     if not found:
-        donor_dir = target.path / 'cache' / donor
+        donor_dir = target.cache_root / donor
         if not donor_dir.is_dir():
             plan.note(f'no {donor} cache at {donor_dir}.')
         elif not (donor_dir / 'profiles').is_dir():
@@ -353,8 +353,8 @@ def plan_legacy_directory(plan, donor, target_model, force, sample, header_sampl
             return plan
         plan.replace_existing = True
 
-    relative = target.cache_dir.relative_to(target.path / 'cache' / target_model)
-    donor_metadata = target.path / 'cache' / donor / relative / 'metadata'
+    relative = target.cache_dir.relative_to(target.cache_root / target_model)
+    donor_metadata = target.cache_root / donor / relative / 'metadata'
     log(f'{target.path}: looking for {donor} legacy metadata in {donor_metadata}')
     keys_file = donor_metadata / f'grouping_keys{suffix}.json'
     if not keys_file.is_file():
@@ -363,7 +363,7 @@ def plan_legacy_directory(plan, donor, target_model, force, sample, header_sampl
             plan.note(f'{donor_metadata} has {others} but not {keys_file.name}: the donor cached captions under '
                       'other caption settings (prefix, shuffle, dropout, multiline, non-Latin filter, or caption '
                       'augmentation, which follows cache_text_embeddings: see --cache-text-embeddings).')
-        elif (target.path / 'cache' / donor / 'profiles').is_dir():
+        elif (target.cache_root / donor / 'profiles').is_dir():
             plan.note(f'{donor} was cached with reuse_metadata_cache = true (profiles/), not legacy metadata: '
                       'nothing to copy for a reuse_metadata_cache = false target.')
         else:

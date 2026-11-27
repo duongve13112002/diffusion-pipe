@@ -20,6 +20,14 @@ resolutions = [512]
 # First migration from abd164e may read sidecars and build disk indexes once.
 # reuse_metadata_cache = true
 
+# Where the caches (metadata, latents, text embeddings) are written. Default: a `cache` folder inside each
+# dataset directory. With cache_path, each directory gets its own subfolder here, named after the directory and a
+# hash of its absolute path (/fast/cache/my_images_1a2b3c4d5e/<model>/...), so two directories with the same name
+# never share one. Top level, or inside a [[directory]], where it wins. With several nodes it must be a folder
+# every node sees (the same requirement as the dataset). An existing cache is not moved: copy the `cache` folder
+# to <cache_path>/<directory>_<hash>/ (the startup log prints the folder) or let it be built again.
+# cache_path = '/fast/cache'
+
 # You can give resolutions as (width, height) pairs also. This doesn't do anything different, it's just
 # another way of specifying the area(s) (i.e. total number of pixels) you want to train on.
 # resolutions = [[1280, 720]]

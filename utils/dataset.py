@@ -2070,6 +2070,23 @@ def directory_setting(directory_config, dataset_config, key, why):
     raise ValueError(f'{directory_config["path"]}: set {key} in the dataset config or its [[directory]] ({why})')
 
 
+def directory_cache_root(path, directory_config, dataset_config):
+    """Where the caches of the dataset directory `path` live, before the model's name: `<path>/cache` by default.
+
+    `cache_path` (top level of the dataset TOML, or in a [[directory]], which wins) puts them under that folder
+    instead, in a subfolder of its own per dataset directory (the directory's name and a hash of its absolute
+    path, so two directories with the same name never share a cache)."""
+    cache_path = directory_config.get('cache_path', dataset_config.get('cache_path'))
+    if cache_path is None:
+        return Path(path) / 'cache'
+    if not isinstance(cache_path, str) or not cache_path.strip():
+        raise ValueError(f'cache_path must be a folder path (a string), got {cache_path!r}')
+    absolute = os.path.abspath(os.path.expanduser(str(path)))
+    key = hashlib.sha1(absolute.encode()).hexdigest()[:10]
+    name = re.sub(r'[^A-Za-z0-9._-]+', '_', os.path.basename(absolute.rstrip('/')) or 'dataset')
+    return Path(os.path.abspath(os.path.expanduser(cache_path))) / f'{name}_{key}'
+
+
 class DirectoryDataset:
     def __init__(self, directory_config, dataset_config, model_name, framerate=None,
                  round_to_multiple=32, skip_dataset_validation=False,
@@ -2128,7 +2145,10 @@ class DirectoryDataset:
         self.control_sizing = control_sizing if self.control_path is not None else None
         # For testing. Default if a mask is missing.
         self.default_mask_file = Path(self.directory_config['default_mask_file']) if 'default_mask_file' in self.directory_config else None
-        self.cache_dir = self.path / 'cache' / self.model_name
+        self.cache_root = directory_cache_root(self.path, directory_config, dataset_config)
+        self.cache_dir = self.cache_root / self.model_name
+        if self.cache_root != self.path / 'cache' and is_main_process():
+            print(f'{self.path}: caches go to {self.cache_root} (cache_path)')
         self.require_non_latin_caption = directory_config['require_non_latin_caption']
         if self.require_non_latin_caption is not None:
             # Selection changes image rows, so isolate all row-indexed caches, not only captions.
@@ -2277,7 +2297,7 @@ class DirectoryDataset:
         else:
             self.captions_dict = None
 
-        self.legacy_cache_dir = self.path / 'cache' / self.model_name
+        self.legacy_cache_dir = self.cache_root / self.model_name
         if self.reuse_metadata_cache:
             self.geometry_dir = self.legacy_cache_dir / 'profiles' / Hasher.hash(self.snapshot_geometry())
             self.legacy_geometry_file = self.legacy_cache_dir / 'profiles' / 'legacy_geometry.json'
