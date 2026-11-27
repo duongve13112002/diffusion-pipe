@@ -422,3 +422,32 @@ def test_cosmos_and_iris_free_the_unused_text_encoder_unless_it_is_cached_or_nee
             cached.text_encoder = types.SimpleNamespace(decoder=torch.nn.Linear(4, 4), tokenizer='kept')
         pipeline.free_unused_text_encoder(cached, _stage_engine(1, 2))
         assert (cached.text_encoder.decoder if pipeline is IrisPipeline else cached.text_encoder).weight.numel() == 16
+
+
+def _pipeline_engine(stage, stages):
+    grid = types.SimpleNamespace(stage_to_global=lambda s: s)
+    return types.SimpleNamespace(is_pipe_parallel=True, grid=grid, num_stages=stages,
+                                 is_first_stage=lambda: stage == 0, is_last_stage=lambda: stage == stages - 1)
+
+
+@pytest.mark.parametrize('stage', [1, 2])
+def test_a_stage_that_does_not_encode_empties_the_weights_it_was_built_with(stage):
+    model = Model(cache_text_embeddings=False)
+    linear = torch.nn.Linear(4, 4)
+    linear.number = 1
+    model.text_encoders = [linear]
+    encoder = TextEncodingOnTheFly(model)
+    encoder.bind(_pipeline_engine(stage, 3))
+    assert linear.weight.numel() == 0 and encoder.text_encoders == []
+
+
+def test_the_first_stage_loads_its_encoders_when_bound_not_at_the_first_batch():
+    loads = []
+    model = Model(cache_text_embeddings=False)
+    for te in model.text_encoders:
+        te.load_model_if_needed = lambda: loads.append(1)
+    encoder = TextEncodingOnTheFly(model)
+    encoder.bind(_pipeline_engine(0, 3))
+    assert len(loads) == 2
+    encoder.bind(_pipeline_engine(0, 3))
+    assert len(loads) == 2

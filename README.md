@@ -459,10 +459,18 @@ The command is the usual one on every node, through any launcher that sets `RANK
 --deepspeed --config ...`), and a Kubernetes PyTorchJob. `--master_port` is only needed to override
 the launcher's port.
 
-- Ranks are numbered stage by stage: with 2 nodes of 8 GPUs and `pipeline_stages = 2`, stage 0 is the
-  first node and stage 1 the second. The data-parallel gradient all-reduce then stays inside each
-  node, and only the activations between the two stages cross the network. With
-  `pipeline_stages = 1`, the all-reduce crosses nodes on every step.
+- `pipeline_placement` (top level, default `'node_local'`) says which ranks make one pipeline. With `'node_local'` the
+  stages of a pipeline sit on consecutive ranks, so a pipeline fills a node before it uses the next one: with 2 nodes
+  of 8 GPUs and `pipeline_stages = 4` or 8, every pipeline is inside one node, the activations between stages never
+  cross the network, and only the data-parallel gradient all-reduce (once per step) does. A pipeline crosses a
+  node boundary only when it has more stages than a node has GPUs (`pipeline_stages = 16` on 8-GPU nodes), or when
+  `pipeline_stages` does not divide the GPUs of a node (3 stages on 8 GPUs: a startup warning says so). Pick a
+  `pipeline_stages` that divides the GPUs per node. `'stage_major'` is DeepSpeed's own numbering (stage 0 is ranks
+  `0..dp-1`, stage 1 the next `dp`, ...), the only placement before; it keeps the all-reduce inside a node and
+  sends activations across nodes. Checkpoints are the same under both: a run saved with one resumes with the other.
+  Needs the ranks to be numbered node by node, as `deepspeed` and `torchrun` do. With `pipeline_stages = 1` the
+  all-reduce crosses nodes on every step. Tested with real gloo pipeline engines on CPU; not measured on several
+  GPU nodes.
 - `output_dir` and the dataset directories (their `cache` folders) must be on a volume that every
   node shares, such as NFS or a ReadWriteMany PVC. Training checks `output_dir` at start; pipeline
   stages pass saved weights to stage 0 through it.
@@ -617,7 +625,8 @@ Where the text encoders live with `pipeline_stages > 1`: the first stage encodes
 the last row, whose captions are encoded before the model (`utils/text_encoding.py`), the last stage
 also reads every batch (it needs the label), so it used to load the text encoders and encode every
 caption a second time; now the first stage sends its encoded rows to the last stage, which holds no
-text encoder, and the stages between hold none either. Wan, Cosmos-Predict2 / Anima, Iris and
+text encoder, and the stages between hold none either (they empty the weights the model loaded; a ComfyUI
+encoder is never loaded there). Wan, Cosmos-Predict2 / Anima, Iris and
 MOSS-Image encode in their first layer, so only the first stage's GPU holds the encoder; Cosmos-Predict2
 and Iris free its weights from the other stages' host memory once the pipeline is built (MOSS-Image never
 loads it there). The `parameters` partition does not count a frozen text encoder, so the first stage has
@@ -636,7 +645,8 @@ training batch instead of the caption files' order. So:
   depends on whether the model masks it out; that has not been checked model by model, so keep
   `1` if you need the result to match the cache exactly.
 
-With `pipeline_stages` above 1, the first and last stages both load the text encoders.
+With `pipeline_stages` above 1 only the first stage runs the text encoders (see above); the others free the weights
+of the ones the model loaded on every rank.
 Switching between `true` and `false` keeps the latent caches; the text embedding cache is only
 written and read with `true`.
 

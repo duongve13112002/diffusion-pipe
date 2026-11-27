@@ -67,6 +67,7 @@ class TextEncodingOnTheFly:
         self.takes_control_file = [len(signature(fn).parameters) == 3 for fn in self.call_fns]
         self.caching_batch_size = caching_batch_size
         self.loaded = False
+        self.encoders_loaded = False
         # None: this process encodes and nobody else needs the rows. ('send', rank): it encodes and sends
         # each batch's rows to the last stage. ('recv', rank): it takes them from the first stage.
         self.relay = None
@@ -82,9 +83,15 @@ class TextEncodingOnTheFly:
         grid = engine.grid
         if engine.is_first_stage():
             self.relay = ('send', grid.stage_to_global(engine.num_stages - 1))
+            # Now rather than at the first batch: the last stage is already waiting for that batch's rows, and
+            # a long read of the encoders (a big one from a network volume) would count against its timeout.
+            self._load_encoders()
             return
         if engine.is_last_stage():
             self.relay = ('recv', grid.stage_to_global(0))
+        # The encoders were built with the model on every rank; this one never runs them.
+        from utils.model_teacher import empty_weights
+        empty_weights(self.text_encoders)
         self.text_encoders, self.call_fns, self.takes_control_file = [], [], []
 
     @staticmethod
@@ -99,11 +106,10 @@ class TextEncodingOnTheFly:
         torch_dist.recv_object_list(received, src=self.relay[1], device=self._object_device())
         return received[0]
 
-    def _load(self):
-        self.loaded = True
-        if self.relay is not None and self.relay[0] == 'recv':
-            self.model.uncond_dict = self._receive()
+    def _load_encoders(self):
+        if self.encoders_loaded:
             return
+        self.encoders_loaded = True
         for text_encoder in self.text_encoders:
             if isinstance(text_encoder, nn.Module):
                 # eval: an encoder built from its config starts in train mode, with dropout on.
@@ -111,6 +117,13 @@ class TextEncodingOnTheFly:
             else:
                 # A ComfyUI model behind a ModelWrapper; ComfyUI moves it to the GPU per call.
                 text_encoder.load_model_if_needed()
+
+    def _load(self):
+        self.loaded = True
+        if self.relay is not None and self.relay[0] == 'recv':
+            self.model.uncond_dict = self._receive()
+            return
+        self._load_encoders()
         # The empty caption's embeddings, which caching leaves in model.uncond_dict for a model
         # that reads them (MiniMax H3 with cfg > 1). Encoded as caching encodes it.
         self.model.uncond_dict = self._encode([''], [False], None)[0]

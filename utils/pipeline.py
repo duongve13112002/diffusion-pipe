@@ -5,6 +5,7 @@ from deepspeed.pipe import PipelineModule
 from deepspeed.runtime.pipe import LayerSpec
 
 from models.base import tie_unused
+from utils.placement import DEFAULT_PLACEMENT, check_placement, pipeline_topology
 
 
 # PipelineModule partition_method doesn't support uneven partitioning
@@ -12,9 +13,16 @@ from models.base import tie_unused
 # For example if you have 2 gpus - one with 16GB and other with 24GB normal partitioning would throw OOM
 # With this implementation you can set partition_split in config so that less layers is loaded onto 16GB GPU
 class ManualPipelineModule(PipelineModule):
-    def __init__(self, *args, manual_partition_split=None, mark_first_stage_inputs=False, **kwargs):
+    def __init__(self, *args, manual_partition_split=None, mark_first_stage_inputs=False,
+                 placement=DEFAULT_PLACEMENT, **kwargs):
         self.manual_partition_split = manual_partition_split
         self.mark_first_stage_inputs = mark_first_stage_inputs
+        if kwargs.get('topology') is None and kwargs.get('num_stages'):
+            # See utils/placement.py. The teacher's second pipeline takes the student's placement.
+            topology = pipeline_topology(kwargs['num_stages'], torch.distributed.get_world_size(),
+                                         check_placement(placement))
+            if topology is not None:
+                kwargs['topology'] = topology
         super().__init__(*args, **kwargs)
 
     def forward(self, forward_input):

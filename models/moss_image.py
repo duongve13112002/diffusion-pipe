@@ -50,6 +50,7 @@ from models.base import ComfyPipeline, ModelWrapper, PreprocessMediaFile, make_c
 from utils.common import is_main_process, warn_ignored
 from utils.distillation import distill_loss, distill_warnings, parse_distill_config
 from utils.offloading import ModelOffloader
+from utils.placement import DEFAULT_PLACEMENT, data_rank_of_rank, stage_of_rank
 from utils.stream_loss import StreamLayout, StreamMetrics, channel_energy, check_width, parse_stream_loss
 import comfy.latent_formats
 import comfy.lora
@@ -1360,7 +1361,8 @@ class MossImagePipeline(ComfyPipeline):
     def on_first_stage(self):
         """Whether this rank is on the first pipeline stage (DeepSpeed numbers ranks stage-major)."""
         rank, world = rank_and_world_size()
-        return rank // max(1, world // int(self.config.get('pipeline_stages', 1))) == 0
+        return stage_of_rank(rank, world, self.config.get('pipeline_stages', 1),
+                             self.config.get('pipeline_placement', DEFAULT_PLACEMENT)) == 0
 
     def get_call_vae_fn(self, vae):
         def fn(images):
@@ -1558,12 +1560,12 @@ class MossImagePipeline(ComfyPipeline):
                      if p.requires_grad or getattr(p, '_moss_lr_frozen', False)]
         rates.check_used(trainable)
         # Each pipeline stage has its own parameters: the first data-parallel rank of every stage
-        # reports them (DeepSpeed numbers ranks stage-major: stage * data_parallel + data_rank).
+        # reports them (utils/placement.py says which ranks hold which stage).
         stages = int(self.config.get('pipeline_stages', 1))
         rank, world = rank_and_world_size()
-        data_parallel = max(1, world // stages)
-        report = rank % data_parallel == 0
-        where = f' (pipeline stage {rank // data_parallel})' if stages > 1 else ''
+        placement = self.config.get('pipeline_placement', DEFAULT_PLACEMENT)
+        report = data_rank_of_rank(rank, world, stages, placement) == 0
+        where = f' (pipeline stage {stage_of_rank(rank, world, stages, placement)})' if stages > 1 else ''
         groups = rates.groups(parameters, report=report, where=where)
         if not groups:
             raise ValueError(f'The learning rate settings freeze every parameter of this pipeline stage{where}: '

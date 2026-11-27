@@ -33,6 +33,7 @@ from utils.text_encoding import TextEncodingOnTheFly, encodes_text_in_loader
 from utils.patches import apply_patches
 from utils.unsloth_utils import unsloth_checkpoint
 from utils.pipeline import ManualPipelineModule
+from utils.placement import DEFAULT_PLACEMENT, check_placement, local_world_size, straddling_note
 from utils.dora import apply_dora_config_defaults, check_model_dtypes as check_dora_model_dtypes
 from utils.oplora import OPLoRAProjector, apply_oplora_config_defaults
 from utils.outlier_decay import OutlierDecay, apply_outlier_decay_config_defaults
@@ -884,11 +885,17 @@ if __name__ == '__main__':
         })
 
     num_stages = config.get('pipeline_stages', 1)
+    placement = check_placement(config.get('pipeline_placement', DEFAULT_PLACEMENT))
+    if is_main_process():
+        note = straddling_note(num_stages, dist.get_world_size(), local_world_size()) if placement == 'node_local' else None
+        if note:
+            print(f'WARNING: {note}')
     partition_method=config.get('partition_method', 'parameters')
     partition_split = config.get('partition_split',[len(layers) / num_stages])
     pipeline_model = ManualPipelineModule(
         layers=layers,
         num_stages=num_stages,
+        placement=placement,
         partition_method=partition_method,
         manual_partition_split=partition_split,
         loss_fn=model_teacher.wrap_loss_fn(model.get_loss_fn(), teacher) if teacher_config is not None else model.get_loss_fn(),
@@ -928,6 +935,7 @@ if __name__ == '__main__':
         teacher_module = ManualPipelineModule(
             layers=teacher.layers,
             num_stages=num_stages,
+            placement=placement,
             partition_method=teacher_method,
             manual_partition_split=teacher_split,
             loss_fn=None,

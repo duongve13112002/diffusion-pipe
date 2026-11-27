@@ -21,6 +21,9 @@ micro_batch_size_per_gpu = 1
 #image_micro_batch_size_per_gpu = 4
 # Pipeline parallelism degree. A single instance of the model is divided across this many GPUs.
 pipeline_stages = 1
+# Which ranks make one pipeline: 'node_local' (default) keeps a pipeline's stages on consecutive ranks, so on several
+# nodes a pipeline fills one node before using the next; 'stage_major' is DeepSpeed's own numbering. See the README.
+#pipeline_placement = 'node_local'
 # Number of micro-batches sent through the pipeline for each training step.
 # If pipeline_stages > 1, a higher GAS means better GPU utilization due to smaller pipeline bubbles (where GPUs aren't overlapping computation).
 gradient_accumulation_steps = 1
