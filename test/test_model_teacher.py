@@ -456,7 +456,7 @@ def test_build_teacher_places_layers_only_where_it_runs():
     config = parse()
     elsewhere = mt.build_teacher(pipeline, config, torch.device('cpu'), runs_teacher=False)
     assert elsewhere.layers is None
-    with pytest.raises(RuntimeError, match='first pipeline stage'):
+    with pytest.raises(RuntimeError, match='holds no teacher layers'):
         elsewhere.run(make_features())
     here = mt.build_teacher(pipeline, config, torch.device('cpu'), runs_teacher=True)
     assert all(not p.requires_grad for layer in here.layers for p in layer.parameters())
@@ -464,10 +464,6 @@ def test_build_teacher_places_layers_only_where_it_runs():
     outputs = here.run(make_features())
     assert len(outputs) == 1 and not outputs[0].requires_grad
     assert torch.equal(outputs[0], student_forward(pipeline, make_features()))
-
-
-def test_on_first_stage_without_distributed_is_true():
-    assert mt.on_first_stage(1) and mt.on_first_stage(4)
 
 
 # the loss

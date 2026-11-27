@@ -141,17 +141,17 @@ refiner's teacher guidance. The second term keeps what the model predicts close 
 before fine-tuning, which limits how far a small dataset can drag it. The step log adds
 `train/distill_loss` and `train/distill_lambda`; `train/loss` is their sum with `train/flow_loss`.
 
-- The teacher is always the model the run starts from. LoRA/LoKr/OPLoRA: the same blocks with the adapter
-  switched off, nothing to copy, one extra forward per micro-batch; needs `pipeline_stages = 1`. Full
-  fine-tune: a frozen copy of the model as loaded, on the GPU of every rank of the first pipeline stage (the
-  size of the model: about 10 GB in bf16, worked out from the parameter count), one extra forward per
-  micro-batch on that stage, which should make the first stage the slower one when there are several (an
-  expectation, not yet measured on a GPU). A resumed full fine-tune distills toward the model
-  file's weights, not toward the checkpoint it resumed.
-- The teacher forward runs in `TextEncoderLayer`, which is never activation-checkpointed, so it is not
-  recomputed in backward; it sees the same embeddings the student does (cached or encoded on the fly) and
+- The teacher is the model the run starts from (or another transformer, see `path`). With one pipeline stage:
+  LoRA/LoKr/OPLoRA use the same blocks with the adapter switched off, nothing to copy, one extra forward per
+  micro-batch; a full fine-tune keeps a frozen copy of the model as loaded on the GPU. With `pipeline_stages > 1`
+  (adapter or full fine-tune) the teacher is a frozen copy split over the stages as a second, forward-only
+  pipeline, exactly as for the other models below: every GPU holds 1/stages of it, and the velocity reaches the
+  loss through the label instead of travelling with the activations. A resumed full fine-tune distills toward the
+  model file's weights, not toward the checkpoint it resumed.
+- With one stage the teacher forward runs in `TextEncoderLayer`, which is never activation-checkpointed, so it is
+  not recomputed in backward; it sees the same embeddings the student does (cached or encoded on the fly) and
   its velocity travels with the activations to the loss. Training batches only.
-- Refused: `compile = true`, `blocks_to_swap`, an `[adapter]` with `pipeline_stages > 1`, an `[adapter]` with
+- Refused: `compile = true`, `blocks_to_swap`, an `[adapter]` with
   `init_from_existing` (the teacher would be the base model, not the model the run starts from), unknown keys.
   `decay = 'none'` is warned about: the term never fades, so the model is held near its start for the whole
   run, which is the point of a regulariser but caps how far the fine-tune can move.
@@ -194,13 +194,15 @@ with one GPU, several, several nodes and any `pipeline_stages`.
   with the targets, so no layer needs to pass anything on.
   - `pipeline_stages = 1`: the teacher sits on the same GPU as the student, one extra forward per micro batch.
   - `pipeline_stages > 1`: the teacher is a second, forward-only DeepSpeed pipeline with the student's number of
-    stages (no optimizer, no gradients; same `partition_method` / `partition_split` as the student, so the same
-    layer list is cut the same way). Every GPU holds 1/stages of the teacher, not the whole of it on the first
+    stages (no optimizer, no gradients). Every GPU holds 1/stages of the teacher, not the whole of it on the first
     stage. Each step, before the student's `train_batch`, every rank runs the teacher over the step's micro
     batches; the last stage then has the teacher's output of each micro batch. The teacher forward is therefore
     sequential with the student's step (it fills the same GPUs one after the other) rather than overlapped.
-    Each rank builds the teacher's layers on the CPU first and keeps only its stage: the CPU RAM peaks by about the
-    size of the weights in `dtype` on every rank. Neither the speed nor the VRAM has been measured on a GPU.
+    The default `partition_method = 'parameters'` weighs trainable parameters, which a frozen teacher has none of,
+    so the teacher is balanced by its parameter counts instead (`uniform` and a `manual` `partition_split` are the
+    student's own). Each rank builds the teacher's layers on the CPU first, then frees the other stages' weights:
+    the CPU RAM peaks by about the size of the weights in `dtype` on every rank while loading. Neither the speed
+    nor the VRAM has been measured on a GPU.
   Once `decay` has brought lambda to 0 (step `decay_steps`) the teacher no longer runs: the loss ignores it from
   there on, and the label carries zeros. Under `[fp8_training]` the teacher runs in bf16, and MOSS-Image's full
   fine-tune teacher (without `path`) is copied from the model before fp8 touches it.

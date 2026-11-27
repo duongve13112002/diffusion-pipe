@@ -753,7 +753,7 @@ if __name__ == '__main__':
 
     model.load_diffusion_model()
     # The teacher is a copy of the model as loaded, so it is made before fp8 training and the adapter change the
-    # student's modules; on the first pipeline stage only, which is where it runs.
+    # student's modules.
     teacher = None
     teacher_stages = config.get('pipeline_stages', 1)
     # MOSS-Image reads its own [teacher]; with several stages that one also runs as the teacher pipeline.
@@ -761,7 +761,7 @@ if __name__ == '__main__':
     if pipeline_teacher_config is None and hasattr(model, 'own_teacher_config'):
         pipeline_teacher_config = model.own_teacher_config()
     if pipeline_teacher_config is not None:
-        # With one stage the loader runs the teacher on the same GPU as the student. With several, every rank builds
+            # With one stage the loader runs the teacher on the same GPU as the student. With several, every rank builds
         # the teacher's layers (on the CPU) and the second, forward-only pipeline engine below keeps its own
         # stage's share on the GPU. Building can fail on one rank alone (a missing file, a mismatching checkpoint):
         # every rank hears of it before the next collective rather than waiting out the timeout.
@@ -915,23 +915,28 @@ if __name__ == '__main__':
     model_engine._support_torch_style_backward = True
     teacher_pipeline = None
     if teacher is not None and num_stages > 1:
-        # The teacher's layers, split like the student's (same partition_method and partition_split: the same layer
-        # list), with no loss function, optimizer or ZeRO: it only runs forward, over the step's micro batches
-        # before the student's train_batch (model_teacher.TeacherPipeline).
+        # The teacher's layers over the same stages. 'uniform' and a manual split are the student's own (the same
+        # layer list); the default 'parameters' weighs trainable parameters, which are all 0 in a frozen teacher,
+        # so the teacher is balanced by its parameter counts. No loss function, optimizer or ZeRO: it only runs
+        # forward, over the step's micro batches before the student's train_batch (model_teacher.TeacherPipeline).
+        teacher_method, teacher_split = model_teacher.teacher_partition(
+            teacher.layers, num_stages, partition_method, partition_split if len(layers) == len(teacher.layers) else None)
+        teacher_layers = list(teacher.layers)
         teacher_module = ManualPipelineModule(
             layers=teacher.layers,
             num_stages=num_stages,
-            partition_method=partition_method,
-            manual_partition_split=partition_split,
+            partition_method=teacher_method,
+            manual_partition_split=teacher_split,
             loss_fn=None,
             dynamic_shape=True,
         )
         teacher_engine, *_ = deepspeed.initialize(args=args, model=teacher_module, config=dict(ds_config))
         teacher_engine._support_torch_style_backward = True
         # The other stages' layers were only held to be partitioned; the engine's own stage is on its GPU.
+        model_teacher.release_foreign_weights(teacher_layers, teacher_engine.module)
         teacher_module._layer_specs = []
         teacher.layers = None
-        del teacher_module
+        del teacher_module, teacher_layers
         teacher_pipeline = model_teacher.TeacherPipeline(
             teacher, teacher_engine, label_targets=getattr(model, 'teacher_label_targets', None),
             keep_float32=getattr(model, 'teacher_output_float32', False))

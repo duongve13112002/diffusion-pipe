@@ -38,7 +38,7 @@ import torch
 
 from models.teacher_guidance import DECAYS, decay_at, is_anima_teacher
 from utils import fp8_training
-from utils.common import warn_ignored
+from utils.common import all_ok, warn_ignored
 from utils.distillation import DistillConfig, distill_warnings
 
 KEY = 'teacher'
@@ -119,7 +119,8 @@ def warnings_for(teacher_config, config):
 
 
 class ModelTeacher:
-    """The teacher on one rank: its layers (first pipeline stage only), the step, and lambda.
+    """The teacher on one rank: its layers (all of them with one pipeline stage, where the loader runs them;
+    with several the TeacherPipeline's engine holds them), the step, and lambda.
 
     `layers` is None on a rank that does not run it. `select` turns the chain's output into the tensors that
     stand in for the label's targets, in the label's order (CommonPipeline.teacher_targets_of).
@@ -146,7 +147,8 @@ class ModelTeacher:
     def run(self, features):
         """The teacher's output for one micro batch of features: a list of tensors, one per target."""
         if self.layers is None:
-            raise RuntimeError('This rank holds no teacher layers: only the first pipeline stage runs the teacher')
+            raise RuntimeError('This rank holds no teacher layers (with several pipeline stages the teacher runs in the '
+                               'TeacherPipeline, not here)')
         x = tuple(t.to(self.device) if torch.is_tensor(t) and self.device is not None else t for t in features)
         # The student's fp8 attention sites count the calls of its own blocks; the teacher is plain bf16.
         with fp8_training.disabled():
@@ -154,13 +156,6 @@ class ModelTeacher:
                 x = layer(x)
         outputs = self.select(x)
         return [t.detach() for t in outputs]
-
-
-def on_first_stage(pipeline_stages):
-    """Whether this rank is on the first pipeline stage (DeepSpeed numbers ranks stage-major)."""
-    if not torch.distributed.is_initialized():
-        return True
-    return torch.distributed.get_rank() // max(1, torch.distributed.get_world_size() // int(pipeline_stages)) == 0
 
 
 def fit_trailing_dim(output, target):
@@ -174,6 +169,51 @@ def fit_trailing_dim(output, target):
     if output.shape[-1] > target.shape[-1]:
         return output[..., :target.shape[-1]]
     return torch.nn.functional.pad(output, (0, target.shape[-1] - output.shape[-1]))
+
+
+def teacher_partition(layers, num_stages, partition_method, partition_split):
+    """(partition_method, partition_split) for the teacher pipeline's module. The student's 'parameters' method
+    weighs a layer by its trainable parameters, and every teacher layer is frozen (all weights 0, so nearly all
+    layers land on stage 0): the teacher is balanced by its parameter counts instead. 'uniform' and an explicit
+    'manual' split are the student's own (the same layer list)."""
+    method = str(partition_method).lower()
+    if method == 'uniform' or (method == 'manual' and partition_split is not None):
+        return partition_method, partition_split
+    return 'manual', balanced_split(layers, num_stages)
+
+
+def balanced_split(layers, num_stages):
+    """Stage boundaries (without the 0 and the end) that balance the layers' parameter counts."""
+    from deepspeed.runtime.utils import partition_balanced
+    weights = [sum(p.numel() for p in layer.parameters()) if isinstance(layer, torch.nn.Module) else 0
+               for layer in layers]
+    return [int(b) for b in partition_balanced(weights, num_stages)[1:-1]]
+
+
+def release_foreign_weights(layers, module):
+    """Free the weights of the teacher layers that are not `module`'s (the other stages'). Several layers hold a
+    hidden reference to the whole copied model (a list, so it is not a parameter of theirs), which keeps the
+    other stages' blocks alive in host memory for the whole run; their storage is emptied instead."""
+    kept = {id(t) for t in (*module.parameters(), *module.buffers())}
+    for layer in layers:
+        if not isinstance(layer, torch.nn.Module):
+            continue
+        for t in (*layer.parameters(), *layer.buffers()):
+            if id(t) not in kept:
+                t.data = torch.empty(0, dtype=t.dtype)
+
+
+def _release_engine_buffers(engine):
+    """What the teacher engine keeps after a forward (two micro batches' inputs, outputs and the received
+    activations on every stage) would sit on the GPU through the student's step."""
+    for buffers in getattr(engine, 'pipe_buffers', {}).values():
+        for i in range(len(buffers)):
+            buffers[i] = None
+    engine.pipe_recv_buf = None
+    engine.fwd_outputs = []
+    engine.loss = None
+    engine.total_loss = None
+    engine.total_additional_losses = None
 
 
 def build_teacher(model, config, device, runs_teacher=True, all_ranks_run=True, place=True):
@@ -231,12 +271,27 @@ class TeacherPipeline:
                 return items
             return [(features, (*label, *[torch.zeros_like(t) for t in label[:self._count(label)]]))
                     for features, label in items]
+        # eval_batch never clears the totals the last stage adds every forward to (only train_batch does), so a
+        # micro batch of another shape than the first would fail to add into them.
+        engine.total_loss = None
+        engine.total_additional_losses = None
         engine.reset_activation_shape()
         with fp8_training.disabled():
             outputs = engine.eval_batch(iter(items) if items is not None else None, compute_loss=False,
                                         reduce_output=None, bcast_loss=False)
-        if not last:
-            return items
+        _release_engine_buffers(engine)
+        attached, error = items, None
+        if last:
+            try:
+                attached = self._attach_outputs(outputs, items)
+            except Exception as e:
+                error = e
+        # The last stage alone can fail here; every rank stops with it instead of waiting in the student's step.
+        all_ok(error)
+        return attached
+
+    def _attach_outputs(self, outputs, items):
+        teacher = self.teacher
         if len(outputs) != len(items):
             raise RuntimeError(f'[teacher]: the teacher pipeline returned {len(outputs)} outputs for '
                                f'{len(items)} micro batches')

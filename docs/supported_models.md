@@ -1187,9 +1187,9 @@ rather than loaded with layers' weights in their neighbours.
   decay = 'none'                     # or 'linear' / 'cosine' with decay_steps
   ```
 
-  An adapter's teacher is the same blocks with the adapter switched off (needs `pipeline_stages = 1`; one
-  extra forward per micro-batch). A full fine-tune keeps a frozen copy of the starting model on the GPU of
-  every rank of the first pipeline stage (about 10 GB in bf16) and runs it once per micro-batch there. It
+  With one stage an adapter's teacher is the same blocks with the adapter switched off (one extra forward
+  per micro-batch) and a full fine-tune keeps a frozen copy of the starting model on the GPU (about 10 GB in
+  bf16). With `pipeline_stages > 1` the teacher is a frozen copy split over the stages as a second, forward-only pipeline. It
   runs in the text-encoder layer so activation checkpointing does not repeat it, for training batches only;
   refused with `compile`, `blocks_to_swap` and unknown keys. The step log gets `train/distill_loss` and
   `train/distill_lambda`. No image-quality benefit has been measured.
