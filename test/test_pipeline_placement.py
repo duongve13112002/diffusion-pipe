@@ -156,3 +156,56 @@ def test_the_placement_applies_whether_the_stages_are_given_by_keyword_or_positi
     seen.clear()
     pipeline_module.ManualPipelineModule(layers=[], num_stages=4, placement='stage_major')
     assert 'topology' not in seen
+
+
+def _relay_replicas_worker(rank, world, stages, placement_name, init_file, out_dir):
+    """The text encoder relay and the label broadcast on a real engine, every replica with batches of its own."""
+    import os
+    import sys
+    from pathlib import Path
+    import deepspeed
+    sys.path.insert(0, str(Path(__file__).parent))
+    os.environ['LOCAL_RANK'] = str(rank)
+    deepspeed.init_distributed('gloo', auto_mpi_discovery=False, init_method=f'file://{init_file}',
+                               rank=rank, world_size=world, verbose=False)
+    from utils.patches import apply_patches
+    apply_patches()
+    import utils.dataset as dataset_util
+    from test_text_encoding_on_the_fly import CONTROL_FILE_KEY, IS_VIDEO_KEY, Model, TextEncodingOnTheFly
+    engine = _engine(placement_name, stages)
+    replica = engine.grid.get_data_parallel_rank()
+    batches = [{'caption': [chr(97 + replica) * 3, chr(100 + replica) * 3], IS_VIDEO_KEY: [False, False],
+                CONTROL_FILE_KEY: [None, None]} for _ in range(2)]
+    model = Model(cache_text_embeddings=False)
+
+    class Prepared:
+        def prepare_inputs(self, batch, timestep_quantile=None):
+            return (batch['emb1'],), (torch.full((2,), float(replica)), None)
+
+    loader = dataset_util.PipelineDataLoader(batches, engine, 1, Prepared(), num_dataloader_workers=0,
+                                             text_encoding=TextEncodingOnTheFly(model))
+    result = {'stage': engine.stage_id, 'replica': replica, 'calls': len(model.calls), 'features': [], 'targets': []}
+    if engine.is_first_stage() or engine.is_last_stage():
+        for _ in batches:
+            features, label = next(loader)
+            result['features'].append(features[0].float().tolist())
+            result['targets'].append(label[0].tolist())
+    result['calls'] = len(model.calls)
+    import json
+    with open(f'{out_dir}/{rank}.json', 'w') as f:
+        json.dump(result, f)
+
+
+@pytest.mark.parametrize('name', ['node_local', 'stage_major'])
+def test_the_relay_pairs_each_replicas_first_and_last_stage_under_either_placement(name, tmp_path):
+    mp.spawn(_relay_replicas_worker, args=(4, 2, name, str(tmp_path / 'init'), str(tmp_path)), nprocs=4)
+    results = [json.loads((tmp_path / f'{r}.json').read_text()) for r in range(4)]
+    for replica in (0, 1):
+        first = next(r for r in results if r['replica'] == replica and r['stage'] == 0)
+        last = next(r for r in results if r['replica'] == replica and r['stage'] == 1)
+        assert first['calls'] > 0 and last['calls'] == 0
+        assert first['features'] and last['features'] == first['features']
+        assert last['targets'] == first['targets'] == [[float(replica)] * 2] * 2
+    # the replicas really had different captions, so a crossed pair would have shown
+    assert next(r for r in results if r['replica'] == 0 and r['stage'] == 0)['features'] != \
+        next(r for r in results if r['replica'] == 1 and r['stage'] == 0)['features']
