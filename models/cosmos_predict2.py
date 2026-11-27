@@ -1199,8 +1199,11 @@ class CosmosPredict2Pipeline(BasePipeline):
                         f'Teacher guidance has fully decayed at step {step}: lambda is 0 at '
                         'every timestep, and the teacher no longer contributes. Training '
                         'continues on the ground truth alone, which is what the schedule is '
-                        'for. The teacher stays resident; restart to reclaim its memory.'
+                        'for.'
                     )
+            if self.teacher_cfg.decay != 'none' and step >= self.teacher_cfg.decay_steps:
+                # lambda is 0 for good: nothing reads the teacher again (a no-op after the first time)
+                self.teacher.release()
 
         return (noisy_latents, t, *prompt_embeds_or_batch_encoding), (target, mask)
 

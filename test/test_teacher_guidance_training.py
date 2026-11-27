@@ -429,3 +429,25 @@ class TestItIsVisibleThatTheTeacherIsOn:
         printed = capsys.readouterr().out
         assert 'fully decayed' in printed
         assert printed.count('fully decayed') == 1, 'announced once, not on every batch'
+
+    def test_the_teachers_weights_are_freed_once_lambda_is_zero_for_good(self):
+        _, _, guide = build_student_and_teacher()
+        cfg = teacher_cfg(decay='linear', decay_steps=10)
+        pipe = build_pipeline(teacher=guide, cfg=cfg, step=9)
+        pipe.prepare_inputs(toy_batch())
+        sizes = [p.numel() for m in (guide.llm_adapter, guide.dit[0]) for p in m.parameters()]
+        assert all(sizes)
+        pipe._step_source = lambda: 10
+        pipe.prepare_inputs(toy_batch())
+        assert not any(p.numel() for m in (guide.llm_adapter, guide.dit[0]) for p in m.parameters())
+        pipe.prepare_inputs(toy_batch())
+
+    def test_a_dit_shared_with_the_student_is_not_freed(self):
+        student, _, guide = build_student_and_teacher()
+        guide.dit[0] = student
+        guide.shares_dit = True
+        pipe = build_pipeline(teacher=guide, cfg=teacher_cfg(decay='linear', decay_steps=10), step=10)
+        pipe.prepare_inputs(toy_batch())
+        assert all(p.numel() for p in student.parameters())
+        assert not any(p.numel() for p in guide.llm_adapter.parameters())
+

@@ -1610,7 +1610,7 @@ class MossImagePipeline(ComfyPipeline):
         state = LayerState(model.rope, self.compute_dtype, self.fp16_fold)
         path = self.distill.path
         if path is None and 'adapter' in self.config:
-            return TeacherForward(model, state, lambda: adapter_switched_off(self.lora_model))
+            return TeacherForward(model, state, lambda: adapter_switched_off(self.lora_model), self.distill_finished)
         if path is None and self.teacher_snapshot is None:
             raise RuntimeError('[teacher]: the starting model was not copied by load_diffusion_model (a full fine-tune '
                                'copies it there, before fp8 training changes the student)')
@@ -1622,7 +1622,12 @@ class MossImagePipeline(ComfyPipeline):
             size = sum(p.numel() * p.element_size() for p in copy_of_model.parameters()) / 2**30
             print(f'MOSS-Image: [teacher] keeps a frozen copy of {"the starting model" if path is None else path} '
                   f'({size:.1f} GiB) on the GPU of every rank of the first pipeline stage')
-        return TeacherForward(copy_of_model, state)
+        return TeacherForward(copy_of_model, state, finished=self.distill_finished)
+
+    def distill_finished(self):
+        """Whether [teacher]'s decay has reached 0 for good (the loss reads no teacher velocity from here on)."""
+        d = self.distill
+        return d is not None and d.decay != 'none' and self.training_step >= d.decay_steps
 
     def load_teacher_model(self, path):
         """The transformer at `path`, loaded the way the starting one is (dtype, fp16 fold) on a copy
@@ -1945,8 +1950,9 @@ class TeacherForward:
     teacher is a separate frozen copy. Not an nn.Module: nothing in it is the student's.
     """
 
-    def __init__(self, model, state, adapter_off=None):
+    def __init__(self, model, state, adapter_off=None, finished=None):
         self.adapter_off = adapter_off
+        self.finished = finished
         self.state = state
         offloader = ModelOffloader('dummy', [], 0, 0, True, torch.device('cuda' if torch.cuda.is_available() else 'cpu'),
                                    False, debug=False)
@@ -1955,12 +1961,26 @@ class TeacherForward:
     @torch.no_grad()
     def velocity(self, x, sigma, text, mask):
         """The prediction for the batch, in float32. The inputs are detached first: InitialLayer marks
-        its floating inputs as requiring grad, which must not reach the student's tensors."""
+        its floating inputs as requiring grad, which must not reach the student's tensors.
+
+        Once the decay has reached 0 the loss ignores the velocity: it is zeros of the prediction's shape, and a
+        teacher copy of its own (a full fine-tune's) is freed."""
+        if self.finished is not None and self.finished():
+            self.release()
+            return torch.zeros(x.shape, dtype=torch.float32, device=x.device)
         inputs = tuple(t.detach() for t in (x, sigma, text, mask))
         with (self.adapter_off() if self.adapter_off is not None else nullcontext()):
             for layer in self.layers:
                 inputs = layer(inputs)
         return inputs.detach().float()
+
+    def release(self):
+        """Free the copy's weights. With the adapter case the layers are the student's own blocks: kept."""
+        if self.adapter_off is None and self.layers:
+            from utils.model_teacher import empty_weights, free_gpu_cache
+            empty_weights(self.layers)
+            self.layers = []
+            free_gpu_cache()
 
 
 def _length_groups(lengths):

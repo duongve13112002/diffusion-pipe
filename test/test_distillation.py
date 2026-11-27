@@ -227,6 +227,31 @@ def test_full_fine_tune_teacher_is_the_starting_model_after_the_student_moves():
     assert first_layer.teacher[0].layers[1].block is not pipe.pipeline_model.layers[2].block
 
 
+@pytest.mark.parametrize('lora', [False, True], ids=['full fine-tune', 'adapter'])
+def test_once_the_decay_has_finished_the_teacher_does_not_forward_and_a_copy_is_freed(lora):
+    pipe, reference = distilling_pipeline(lora=lora, distill=cfg(loss_weight=1.0, decay='linear', decay_steps=5))
+    inputs = forward_inputs()
+    teacher = pipe.pipeline_model.layers[0].teacher[0]
+    calls = []
+    original = teacher.layers[0].forward
+    teacher.layers[0].forward = lambda x: calls.append(1) or original(x)
+    pipe.training_step = 4
+    _, velocity = pipe.pipeline_model(inputs)
+    assert calls and velocity.abs().sum() > 0
+    calls.clear()
+    pipe.training_step = 5
+    out, velocity = pipe.pipeline_model(inputs)
+    assert not calls and velocity.shape == out.shape and velocity.dtype == torch.float32
+    assert not velocity.any()
+    student_weights = [p.numel() for p in pipe.diffusion_model.parameters()]
+    if lora:
+        # the blocks are the student's own: kept
+        assert teacher.layers and all(n > 0 for n in student_weights)
+    else:
+        assert teacher.layers == []
+    assert all(n > 0 for n in student_weights)
+
+
 def test_adapter_teacher_is_the_base_model_and_leaves_the_adapter_alone():
     pipe, reference = distilling_pipeline(lora=True)
     x, t, text, mask = forward_inputs()

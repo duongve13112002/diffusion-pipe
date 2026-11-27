@@ -311,6 +311,19 @@ class TeacherGuide(nn.Module):
         target = _tokenize(self.t5_tokenizer, captions, self.max_text_length)
         return source.input_ids, source.attention_mask, target.input_ids, target.attention_mask
 
+    def release(self):
+        """Free the teacher's weights once lambda is 0 for good. Its LLM and llm_adapter are its own; the DiT only
+        when it is not the student's."""
+        from utils.model_teacher import empty_weights, free_gpu_cache
+        if getattr(self, 'released', False):
+            return
+        self.released = True
+        modules = [self.llm_adapter, self.text_encoder]
+        if not self.shares_dit:
+            modules.append(self.dit[0])
+        empty_weights(modules)
+        free_gpu_cache()
+
     @torch.no_grad()
     def text_features(self, captions, device):
         """LLMAdapter output for a batch of caption strings: (B, max_text_length, 1024).
