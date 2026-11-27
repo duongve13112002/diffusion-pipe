@@ -1,4 +1,5 @@
 import argparse
+import contextlib
 import os
 import wandb
 from datetime import datetime, timezone
@@ -26,14 +27,14 @@ from utils import attention as attention_util
 from utils import fp8_training
 from utils import startup_timing
 from utils import common
-from utils.common import is_main_process, get_rank, DTYPE_MAP, empty_cuda_cache, all_ok
+from utils.common import is_main_process, get_rank, DTYPE_MAP, empty_cuda_cache, all_ok, one_at_a_time
 import utils.saver
 from utils.isolate_rng import isolate_rng
 from utils.text_encoding import TextEncodingOnTheFly, encodes_text_in_loader
 from utils.patches import apply_patches
 from utils.unsloth_utils import unsloth_checkpoint
 from utils.pipeline import ManualPipelineModule
-from utils.placement import DEFAULT_PLACEMENT, check_placement, local_world_size, straddling_note
+from utils.placement import DEFAULT_PLACEMENT, check_placement, local_world_size, stage_of_rank, straddling_note
 from utils.dora import apply_dora_config_defaults, check_model_dtypes as check_dora_model_dtypes
 from utils.oplora import OPLoRAProjector, apply_oplora_config_defaults
 from utils.outlier_decay import OutlierDecay, apply_outlier_decay_config_defaults
@@ -759,6 +760,7 @@ if __name__ == '__main__':
     # The teacher is a copy of the model as loaded, so it is made before fp8 training and the adapter change the
     # student's modules.
     teacher = None
+    teacher_plan = None
     teacher_stages = config.get('pipeline_stages', 1)
     # MOSS-Image reads its own [teacher]; with several stages that one also runs as the teacher pipeline.
     pipeline_teacher_config = teacher_config
@@ -770,12 +772,23 @@ if __name__ == '__main__':
         # stage's share on the GPU. Building can fail on one rank alone (a missing file, a mismatching checkpoint):
         # every rank hears of it before the next collective rather than waiting out the timeout.
         error = None
-        try:
-            teacher = model_teacher.build_teacher(
-                model, pipeline_teacher_config, torch.device('cuda', torch.cuda.current_device()),
-                place=teacher_stages == 1)
-        except Exception as e:
-            error = e
+        placement = check_placement(config.get('pipeline_placement', DEFAULT_PLACEMENT))
+        # With several stages one rank at a time: every rank reads and copies the whole teacher, and all of them at
+        # once is the host memory of ranks x (student + teacher). Each then frees the stages it does not run at once
+        # (a manual split of the student's is only known once its layers exist, so that one is freed later).
+        with (one_at_a_time() if teacher_stages > 1 else contextlib.nullcontext()):
+            try:
+                teacher = model_teacher.build_teacher(
+                    model, pipeline_teacher_config, torch.device('cuda', torch.cuda.current_device()),
+                    place=teacher_stages == 1)
+                if teacher_stages > 1 and str(config.get('partition_method', 'parameters')).lower() != 'manual':
+                    teacher_plan = model_teacher.teacher_plan(
+                        teacher.layers, teacher_stages, config.get('partition_method', 'parameters'))
+                    model_teacher.free_other_stages(
+                        list(teacher.layers), teacher_plan[2],
+                        stage_of_rank(dist.get_rank(), dist.get_world_size(), teacher_stages, placement))
+            except Exception as e:
+                error = e
         all_ok(error)
         if is_main_process():
             source = (getattr(pipeline_teacher_config, 'path', None) or getattr(pipeline_teacher_config, 'transformer_path', None)
@@ -930,8 +943,12 @@ if __name__ == '__main__':
         # layer list); the default 'parameters' weighs trainable parameters, which are all 0 in a frozen teacher,
         # so the teacher is balanced by its parameter counts. No loss function, optimizer or ZeRO: it only runs
         # forward, over the step's micro batches before the student's train_batch (model_teacher.TeacherPipeline).
-        teacher_method, teacher_split = model_teacher.teacher_partition(
-            teacher.layers, num_stages, partition_method, partition_split if len(layers) == len(teacher.layers) else None)
+        if teacher_plan is not None:
+            teacher_method, teacher_split = teacher_plan[:2]
+        else:
+            teacher_method, teacher_split = model_teacher.teacher_partition(
+                teacher.layers, num_stages, partition_method,
+                partition_split if len(layers) == len(teacher.layers) else None)
         teacher_layers = list(teacher.layers)
         teacher_module = ManualPipelineModule(
             layers=teacher.layers,

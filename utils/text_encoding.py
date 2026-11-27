@@ -17,6 +17,8 @@ import torch
 import torch.distributed as torch_dist
 from torch import nn
 
+from utils.common import all_ok
+
 # Put into each sample by the dataset for TextEncodingOnTheFly, which takes them out of the batch
 # again before it reaches the model.
 IS_VIDEO_KEY = '_text_encoder_is_video'
@@ -85,10 +87,16 @@ class TextEncodingOnTheFly:
             self.relay = ('send', grid.stage_to_global(engine.num_stages - 1))
             # Now rather than at the first batch: the last stage is already waiting for that batch's rows, and
             # a long read of the encoders (a big one from a network volume) would count against its timeout.
-            self._load_encoders()
+            error = None
+            try:
+                self._load_encoders()
+            except Exception as e:  # noqa: BLE001
+                error = e
+            all_ok(error)
             return
         if engine.is_last_stage():
             self.relay = ('recv', grid.stage_to_global(0))
+        all_ok(None)
         # The encoders were built with the model on every rank; this one never runs them.
         from utils.model_teacher import empty_weights
         empty_weights(self.text_encoders)

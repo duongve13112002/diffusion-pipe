@@ -4763,7 +4763,7 @@ class PipelineDataLoader:
         self.model = model
         # A utils.text_encoding.TextEncodingOnTheFly when the captions are encoded per batch.
         self.text_encoding = text_encoding
-        if text_encoding is not None:
+        if hasattr(text_encoding, 'bind'):
             text_encoding.bind(model_engine)
         # A utils.model_teacher.ModelTeacher on the training loader of a run with [teacher]; its output joins the label.
         self.teacher = teacher

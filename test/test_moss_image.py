@@ -2016,12 +2016,14 @@ def test_a_pipeline_stage_left_with_nothing_to_train_is_refused(tmp_path):
         pipe.get_param_groups([q for q in params if q.original_name.startswith('layers.2.')])
 
 
-def test_each_pipeline_stage_reports_its_learning_rates(tmp_path, monkeypatch, capsys, caplog):
+@pytest.mark.parametrize('placement, stage_1_ranks', [('stage_major', (2, 3)), ('node_local', (1, 3))])
+def test_each_pipeline_stage_reports_its_learning_rates(tmp_path, monkeypatch, capsys, caplog, placement, stage_1_ranks):
     pipe = lr_pipeline(tmp_path, {'block_lr_scale': [{'blocks': '2', 'scale': 0.005}]})
-    pipe.config.update(pipeline_stages=2, lr_scheduler='cosine')
+    pipe.config.update(pipeline_stages=2, lr_scheduler='cosine', pipeline_placement=placement)
     params = trainable(pipe)
     stage_1 = [q for q in params if q.original_name.startswith('layers.2.')]
-    for rank, reports in ((2, True), (3, False)):  # 4 GPUs: stage 1 is ranks 2 and 3
+    # 4 GPUs: the first rank of stage 1 reports, whichever ranks the placement gives that stage
+    for rank, reports in ((stage_1_ranks[0], True), (stage_1_ranks[1], False)):
         monkeypatch.setattr(mi, 'rank_and_world_size', lambda: (rank, 4))
         capsys.readouterr()
         caplog.clear()

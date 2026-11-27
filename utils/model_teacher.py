@@ -193,6 +193,30 @@ def teacher_partition(layers, num_stages, partition_method, partition_split):
     return 'manual', balanced_split(layers, num_stages)
 
 
+def teacher_plan(layers, num_stages, partition_method):
+    """(method, split, parts) of the teacher pipeline, fixed before any weight is freed (a balanced split reads the
+    parameter counts). `parts` are the stage boundaries, or None for a manual split of the student's, which is only
+    known once the student's layers exist."""
+    method, split = teacher_partition(layers, num_stages, partition_method, None)
+    if str(method).lower() == 'manual' and split is not None:
+        return method, split, [0, *[int(b) for b in split], len(layers)]
+    if str(method).lower() == 'uniform':
+        from deepspeed.runtime.utils import partition_uniform
+        return method, split, [int(b) for b in partition_uniform(len(layers), num_stages)]
+    return method, split, None
+
+
+def free_other_stages(layers, parts, stage):
+    """Free, at once, the weights of the layers that are not stage `stage`'s: every rank builds the whole teacher on
+    the CPU, and the copies of the stages it will not run are what would otherwise sit in host memory until the
+    engine is built. Tensors the stage's own layers hold stay."""
+    kept = set()
+    for layer in layers[parts[stage]:parts[stage + 1]]:
+        if isinstance(layer, torch.nn.Module):
+            kept.update(id(t) for t in (*layer.parameters(), *layer.buffers()))
+    empty_weights(layers, kept)
+
+
 def balanced_split(layers, num_stages):
     """Stage boundaries (without the 0 and the end) that balance the layers' parameter counts."""
     from deepspeed.runtime.utils import partition_balanced

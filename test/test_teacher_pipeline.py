@@ -118,6 +118,9 @@ def test_the_last_stage_gets_the_teachers_output_and_the_loss_uses_it(world, sta
     for r in results:
         assert r['loss'] == pytest.approx(loss, abs=1e-5)
         # balanced by parameter counts, not piled on stage 0, and the other stages' weights are freed
+        # the plan train.py fixes before freeing anything is the partition the engine then makes
+        from utils import model_teacher
+        assert model_teacher.teacher_plan(_chain(1), stages, 'parameters')[2] == r['parts']
         sizes = [b - a for a, b in zip(r['parts'], r['parts'][1:])]
         assert min(sizes) >= 1 and max(sizes) <= -(-LAYERS // stages)
         assert r['emptied'] == LAYERS - sizes[r['stage']]
@@ -192,3 +195,19 @@ def test_releasing_the_other_stages_teacher_keeps_what_the_student_shares():
     local = torch.nn.Sequential(torch.nn.Linear(2, 2))
     model_teacher.release_foreign_weights([local, foreign], local, protect=torch.nn.Sequential(shared))
     assert shared.weight.numel() == 4 and foreign[1].weight.numel() == 0 and local[0].weight.numel() == 4
+
+
+def test_the_other_stages_weights_are_freed_up_front_and_what_the_stage_shares_stays():
+    from utils import model_teacher
+    layers = _chain(1)
+    shared = layers[1].weight
+    layers[2].weight = shared  # tied across the stage boundary: the stage that runs layer 1 keeps it
+    method, split, parts = model_teacher.teacher_plan(layers, 2, 'parameters')
+    assert parts == [0, split[0], LAYERS] and method == 'manual'
+    parts = [0, 2, LAYERS]
+    model_teacher.free_other_stages(layers, parts, 0)
+    assert layers[0].weight.numel() == WIDTH * WIDTH and layers[1].weight.numel() == WIDTH * WIDTH
+    assert layers[2].weight is shared and layers[3].weight.numel() == 0
+    # a uniform plan and a manual split of the student's, which is only known later
+    assert model_teacher.teacher_plan(_chain(1), 2, 'uniform')[2] == [0, 2, LAYERS]
+    assert model_teacher.teacher_plan(_chain(1), 2, 'manual')[2] is not None  # no split given: balanced
