@@ -1160,6 +1160,7 @@ if __name__ == '__main__':
     # adapter keeps its gradients in fp32 through the data-parallel all-reduce.
     communication_data_type = config['adapter']['dtype'] if 'adapter' in config else config['model']['dtype']
     model_engine.communication_data_type = communication_data_type
+    model.free_unused_text_encoder(model_engine)
 
     train_dataloader = dataset_util.PipelineDataLoader(
         train_data, model_engine, model_engine.gradient_accumulation_steps(), model,

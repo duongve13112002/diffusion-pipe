@@ -612,6 +612,17 @@ captions on each GPU. For example, with a micro batch of 16 (and no gradient acc
 `caching_batch_size = 4`, each text encoder runs 4 times per step on 4 captions, and the results
 are put back together as 16.
 
+Where the text encoders live with `pipeline_stages > 1`: the first stage encodes. For the models of
+the last row, whose captions are encoded before the model (`utils/text_encoding.py`), the last stage
+also reads every batch (it needs the label), so it used to load the text encoders and encode every
+caption a second time; now the first stage sends its encoded rows to the last stage, which holds no
+text encoder, and the stages between hold none either. Wan, Cosmos-Predict2 / Anima, Iris and
+MOSS-Image encode in their first layer, so only the first stage's GPU holds the encoder; Cosmos-Predict2
+and Iris free its weights from the other stages' host memory once the pipeline is built (MOSS-Image never
+loads it there). The `parameters` partition does not count a frozen text encoder, so the first stage has
+as many blocks as the others plus the encoder; with `partition_method = 'manual'` and `partition_split` move blocks off
+stage 0 if its VRAM is the limit.
+
 Padding, for the models of the last row: each caption is padded to the longest one of its group,
 as caching does with the same `caching_batch_size`, except that the group is taken from the
 training batch instead of the caption files' order. So:

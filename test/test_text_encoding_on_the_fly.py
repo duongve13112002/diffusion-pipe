@@ -315,3 +315,110 @@ def test_a_torch_text_encoder_runs_in_eval_mode():
         seen.append(text_encoder.training) or {'emb': torch.ones(len(captions), 1)})
     TextEncodingOnTheFly(model)({'caption': ['ab'], IS_VIDEO_KEY: [False], CONTROL_FILE_KEY: [None]})
     assert seen and not any(seen)
+
+
+RELAY_BATCHES = [
+    {'caption': ['ab', 'cd'], IS_VIDEO_KEY: [False, True], CONTROL_FILE_KEY: [None, None]},
+    {'caption': ['xyz', 'abc'], IS_VIDEO_KEY: [False, False], CONTROL_FILE_KEY: [None, None]},
+]
+
+
+def _relay_worker(rank, world, init_file, out_dir):
+    import json
+    import os
+    import deepspeed
+    os.environ['LOCAL_RANK'] = str(rank)
+    deepspeed.init_distributed('gloo', auto_mpi_discovery=False, init_method=f'file://{init_file}',
+                               rank=rank, world_size=world, verbose=False)
+    grid = types.SimpleNamespace(stage_to_global=lambda stage: stage, pp_group=list(range(world)))
+    engine = types.SimpleNamespace(is_pipe_parallel=True, grid=grid, num_stages=world,
+                                   is_first_stage=lambda: rank == 0, is_last_stage=lambda: rank == world - 1)
+    model = Model(cache_text_embeddings=False)
+
+    class Prepared:
+        def prepare_inputs(self, batch, timestep_quantile=None):
+            return (batch['emb1'], batch['emb2']), (torch.full((len(batch['caption']),), float(rank)), None)
+
+    encoder = TextEncodingOnTheFly(model)
+    loader = dataset_util.PipelineDataLoader([dict(b) for b in RELAY_BATCHES], engine, 1, Prepared(),
+                                             num_dataloader_workers=0, text_encoding=encoder)
+    result = {'encoders': len(encoder.text_encoders), 'calls': 0, 'features': [], 'targets': []}
+    if rank == 0 or rank == world - 1:
+        for _ in RELAY_BATCHES:
+            features, label = next(loader)
+            result['features'].append([f.float().tolist() for f in features])
+            result['targets'].append(label[0].tolist())
+    result['calls'] = len(model.calls)
+    result['uncond'] = None if not hasattr(model, 'uncond_dict') else {
+        k: v.float().tolist() for k, v in model.uncond_dict.items()}
+    with open(f'{out_dir}/{rank}.json', 'w') as f:
+        json.dump(result, f)
+
+
+@pytest.mark.parametrize('world', [2, 3], ids=['first-last', 'first-middle-last'])
+def test_with_pipeline_stages_only_the_first_stage_encodes_and_the_last_receives_its_rows(world, tmp_path):
+    import json
+    torch.multiprocessing.spawn(_relay_worker, args=(world, str(tmp_path / 'init'), str(tmp_path)), nprocs=world)
+    results = [json.loads((tmp_path / f'{r}.json').read_text()) for r in range(world)]
+    first, last = results[0], results[-1]
+    assert first['encoders'] == 2 and first['calls'] > 0
+    # the last stage built the same rows prepare_inputs sees, without running an encoder or keeping one
+    assert last['calls'] == 0 and last['encoders'] == 0
+    assert last['features'] == first['features']
+    assert len(first['features']) == len(RELAY_BATCHES)
+    assert last['uncond'] == first['uncond'] and first['uncond']
+    # the label's target still comes from the first stage
+    assert first['targets'] == [[0.0, 0.0]] * 2 and last['targets'] == first['targets']
+    for middle in results[1:-1]:
+        assert middle['calls'] == 0 and middle['encoders'] == 0
+
+
+def test_without_pipeline_parallelism_the_process_encodes_for_itself():
+    encoder = TextEncodingOnTheFly(Model(cache_text_embeddings=False))
+    encoder.bind(types.SimpleNamespace(is_pipe_parallel=False))
+    assert encoder.relay is None and len(encoder.text_encoders) == 2
+
+
+def _stage_engine(stage, stages):
+    return types.SimpleNamespace(is_pipe_parallel=stages > 1, is_first_stage=lambda: stage == 0,
+                                 is_last_stage=lambda: stage == stages - 1)
+
+
+@pytest.mark.parametrize('stage, stages, freed', [(0, 1, False), (0, 3, False), (1, 3, True), (2, 3, True)])
+def test_only_the_first_stage_keeps_the_weights_of_a_text_encoder_its_first_layer_runs(stage, stages, freed):
+    encoder = torch.nn.Linear(4, 4)
+    result = text_encoding.free_text_encoder_off_first_stage(encoder, _stage_engine(stage, stages))
+    assert result is freed
+    assert (encoder.weight.numel() == 0) is freed
+
+
+def test_no_text_encoder_is_nothing_to_free():
+    assert not text_encoding.free_text_encoder_off_first_stage(None, _stage_engine(1, 2))
+
+
+def test_cosmos_and_iris_free_the_unused_text_encoder_unless_it_is_cached_or_needed():
+    from models.cosmos_predict2 import CosmosPredict2Pipeline
+    from models.iris import IrisPipeline
+
+    def make(cache):
+        return types.SimpleNamespace(cache_text_embeddings=cache, text_encoder=torch.nn.Linear(4, 4))
+
+    for pipeline in (CosmosPredict2Pipeline, IrisPipeline):
+        model = make(False)
+        if pipeline is IrisPipeline:
+            model.text_encoder = types.SimpleNamespace(decoder=torch.nn.Linear(4, 4), tokenizer='kept')
+        pipeline.free_unused_text_encoder(model, _stage_engine(1, 2))
+        module = model.text_encoder.decoder if pipeline is IrisPipeline else model.text_encoder
+        assert module.weight.numel() == 0
+        if pipeline is IrisPipeline:
+            assert model.text_encoder.tokenizer == 'kept'
+        first = make(False)
+        if pipeline is IrisPipeline:
+            first.text_encoder = types.SimpleNamespace(decoder=torch.nn.Linear(4, 4), tokenizer='kept')
+        pipeline.free_unused_text_encoder(first, _stage_engine(0, 2))
+        assert (first.text_encoder.decoder if pipeline is IrisPipeline else first.text_encoder).weight.numel() == 16
+        cached = make(True)
+        if pipeline is IrisPipeline:
+            cached.text_encoder = types.SimpleNamespace(decoder=torch.nn.Linear(4, 4), tokenizer='kept')
+        pipeline.free_unused_text_encoder(cached, _stage_engine(1, 2))
+        assert (cached.text_encoder.decoder if pipeline is IrisPipeline else cached.text_encoder).weight.numel() == 16

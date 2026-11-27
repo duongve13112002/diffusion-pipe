@@ -626,6 +626,11 @@ class CommonPipeline:
     def free_vae_and_te(self):
         pass
 
+    def free_unused_text_encoder(self, engine):
+        """Called once the pipeline engine exists. A model whose first layer encodes the captions (it has no
+        cached text embeddings) frees the text encoder's weights on the stages that never run it."""
+        pass
+
     # [teacher] (utils/model_teacher.py). The pipeline attributes that hold the denoiser to_layers() wraps: a
     # teacher built from the model as loaded deep-copies them, so its layers share nothing the student trains.
     teacher_denoiser_attrs = ()

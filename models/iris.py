@@ -41,6 +41,7 @@ from models.base import BasePipeline, PreprocessMediaFile, make_contiguous
 from utils import attention as attention_util
 from utils.common import AUTOCAST_DTYPE, is_main_process, iterate_safetensors, zero_first
 from utils.offloading import ModelOffloader
+from utils.text_encoding import free_text_encoder_off_first_stage
 
 from iris3b.config import RepaConfig, inference_config
 from iris3b.flow.schedule import FlowSchedule, resolution_shift
@@ -917,6 +918,11 @@ class IrisPipeline(BasePipeline):
         return features, (target, mask)
 
     # ---- pipeline --------------------------------------------------------------------------------
+
+    def free_unused_text_encoder(self, engine):
+        # The decoder only: prepare_inputs of the first and last stage tokenizes with the rest.
+        if not self.cache_text_embeddings and self.text_encoder is not None:
+            free_text_encoder_off_first_stage(self.text_encoder.decoder, engine)
 
     def to_layers(self):
         transformer = self.transformer

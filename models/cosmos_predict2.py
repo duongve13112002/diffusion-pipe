@@ -40,6 +40,7 @@ from models.teacher_guidance import (
 )
 from utils.common import load_state_dict, AUTOCAST_DTYPE, is_main_process, iterate_safetensors
 from utils.offloading import ModelOffloader
+from utils.text_encoding import free_text_encoder_off_first_stage
 from models.wan.vae2_1 import WanVAE_
 
 
@@ -1295,6 +1296,10 @@ class CosmosPredict2Pipeline(BasePipeline):
             raise ValueError(f'[teacher] path {path} has no trained context_refiner (a freshly initialised one is random '
                              'weights, and distilling toward them teaches nothing). Name a checkpoint a refiner run saved, '
                              'or set [model] context_refiner_path.')
+
+    def free_unused_text_encoder(self, engine):
+        if not self.cache_text_embeddings:
+            free_text_encoder_off_first_stage(self.text_encoder, engine)
 
     def to_layers(self):
         transformer = self.transformer
