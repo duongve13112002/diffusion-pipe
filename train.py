@@ -379,6 +379,7 @@ if __name__ == '__main__':
         raise SystemExit(0)
 
     set_config_defaults(config)
+    teacher_config = model_teacher.parse_model_teacher_config(config)
     if args.nan_check and config.get('loss_scale') is not None:
         raise SystemExit("--nan_check stops at the first inf in a gradient, which with compute_dtype = 'float16' is "
                          "the loss scale's normal back-off signal, not an error. Debug in bfloat16 or float32.")
