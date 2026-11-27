@@ -1203,7 +1203,7 @@ def test_train_py_shares_a_teacher_build_failure_with_every_rank():
     start = source.index('teacher = model_teacher.build_teacher(')
     block = source[start - 300:start + 700]
     assert re.search(r'try:\s+teacher = model_teacher\.build_teacher\(', block)
-    assert 'all_ranks_run=config.get(\'pipeline_stages\', 1) == 1' in block
+    assert 'place=teacher_stages == 1' in block
     assert block.index('except Exception as e:') < block.index('all_ok(error)')
 
 
