@@ -451,3 +451,14 @@ class TestItIsVisibleThatTheTeacherIsOn:
         assert all(p.numel() for p in student.parameters())
         assert not any(p.numel() for p in guide.llm_adapter.parameters())
 
+    def test_the_teacher_forward_is_outside_the_students_fp8(self):
+        from utils import fp8_training
+        _, _, guide = build_student_and_teacher()
+        seen = []
+        original = guide.text_features
+        guide.text_features = lambda captions, device: seen.append(fp8_training._disabled) or original(captions, device)
+        pipe = build_pipeline(teacher=guide)
+        pipe.prepare_inputs(toy_batch())
+        assert seen and all(disabled > 0 for disabled in seen)
+        assert fp8_training._disabled == 0
+

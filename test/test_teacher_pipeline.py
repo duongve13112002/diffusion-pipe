@@ -67,10 +67,15 @@ def _worker(rank, world_size, num_stages, finished, init_file, out_dir):
     teacher_pipeline = model_teacher.TeacherPipeline(teacher, teacher_engine)
 
     model_teacher.release_foreign_weights(teacher_layers, teacher_engine.module)
+    import gc
+    import weakref
+    refs = [weakref.ref(p) for p in teacher_engine.module.parameters()]
     items = _micro_batches() if engine.is_first_stage() or engine.is_last_stage() else None
     attached = teacher_pipeline.attach(items)
+    gc.collect()
     result = {'stage': engine.stage_id, 'parts': parts,
-              'emptied': sum(1 for layer in teacher_layers if layer.weight.numel() == 0)}
+              'emptied': sum(1 for layer in teacher_layers if layer.weight.numel() == 0),
+              'alive': sum(r() is not None for r in refs)}
     # Another step with micro batches of another shape: the engine keeps no totals from the first.
     wide = [(torch.randn(3, WIDTH), (torch.randn(3, WIDTH), torch.ones(1))) for _ in range(GAS)]
     again = teacher_pipeline.attach(wide if items is not None else None)
@@ -128,6 +133,8 @@ def test_a_finished_teacher_attaches_zeros_and_the_engine_does_not_run(tmp_path)
     assert all(all(v == 0 for row in t[0] for v in row) for t in last['teacher_targets'])
     # Nothing reads the teacher again: every rank has freed its stage's share too, not just the foreign ones.
     assert [r['emptied'] for r in results] == [LAYERS, LAYERS]
+    # and nothing (the engine's own name table, say) holds their storage
+    assert [r['alive'] for r in results] == [0, 0]
 
 
 def test_release_foreign_weights_frees_payloads_a_hidden_reference_keeps():
@@ -176,3 +183,12 @@ def test_releasing_a_finished_teacher_keeps_what_the_student_shares():
     teacher.set_step(100)
     teacher.release(protect=torch.nn.Sequential(shared))
     assert shared.weight.numel() == 4 and layers[0][1].weight.numel() == 0
+
+
+def test_releasing_the_other_stages_teacher_keeps_what_the_student_shares():
+    from utils import model_teacher
+    shared = torch.nn.Linear(2, 2)
+    foreign = torch.nn.Sequential(shared, torch.nn.Linear(2, 2))
+    local = torch.nn.Sequential(torch.nn.Linear(2, 2))
+    model_teacher.release_foreign_weights([local, foreign], local, protect=torch.nn.Sequential(shared))
+    assert shared.weight.numel() == 4 and foreign[1].weight.numel() == 0 and local[0].weight.numel() == 4

@@ -200,11 +200,12 @@ def balanced_split(layers, num_stages):
     return [int(b) for b in partition_balanced(weights, num_stages)[1:-1]]
 
 
-def release_foreign_weights(layers, module):
+def release_foreign_weights(layers, module, protect=None):
     """Free the weights of the teacher layers that are not `module`'s (the other stages'). Several layers hold a
     hidden reference to the whole copied model (a list, so it is not a parameter of theirs), which keeps the
-    other stages' blocks alive in host memory for the whole run."""
-    kept = {id(t) for t in (*module.parameters(), *module.buffers())}
+    other stages' blocks alive in host memory for the whole run. `protect`: the student's module, whose weights a
+    teacher layer may share (a text encoder both hold) and are kept."""
+    kept = {id(t) for t in (*module.parameters(), *module.buffers())} | owned_ids(protect)
     empty_weights(layers, kept)
 
 
@@ -331,6 +332,8 @@ class TeacherPipeline:
             if not self.released:
                 # every rank takes this step together: the engine's stage of the teacher is of no use any more
                 empty_weights([engine.module], owned_ids(self.protect))
+                # The engine keeps every Parameter it was given (a dict of names), which would hold their storage
+                getattr(engine, 'param_names', {}).clear()
                 self.released = True
                 free_gpu_cache()
             if not last:

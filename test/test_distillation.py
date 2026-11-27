@@ -252,6 +252,18 @@ def test_once_the_decay_has_finished_the_teacher_does_not_forward_and_a_copy_is_
     assert all(n > 0 for n in student_weights)
 
 
+def test_the_one_stage_teacher_runs_plain_bf16_not_the_students_fp8():
+    from utils import fp8_training
+    pipe, _ = distilling_pipeline(lora=True)
+    teacher = pipe.pipeline_model.layers[0].teacher[0]
+    seen = []
+    original = teacher.layers[0].forward
+    teacher.layers[0].forward = lambda x: seen.append(fp8_training._disabled) or original(x)
+    pipe.pipeline_model(forward_inputs())
+    assert seen and all(disabled > 0 for disabled in seen)
+    assert fp8_training._disabled == 0
+
+
 def test_adapter_teacher_is_the_base_model_and_leaves_the_adapter_alone():
     pipe, reference = distilling_pipeline(lora=True)
     x, t, text, mask = forward_inputs()

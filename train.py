@@ -934,7 +934,7 @@ if __name__ == '__main__':
         teacher_engine, *_ = deepspeed.initialize(args=args, model=teacher_module, config=dict(ds_config))
         teacher_engine._support_torch_style_backward = True
         # The other stages' layers were only held to be partitioned; the engine's own stage is on its GPU.
-        model_teacher.release_foreign_weights(teacher_layers, teacher_engine.module)
+        model_teacher.release_foreign_weights(teacher_layers, teacher_engine.module, protect=model_engine.module)
         teacher_module._layer_specs = []
         teacher.layers = None
         del teacher_module, teacher_layers

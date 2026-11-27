@@ -378,12 +378,15 @@ class TeacherGuide(nn.Module):
         # transformer_dtype does not have one -- KEEP_IN_HIGH_PRECISION leaves x_embedder and
         # final_layer wider than the blocks. Autocast is also what the student's forward does,
         # so this keeps the two numerically comparable, which is the entire point of the term.
+        from utils import fp8_training
+
         autocast_dtype = utils.common.AUTOCAST_DTYPE
         was_training = dit.training
         dit.eval()
         try:
-            with torch.autocast('cuda', dtype=autocast_dtype,
-                                enabled=torch.cuda.is_available() and autocast_dtype is not None):
+            # A DiT shared with the student holds its fp8 layers and calibration sites: the teacher is plain bf16.
+            with fp8_training.disabled(), torch.autocast('cuda', dtype=autocast_dtype,
+                                                         enabled=torch.cuda.is_available() and autocast_dtype is not None):
                 # Inside the autocast, because the student computes its text features inside one
                 # too -- InitialLayer and ContextRefinerLayer carry the same decorator.
                 feats = self.text_features(captions, device)

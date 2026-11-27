@@ -1968,8 +1968,11 @@ class TeacherForward:
         if self.finished is not None and self.finished():
             self.release()
             return torch.zeros(x.shape, dtype=torch.float32, device=x.device)
+        from utils import fp8_training
+
         inputs = tuple(t.detach() for t in (x, sigma, text, mask))
-        with (self.adapter_off() if self.adapter_off is not None else nullcontext()):
+        # The adapter case runs the student's own blocks, with their fp8 layers and calibration: the teacher is bf16
+        with fp8_training.disabled(), (self.adapter_off() if self.adapter_off is not None else nullcontext()):
             for layer in self.layers:
                 inputs = layer(inputs)
         return inputs.detach().float()
