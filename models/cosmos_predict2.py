@@ -850,7 +850,7 @@ class CosmosPredict2Pipeline(BasePipeline):
         if shares_dit and self.teacher_in_pipeline():
             # The teacher pipeline cuts the teacher over the stages like the student, so it cannot be the student's
             # own modules: a frozen copy (the weights are the stock ones, as sharing was only allowed then).
-            teacher_dit = copy.deepcopy(self.transformer)
+            teacher_dit = _copy_without_refiner(self.transformer)
             teacher_dit.requires_grad_(False)
             teacher_dit.eval()
             share_reason += ', copied for the teacher pipeline'
@@ -1246,6 +1246,10 @@ class CosmosPredict2Pipeline(BasePipeline):
         return self.teacher_cfg if self.teacher_in_pipeline() else None
 
     def teacher_label_hooks(self):
+        """How the label carries the stock teacher; None when the teacher pipeline is not that teacher (the generic
+        [teacher] uses the plain hooks)."""
+        if not self.teacher_in_pipeline():
+            return None
         return AnimaLabelHooks(self.teacher_cfg, self._current_step)
 
     def make_stock_teacher_layers(self):
@@ -1479,6 +1483,19 @@ class CosmosPredict2Pipeline(BasePipeline):
 
             return loss
         return loss_fn
+
+
+def _copy_without_refiner(transformer):
+    """A deep copy of the DiT without the student's context_refiner, which no teacher layer registers and
+    would sit in host memory on every rank."""
+    refiner = getattr(transformer, 'context_refiner', None)
+    if refiner is not None:
+        transformer.context_refiner = None
+    try:
+        return copy.deepcopy(transformer)
+    finally:
+        if refiner is not None:
+            transformer.context_refiner = refiner
 
 
 class InitialLayer(nn.Module):

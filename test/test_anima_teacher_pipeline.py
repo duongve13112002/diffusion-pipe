@@ -13,6 +13,7 @@ pytest.importorskip('models.cosmos_predict2')
 from models.teacher_guidance import AnimaLabelHooks  # noqa: E402
 from test.test_teacher_guidance_training import (  # noqa: E402
     _NullOffloader, build_layers, build_pipeline, build_student_and_teacher, teacher_cfg, toy_batch)
+from test.test_teacher_guidance import _FakeTokenizer  # noqa: E402
 
 GAS = 2
 
@@ -33,7 +34,9 @@ def _split(features, label):
 
 def _pipe(stages):
     student, student_llm, guide = build_student_and_teacher()
-    pipe = build_pipeline(teacher=guide, cfg=teacher_cfg())
+    # Another vocabulary for the T5 side, so the two token pairs differ; a lambda that depends on the step
+    guide.t5_tokenizer = _FakeTokenizer(vocab=17)
+    pipe = build_pipeline(teacher=guide, cfg=teacher_cfg(decay='linear', decay_steps=10), step=4)
     pipe.config['pipeline_stages'] = stages
     pipe.offloader = _NullOffloader()
     return pipe, student, student_llm, guide
@@ -96,7 +99,7 @@ def _worker(rank, world_size, finished, init_file, out_dir):
         pipe.teacher_cfg = teacher_cfg(decay='linear', decay_steps=10)
         pipe._step_source = lambda: 100
     teacher = model_teacher.build_teacher(pipe, pipe.own_teacher_config(), torch.device('cpu'), place=False)
-    teacher.set_step(100 if finished else 1)
+    teacher.set_step(100 if finished else 4)
     teacher_layers = list(teacher.layers)
     hooks = pipe.teacher_label_hooks()
 
@@ -156,3 +159,40 @@ def test_two_stage_loss_is_the_single_stage_loss_with_the_teacher_in_its_own_pip
     assert [r for r in results if r['stage'] == 1][0]['label_len'] == [2] * GAS
     for r in results:
         assert r['loss'] == pytest.approx(expected, rel=1e-4, abs=1e-5)
+
+
+def test_the_generic_teacher_of_an_anima_pipeline_uses_the_plain_label_hooks():
+    from utils import model_teacher
+    pipe, *_ = _pipe(2)
+    assert isinstance(model_teacher.label_hooks_for(pipe, own_teacher=True), AnimaLabelHooks)
+    # [teacher] without transformer_path / llm_path is the generic one, whatever the model
+    generic = model_teacher.label_hooks_for(pipe, own_teacher=False)
+    assert type(generic) is model_teacher.LabelHooks
+    label = (torch.zeros(2, 1), torch.ones(2))
+    features = (torch.zeros(1),)
+    assert generic.inputs(features, label) is features
+    assert len(generic.targets(label)) == 1 and generic.targets(label)[0] is label[0]
+    # with the stock teacher off (one stage) the model gives no hooks of its own
+    one, *_ = _pipe(1)
+    assert one.teacher_label_hooks() is None
+    assert type(model_teacher.label_hooks_for(one, own_teacher=True)) is model_teacher.LabelHooks
+
+
+def test_the_deep_copy_for_the_teacher_pipeline_leaves_the_students_refiner_out():
+    from models.cosmos_predict2 import _copy_without_refiner
+    student, *_ = build_student_and_teacher()
+    refiner = student.context_refiner
+    copy_of = _copy_without_refiner(student)
+    assert student.context_refiner is refiner and copy_of.context_refiner is None
+    assert copy_of.blocks[0] is not student.blocks[0]
+    torch.testing.assert_close(next(copy_of.blocks[0].parameters()), next(student.blocks[0].parameters()))
+
+
+def test_the_hooks_take_lambdas_step_from_the_teacher_the_pipeline_decides_finished_from():
+    from utils import model_teacher
+    pipe, *_ = _pipe(2)
+    hooks = pipe.teacher_label_hooks()
+    teacher = model_teacher.ModelTeacher(model_teacher.ModelTeacherConfig(1.0, 'linear', 10, None))
+    model_teacher.TeacherPipeline(teacher, engine=None, hooks=hooks)
+    teacher.set_step(7)
+    assert hooks.current_step() == 7

@@ -410,6 +410,10 @@ class AnimaLabelHooks:
         self.cfg = cfg
         self.current_step = current_step
 
+    def bind_step(self, current_step):
+        """The step the teacher pipeline decides `finished()` from, so lambda and the decision agree."""
+        self.current_step = current_step
+
     def inputs(self, features, label):
         noisy_latents, t, *tokens, _mask = (features[0], *label[1:])
         return (noisy_latents, t, *tokens)

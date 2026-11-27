@@ -940,9 +940,7 @@ if __name__ == '__main__':
         del teacher_module, teacher_layers
         teacher_pipeline = model_teacher.TeacherPipeline(
             teacher, teacher_engine, protect=model_engine.module,
-            hooks=model.teacher_label_hooks() if hasattr(model, 'teacher_label_hooks') else model_teacher.LabelHooks(
-                label_targets=getattr(model, 'teacher_label_targets', None),
-                keep_float32=getattr(model, 'teacher_output_float32', False)))
+            hooks=model_teacher.label_hooks_for(model, own_teacher=teacher_config is None))
         gc.collect()
     # Read by the engine step in utils/patches.py.
     nonfinite_guard = None

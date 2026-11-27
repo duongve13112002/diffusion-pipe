@@ -317,6 +317,8 @@ class TeacherPipeline:
         self.engine = engine
         self.protect = protect
         self.hooks = hooks or LabelHooks()
+        if hasattr(self.hooks, 'bind_step'):
+            self.hooks.bind_step(lambda: teacher.step)
         self.released = False
 
     def attach(self, items):
@@ -379,6 +381,17 @@ class TeacherPipeline:
                 teacher_targets.append(out)
             attached.append((features, self.hooks.with_teacher(label, teacher_targets)))
         return attached
+
+
+def label_hooks_for(model, own_teacher):
+    """The label hooks of the teacher pipeline. `own_teacher`: the model's own [teacher] (own_teacher_config)
+    drives it, so the model says how its label carries the teacher; the generic [teacher] of any model, anima
+    included, is the plain LabelHooks."""
+    hooks = model.teacher_label_hooks() if own_teacher and hasattr(model, 'teacher_label_hooks') else None
+    if hooks is not None:
+        return hooks
+    return LabelHooks(label_targets=getattr(model, 'teacher_label_targets', None) if own_teacher else None,
+                      keep_float32=getattr(model, 'teacher_output_float32', False) if own_teacher else False)
 
 
 def wrap_loss_fn(inner, teacher):
