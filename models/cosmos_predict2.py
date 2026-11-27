@@ -10,6 +10,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import copy
 import math
 import types
 import os.path
@@ -29,6 +30,7 @@ from models.base import BasePipeline, PreprocessMediaFile, make_contiguous
 from models.cosmos_predict2_modeling import MiniTrainDIT
 from models.text_refiner import extract_refiner_state_dict
 from models.teacher_guidance import (
+    AnimaLabelHooks,
     TeacherGuide,
     blend_target,
     lambda_at,
@@ -845,7 +847,15 @@ class CosmosPredict2Pipeline(BasePipeline):
             elif self._dit_weights_match(teacher_state_dict):
                 shares_dit, share_reason = True, 'different file, identical weights'
 
-        if shares_dit:
+        if shares_dit and self.teacher_in_pipeline():
+            # The teacher pipeline cuts the teacher over the stages like the student, so it cannot be the student's
+            # own modules: a frozen copy (the weights are the stock ones, as sharing was only allowed then).
+            teacher_dit = copy.deepcopy(self.transformer)
+            teacher_dit.requires_grad_(False)
+            teacher_dit.eval()
+            share_reason += ', copied for the teacher pipeline'
+            shares_dit = False
+        elif shares_dit:
             teacher_dit = self.transformer
         else:
             teacher_dit_config = get_dit_config(teacher_state_dict)
@@ -904,7 +914,8 @@ class CosmosPredict2Pipeline(BasePipeline):
             for message in teacher_warnings(cfg, self.config):
                 print(message)
             how = (f"sharing the student's frozen DiT ({share_reason})" if shares_dit
-                   else 'with its own frozen copy of the DiT')
+                   else 'with its own frozen copy of the DiT'
+                   + (' split over the pipeline stages' if self.teacher_in_pipeline() else ''))
             print(
                 f'Teacher guidance on: loss_weight={cfg.loss_weight}, shape={cfg.shape} '
                 f'(t_mid={cfg.t_mid}, width={cfg.width}), decay={cfg.decay}'
@@ -1168,6 +1179,13 @@ class CosmosPredict2Pipeline(BasePipeline):
             # the only evidence the teacher exists is one line at startup, and a run cannot be
             # told apart from one whose decay reached zero hours ago.
             self._last_teacher_lambda = float(lam.mean())
+            if self.teacher_in_pipeline():
+                # With several stages the teacher runs in its own pipeline (model_teacher.TeacherPipeline) and the
+                # last stage mixes its velocity into the target (AnimaLabelHooks). The label carries what that
+                # needs: t, and the teacher's own tokens of the same captions (the loader sends them to the last
+                # stage with the target); the teacher pipeline replaces it with (mixed target, mask).
+                return ((noisy_latents, t, *prompt_embeds_or_batch_encoding),
+                        (target, t, *self.teacher.tokenize(captions), mask))
             if float(lam.max()) > 0:
                 self._ensure_teacher_device()
                 device = self.teacher.device
@@ -1216,7 +1234,34 @@ class CosmosPredict2Pipeline(BasePipeline):
         self.teacher.device = torch.device(device)
         self.teacher._placed = True
 
+    def teacher_in_pipeline(self):
+        """Whether the stock-Anima [teacher] runs as the teacher pipeline: with more than one pipeline stage."""
+        return self.teacher_cfg.enabled and int(self.config.get('pipeline_stages', 1)) > 1
+
+    def own_teacher_config(self):
+        """The stock-Anima [teacher] config train.py builds the teacher pipeline from."""
+        return self.teacher_cfg if self.teacher_in_pipeline() else None
+
+    def teacher_label_hooks(self):
+        return AnimaLabelHooks(self.teacher_cfg, self._current_step)
+
+    def make_stock_teacher_layers(self):
+        """The layers of the stock-Anima teacher pipeline: the same layer classes as the student's, over the
+        teacher's own DiT, llm_adapter and text encoder (its tokens arrive in the features, see AnimaLabelHooks),
+        on the CPU where the engine moves each stage's share to its GPU."""
+        guide = self.teacher
+        dit = guide.dit[0]
+        guide.requires_grad_(False)
+        dit.requires_grad_(False)
+        dit.eval()
+        layers = [InitialLayer(dit, guide.text_encoder, False, None), LLMAdapterLayer(guide.llm_adapter)]
+        layers += [TransformerLayer(block, i, self.offloader) for i, block in enumerate(dit.blocks)]
+        layers.append(FinalLayer(dit))
+        return layers
+
     def make_teacher_layers(self, path=None):
+        if self.teacher is not None:
+            return self.make_stock_teacher_layers()
         # [teacher] without transformer_path / llm_path (utils/model_teacher.py): a frozen copy of the model as
         # loaded. A refiner that was just initialised is random weights, and distilling toward them teaches nothing.
         if path is None and self.use_context_refiner and getattr(self, '_refiner_is_fresh', False):

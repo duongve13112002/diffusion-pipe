@@ -774,7 +774,8 @@ if __name__ == '__main__':
             error = e
         all_ok(error)
         if is_main_process():
-            source = pipeline_teacher_config.path or 'the model the run started from'
+            source = (getattr(pipeline_teacher_config, 'path', None) or getattr(pipeline_teacher_config, 'transformer_path', None)
+                      or 'the model the run started from')
             where = ('on the same GPU as the student' if teacher_stages == 1 else
                      f'as a second, forward-only pipeline split over the {teacher_stages} stages')
             print(f'[teacher] on: a frozen copy of {source} runs {where} '
@@ -938,8 +939,10 @@ if __name__ == '__main__':
         teacher.layers = None
         del teacher_module, teacher_layers
         teacher_pipeline = model_teacher.TeacherPipeline(
-            teacher, teacher_engine, label_targets=getattr(model, 'teacher_label_targets', None),
-            keep_float32=getattr(model, 'teacher_output_float32', False))
+            teacher, teacher_engine,
+            hooks=model.teacher_label_hooks() if hasattr(model, 'teacher_label_hooks') else model_teacher.LabelHooks(
+                label_targets=getattr(model, 'teacher_label_targets', None),
+                keep_float32=getattr(model, 'teacher_output_float32', False)))
         gc.collect()
     # Read by the engine step in utils/patches.py.
     nonfinite_guard = None

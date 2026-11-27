@@ -94,8 +94,8 @@ def _worker(rank, world_size, num_stages, finished, init_file, out_dir):
     teacher_module = ManualPipelineModule(layers=teacher.layers, num_stages=num_stages, partition_method='uniform',
                                           loss_fn=None, dynamic_shape=True)
     teacher_engine, *_ = deepspeed.initialize(model=teacher_module, config=dict(ds_config))
-    teacher_pipeline = model_teacher.TeacherPipeline(teacher, teacher_engine, label_targets=pipe.teacher_label_targets,
-                                                     keep_float32=pipe.teacher_output_float32)
+    teacher_pipeline = model_teacher.TeacherPipeline(
+        teacher, teacher_engine, hooks=model_teacher.LabelHooks(pipe.teacher_label_targets, pipe.teacher_output_float32))
     items = _micro_batches() if engine.is_first_stage() or engine.is_last_stage() else None
     attached = teacher_pipeline.attach(items)
     loss = engine.train_batch(iter(attached) if attached is not None else None)

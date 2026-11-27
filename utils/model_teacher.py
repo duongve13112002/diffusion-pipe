@@ -228,7 +228,7 @@ def build_teacher(model, config, device, runs_teacher=True, all_ranks_run=True, 
     import contextlib
     from utils.common import barriers_off
     with contextlib.nullcontext() if all_ranks_run else barriers_off():
-        layers = model.make_teacher_layers(config.path)
+        layers = model.make_teacher_layers(getattr(config, 'path', None))
     for layer in layers:
         # A layer can be a plain function (AuraFlow's concat_hidden_states).
         if isinstance(layer, torch.nn.Module):
@@ -238,6 +238,35 @@ def build_teacher(model, config, device, runs_teacher=True, all_ranks_run=True, 
                 layer.to(device)
     teacher.layers = layers
     return teacher
+
+
+class LabelHooks:
+    """How a TeacherPipeline reads a micro batch and puts the teacher's output into its label. The default
+    appends the output after the label's last entry (the loss then reads it there). A model whose label carries
+    more than the loss reads (the Anima teacher's own text tokens) or whose teacher mixes into the target
+    subclasses it.
+
+    `label_targets`: how many leading label entries the teacher's output stands in for (default: all but the
+    mask, the last). `keep_float32`: leave the output in float32 instead of the target's dtype."""
+
+    def __init__(self, label_targets=None, keep_float32=False):
+        self.label_targets = label_targets
+        self.keep_float32 = keep_float32
+
+    def inputs(self, features, label):
+        """The features the teacher engine's first stage reads for this micro batch."""
+        return features
+
+    def targets(self, label):
+        """The label entries the teacher's outputs stand in for, one per output tensor."""
+        return label[:len(label) - 1 if self.label_targets is None else self.label_targets]
+
+    def with_teacher(self, label, teacher_outputs):
+        return (*label, *teacher_outputs)
+
+    def without_teacher(self, label):
+        """The label once lambda has decayed to 0 for good: no teacher output is computed."""
+        return (*label, *[torch.zeros_like(t) for t in self.targets(label)])
 
 
 class TeacherPipeline:
@@ -251,14 +280,10 @@ class TeacherPipeline:
     ModelTeacher.run's output joins in the loader, so the loss function is the same.
     """
 
-    def __init__(self, teacher, engine, label_targets=None, keep_float32=False):
-        """`label_targets`: how many leading entries of a label are targets the teacher's output stands in for
-        (default: all but the mask, the last); the output joins the label after its last entry. `keep_float32`:
-        leave the teacher's output in float32 instead of casting it to its target's dtype (MOSS-Image's loss)."""
+    def __init__(self, teacher, engine, hooks=None):
         self.teacher = teacher
         self.engine = engine
-        self.label_targets = label_targets
-        self.keep_float32 = keep_float32
+        self.hooks = hooks or LabelHooks()
 
     def attach(self, items):
         """`items`: the step's micro batches [(features, label)] on the first and last stage, None on the others.
@@ -269,15 +294,16 @@ class TeacherPipeline:
         if teacher.finished():
             if not last:
                 return items
-            return [(features, (*label, *[torch.zeros_like(t) for t in label[:self._count(label)]]))
-                    for features, label in items]
+            return [(features, self.hooks.without_teacher(label)) for features, label in items]
         # eval_batch never clears the totals the last stage adds every forward to (only train_batch does), so a
         # micro batch of another shape than the first would fail to add into them.
         engine.total_loss = None
         engine.total_additional_losses = None
         engine.reset_activation_shape()
         with fp8_training.disabled():
-            outputs = engine.eval_batch(iter(items) if items is not None else None, compute_loss=False,
+            teacher_items = (None if items is None else
+                             [(self.hooks.inputs(features, label), label) for features, label in items])
+            outputs = engine.eval_batch(iter(teacher_items) if items is not None else None, compute_loss=False,
                                         reduce_output=None, bcast_loss=False)
         _release_engine_buffers(engine)
         attached, error = items, None
@@ -297,7 +323,7 @@ class TeacherPipeline:
                                f'{len(items)} micro batches')
         attached = []
         for output, (features, label) in zip(outputs, items):
-            targets = label[:self._count(label)]
+            targets = self.hooks.targets(label)
             if not torch.is_tensor(output):
                 output = tuple(output)
             selected = teacher.select(output)
@@ -307,16 +333,13 @@ class TeacherPipeline:
             teacher_targets = []
             for out, target in zip(selected, targets):
                 out = fit_trailing_dim(out.detach(), target)
-                out = out.to(target.device, torch.float32 if self.keep_float32 else target.dtype)
+                out = out.to(target.device, torch.float32 if self.hooks.keep_float32 else target.dtype)
                 if out.shape != target.shape:
                     raise RuntimeError(f'[teacher]: the teacher output {tuple(out.shape)} does not match the '
                                        f'target {tuple(target.shape)} it stands in for')
                 teacher_targets.append(out)
-            attached.append((features, (*label, *teacher_targets)))
+            attached.append((features, self.hooks.with_teacher(label, teacher_targets)))
         return attached
-
-    def _count(self, label):
-        return len(label) - 1 if self.label_targets is None else self.label_targets
 
 
 def wrap_loss_fn(inner, teacher):

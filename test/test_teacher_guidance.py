@@ -200,9 +200,9 @@ class TestValidation:
         with pytest.raises(ValueError, match='cache_text_embeddings = false'):
             validate_teacher_config(self.base_config(), True, True)
 
-    def test_it_refuses_split_pipelines(self):
-        with pytest.raises(ValueError, match='pipeline_stages = 1'):
-            validate_teacher_config(self.base_config(pipeline_stages=2), True, False)
+    def test_it_accepts_split_pipelines(self):
+        # The teacher then runs as its own pipeline (test_anima_teacher_pipeline.py).
+        assert validate_teacher_config(self.base_config(pipeline_stages=2), True, False).enabled
 
     def test_it_refuses_block_swapping(self):
         with pytest.raises(ValueError, match='blocks_to_swap'):

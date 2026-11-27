@@ -333,7 +333,7 @@ A new top-level `[teacher]` table, gated exactly the way `[rollout]` is: **`loss
 disables the feature entirely**, including loading anything.
 
 ```toml
-# Top level, not inside a table.
+# Top level, not inside a table. Any number of stages: with more than one the teacher is a second pipeline.
 pipeline_stages = 1
 
 [model]
@@ -382,11 +382,14 @@ target the student chases is not one the DiT can read.
 - **`cache_text_embeddings = true`.** See the section above: the teacher and the student have to
   read one augmentation draw of one caption, and caching cannot promise that today. The error
   should say to set it false rather than name a missing cache.
-- **`pipeline_stages > 1`.** The teacher forward happens where `prepare_inputs` runs, so the
-  whole teacher DiT would sit on stage 0 while the student is split across stages — the memory
-  imbalance defeats the point of splitting. `pipeline_stages = 1` with data parallelism across
-  GPUs is the supported path, which is the same constraint `train.py:809` already imposes on
-  refiner-only runs.
+- **`pipeline_stages > 1` is supported**, and it is no longer refused. The stock Anima teacher then runs as a
+  second, forward-only DeepSpeed pipeline over the same stages (`utils/model_teacher.py` `TeacherPipeline`), so
+  every GPU holds 1/stages of it instead of stage 0 holding all of it. `prepare_inputs` does not mix the target
+  itself in that case: its training label is `(target, t, source_ids, source_mask, t5_ids, t5_mask, mask)`, the
+  loader broadcasts it from the first stage to the last, the teacher pipeline reads the noisy latent and the
+  teacher's own tokens from it, and the last stage mixes the teacher velocity into the target with this step's
+  lambda (`AnimaLabelHooks`), leaving the `(target, mask)` label the loss reads. Evaluation batches keep the plain
+  label. Tested on CPU with fake DiT layers and real gloo pipeline engines; speed and VRAM are not measured on a GPU.
 - **`blocks_to_swap` > 0.** Block swapping is moving the student's blocks between CPU and GPU
   already; a second full forward per step thrashes it.
 - **A teacher checkpoint with no `llm_adapter.*` keys.** That is not a teacher, and the failure

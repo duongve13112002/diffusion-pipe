@@ -1075,6 +1075,7 @@ def test_a_teacher_path_without_a_trained_refiner_is_refused(monkeypatch):
 
     monkeypatch.setattr(base.BasePipeline, 'load_teacher_denoiser', fake_load)
     pipe = cp2_pipeline(use_context_refiner=True)
+    pipe.teacher = None
     pipe._refiner_is_fresh = False
     with pytest.raises(ValueError, match='no trained context_refiner'):
         pipe.load_teacher_denoiser('/other')
@@ -1094,6 +1095,7 @@ def test_a_fresh_refiner_cannot_be_its_own_teacher(monkeypatch):
     monkeypatch.setattr(base.CommonPipeline, 'make_teacher_layers', lambda self, path=None: 'layers')
     pipe = cp2.CosmosPredict2Pipeline.__new__(cp2.CosmosPredict2Pipeline)
     pipe.use_context_refiner = True
+    pipe.teacher = None
     pipe._refiner_is_fresh = True
     with pytest.raises(ValueError, match='freshly initialised context_refiner'):
         pipe.make_teacher_layers()

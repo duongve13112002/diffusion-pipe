@@ -116,16 +116,6 @@ def validate_teacher_config(config, use_context_refiner, cache_text_embeddings):
             'way; only the text half runs in the loop.'
         )
 
-    if config.get('pipeline_stages', 1) != 1:
-        # The teacher's forward runs where prepare_inputs runs, which is stage 0. A separate
-        # teacher DiT would sit there whole while the student is split across stages, and a
-        # shared one cannot be called at all, because its blocks are spread over the stages.
-        raise ValueError(
-            '[teacher] requires pipeline_stages = 1.\n'
-            "  The teacher's forward runs on the first stage, so a split student either leaves "
-            'the whole teacher on one GPU or has no complete DiT to share.\n'
-            '  Use data parallelism across GPUs instead (--num_gpus with pipeline_stages = 1).'
-        )
     if config.get('blocks_to_swap', 0):
         raise ValueError(
             '[teacher] cannot be combined with blocks_to_swap.\n'
@@ -312,6 +302,15 @@ class TeacherGuide(nn.Module):
             self.dit[0].to(device, dtype)
         return self
 
+    def tokenize(self, captions):
+        """The teacher's own token tensors for a batch of captions, on the CPU: the LLM's (ids, mask) and the T5
+        tokenizer's (ids, mask) the llm_adapter's queries read. The teacher pipeline carries them in the label."""
+        from models.cosmos_predict2 import _tokenize
+
+        source = _tokenize(self.tokenizer, captions, self.max_text_length)
+        target = _tokenize(self.t5_tokenizer, captions, self.max_text_length)
+        return source.input_ids, source.attention_mask, target.input_ids, target.attention_mask
+
     @torch.no_grad()
     def text_features(self, captions, device):
         """LLMAdapter output for a batch of caption strings: (B, max_text_length, 1024).
@@ -381,3 +380,34 @@ class TeacherGuide(nn.Module):
             if was_training:
                 dit.train()
         return out.to(noisy_latents.dtype)
+
+
+class AnimaLabelHooks:
+    """The teacher pipeline's view of the Anima teacher (utils/model_teacher.py TeacherPipeline).
+
+    With several pipeline stages prepare_inputs does not mix the target itself: its label for a training batch is
+    (target, t, source_ids, source_mask, t5_ids, t5_mask, mask), which the loader broadcasts from the first stage
+    to the last. The teacher pipeline reads the noisy latent from the features and (t, the teacher's own tokens)
+    from the label, and the last stage mixes the teacher's velocity into the target with this step's lambda,
+    leaving the label (mixed target, mask) the loss function reads as ever.
+    """
+    keep_float32 = False
+
+    def __init__(self, cfg, current_step):
+        self.cfg = cfg
+        self.current_step = current_step
+
+    def inputs(self, features, label):
+        noisy_latents, t, *tokens, _mask = (features[0], *label[1:])
+        return (noisy_latents, t, *tokens)
+
+    def targets(self, label):
+        return (label[0],)
+
+    def with_teacher(self, label, teacher_outputs):
+        target, t, mask = label[0], label[1], label[-1]
+        lam = lambda_at(t.to(target.device, torch.float32), self.current_step(), self.cfg)
+        return (blend_target(target, teacher_outputs[0], lam), mask)
+
+    def without_teacher(self, label):
+        return (label[0], label[-1])
