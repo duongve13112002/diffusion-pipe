@@ -10,6 +10,9 @@ Weights that live outside the layers' parameters (a text encoder a layer holds i
 the first stage) are added to the first layer by the model's `first_stage_extra_bytes()`. That is known only on
 the ranks that loaded it, so every rank shares its numbers and the largest is taken: all ranks then split alike.
 """
+import math
+import os
+
 import torch
 
 from utils.common import all_ok, warn_ignored
@@ -25,11 +28,13 @@ def check_partition_config(config):
     active = method == 'memory' and int(config.get('pipeline_stages', 1)) > 1
     if method == 'memory' and not active:
         warn_ignored("partition_method = 'memory' with pipeline_stages = 1: there is nothing to split, ignored.")
+    if active and 'partition_split' in config:
+        warn_ignored("partition_split only applies with partition_method = 'manual'; ignored with 'memory'.")
     for key in ('partition_extra_first_stage_gb', 'partition_trainable_factor'):
         if key not in config:
             continue
         value = config[key]
-        if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0 or value != value:
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
             raise ValueError(f'{key} must be a number >= 0, got {value!r}')
         if not active:
             warn_ignored(f"{key} only applies with partition_method = 'memory' and pipeline_stages > 1; ignored.")
@@ -42,7 +47,9 @@ def tensors_bytes(tensors):
         if id(t) in seen:
             continue
         seen.add(id(t))
-        total += t.numel() * t.element_size()
+        # nbytes, not numel x element_size: a quantized tensor (ComfyUI's fp8 / nvfp4 weights) reports its logical
+        # size through those two, and its real storage through nbytes.
+        total += int(t.nbytes)
     return total
 
 
@@ -111,13 +118,42 @@ def agree(local_weights, local_extra, error=None):
     return local
 
 
-def plan(layers, model, num_stages, trainable_factor, extra_first_stage_gb):
-    """(split, report) for the student's pipeline. Must be called on every rank, before the engine."""
+def loader_encoders_bytes(model, loader_encoders):
+    """The text encoders the data loader runs on the first stage (utils/text_encoding.py): their bytes where they are
+    loaded, and where they are not yet (a ComfyUI encoder is read only when the loader is bound, after the engine
+    exists) the size of their files, which `model.text_encoder_file_bytes()` knows."""
+    if not loader_encoders:
+        return 0
+    loaded = sum(text_encoder_bytes(te) for te in loader_encoders)
+    if any(text_encoder_bytes(te) == 0 for te in loader_encoders):
+        loaded = max(loaded, int(model.text_encoder_file_bytes()))
+    return loaded
+
+
+def text_files_bytes(paths):
+    """The summed sizes of text encoder checkpoint files (a directory: its .safetensors / .bin files); 0 for
+    anything that is not there."""
+    total = 0
+    for path in ([paths] if isinstance(paths, str) else list(paths)):
+        path = os.path.expanduser(str(path))
+        if os.path.isdir(path):
+            total += sum(os.path.getsize(os.path.join(root, f)) for root, _, files in os.walk(path) for f in files
+                         if f.endswith(('.safetensors', '.bin', '.pt', '.pth')))
+        elif os.path.isfile(path):
+            total += os.path.getsize(path)
+    return total
+
+
+def plan(layers, model, num_stages, trainable_factor, extra_first_stage_gb, loader_encoders=()):
+    """(split, report) for the student's pipeline. Must be called on every rank, before the engine.
+    `loader_encoders`: the text encoders the data loader runs on the first stage (none when the layers or the
+    model's own hook account for them)."""
     error = None
     weights, extra = [], 0
     try:
         weights = [layer_weight_bytes(layer, trainable_factor) for layer in layers]
         extra = int(model.first_stage_extra_bytes()) if model is not None else 0
+        extra += loader_encoders_bytes(model, loader_encoders)
     except Exception as e:
         error = e
     weights, extra = agree(weights, extra, error)
@@ -135,3 +171,17 @@ def report(weights, split, extra):
         parts.append(f'stage {i}: {bounds[i + 1] - bounds[i]} layers, {size / GIB:.1f} GiB')
     note = f' (first stage text encoder and extra: {extra / GIB:.1f} GiB)' if extra else ''
     return "partition_method = 'memory'" + note + ' -> ' + '; '.join(parts)
+
+
+def check_resumed_partition(saved, current, reset_optimizer=False):
+    """The optimizer state of a checkpoint is per stage, so it fits only the stage boundaries it was saved with
+    (the layers' weights are per layer and load under any split). `partition_method = 'memory'` moves them
+    when the dtype, the fp8 setting, the text encoder or its keys change. Raises on a mismatch unless the
+    optimizer is reset; a checkpoint from before this was recorded (`saved` None) is not checked."""
+    if saved is None or current is None or reset_optimizer or [int(b) for b in saved] == [int(b) for b in current]:
+        return
+    raise RuntimeError(
+        f'The checkpoint was saved with the pipeline stage boundaries {[int(b) for b in saved]}, this run has '
+        f'{[int(b) for b in current]}: its optimizer state is per stage and would be given to the wrong layers. '
+        f"Set partition_method = 'manual' and partition_split = {[int(b) for b in saved][1:-1]} to keep the old "
+        'split, or pass --reset_optimizer to start the optimizer fresh.')

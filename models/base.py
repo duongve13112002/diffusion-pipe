@@ -633,14 +633,13 @@ class CommonPipeline:
 
     def first_stage_extra_bytes(self):
         """Bytes of text encoder the first stage's GPU holds while training that no layer carries as parameters
-        (partition_method = 'memory' adds them to the first layer). Here: the encoders the data loader runs
-        (utils/text_encoding.py), as far as they are loaded on this rank; a model that holds its encoder in a
-        layer in a list overrides this. Read on every rank, which then share the largest."""
-        from utils.memory_partition import text_encoder_bytes
-        from utils.text_encoding import encodes_text_in_loader
-        if not encodes_text_in_loader(self):
-            return 0
-        return sum(text_encoder_bytes(te) for te in self.get_text_encoders())
+        and the data loader does not run (partition_method = 'memory' adds them to the first layer): a model that
+        holds its encoder in a layer in a list overrides this. Read on every rank, which then share the largest."""
+        return 0
+
+    def text_encoder_file_bytes(self):
+        """The size of the text encoder files, for a loader-run encoder that is not loaded yet. 0 when unknown."""
+        return 0
 
     # [teacher] (utils/model_teacher.py). The pipeline attributes that hold the denoiser to_layers() wraps: a
     # teacher built from the model as loaded deep-copies them, so its layers share nothing the student trains.
@@ -996,6 +995,13 @@ class ComfyPipeline(CommonPipeline):
 
     def load_text_encoder(self, paths, clip_type):
         return comfy.sd.load_clip(ckpt_paths=paths, clip_type=clip_type, disable_dynamic=True)
+
+    def text_encoder_file_bytes(self):
+        from utils.memory_partition import text_files_bytes
+        total = 0
+        for te_config in self.model_config.get('text_encoders', []):
+            total += text_files_bytes(te_config.get('paths', te_config.get('path', [])))
+        return total
 
     def load_model_patcher(self, model_options):
         """The diffusion model's ModelPatcher. A pipeline whose checkpoints come in layouts ComfyUI does not

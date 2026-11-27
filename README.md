@@ -630,16 +630,22 @@ encoder is never loaded there). Wan, Cosmos-Predict2 / Anima, Iris and
 MOSS-Image encode in their first layer, so only the first stage's GPU holds the encoder; Wan, Cosmos-Predict2
 and Iris free its weights from the other stages' host memory once the pipeline is built (MOSS-Image never
 loads it there). MOSS-Image's `[teacher]` copy of a full fine-tune is made when the teacher pipeline is built, one
-rank at a time, not when the model loads. The `parameters` partition does not count a frozen text encoder, so the first stage has
-as many blocks as the others plus the encoder. Two ways to move blocks off stage 0: `partition_method = 'manual'` with
+rank at a time, not when the model loads. The `parameters` partition counts parameters by number (frozen ones too, dtype ignored) and does not see an encoder
+that is not one of the layers' parameters (the data loader's, Iris's and MOSS-Image's own), so the first stage has
+as many blocks as the others plus that encoder. Two ways to move blocks off stage 0: `partition_method = 'manual'` with
 `partition_split`, or `partition_method = 'memory'`, which balances the stages by the bytes their layers hold:
 every parameter and buffer counts at its own dtype (a block kept in fp8 weighs half a bfloat16 one), frozen weights
 included, plus `partition_trainable_factor` (default 3: the gradient and two optimizer states, an Adam-like estimate)
-times the bytes of the trainable parameters, plus the first stage's text encoder. A text encoder the tool cannot
-see (a ComfyUI one that is not loaded yet) and the activations that the first stage holds most of can be added as
-`partition_extra_first_stage_gb`. The chosen stages and their sizes are printed at startup; check them against
-`nvidia-smi` on the first run and adjust. The `[teacher]`'s own pipeline is balanced by its bytes as well. The
-partition covers the diffusion model's layers (the pipeline); the VAE is not in them (latents are cached before training).
+times the bytes of the trainable parameters, plus the first stage's text encoder (a ComfyUI one that is not loaded
+yet is taken from the size of its files). Whatever the tool cannot see, and the activations that the first stage
+holds most of, can be added as `partition_extra_first_stage_gb`. The chosen stages and their sizes are printed at
+startup; check them against `nvidia-smi` on the first run and adjust. A component whose learning rate is 0 (Iris, MOSS-Image,
+...) is frozen only after the partition, so it still counts as trainable there. The `[teacher]`'s own pipeline is
+balanced by its own layers' bytes, a text encoder shared with the student included. A checkpoint records its stage
+boundaries, because the optimizer state is per stage: resuming under other boundaries (the dtype or these keys
+changed under `'memory'`) stops with the `partition_split` that keeps the old ones, unless `--reset_optimizer`.
+The partition covers the diffusion model's layers (the pipeline); the VAE is not in them (latents are cached before
+training).
 
 Padding, for the models of the last row: each caption is padded to the longest one of its group,
 as caching does with the same `caching_batch_size`, except that the group is taken from the

@@ -399,6 +399,9 @@ class Saver:
                     'step': step,
                     'examples': examples,
                     'custom_loader': self.train_dataloader.state_dict(),
+                    # The optimizer state is per stage: a resume under other boundaries must not load it.
+                    **({'partition_parts': [int(b) for b in parts]}
+                       if (parts := getattr(getattr(self.model_engine, 'module', None), 'parts', None)) is not None else {}),
                     **({'loss_average': self.loss_average.state_dict()} if self.loss_average is not None else {}),
                     **({'loss_scaler': scaler.state_dict()}
                        if (scaler := getattr(self.model_engine, 'loss_scaler', None)) is not None else {}),

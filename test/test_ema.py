@@ -253,6 +253,7 @@ class _Engine:
                                     str(Path(save_dir, tag, 'layer_00-model_states.pt')))
         self.barrier()
         self.saved.append(tag)
+        self.client_state = kwargs.get('client_state')
 
 
 class _Model:
@@ -409,6 +410,19 @@ def test_saver_without_ema_is_unchanged(tmp_path, no_barrier):
     assert sorted(p.name for p in (tmp_path / 'run').iterdir()) == ['global_step12', 'latest', 'step3']
     assert sorted(p.name for p in (tmp_path / 'run' / 'step3').iterdir()) == ['model.pt', 'train.toml']
     assert not list((tmp_path / 'run').rglob('ema*'))
+
+
+def test_the_checkpoint_records_the_stage_boundaries_for_the_resume_check(tmp_path, no_barrier):
+    module = nn.Linear(2, 2)
+    named(module)
+    config_file = tmp_path / 'train.toml'
+    config_file.write_text('')
+    engine = _Engine()
+    engine.module = types.SimpleNamespace(parts=[0, 3, 9])
+    saver = saver_util.Saver(types.SimpleNamespace(config=str(config_file)), {}, False, tmp_path / 'run', _Model(),
+                             types.SimpleNamespace(state_dict=lambda: {}), engine, module)
+    saver.save_checkpoint(3, 24)
+    assert engine.client_state['partition_parts'] == [0, 3, 9]
 
 
 def test_stochastic_rounding_is_unbiased():

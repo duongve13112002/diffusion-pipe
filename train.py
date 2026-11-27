@@ -913,7 +913,8 @@ if __name__ == '__main__':
         # Balanced by the bytes of the layers (utils/memory_partition.py), the same split on every rank.
         student_split, partition_report = memory_partition.plan(
             layers, model, num_stages, config.get('partition_trainable_factor', memory_partition.DEFAULT_TRAINABLE_FACTOR),
-            config.get('partition_extra_first_stage_gb', 0))
+            config.get('partition_extra_first_stage_gb', 0),
+            loader_encoders=list(text_encoding.text_encoders) if text_encoding is not None else ())
         student_method = 'manual'
         if is_main_process():
             print(partition_report)
@@ -1296,6 +1297,8 @@ if __name__ == '__main__':
             train_dataloader.epoch = client_state['custom_loader']['epoch']
         else:
             train_dataloader.load_state_dict(client_state['custom_loader'])
+        memory_partition.check_resumed_partition(
+            client_state.get('partition_parts'), getattr(model_engine.module, 'parts', None), args.reset_optimizer)
         step = client_state['step'] + 1
         if 'examples' in client_state:
             examples = client_state['examples'] + global_batch_size

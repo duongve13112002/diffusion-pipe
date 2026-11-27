@@ -86,11 +86,8 @@ def test_the_models_say_how_much_text_encoder_the_first_stage_holds():
     from models.iris import IrisPipeline
     from models.moss_image import MossImagePipeline
     encoder = torch.nn.Linear(4, 4, bias=False)
-    loader = types.SimpleNamespace(config={'model': {'cache_text_embeddings': False}}, encodes_text_on_the_fly=False,
-                                   get_text_encoders=lambda: [encoder])
-    assert BasePipeline.first_stage_extra_bytes(loader) == 64
-    cached = types.SimpleNamespace(config={'model': {}}, encodes_text_on_the_fly=False, get_text_encoders=lambda: [encoder])
-    assert BasePipeline.first_stage_extra_bytes(cached) == 0
+    # The loader's encoders are the plan's business (loader_encoders), not a model hook.
+    assert BasePipeline.first_stage_extra_bytes(types.SimpleNamespace()) == 0
     iris = types.SimpleNamespace(cache_text_embeddings=False, text_encoder=types.SimpleNamespace(decoder=encoder))
     assert IrisPipeline.first_stage_extra_bytes(iris) == 64
     assert IrisPipeline.first_stage_extra_bytes(types.SimpleNamespace(cache_text_embeddings=True, text_encoder=None)) == 0
@@ -101,8 +98,57 @@ def test_the_models_say_how_much_text_encoder_the_first_stage_holds():
         types.SimpleNamespace(cache_text_embeddings=True, text_encoders=[comfy])) == 0
 
 
+def test_a_quantized_tensor_weighs_its_real_storage_not_its_logical_size():
+    from comfy_kitchen.tensor import QuantizedTensor
+    weight = torch.randn(64, 64)
+    quantized = QuantizedTensor.from_float(weight, 'TensorCoreFP8Layout')
+    assert mp_.tensors_bytes([quantized]) == 64 * 64 == int(quantized.nbytes)
+    assert quantized.numel() * quantized.element_size() > 64 * 64
+
+
+def test_loader_encoders_are_counted_where_loaded_and_by_file_size_where_not(tmp_path):
+    (tmp_path / 'te.safetensors').write_bytes(b'x' * 1000)
+    (tmp_path / 'dir').mkdir()
+    (tmp_path / 'dir' / 'a.safetensors').write_bytes(b'x' * 300)
+    (tmp_path / 'dir' / 'notes.txt').write_bytes(b'x' * 50)
+    assert mp_.text_files_bytes([str(tmp_path / 'te.safetensors'), str(tmp_path / 'dir'), str(tmp_path / 'none')]) == 1300
+    model = types.SimpleNamespace(text_encoder_file_bytes=lambda: 1300)
+    unloaded = types.SimpleNamespace(_model=None)
+    loaded = types.SimpleNamespace(_model=types.SimpleNamespace(patcher=types.SimpleNamespace(model_size=lambda: 500)))
+    assert mp_.loader_encoders_bytes(model, []) == 0
+    assert mp_.loader_encoders_bytes(model, [unloaded]) == 1300
+    assert mp_.loader_encoders_bytes(model, [loaded]) == 500
+    module = torch.nn.Linear(4, 4, bias=False)
+    assert mp_.loader_encoders_bytes(model, [module]) == 64
+
+
+def test_the_plan_counts_the_loader_encoders_without_asking_the_model_for_its_text_encoders():
+    # ComfyPipeline's free_vae_and_te() deletes `text_encoders` before the plan: the loader keeps its own list.
+    model = types.SimpleNamespace(first_stage_extra_bytes=lambda: 0, text_encoder_file_bytes=lambda: 800)
+    layers = [block(100, trainable=False) for _ in range(5)]
+    split, text = mp_.plan(layers, model, 2, 0.0, 0, loader_encoders=[types.SimpleNamespace(_model=None)])
+    assert split == mp_.split_by_weights([200 + 800] + [200] * 4, 2)
+
+
+def test_a_resume_under_other_stage_boundaries_is_refused_unless_the_optimizer_is_reset():
+    mp_.check_resumed_partition([0, 3, 9], [0, 3, 9])
+    mp_.check_resumed_partition(None, [0, 3, 9])
+    mp_.check_resumed_partition([0, 4, 9], [0, 3, 9], reset_optimizer=True)
+    with pytest.raises(RuntimeError, match=r"partition_split = \[4\]"):
+        mp_.check_resumed_partition([0, 4, 9], [0, 3, 9])
+
+
+def test_train_py_and_the_saver_record_and_check_the_boundaries():
+    from pathlib import Path
+    root = Path(__file__).resolve().parent.parent
+    assert "'partition_parts'" in (root / 'utils' / 'saver.py').read_text()
+    train = (root / 'train.py').read_text()
+    assert "memory_partition.check_resumed_partition(" in train and "loader_encoders=list(text_encoding.text_encoders)" in train
+
+
 @pytest.mark.parametrize('key, value', [('partition_extra_first_stage_gb', -1), ('partition_trainable_factor', 'x'),
-                                        ('partition_extra_first_stage_gb', True)])
+                                        ('partition_extra_first_stage_gb', True),
+                                        ('partition_trainable_factor', float('inf'))])
 def test_a_bad_partition_number_is_refused(key, value):
     with pytest.raises(ValueError, match=key):
         mp_.check_partition_config({'partition_method': 'memory', 'pipeline_stages': 2, key: value})
@@ -112,8 +158,9 @@ def test_partition_keys_that_do_not_apply_are_ignored_with_a_warning(capsys):
     mp_.check_partition_config({'partition_method': 'parameters', 'pipeline_stages': 2,
                                 'partition_extra_first_stage_gb': 2, 'partition_trainable_factor': 3})
     mp_.check_partition_config({'partition_method': 'memory', 'pipeline_stages': 1})
+    mp_.check_partition_config({'partition_method': 'memory', 'pipeline_stages': 2, 'partition_split': [3]})
     out = capsys.readouterr().out
-    assert out.count('WARNING') == 3
+    assert out.count('WARNING') == 4 and 'partition_split only applies' in out
     assert 'partition_extra_first_stage_gb' in out and 'partition_trainable_factor' in out and 'pipeline_stages = 1' in out
     mp_.check_partition_config({'partition_method': 'memory', 'pipeline_stages': 2, 'partition_extra_first_stage_gb': 2})
     assert capsys.readouterr().out == ''

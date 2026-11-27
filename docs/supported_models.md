@@ -989,7 +989,7 @@ cached embedding is about 8 KB per token, which for millions of captions is tera
 `cache_text_embeddings = true` caches them once anyway and frees the encoder before training.
 On the fly, every GPU of the first pipeline stage loads the encoder onto itself before training
 starts, which costs each of them 18 GB that `partition_method = 'parameters'` does not see (the
-encoder has no trainable parameters). On 141 GB GPUs this fits; if stage 0 runs out of memory
+encoder is not one of the layers' parameters). On 141 GB GPUs this fits; if stage 0 runs out of memory
 with `pipeline_stages` above 1, use `partition_method = 'memory'` (it counts the encoder) or move blocks off it
 with `partition_method = 'manual'` and `partition_split`. The pipeline's layers are the text encoder layer (a pass-through when
 embeddings are cached; it is there either way so checkpoints keep one layout), the input layer,
