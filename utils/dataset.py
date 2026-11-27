@@ -4875,6 +4875,7 @@ class PipelineDataLoader:
         if engine.is_pipe_parallel and not engine.is_first_stage():
             return [self._broadcast_target(torch.empty_like(t)) for t in target_list]
         if self.teacher.finished():
+            self.teacher.release(protect=getattr(engine, 'module', None))
             # lambda is 0 from here on, so the loss never reads these; they keep the label's shape and the send/recv
             # pairing with the last stage, which allocates its buffers the same way.
             teacher_targets = [torch.zeros_like(t) for t in target_list]

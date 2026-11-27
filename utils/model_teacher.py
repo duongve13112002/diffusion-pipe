@@ -32,6 +32,7 @@ refiner's own starting weights like any other model.
 Kept free of training-stack imports so it can be unit-tested on CPU.
 """
 
+import gc
 import math
 
 import torch
@@ -157,6 +158,15 @@ class ModelTeacher:
         outputs = self.select(x)
         return [t.detach() for t in outputs]
 
+    def release(self, protect=None):
+        """Free the teacher's weights once it has finished (lambda is 0 for good): they are this teacher's own
+        copies, and nothing reads them again. `protect`: the student's module, whose weights a teacher layer may
+        share (a text encoder both hold) and are kept."""
+        if self.layers is not None:
+            empty_weights(self.layers, owned_ids(protect))
+            self.layers = None
+            free_gpu_cache()
+
 
 def fit_trailing_dim(output, target):
     """`output` cut or zero-padded along its last dimension to the target's, when that is the only way they
@@ -193,10 +203,15 @@ def balanced_split(layers, num_stages):
 def release_foreign_weights(layers, module):
     """Free the weights of the teacher layers that are not `module`'s (the other stages'). Several layers hold a
     hidden reference to the whole copied model (a list, so it is not a parameter of theirs), which keeps the
-    other stages' blocks alive in host memory for the whole run. The modules' entries are replaced by empty ones
-    rather than emptied in place: a tensor subclass (a quantized weight) keeps its payload in attributes that
-    `.data = ...` does not drop."""
+    other stages' blocks alive in host memory for the whole run."""
     kept = {id(t) for t in (*module.parameters(), *module.buffers())}
+    empty_weights(layers, kept)
+
+
+def empty_weights(layers, kept=()):
+    """Replace the parameters and buffers of `layers` (modules; anything else is skipped) that are not in `kept`
+    (ids) by empty ones. The modules' entries are replaced rather than emptied in place: a tensor subclass (a
+    quantized weight) keeps its payload in attributes that `.data = ...` does not drop."""
     for layer in layers:
         if not isinstance(layer, torch.nn.Module):
             continue
@@ -207,6 +222,18 @@ def release_foreign_weights(layers, module):
             for name, b in list(m._buffers.items()):
                 if b is not None and id(b) not in kept:
                     m._buffers[name] = torch.empty(0, dtype=b.dtype)
+
+
+def owned_ids(module):
+    if module is None:
+        return set()
+    return {id(t) for t in (*module.parameters(), *module.buffers())}
+
+
+def free_gpu_cache():
+    if torch.cuda.is_available():
+        gc.collect()
+        torch.cuda.empty_cache()
 
 
 def _release_engine_buffers(engine):
@@ -285,10 +312,12 @@ class TeacherPipeline:
     ModelTeacher.run's output joins in the loader, so the loss function is the same.
     """
 
-    def __init__(self, teacher, engine, hooks=None):
+    def __init__(self, teacher, engine, hooks=None, protect=None):
         self.teacher = teacher
         self.engine = engine
+        self.protect = protect
         self.hooks = hooks or LabelHooks()
+        self.released = False
 
     def attach(self, items):
         """`items`: the step's micro batches [(features, label)] on the first and last stage, None on the others.
@@ -297,6 +326,11 @@ class TeacherPipeline:
         engine, teacher = self.engine, self.teacher
         last = engine.is_last_stage()
         if teacher.finished():
+            if not self.released:
+                # every rank takes this step together: the engine's stage of the teacher is of no use any more
+                empty_weights([engine.module], owned_ids(self.protect))
+                self.released = True
+                free_gpu_cache()
             if not last:
                 return items
             return [(features, self.hooks.without_teacher(label)) for features, label in items]

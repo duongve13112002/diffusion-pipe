@@ -939,7 +939,7 @@ if __name__ == '__main__':
         teacher.layers = None
         del teacher_module, teacher_layers
         teacher_pipeline = model_teacher.TeacherPipeline(
-            teacher, teacher_engine,
+            teacher, teacher_engine, protect=model_engine.module,
             hooks=model.teacher_label_hooks() if hasattr(model, 'teacher_label_hooks') else model_teacher.LabelHooks(
                 label_targets=getattr(model, 'teacher_label_targets', None),
                 keep_float32=getattr(model, 'teacher_output_float32', False)))

@@ -126,6 +126,8 @@ def test_a_finished_teacher_attaches_zeros_and_the_engine_does_not_run(tmp_path)
     last = [r for r in results if r['stage'] == 1][0]
     assert last['label_len'] == [3] * GAS
     assert all(all(v == 0 for row in t[0] for v in row) for t in last['teacher_targets'])
+    # Nothing reads the teacher again: every rank has freed its stage's share too, not just the foreign ones.
+    assert [r['emptied'] for r in results] == [LAYERS, LAYERS]
 
 
 def test_release_foreign_weights_frees_payloads_a_hidden_reference_keeps():
@@ -151,3 +153,26 @@ def test_release_foreign_weights_frees_payloads_a_hidden_reference_keeps():
     gc.collect()
     assert ref() is None and hidden[0].weight.numel() == 0
     assert layers[0].weight.numel() == 4
+
+
+def test_a_finished_one_stage_teacher_frees_its_layers():
+    from utils import model_teacher
+    config = model_teacher.ModelTeacherConfig(1.0, 'linear', 10, None)
+    layers = _chain(1)
+    teacher = model_teacher.ModelTeacher(config, layers=layers, select=lambda out: (out,))
+    teacher.set_step(100)
+    assert teacher.finished()
+    teacher.release()
+    assert teacher.layers is None and all(layer.weight.numel() == 0 for layer in layers)
+    teacher.release()
+
+
+def test_releasing_a_finished_teacher_keeps_what_the_student_shares():
+    from utils import model_teacher
+    shared = torch.nn.Linear(2, 2)
+    layers = [torch.nn.Sequential(shared, torch.nn.Linear(2, 2))]
+    config = model_teacher.ModelTeacherConfig(1.0, 'linear', 10, None)
+    teacher = model_teacher.ModelTeacher(config, layers=layers, select=lambda out: (out,))
+    teacher.set_step(100)
+    teacher.release(protect=torch.nn.Sequential(shared))
+    assert shared.weight.numel() == 4 and layers[0][1].weight.numel() == 0
