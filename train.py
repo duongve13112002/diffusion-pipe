@@ -7,6 +7,7 @@ import time
 import random
 import json
 import inspect
+import gc
 from pathlib import Path
 
 import toml
@@ -241,13 +242,18 @@ def print_model_info(model):
 # Need to preload all micro batches since pulling from the dataloader does IPC between the
 # first and last stage. Can't do that during the train or inference pipeline schedule execution
 # because it conflicts with the send / recv steps.
-def get_data_iterator_for_step(dataloader, engine, num_micro_batches=None):
+def get_micro_batches_for_step(dataloader, engine, num_micro_batches=None):
+    """The step's micro batches [(features, label)] on the first and last stage, None on the stages between."""
     num_micro_batches = num_micro_batches or engine.micro_batches
     if not (engine.is_first_stage() or engine.is_last_stage()):
         return None
     dataloader_iter = iter(dataloader)
-    items = [next(dataloader_iter) for _ in range(num_micro_batches)]
-    return iter(items)
+    return [next(dataloader_iter) for _ in range(num_micro_batches)]
+
+
+def get_data_iterator_for_step(dataloader, engine, num_micro_batches=None):
+    items = get_micro_batches_for_step(dataloader, engine, num_micro_batches)
+    return None if items is None else iter(items)
 
 
 def evaluate_single(model_engine, eval_dataloader, eval_gradient_accumulation_steps, quantile, pbar=None):
@@ -749,22 +755,26 @@ if __name__ == '__main__':
     # The teacher is a copy of the model as loaded, so it is made before fp8 training and the adapter change the
     # student's modules; on the first pipeline stage only, which is where it runs.
     teacher = None
+    teacher_stages = config.get('pipeline_stages', 1)
     if teacher_config is not None:
-        # Only the first pipeline stage builds it, and building can fail there alone (a missing file, a mismatching
-        # checkpoint): every rank hears of it before the next collective rather than waiting out the timeout.
+        # With one stage the loader runs the teacher on the same GPU as the student. With several, every rank builds
+        # the teacher's layers (on the CPU) and the second, forward-only pipeline engine below keeps its own
+        # stage's share on the GPU. Building can fail on one rank alone (a missing file, a mismatching checkpoint):
+        # every rank hears of it before the next collective rather than waiting out the timeout.
         error = None
         try:
             teacher = model_teacher.build_teacher(
                 model, teacher_config, torch.device('cuda', torch.cuda.current_device()),
-                runs_teacher=model_teacher.on_first_stage(config.get('pipeline_stages', 1)),
-                all_ranks_run=config.get('pipeline_stages', 1) == 1)
+                place=teacher_stages == 1)
         except Exception as e:
             error = e
         all_ok(error)
         if is_main_process():
             source = teacher_config.path or 'the model the run started from'
-            print(f'[teacher] on: a frozen copy of {source} runs on the first pipeline stage of every data-parallel '
-                  f'replica (lambda = {teacher_config.loss_weight} x decay {teacher_config.decay!r})')
+            where = ('on the same GPU as the student' if teacher_stages == 1 else
+                     f'as a second, forward-only pipeline split over the {teacher_stages} stages')
+            print(f'[teacher] on: a frozen copy of {source} runs {where} '
+                  f'(lambda = {teacher_config.loss_weight} x decay {teacher_config.decay!r})')
     # Before the adapter, which then wraps the fp8 layers like any Linear.
     fp8_training.prepare_model(model)
 
@@ -899,6 +909,27 @@ if __name__ == '__main__':
     # parallelism has always relied on "Torch-style" backward(), so I think this is an oversight by Deepspeed devs and it's safe
     # to force this to True to get it to work.
     model_engine._support_torch_style_backward = True
+    teacher_pipeline = None
+    if teacher is not None and num_stages > 1:
+        # The teacher's layers, split like the student's (same partition_method and partition_split: the same layer
+        # list), with no loss function, optimizer or ZeRO: it only runs forward, over the step's micro batches
+        # before the student's train_batch (model_teacher.TeacherPipeline).
+        teacher_module = ManualPipelineModule(
+            layers=teacher.layers,
+            num_stages=num_stages,
+            partition_method=partition_method,
+            manual_partition_split=partition_split,
+            loss_fn=None,
+            dynamic_shape=True,
+        )
+        teacher_engine, *_ = deepspeed.initialize(args=args, model=teacher_module, config=dict(ds_config))
+        teacher_engine._support_torch_style_backward = True
+        # The other stages' layers were only held to be partitioned; the engine's own stage is on its GPU.
+        teacher_module._layer_specs = []
+        teacher.layers = None
+        del teacher_module
+        teacher_pipeline = model_teacher.TeacherPipeline(teacher, teacher_engine)
+        gc.collect()
     # Read by the engine step in utils/patches.py.
     nonfinite_guard = None
     if config['skip_nonfinite_steps']:
@@ -1122,7 +1153,7 @@ if __name__ == '__main__':
         # (models with load_media_on_the_fly, e.g. iris); cached latents need only the default.
         num_dataloader_workers=config.get('dataloader_workers', 1),
         text_encoding=text_encoding,
-        teacher=teacher,
+        teacher=teacher if teacher_pipeline is None else None,
     )
     steps_per_epoch = len(train_dataloader) // model_engine.gradient_accumulation_steps()
     startup_timing.mark('batching (post_init) and dataloader')
@@ -1313,7 +1344,14 @@ if __name__ == '__main__':
               + '): nothing left to train. Raise epochs or max_steps to continue it.')
     while not already_complete:
         model_engine.reset_activation_shape()
-        iterator = get_data_iterator_for_step(train_dataloader, model_engine)
+        if teacher_pipeline is not None:
+            # The teacher engine runs over this step's micro batches first, on every rank, and the last stage's
+            # labels carry its output (model_teacher.TeacherPipeline); lambda's step is set before.
+            teacher.set_step(step)
+            items = teacher_pipeline.attach(get_micro_batches_for_step(train_dataloader, model_engine))
+            iterator = None if items is None else iter(items)
+        else:
+            iterator = get_data_iterator_for_step(train_dataloader, model_engine)
         if nan_check is not None:
             nan_check.before_step(step)
         logged_step = step % config['logging_steps'] == 0 or step % steps_per_print == 0

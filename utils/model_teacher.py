@@ -17,11 +17,12 @@ applied to it). With one, it is another checkpoint of the same architecture, rea
 The text encoders, the VAE and the latent space are the student's: the teacher sees the same noisy latents,
 timesteps and text embeddings.
 
-How it runs. The batch's features are what prepare_inputs makes for the first pipeline stage. There the teacher
-(a second chain of layers from the model's own to_layers(), no gradients, eval mode) runs them, and its output
-travels to the last stage the way the target does (utils/dataset.py PipelineDataLoader), appended to the label.
-Any number of pipeline stages therefore works, and no layer has to pass an extra tensor on. The first-stage
-ranks hold the whole teacher on their GPU; the others hold none.
+How it runs. The batch's features are what prepare_inputs makes for the first pipeline stage; the teacher (a second
+chain of layers from the model's own to_layers(), no gradients, eval mode) runs them and its output reaches the last
+stage the way the target does, appended to the label (utils/dataset.py PipelineDataLoader). With one pipeline stage
+the loader runs it (ModelTeacher.run) on the student's GPU. With several, TeacherPipeline runs it as a second,
+forward-only DeepSpeed pipeline with the student's stages, so each GPU holds 1/stages of it, and puts its output in
+the label before the student's train_batch. No layer has to pass an extra tensor on either way.
 
 MOSS-Image has its own implementation (utils/distillation.py: noise-level dependent lambda, the teacher inside
 the first layer). anima_refiner has two forms: a [teacher] that names transformer_path / llm_path distills from a
@@ -175,11 +176,12 @@ def fit_trailing_dim(output, target):
     return torch.nn.functional.pad(output, (0, target.shape[-1] - output.shape[-1]))
 
 
-def build_teacher(model, config, device, runs_teacher, all_ranks_run=True):
-    """The ModelTeacher of this rank. On a rank that runs it (the first pipeline stage) the layers are built
-    from a frozen copy of the model's denoiser (CommonPipeline.make_teacher_layers) and placed on `device`.
-    When only some ranks run it (all_ranks_run False) the loaders do not wait for the others (one_at_a_time):
-    the ranks that do not run it never reach them."""
+def build_teacher(model, config, device, runs_teacher=True, all_ranks_run=True, place=True):
+    """The ModelTeacher of this rank: its layers are built from a frozen copy of the model's denoiser
+    (CommonPipeline.make_teacher_layers), frozen, in eval mode, and put on `device` when `place` is true.
+    With place false the layers stay where they were built (CPU) for a TeacherPipeline, whose engine moves
+    each stage's layers to its GPU. A rank that does not run the teacher (runs_teacher false) builds nothing;
+    then all_ranks_run false tells the loaders not to wait for the others (one_at_a_time)."""
     teacher = ModelTeacher(config, select=model.teacher_targets_of, device=device)
     if not runs_teacher:
         return teacher
@@ -192,9 +194,65 @@ def build_teacher(model, config, device, runs_teacher, all_ranks_run=True):
         if isinstance(layer, torch.nn.Module):
             layer.requires_grad_(False)
             layer.eval()
-            layer.to(device)
+            if place:
+                layer.to(device)
     teacher.layers = layers
     return teacher
+
+
+class TeacherPipeline:
+    """The teacher as a second, forward-only pipeline engine with the student's number of stages.
+
+    The first-stage teacher (ModelTeacher.run in the data loader) holds the whole teacher on the first stage's
+    GPUs. Here the teacher's layers are split over the stages like the student's, so every GPU holds
+    1/stages of it. Every step, before the student's train_batch, all ranks run the teacher engine over the
+    step's micro batches (a collective: every rank calls attach, in the same order on every rank); the last stage
+    then has the teacher's output of each micro batch and puts it in that micro batch's label, which is what
+    ModelTeacher.run's output joins in the loader, so the loss function is the same.
+    """
+
+    def __init__(self, teacher, engine):
+        self.teacher = teacher
+        self.engine = engine
+
+    def attach(self, items):
+        """`items`: the step's micro batches [(features, label)] on the first and last stage, None on the others.
+        Returns them with the teacher's targets appended to each label on the last stage (zeros once lambda has
+        decayed to 0, without running the engine: every rank knows the step)."""
+        engine, teacher = self.engine, self.teacher
+        last = engine.is_last_stage()
+        if teacher.finished():
+            if not last:
+                return items
+            return [(features, (*label, *[torch.zeros_like(t) for t in label[:-1]]))
+                    for features, label in items]
+        engine.reset_activation_shape()
+        with fp8_training.disabled():
+            outputs = engine.eval_batch(iter(items) if items is not None else None, compute_loss=False,
+                                        reduce_output=None, bcast_loss=False)
+        if not last:
+            return items
+        if len(outputs) != len(items):
+            raise RuntimeError(f'[teacher]: the teacher pipeline returned {len(outputs)} outputs for '
+                               f'{len(items)} micro batches')
+        attached = []
+        for output, (features, label) in zip(outputs, items):
+            *targets, mask = label
+            if not torch.is_tensor(output):
+                output = tuple(output)
+            selected = teacher.select(output)
+            if len(selected) != len(targets):
+                raise RuntimeError(f'[teacher]: the teacher gives {len(selected)} output tensors and the label '
+                                   f'has {len(targets)} targets')
+            teacher_targets = []
+            for out, target in zip(selected, targets):
+                out = fit_trailing_dim(out.detach(), target).to(target.device, target.dtype)
+                if out.shape != target.shape:
+                    raise RuntimeError(f'[teacher]: the teacher output {tuple(out.shape)} does not match the '
+                                       f'target {tuple(target.shape)} it stands in for')
+                teacher_targets.append(out)
+            attached.append((features, (*targets, mask, *teacher_targets)))
+        return attached
 
 
 def wrap_loss_fn(inner, teacher):

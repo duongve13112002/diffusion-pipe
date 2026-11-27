@@ -187,16 +187,23 @@ with one GPU, several, several nodes and any `pipeline_stages`.
   `path` teacher: it is the finished model (nor the student's `context_refiner_path` / `llm_adapter_path` of
   an anima, nor the `pdd_heads` / `diffusion_model_format` of a MiniMax-H3 transformer). The text encoders, the VAE and the latent space are the student's
   (SDXL aside: its text encoders train with the UNet, so its teacher is a whole second pipeline).
-- The teacher is a second chain of the model's own layers on the first pipeline stage, no gradients, eval mode.
-  It runs on the same inputs as the student (the noisy latents, timesteps and text embeddings the batch
-  carries; `cache_text_embeddings` true or false makes no difference: with false the loader encodes the captions
-  before the batch is prepared, once, and the student and the teacher both read the result) and its output travels to the last stage with the targets, so no layer needs to pass anything on. A
-  full copy of the transformer sits on the GPU of every first-stage rank on top of the student: that stage
-  needs the memory (about the size of the weights in `dtype`), and the loading peaks the CPU RAM of every
-  rank on it by the same amount. Neither has been measured on a GPU. Once `decay` has brought lambda to 0 (step
-  `decay_steps`) the teacher no longer runs: the loss ignores it from there on, and the label carries zeros.
-  Under `[fp8_training]` the teacher runs in bf16, and MOSS-Image's full fine-tune teacher (without `path`) is
-  copied from the model before fp8 touches it.
+- The teacher is a second copy of the model's own layers (no gradients, eval mode). It runs on the same inputs
+  as the student (the noisy latents, timesteps and text embeddings the batch carries; `cache_text_embeddings`
+  true or false makes no difference: with false the loader encodes the captions before the batch is prepared,
+  once, and the student and the teacher both read the result), and its output joins the label of the last stage
+  with the targets, so no layer needs to pass anything on.
+  - `pipeline_stages = 1`: the teacher sits on the same GPU as the student, one extra forward per micro batch.
+  - `pipeline_stages > 1`: the teacher is a second, forward-only DeepSpeed pipeline with the student's number of
+    stages (no optimizer, no gradients; same `partition_method` / `partition_split` as the student, so the same
+    layer list is cut the same way). Every GPU holds 1/stages of the teacher, not the whole of it on the first
+    stage. Each step, before the student's `train_batch`, every rank runs the teacher over the step's micro
+    batches; the last stage then has the teacher's output of each micro batch. The teacher forward is therefore
+    sequential with the student's step (it fills the same GPUs one after the other) rather than overlapped.
+    Each rank builds the teacher's layers on the CPU first and keeps only its stage: the CPU RAM peaks by about the
+    size of the weights in `dtype` on every rank. Neither the speed nor the VRAM has been measured on a GPU.
+  Once `decay` has brought lambda to 0 (step `decay_steps`) the teacher no longer runs: the loss ignores it from
+  there on, and the label carries zeros. Under `[fp8_training]` the teacher runs in bf16, and MOSS-Image's full
+  fine-tune teacher (without `path`) is copied from the model before fp8 touches it.
 - Evaluation batches (`[eval_datasets]`) report the plain loss, without the distillation term. The step log has
   the combined `train/loss`.
 - `[teacher] path` and an anima_refiner: a table that names `transformer_path` or `llm_path` is the older
