@@ -27,10 +27,12 @@ def test_float16_names(name):
 
 
 @pytest.mark.parametrize('model', [{}, {'compute_dtype': 'bfloat16'}, {'dtype': 'float16'}])
-def test_other_compute_dtypes_need_no_scale_and_refuse_the_table(model):
+def test_other_compute_dtypes_need_no_scale_and_ignore_the_table(model, capsys):
     assert apply_loss_scale_config_defaults({'model': model}) is None
-    with pytest.raises(ValueError, match='only applies'):
-        apply_loss_scale_config_defaults({'model': model, 'loss_scale': {'init_scale': 8}})
+    config = {'model': model, 'loss_scale': {'init_scale': 8}}
+    assert apply_loss_scale_config_defaults(config) is None
+    assert '[loss_scale] is ignored' in capsys.readouterr().out
+    assert 'loss_scale' not in config
 
 
 @pytest.mark.parametrize('table,message', [

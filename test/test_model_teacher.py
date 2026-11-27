@@ -68,7 +68,6 @@ def test_defaults_and_fields():
     ({'decay': 'linear'}, 'decay_steps'),
     ({'decay_steps': -1}, 'decay_steps'),
     ({'decay_steps': 1.5}, 'decay_steps'),
-    ({'decay_steps': 100}, "does not apply with decay = 'none'"),
     ({'path': ''}, 'path'),
     ({'path': 3}, 'path'),
     ({'transformer_path': 'x'}, 'unknown keys'),
@@ -1312,3 +1311,9 @@ def test_wan_encodes_text_in_eval_mode_so_the_teacher_and_the_student_see_the_sa
     from pathlib import Path
     source = (Path(__file__).resolve().parent.parent / 'models' / 'wan' / 'wan.py').read_text()
     assert re.search(r'self\.text_encoder\.eval\(\)\s+with torch\.no_grad\(\):\s+context = self\.text_encoder\(', source)
+
+
+def test_decay_steps_without_a_decay_is_ignored_with_a_warning(capsys):
+    config = parse(decay_steps=100)
+    assert 'decay_steps is ignored with decay = \'none\'' in capsys.readouterr().out
+    assert config.decay_steps == 0

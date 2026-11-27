@@ -29,6 +29,8 @@ import math
 
 import torch
 
+from utils.common import warn_ignored
+
 KEY = 'loss_scale'
 DEFAULTS = {
     'init_scale': 65536.0,
@@ -81,7 +83,7 @@ def apply_loss_scale_config_defaults(config):
     """Validate config['loss_scale'] and fill in its defaults.
 
     The table is optional when [model] compute_dtype is float16 (the defaults apply); with any other
-    compute dtype it is refused, since there is nothing to scale. Returns the spec, or None when the
+    compute dtype it is ignored with a warning, since there is nothing to scale. Returns the spec, or None when the
     run does not compute in float16. gradient_release is refused: it frees each gradient during
     backward, so there is nothing left to unscale when the step runs. The non-finite step guard is
     switched on (skip_nonfinite_steps = true), which drops the steps the scale gives up on; an explicit
@@ -90,8 +92,9 @@ def apply_loss_scale_config_defaults(config):
     model_config = config.get('model', {})
     if not computes_in_float16(model_config):
         if KEY in config:
-            raise ValueError(f'[{KEY}] only applies with [model] compute_dtype = "float16": a bfloat16 or float32 '
-                             'backward needs no loss scaling. Remove it.')
+            warn_ignored(f'[{KEY}] is ignored: it applies with [model] compute_dtype = "float16"; a bfloat16 or '
+                         'float32 backward needs no loss scaling.')
+            del config[KEY]
         return None
     table = config.get(KEY, {})
     if not isinstance(table, dict):

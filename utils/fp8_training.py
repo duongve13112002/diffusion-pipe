@@ -69,6 +69,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from utils.common import warn_ignored
+
 TABLE = 'fp8_training'
 RECIPES = ('block', 'current')
 WEIGHT_MODES = ('dequantize', 'direct')
@@ -153,14 +155,12 @@ def apply_fp8_training_config_defaults(config):
     if isinstance(minimum, bool) or not isinstance(minimum, int) or minimum < 1:
         raise ValueError(f'[{TABLE}] attention_min_tokens must be a whole number of tokens, got {minimum!r}')
     if 'attention_min_tokens' in given and table['attention'] != 'auto':
-        raise ValueError(f"[{TABLE}] attention_min_tokens applies only with attention = 'auto'; remove it or set "
-                         "attention = 'auto'")
+        warn_ignored(f"[{TABLE}] attention_min_tokens is ignored: it applies with attention = 'auto'")
     history = table['attention_amax_history']
     if isinstance(history, bool) or not isinstance(history, int) or not 1 <= history <= 1024:
         raise ValueError(f'[{TABLE}] attention_amax_history must be a whole number from 1 to 1024, got {history!r}')
     if 'attention_amax_history' in given and not table['attention']:
-        raise ValueError(f'[{TABLE}] attention_amax_history applies only with attention on (true or \'auto\'); remove it or turn '
-                         'attention on')
+        warn_ignored(f"[{TABLE}] attention_amax_history is ignored: it applies with attention on (true or 'auto')")
 
     has_adapter = 'adapter' in config
     if table['weights'] == 'direct' and not has_adapter:

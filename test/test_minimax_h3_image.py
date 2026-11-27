@@ -590,14 +590,13 @@ def test_an_audio_transformer_is_refused(tmp_path):
         weights.load_checkpoint(str(tmp_path / 'missing.safetensors'))
 
 
-def test_the_pipeline_refuses_pdd_heads_outside_the_official_layout(tmp_path):
+def test_the_pipeline_ignores_pdd_heads_outside_the_official_layout(tmp_path, capsys):
     model, _ = tiny_pair(3)
     write_comfy(tmp_path, model, 3)
     pipe = image_pipeline(None, {'diffusion_model': str(tmp_path / 'comfy.safetensors'), 'pdd_heads': 'h.safetensors'})
-    with pytest.raises(ValueError, match='pdd_heads applies to the official'):
-        pipe.refuse_unsupported_checkpoint()
-    del pipe.model_config['pdd_heads']
     pipe.refuse_unsupported_checkpoint()
+    assert 'pdd_heads is ignored: it applies to the official' in capsys.readouterr().out
+    assert 'pdd_heads' not in pipe.model_config
     root = tmp_path / 'repo'
     write_official(root, model, 3)
     image_pipeline(None, {'diffusion_model': str(root), 'pdd_heads': str(root / 'pdd_fused_heads.safetensors')}).refuse_unsupported_checkpoint()
@@ -834,13 +833,18 @@ def test_the_text_encoder_must_be_the_minimax_one(text_encoders):
         MiniMaxH3ImagePipeline({'model': {'text_encoders': text_encoders}})
 
 
-def test_the_format_and_the_lr_keys_are_checked():
+def test_the_format_is_checked_and_head_lr_keys_of_an_adapter_are_ignored(capsys):
     from models.minimax_h3_image import MiniMaxH3ImagePipeline
     text_encoders = [{'path': 'x', 'type': 'minimax'}]
     with pytest.raises(ValueError, match='diffusion_model_format must be one of'):
         MiniMaxH3ImagePipeline({'model': {'text_encoders': text_encoders, 'diffusion_model_format': 'gguf'}})
-    with pytest.raises(ValueError, match='head_lr, text_projection_lr do not apply to adapter training'):
-        MiniMaxH3ImagePipeline({'adapter': {'type': 'lora'}, 'model': {'text_encoders': text_encoders, 'head_lr': 1e-4, 'text_projection_lr': 1e-4}})
+    config = {'adapter': {'type': 'lora'}, 'model': {'text_encoders': text_encoders, 'head_lr': 1e-4, 'text_projection_lr': 1e-4}}
+    try:
+        MiniMaxH3ImagePipeline(config)
+    except Exception:
+        pass    # the constructor goes on to load a model; only the check of the keys is tested here
+    assert 'head_lr, text_projection_lr are ignored' in capsys.readouterr().out
+    assert 'head_lr' not in config['model'] and 'text_projection_lr' not in config['model']
 
 
 def test_the_default_shift_is_the_grid_of_the_checkpoint(monkeypatch):
@@ -1240,15 +1244,16 @@ def test_the_gradient_of_a_later_head_reaches_head_0():
     assert model.final_layer.pdd_offset_weight.grad is None
 
 
-def test_train_pdd_head_is_checked(tmp_path):
+def test_train_pdd_head_is_checked(tmp_path, capsys):
     from models.minimax_h3_image import MiniMaxH3ImagePipeline
     with pytest.raises(ValueError, match="train_pdd_head must be 'sigma' or 0"):
         MiniMaxH3ImagePipeline({'model': {'text_encoders': [{'path': 'x', 'type': 'minimax'}], 'train_pdd_head': 2}})
     model, _ = tiny_pair(1)
     write_comfy(tmp_path, model, 1)
     pipe = image_pipeline(None, {'diffusion_model': str(tmp_path / 'comfy.safetensors'), 'train_pdd_head': 0})
-    with pytest.raises(ValueError, match='train_pdd_head does not apply'):
-        pipe.refuse_unsupported_checkpoint()
+    pipe.refuse_unsupported_checkpoint()
+    assert 'train_pdd_head is ignored' in capsys.readouterr().out
+    assert 'train_pdd_head' not in pipe.model_config
     three, _ = tiny_pair(3)
     write_comfy(tmp_path / '..', three, 3)
     image_pipeline(None, {'diffusion_model': str(tmp_path / '..' / 'comfy.safetensors'), 'train_pdd_head': 0}).refuse_unsupported_checkpoint()

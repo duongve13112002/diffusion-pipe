@@ -77,8 +77,10 @@ class TestCodec:
             assert check_text_embedding_dtype({'text_embedding_dtype': name}, True) == dtype
         with pytest.raises(ValueError, match='must be one of float8, bfloat16, float16, float32'):
             check_text_embedding_dtype({'text_embedding_dtype': 'fp8'}, True)
-        with pytest.raises(ValueError, match='cache_text_embeddings = false'):
-            check_text_embedding_dtype({'text_embedding_dtype': 'bfloat16'}, False)
+
+    def test_a_dtype_without_cached_text_is_ignored_with_a_warning(self, capsys):
+        assert check_text_embedding_dtype({'text_embedding_dtype': 'bfloat16'}, False) is None
+        assert 'text_embedding_dtype is ignored' in capsys.readouterr().out
 
 
 class Float8Model(Model):
@@ -115,10 +117,10 @@ def test_cached_float8_embeddings_train_like_the_plain_ones(tmp_path, reuse_meta
         assert all(torch.equal(x, y) for x, y in zip(xs, ys))
 
 
-def test_float8_with_captions_encoded_on_the_fly_is_refused(tmp_path):
+def test_float8_with_captions_encoded_on_the_fly_is_ignored_with_a_warning(tmp_path, capsys):
     images = make_images(tmp_path / 'images', ['a red bus'])
-    with pytest.raises(ValueError, match='Remove text_embedding_dtype'):
-        batches(Float8Model('float8', cache_text_embeddings=False), dataset_config(images))
+    batches(Float8Model('float8', cache_text_embeddings=False), dataset_config(images))
+    assert 'text_embedding_dtype is ignored' in capsys.readouterr().out
 
 
 class OnTheFlyModel(Float8Model):
@@ -130,10 +132,10 @@ class OnTheFlyModel(Float8Model):
         return self.text_encoders if self.config['model']['cache_text_embeddings'] else []
 
 
-def test_float8_is_refused_for_a_model_that_encodes_captions_itself(tmp_path):
+def test_float8_is_ignored_for_a_model_that_encodes_captions_itself(tmp_path, capsys):
     images = make_images(tmp_path / 'images', ['a red bus'])
-    with pytest.raises(ValueError, match='Remove text_embedding_dtype'):
-        dataset_util.DatasetManager(OnTheFlyModel('float8', cache_text_embeddings=False))
+    assert dataset_util.DatasetManager(OnTheFlyModel('float8', cache_text_embeddings=False)).text_embedding_dtype is None
+    assert 'text_embedding_dtype is ignored' in capsys.readouterr().out
     assert dataset_util.DatasetManager(OnTheFlyModel('float8')).text_embedding_dtype == FLOAT8
 
 

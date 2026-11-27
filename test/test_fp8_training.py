@@ -224,6 +224,15 @@ class Pipeline:
         return self.diffusion_model
 
 
+def test_attention_keys_of_a_feature_that_is_off_are_ignored_with_a_warning(capsys):
+    for table, key in (({'attention': True, 'attention_min_tokens': 4096}, 'attention_min_tokens'),
+                       ({'attention_min_tokens': 4096}, 'attention_min_tokens'),
+                       ({'attention_amax_history': 8}, 'attention_amax_history')):
+        config = {'model': {'type': 'flux'}, 'fp8_training': dict(table)}
+        assert fp8_training.apply_fp8_training_config_defaults(config) is not None
+        assert f'{key} is ignored' in capsys.readouterr().out
+
+
 def test_config_defaults_and_refusals():
     config = {'model': {'type': 'flux'}, 'fp8_training': {}}
     table = fp8_training.apply_fp8_training_config_defaults(config)
@@ -243,13 +252,10 @@ def test_config_defaults_and_refusals():
     refused({'exclude': [1]}, 'list of regular expressions')
     refused({'attention': 'yes'}, "attention must be true, false or 'auto'")
     refused({'attention': 1}, "attention must be true, false or 'auto'")
-    refused({'attention': True, 'attention_min_tokens': 4096}, "applies only with attention = 'auto'")
-    refused({'attention_min_tokens': 4096}, "applies only with attention = 'auto'")
     refused({'attention': 'auto', 'attention_min_tokens': 0}, 'whole number of tokens')
     refused({'attention': 'auto', 'attention_min_tokens': True}, 'whole number of tokens')
     refused({'attention': 'auto'}, 'compile = true', compile=True)
     refused({'attention_amax_history': 0}, 'from 1 to 1024')
-    refused({'attention_amax_history': 8}, 'applies only with attention on')
     refused({'attention': 'auto'}, "attention = 'auto' cannot be combined with compile", compile=True)
     refused({'weights': 'direct'}, "needs an \\[adapter\\]")
     refused({'weights': 'direct'}, 'use_dora', adapter={'use_dora': True})

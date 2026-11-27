@@ -30,10 +30,15 @@ def test_config_defaults_and_validation():
                       'ema_dtype': 'float32'}
     for bad in ({'ema_decay': 1.0}, {'ema_decay': 0}, {'ema_decay': True}, {'ema_decay': '0.9'},
                 {'ema_decay': 0.9, 'ema_update_every': 0}, {'ema_decay': 0.9, 'ema_start_step': -1},
-                {'ema_decay': 0.9, 'ema_device': 'cuda'}, {'ema_decay': 0.9, 'ema_dtype': 'float16'},
-                {'ema_update_every': 10}, {'ema_dtype': 'bfloat16'}):
+                {'ema_decay': 0.9, 'ema_device': 'cuda'}, {'ema_decay': 0.9, 'ema_dtype': 'float16'}):
         with pytest.raises(ValueError):
             apply_ema_config_defaults(dict(bad))
+
+
+def test_ema_options_without_ema_decay_are_ignored_with_a_warning(capsys):
+    for stray in ({'ema_update_every': 10}, {'ema_dtype': 'bfloat16'}):
+        assert apply_ema_config_defaults(dict(stray)) is False
+        assert 'are ignored: ema_decay is not set' in capsys.readouterr().out
 
 
 def test_update_is_the_exponential_average_of_the_weights():
@@ -459,8 +464,7 @@ def test_init_path_validation(tmp_path):
                 {'ema_init_path': str(tmp_path), 'ema_start_step': 100}, {'ema_init_path': 3}):
         with pytest.raises(ValueError):
             apply_ema_config_defaults({'ema_decay': 0.9, **bad})
-    with pytest.raises(ValueError):    # EMA off
-        apply_ema_config_defaults({'ema_init_path': str(tmp_path)})
+    assert apply_ema_config_defaults({'ema_init_path': str(tmp_path)}) is False    # EMA off: ignored
     (tmp_path / 'a.safetensors').write_bytes(b'')
     (tmp_path / 'model.safetensors').unlink()
     (tmp_path / 'b.safetensors').write_bytes(b'')

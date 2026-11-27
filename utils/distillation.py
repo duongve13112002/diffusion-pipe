@@ -36,6 +36,7 @@ import torch
 import torch.nn.functional as F
 
 from models.teacher_guidance import DECAYS, SHAPES, lambda_at
+from utils.common import warn_ignored
 
 KEY = 'teacher'
 _KEYS = ('loss_weight', 'shape', 't_mid', 'width', 'decay', 'decay_steps', 'path')
@@ -100,8 +101,9 @@ def parse_distill_config(config):
     if isinstance(decay_steps, bool) or not isinstance(decay_steps, int) or decay_steps < 0:
         raise ValueError(f'[{KEY}] decay_steps must be a whole number >= 0, got {decay_steps!r}')
     if decay == 'none' and decay_steps > 0:
-        raise ValueError(f"[{KEY}] decay_steps does not apply with decay = 'none' (nothing falls): set decay = 'linear' "
-                         "or 'cosine', or remove decay_steps")
+        warn_ignored(f"[{KEY}] decay_steps is ignored with decay = 'none' (nothing falls): set decay = 'linear' "
+                     "or 'cosine' for it to apply.")
+        decay_steps = 0
     if decay != 'none' and decay_steps <= 0:
         raise ValueError(f'[{KEY}] decay = {decay!r} needs decay_steps > 0 (the optimizer steps over which '
                          "lambda falls to 0); use decay = 'none' to keep the term on for the whole run")

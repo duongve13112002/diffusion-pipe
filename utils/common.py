@@ -35,6 +35,14 @@ def is_main_process():
     return get_rank() == 0
 
 
+def warn_ignored(message):
+    """Prints a warning once, from rank 0: for a setting that does not apply to this run (another switch is off,
+    so nothing reads it), which is ignored rather than refused. Config checks run before the process group exists,
+    so the rank comes from the launcher's environment."""
+    if int(os.environ.get('RANK', os.environ.get('LOCAL_RANK', 0))) == 0:
+        print('WARNING:', message, flush=True)
+
+
 @contextmanager
 def zero_first():
     if not is_main_process():

@@ -55,13 +55,18 @@ def test_defaults():
     ({'decay': 'cosine', 'decay_steps': 0}, 'decay_steps'),
     ({'decay_steps': -3}, 'decay_steps'),
     ({'decay_steps': 2.5}, 'decay_steps'),
-    ({'decay_steps': 100}, "does not apply with decay = 'none'"),
 ])
 def test_bad_tables_are_refused(table, match):
     with pytest.raises(ValueError, match=match):
         parse_distill_config({'teacher': {'loss_weight': 0.5, **table}})
     with pytest.raises(ValueError, match='must be a table'):
         parse_distill_config({'teacher': 3})
+
+
+def test_decay_steps_without_a_decay_is_ignored_with_a_warning(capsys):
+    config = parse_distill_config({'teacher': {'loss_weight': 0.5, 'decay_steps': 100}})
+    assert 'decay_steps is ignored with decay = \'none\'' in capsys.readouterr().out
+    assert config.decay_steps == 0
 
 
 def test_settings_distillation_cannot_run_with():

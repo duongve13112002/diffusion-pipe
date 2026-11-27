@@ -373,7 +373,7 @@ class CommonPipeline:
     def vae_dtypes(self):
         if '_vae_dtypes' not in self.__dict__:
             if self.vae_dtype_refusal:
-                vae_dtype_lib.refuse(self.model_config, type(self).__name__, self.vae_dtype_refusal)
+                vae_dtype_lib.ignore(self.model_config, type(self).__name__, self.vae_dtype_refusal)
             self.__dict__['_vae_dtypes'] = vae_dtype_lib.LatentDtypes(self.model_config, self.default_vae_dtype)
         return self.__dict__['_vae_dtypes']
 

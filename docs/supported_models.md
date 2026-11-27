@@ -841,7 +841,7 @@ See [examples/minimax_h3_image.toml](../examples/minimax_h3_image.toml) and its 
   one head (which without a method trains `logit_normal`). A config that sets `shift`, `image_shift`, `flux_shift` or
   `sigmoid_scale` without a method keeps the continuous sampling. `logit_normal` and `uniform` draw any noise level,
   shifted by `shift`; a sample then trains through the head of the grid interval its noise level falls in
-  (`train_pdd_head = 0` trains through head 0 alone; refused for a checkpoint with one head). AI Toolkit trains on the
+  (`train_pdd_head = 0` trains through head 0 alone; ignored with a warning for a checkpoint with one head). AI Toolkit trains on the
   six sigmas only.
 - `shift` (for `logit_normal` / `uniform`): 3 when none of `shift`, `image_shift` and `flux_shift` is set. The
   checkpoint's grid is flow shift 3 applied to a base grid symmetric about 1/2 (`base[k] + base[6 - k] = 1`); shift 3 is
@@ -1240,7 +1240,7 @@ rather than loaded with layers' weights in their neighbours.
   refused with float16 compute, as are `gradient_release` (the gradients must exist at the step to unscale
   them), `type = 'offload'` (the host optimizer copies each gradient during backward, before it is unscaled),
   an explicit `[adapter] dtype = 'float16'` (float16 gradients cannot be unscaled without flushing the small
-  ones), and `--nan_check` (it would stop at an overflow the scale handles). And `compute_dtype`, `fp16_fix` and `[loss_scale]` are refused on every other model.
+  ones), and `--nan_check` (it would stop at an overflow the scale handles). And `compute_dtype` and `fp16_fix` are refused on every other model (`[loss_scale]` without float16 compute is ignored with a warning).
   Not measured against bfloat16 on image quality or speed.
 - `merge_adapters` also takes ai-toolkit's MOSS-Image LoRAs, which adapt the fused `proj.qkv`
   (ComfyUI, diffusers `transformer.` and kohya `lora_unet_` names): each of q, k and v gets the

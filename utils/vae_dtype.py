@@ -14,6 +14,8 @@ import functools
 
 import torch
 
+from utils.common import warn_ignored
+
 DTYPES = {
     'bfloat16': torch.bfloat16, 'bf16': torch.bfloat16, 'float32': torch.float32, 'fp32': torch.float32,
     'float16': torch.float16, 'fp16': torch.float16,
@@ -71,11 +73,13 @@ class LatentDtypes:
         return key
 
 
-def refuse(model_config, model_name, why):
-    """Raises for the keys of a model they do not apply to, naming them."""
+def ignore(model_config, model_name, why):
+    """Warns about the keys of a model they do not apply to, naming them, and drops them from the config."""
     present = [key for key in KEYS if key in model_config]
     if present:
-        raise ValueError(f'{", ".join(present)} in [model] do not apply to {model_name}: {why}. Remove them.')
+        warn_ignored(f'{", ".join(present)} in [model] are ignored: they do not apply to {model_name}: {why}.')
+        for key in present:
+            del model_config[key]
 
 
 def _rows(tensor, batch):

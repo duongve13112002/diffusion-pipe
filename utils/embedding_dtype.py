@@ -14,6 +14,8 @@ gets what it got before.
 
 import torch
 
+from utils.common import warn_ignored
+
 FLOAT8 = torch.float8_e4m3fn
 FLOAT8_MAX = torch.finfo(FLOAT8).max
 SCALE = '.stored_scale'
@@ -35,8 +37,9 @@ def check_text_embedding_dtype(model_config, caches_text_embeddings):
         raise ValueError(f"text_embedding_dtype must be one of {', '.join(TEXT_EMBEDDING_DTYPES)}, got {value!r}. "
                          'Remove it to cache text embeddings in the dtype the text encoder returns.')
     if not caches_text_embeddings:
-        raise ValueError('text_embedding_dtype only applies to cached text embeddings, and this run encodes '
-                         'captions on the fly (cache_text_embeddings = false). Remove text_embedding_dtype.')
+        warn_ignored('text_embedding_dtype is ignored: it is the dtype of cached text embeddings, and this run '
+                     'encodes captions on the fly (cache_text_embeddings = false).')
+        return None
     return TEXT_EMBEDDING_DTYPES[value]
 
 

@@ -112,8 +112,6 @@ def test_float16_storage_is_for_an_adapter_over_a_float16_compute_base():
     ({'dtype': 'float16', 'compute_dtype': 'float16'}, None, 'stores the weights in float16'),
     ({'dtype': 'float16', 'compute_dtype': 'bfloat16'}, {'adapter': {}}, 'stores the weights in float16'),
     ({'dtype': 'float32', 'compute_dtype': 'float16', 'fp16_fix': 'weights'}, None, "'none' or 'online'"),
-    ({'compute_dtype': 'float16', 'fp16_fix_scale': 0.5}, None, "only applies with fp16_fix = 'online'"),
-    ({'dtype': 'bfloat16', 'fp16_fix': 'online'}, None, 'only applies with compute_dtype'),
     ({'compute_dtype': 'float16', 'fp16_fix': 'online', 'fp16_fix_scale': 0}, None, 'fp16_fix_scale'),
     ({'compute_dtype': 'float16', 'fp16_fix': 'online', 'fp16_fix_scale': 2.0}, None, 'fp16_fix_scale'),
     ({'compute_dtype': 'float16', 'fp16_fix': 'online', 'fp16_fix_scale': True}, None, 'fp16_fix_scale'),
@@ -123,6 +121,15 @@ def test_float16_storage_is_for_an_adapter_over_a_float16_compute_base():
 def test_precision_refusals(model, config, match):
     with pytest.raises(ValueError, match=match):
         precision_of(model, config)
+
+
+def test_fp16_fix_without_what_it_needs_is_ignored_with_a_warning(capsys):
+    pipe = precision_of({'compute_dtype': 'float16', 'fp16_fix_scale': 0.5})
+    assert "fp16_fix_scale is ignored" in capsys.readouterr().out
+    assert 'fp16_fix_scale' not in pipe.model_config and pipe.fp16_fold is None
+    pipe = precision_of({'dtype': 'bfloat16', 'fp16_fix': 'online'})
+    assert "fp16_fix = 'online' is ignored" in capsys.readouterr().out
+    assert pipe.model_config['fp16_fix'] == 'none' and pipe.fp16_fold is None
 
 
 def test_float16_without_the_fold_warns_about_the_base_weights(capsys):

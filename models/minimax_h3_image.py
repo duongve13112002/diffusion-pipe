@@ -35,7 +35,7 @@ from tqdm import tqdm
 from models.base import PreprocessMediaFile, convert_to_rgb, make_contiguous
 from models.minimax_h3 import MinimaxH3Pipeline, TransformerLayer, pack_references, pad_sequences
 from utils import minimax_h3_weights as weights
-from utils.common import AUTOCAST_DTYPE, is_main_process
+from utils.common import AUTOCAST_DTYPE, is_main_process, warn_ignored
 import comfy.model_management
 import comfy.sd
 import comfy.text_encoders.minimax
@@ -146,8 +146,10 @@ class MiniMaxH3ImagePipeline(MinimaxH3Pipeline):
             raise ValueError(f"[model] diffusion_model_format must be one of {weights.LAYOUTS}, "
                              f"got {model_config['diffusion_model_format']!r}")
         if 'adapter' in config and (keys := [k for k in HEAD_LR_KEYS if k in model_config]):
-            raise ValueError(f'[model] {", ".join(keys)} do not apply to adapter training: they set the learning rate of '
-                             'weights an adapter leaves frozen. Remove them (blocks_lr and token_refiner_lr do apply).')
+            warn_ignored(f'[model] {", ".join(keys)} are ignored: they set the learning rate of weights an adapter '
+                         'leaves frozen (blocks_lr and token_refiner_lr do apply).')
+            for key in keys:
+                del model_config[key]
         method = model_config.get('timestep_sample_method')
         if method is not None and method not in SAMPLE_METHODS:
             raise ValueError(f'[model] timestep_sample_method must be one of {SAMPLE_METHODS}, got {method!r}')
@@ -177,11 +179,13 @@ class MiniMaxH3ImagePipeline(MinimaxH3Pipeline):
                              'head and no sampling grid. For an official transformer/ give its pdd_fused_heads.safetensors '
                              '(pdd_heads), or use logit_normal / uniform.')
         if heads == 1 and 'train_pdd_head' in self.model_config:
-            raise ValueError('[model] train_pdd_head does not apply: this diffusion_model has one output head, not the PDD bank '
-                             'of six. Remove it.')
+            warn_ignored('[model] train_pdd_head is ignored: this diffusion_model has one output head, not the PDD bank '
+                         'of six.')
+            del self.model_config['train_pdd_head']
         if 'pdd_heads' in self.model_config and layout != 'official':
-            raise ValueError(f"[model] pdd_heads applies to the official transformer/ layout only; this diffusion_model is "
-                             f"in the {layout} layout, which carries its heads itself. Remove pdd_heads.")
+            warn_ignored(f"[model] pdd_heads is ignored: it applies to the official transformer/ layout only; this "
+                         f"diffusion_model is in the {layout} layout, which carries its heads itself.")
+            del self.model_config['pdd_heads']
 
     def model_specific_dataset_config_validation(self, dataset_config):
         directories = dataset_config.get('directory', [])

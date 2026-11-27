@@ -1,4 +1,5 @@
 import inspect
+import re
 import types
 
 import pytest
@@ -48,10 +49,13 @@ def test_cache_key():
         dtypes(vae_dtype='bfloat16', latent_cache_dtype='float16').cache_key()
 
 
-def test_refuse_names_the_keys():
-    vd.refuse({'dtype': 'bfloat16'}, 'Iris', 'it caches pixels')
-    with pytest.raises(ValueError, match='vae_dtype, latent_cache_dtype.*Iris.*caches pixels'):
-        vd.refuse({'vae_dtype': 'float16', 'latent_cache_dtype': 'float16'}, 'Iris', 'it caches pixels')
+def test_ignore_names_the_keys_and_drops_them(capsys):
+    vd.ignore({'dtype': 'bfloat16'}, 'Iris', 'it caches pixels')
+    assert capsys.readouterr().out == ''
+    config = {'vae_dtype': 'float16', 'latent_cache_dtype': 'float16'}
+    vd.ignore(config, 'Iris', 'it caches pixels')
+    assert re.search('vae_dtype, latent_cache_dtype.*ignored.*Iris.*caches pixels', capsys.readouterr().out)
+    assert config == {}
 
 
 def fake_fn(calls, overflow_at=1e4):
@@ -216,10 +220,11 @@ def test_float32_is_the_default_only_for_a_model_that_says_so():
     assert 'vae_dtype' not in legacy.vae_cache_key()
 
 
-def test_a_model_without_latents_refuses_the_keys_naming_them():
+def test_a_model_without_latents_ignores_the_keys_with_a_warning(capsys):
     pipe = FakePipeline.make({'vae_dtype': 'float16', 'dtype': 'bfloat16'}, vae_dtype_refusal='it caches pixels')
-    with pytest.raises(ValueError, match='vae_dtype in .model. do not apply to Pipeline: it caches pixels'):
-        pipe.vae_dtypes
+    assert not pipe.vae_dtypes.active
+    assert re.search('vae_dtype in .model. are ignored: they do not apply to Pipeline: it caches pixels', capsys.readouterr().out)
+    assert 'vae_dtype' not in pipe.model_config
     FakePipeline.make({'dtype': 'bfloat16'}, vae_dtype_refusal='it caches pixels').vae_dtypes
 
 

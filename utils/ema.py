@@ -42,7 +42,7 @@ from pathlib import Path
 
 import torch
 
-from utils.common import torch_save_atomic
+from utils.common import torch_save_atomic, warn_ignored
 from utils.dora import DORA_SCALE, saved_key as dora_saved_key
 
 DEVICES = ('cpu', 'gpu')
@@ -56,8 +56,8 @@ def apply_ema_config_defaults(config):
     if 'ema_decay' not in config:
         stray = [k for k in _OPTION_KEYS if k in config]
         if stray:
-            raise ValueError(f'{stray} set but ema_decay is not, so EMA is off. Set ema_decay (e.g. 0.9999) '
-                             'to train with EMA, or remove them.')
+            warn_ignored(f'{stray} are ignored: ema_decay is not set, so EMA is off. Set ema_decay (e.g. 0.9999) '
+                         'to train with EMA.')
         return False
     decay = config['ema_decay']
     if isinstance(decay, bool) or not isinstance(decay, (int, float)) or not 0 < decay < 1:

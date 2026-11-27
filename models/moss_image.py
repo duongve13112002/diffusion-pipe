@@ -47,7 +47,7 @@ import deepspeed.comm.comm as dist
 from tqdm import tqdm
 
 from models.base import ComfyPipeline, ModelWrapper, PreprocessMediaFile, make_contiguous
-from utils.common import is_main_process
+from utils.common import is_main_process, warn_ignored
 from utils.distillation import distill_loss, distill_warnings, parse_distill_config
 from utils.offloading import ModelOffloader
 from utils.stream_loss import StreamLayout, StreamMetrics, channel_energy, check_width, parse_stream_loss
@@ -1208,12 +1208,15 @@ class MossImagePipeline(ComfyPipeline):
         if fix not in ('none', 'online'):
             raise ValueError(f"fp16_fix must be 'none' or 'online', got {fix!r}")
         if fix == 'none' and 'fp16_fix_scale' in mc:
-            raise ValueError("fp16_fix_scale only applies with fp16_fix = 'online'")
+            warn_ignored("fp16_fix_scale is ignored: it applies with fp16_fix = 'online'")
+            del mc['fp16_fix_scale']
         self.fp16_fold = None
+        if fix == 'online' and not fp16:
+            warn_ignored("fp16_fix = 'online' is ignored: it applies with compute_dtype = 'float16' (it keeps "
+                         "the residual stream inside float16's range)")
+            mc['fp16_fix'] = fix = 'none'
+            mc.pop('fp16_fix_scale', None)
         if fix == 'online':
-            if not fp16:
-                raise ValueError("fp16_fix = 'online' only applies with compute_dtype = 'float16': it keeps the "
-                                 'residual stream inside float16\'s range')
             scale = mc.setdefault('fp16_fix_scale', 1 / 16)
             if isinstance(scale, bool) or not isinstance(scale, (int, float)) or not 0 < scale <= 1:
                 raise ValueError(f'fp16_fix_scale must be a number in (0, 1], got {scale!r}')
