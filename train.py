@@ -34,6 +34,7 @@ from utils.text_encoding import TextEncodingOnTheFly, encodes_text_in_loader
 from utils.patches import apply_patches
 from utils.unsloth_utils import unsloth_checkpoint
 from utils.pipeline import ManualPipelineModule
+from utils import memory_partition
 from utils.placement import DEFAULT_PLACEMENT, check_placement, local_world_size, stage_of_rank, straddling_note
 from utils.dora import apply_dora_config_defaults, check_model_dtypes as check_dora_model_dtypes
 from utils.oplora import OPLoRAProjector, apply_oplora_config_defaults
@@ -106,6 +107,7 @@ def set_config_defaults(config):
 
     config.setdefault('pipeline_stages', 1)
     check_placement(config.get('pipeline_placement', DEFAULT_PLACEMENT))
+    memory_partition.check_partition_config(config)
     if 'optimizer' in config:
         check_pipeline_optimizer(config['optimizer']['type'], config['pipeline_stages'])
     config.setdefault('activation_checkpointing', False)
@@ -906,12 +908,23 @@ if __name__ == '__main__':
             print(f'WARNING: {note}')
     partition_method=config.get('partition_method', 'parameters')
     partition_split = config.get('partition_split',[len(layers) / num_stages])
+    student_method, student_split = partition_method, partition_split
+    if str(partition_method).lower() == 'memory' and num_stages > 1:
+        # Balanced by the bytes of the layers (utils/memory_partition.py), the same split on every rank.
+        student_split, partition_report = memory_partition.plan(
+            layers, model, num_stages, config.get('partition_trainable_factor', memory_partition.DEFAULT_TRAINABLE_FACTOR),
+            config.get('partition_extra_first_stage_gb', 0))
+        student_method = 'manual'
+        if is_main_process():
+            print(partition_report)
+    elif str(partition_method).lower() == 'memory':
+        student_method = 'uniform'
     pipeline_model = ManualPipelineModule(
         layers=layers,
         num_stages=num_stages,
         placement=placement,
-        partition_method=partition_method,
-        manual_partition_split=partition_split,
+        partition_method=student_method,
+        manual_partition_split=student_split,
         loss_fn=model_teacher.wrap_loss_fn(model.get_loss_fn(), teacher) if teacher_config is not None else model.get_loss_fn(),
         dynamic_shape=True,
         **additional_pipeline_module_kwargs

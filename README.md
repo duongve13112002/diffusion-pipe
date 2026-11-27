@@ -631,8 +631,15 @@ MOSS-Image encode in their first layer, so only the first stage's GPU holds the 
 and Iris free its weights from the other stages' host memory once the pipeline is built (MOSS-Image never
 loads it there). MOSS-Image's `[teacher]` copy of a full fine-tune is made when the teacher pipeline is built, one
 rank at a time, not when the model loads. The `parameters` partition does not count a frozen text encoder, so the first stage has
-as many blocks as the others plus the encoder; with `partition_method = 'manual'` and `partition_split` move blocks off
-stage 0 if its VRAM is the limit.
+as many blocks as the others plus the encoder. Two ways to move blocks off stage 0: `partition_method = 'manual'` with
+`partition_split`, or `partition_method = 'memory'`, which balances the stages by the bytes their layers hold:
+every parameter and buffer counts at its own dtype (a block kept in fp8 weighs half a bfloat16 one), frozen weights
+included, plus `partition_trainable_factor` (default 3: the gradient and two optimizer states, an Adam-like estimate)
+times the bytes of the trainable parameters, plus the first stage's text encoder. A text encoder the tool cannot
+see (a ComfyUI one that is not loaded yet) and the activations that the first stage holds most of can be added as
+`partition_extra_first_stage_gb`. The chosen stages and their sizes are printed at startup; check them against
+`nvidia-smi` on the first run and adjust. The `[teacher]`'s own pipeline is balanced by its bytes as well. The
+partition covers the diffusion model's layers (the pipeline); the VAE is not in them (latents are cached before training).
 
 Padding, for the models of the last row: each caption is padded to the longest one of its group,
 as caching does with the same `caching_batch_size`, except that the group is taken from the

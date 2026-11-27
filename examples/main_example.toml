@@ -130,6 +130,11 @@ activation_checkpointing = true
 
 # Controls how Deepspeed decides how to divide layers across GPUs. Probably don't change this.
 partition_method = 'parameters'
+# 'memory' balances the stages by the bytes their layers hold (every parameter at its own dtype, frozen ones included,
+# trainable ones plus gradients and optimizer states, and the first stage's text encoder when it encodes the captions).
+# Use it when stage 0 runs out of VRAM or the layers are in different dtypes. Optional with it:
+#partition_trainable_factor = 3.0         # extra bytes per trainable byte (gradient + optimizer states)
+#partition_extra_first_stage_gb = 0       # headroom to add to the first stage (an encoder not seen yet, activations)
 # Alternatively you can use 'manual' in combination with partition_split, which specifies the split points for dividing
 # layers between GPUs. For example, with two GPUs, partition_split=[10] puts layers 0-9 on GPU 0, and the rest on GPU 1.
 # With three GPUs, partition_split=[10, 20] puts layers 0-9 on GPU 0, layers 10-19 on GPU 1, and the rest on GPU 2.

@@ -190,6 +190,10 @@ def teacher_partition(layers, num_stages, partition_method, partition_split):
     method = str(partition_method).lower()
     if method == 'uniform' or (method == 'manual' and partition_split is not None):
         return partition_method, partition_split
+    if method == 'memory':
+        # By the bytes of the layers, so a block kept in fp8 weighs less than one in bfloat16.
+        from utils.memory_partition import teacher_split
+        return 'manual', teacher_split(layers, num_stages)
     return 'manual', balanced_split(layers, num_stages)
 
 

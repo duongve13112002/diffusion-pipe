@@ -204,7 +204,7 @@ with one GPU, several, several nodes and any `pipeline_stages`.
     split is only known once the student's layers exist, so all ranks build it together and free it afterwards.
     The default `partition_method = 'parameters'` weighs trainable parameters, which a frozen teacher has none of,
     so the teacher is balanced by its parameter counts instead (`uniform` and a `manual` `partition_split` are the
-    student's own). Each rank builds the teacher's layers on the CPU first, then frees the other stages' weights:
+    student's own; `memory` balances it by the bytes of its layers). Each rank builds the teacher's layers on the CPU first, then frees the other stages' weights:
     the CPU RAM peaks by about the size of the weights in `dtype` on every rank while loading. Neither the speed
     nor the VRAM has been measured on a GPU.
   Once `decay` has brought lambda to 0 (step `decay_steps`) the teacher no longer runs: the loss ignores it from

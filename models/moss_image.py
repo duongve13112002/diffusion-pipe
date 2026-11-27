@@ -48,6 +48,7 @@ from tqdm import tqdm
 
 from models.base import ComfyPipeline, ModelWrapper, PreprocessMediaFile, make_contiguous
 from utils.common import is_main_process, warn_ignored
+from utils.memory_partition import text_encoder_bytes
 from utils.distillation import distill_loss, distill_warnings, parse_distill_config
 from utils.offloading import ModelOffloader
 from utils.placement import DEFAULT_PLACEMENT, data_rank_of_rank, stage_of_rank
@@ -1375,6 +1376,10 @@ class MossImagePipeline(ComfyPipeline):
             pixels = images.to('cuda', torch.float32)
             return {'latents': self.vae_encode(pixels, vae)}
         return fn
+
+    def first_stage_extra_bytes(self):
+        # TextEncoderLayer holds the ComfyUI encoder in a list, and only the first stage's rank loaded it.
+        return 0 if self.cache_text_embeddings else text_encoder_bytes(self.text_encoders[0])
 
     def get_text_encoders(self):
         # None to cache: the dataset then hands the batch its captions, which run through the

@@ -990,8 +990,8 @@ cached embedding is about 8 KB per token, which for millions of captions is tera
 On the fly, every GPU of the first pipeline stage loads the encoder onto itself before training
 starts, which costs each of them 18 GB that `partition_method = 'parameters'` does not see (the
 encoder has no trainable parameters). On 141 GB GPUs this fits; if stage 0 runs out of memory
-with `pipeline_stages` above 1, move blocks off it with `partition_method = 'manual'` and
-`partition_split`. The pipeline's layers are the text encoder layer (a pass-through when
+with `pipeline_stages` above 1, use `partition_method = 'memory'` (it counts the encoder) or move blocks off it
+with `partition_method = 'manual'` and `partition_split`. The pipeline's layers are the text encoder layer (a pass-through when
 embeddings are cached; it is there either way so checkpoints keep one layout), the input layer,
 the 42 blocks and the output layer, 45 in all. For a full fine-tune `'parameters'` splits at
 `[22]` over two stages (20 blocks on stage 0) and `[11, 22, 33]` over four (9 blocks on stage 0,
@@ -1376,9 +1376,9 @@ Differences from Iris's own training recipe worth knowing:
   `shift_law`, `logit_std` and `cache_text_embeddings` instead.
 
 With `cache_text_embeddings = false` the Qwen3-VL-4B text encoder (about 8 GB in bf16) lives on
-the first pipeline stage's GPU but is not counted by `partition_method`; with more than one
-pipeline stage, give stage 0 fewer layers with `partition_method = 'manual'` / `partition_split` if it runs
-out of memory, or cache the embeddings. `train/repa_loss` is the mean over the step's
+the first pipeline stage's GPU but is not counted by `partition_method = 'parameters'`; with more than one
+pipeline stage, use `partition_method = 'memory'` (it counts the encoder), or give stage 0 fewer layers with
+`partition_method = 'manual'` / `partition_split`, if it runs out of memory, or cache the embeddings. `train/repa_loss` is the mean over the step's
 micro-batches and data-parallel ranks, whichever stage REPA runs on.
 
 All `[model]` options:

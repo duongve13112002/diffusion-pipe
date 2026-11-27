@@ -631,6 +631,17 @@ class CommonPipeline:
         cached text embeddings) frees the text encoder's weights on the stages that never run it."""
         pass
 
+    def first_stage_extra_bytes(self):
+        """Bytes of text encoder the first stage's GPU holds while training that no layer carries as parameters
+        (partition_method = 'memory' adds them to the first layer). Here: the encoders the data loader runs
+        (utils/text_encoding.py), as far as they are loaded on this rank; a model that holds its encoder in a
+        layer in a list overrides this. Read on every rank, which then share the largest."""
+        from utils.memory_partition import text_encoder_bytes
+        from utils.text_encoding import encodes_text_in_loader
+        if not encodes_text_in_loader(self):
+            return 0
+        return sum(text_encoder_bytes(te) for te in self.get_text_encoders())
+
     # [teacher] (utils/model_teacher.py). The pipeline attributes that hold the denoiser to_layers() wraps: a
     # teacher built from the model as loaded deep-copies them, so its layers share nothing the student trains.
     teacher_denoiser_attrs = ()
