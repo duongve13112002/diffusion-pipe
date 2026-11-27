@@ -70,7 +70,7 @@ def _number(table, key, default):
 def parse_distill_config(config):
     """The [teacher] table of a MOSS-Image config as a DistillConfig, or None when it is absent or
     its loss_weight is 0. Raises on a key it does not know, a value out of range, or a setting
-    distillation cannot run with (adapters on several pipeline stages, block swapping, compile)."""
+    distillation cannot run with (block swapping, compile)."""
     table = config.get(KEY)
     if table is None:
         return None
@@ -123,11 +123,6 @@ def parse_distill_config(config):
                          'the adapter switched off, which is the base model, not the base plus the adapter the run '
                          'starts from, so the term would pull the first steps away from the starting adapter. '
                          'Remove one of them, or set [teacher] path.')
-    if path is None and 'adapter' in config and int(config.get('pipeline_stages', 1)) != 1:
-        raise ValueError(f'[{KEY}] with an [adapter] needs pipeline_stages = 1: the teacher is the same blocks '
-                         'with the adapter switched off, which only a stage that holds the whole model can run. '
-                         'Use data parallelism across the GPUs, or train a full fine-tune (which keeps a frozen '
-                         'copy on the first stage).')
     return DistillConfig(loss_weight, shape, t_mid, width, decay, int(decay_steps), path)
 
 

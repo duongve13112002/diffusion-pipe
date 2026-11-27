@@ -1313,9 +1313,38 @@ class MossImagePipeline(ComfyPipeline):
             comfy.model_management.load_models_gpu([te.patcher], force_full_load=True)
         # The starting model of a full fine-tune's [teacher], taken here: to_layers() runs after fp8_training has
         # swapped the student's Linears and attention for fp8 ones, which a later copy would carry along.
-        if (self.distill is not None and self.distill.path is None and 'adapter' not in self.config
-                and self.on_first_stage()):
+        # With several pipeline stages every rank takes it (the teacher pipeline builds its layers on all of them,
+        # adapter or not: its blocks are a copy, not the student's with the adapter off).
+        if self.distill is not None and self.distill.path is None and (
+                self.teacher_in_pipeline() or ('adapter' not in self.config and self.on_first_stage())):
             self.teacher_snapshot = copy.deepcopy(self.diffusion_model)
+
+    def teacher_in_pipeline(self):
+        """Whether [teacher] runs as a second, forward-only pipeline (model_teacher.TeacherPipeline): with more
+        than one pipeline stage. With one, TeacherForward runs it in the first layer."""
+        return self.distill is not None and int(self.config.get('pipeline_stages', 1)) > 1
+
+    def own_teacher_config(self):
+        """The [teacher] config train.py builds the teacher pipeline from (its own table, not the generic one)."""
+        return self.distill if self.teacher_in_pipeline() else None
+
+    # The label is (target, sigma, mask); the teacher's velocity joins it after the mask, in float32 as TeacherForward's.
+    teacher_label_targets = 1
+    teacher_output_float32 = True
+
+    def make_teacher_layers(self, path=None):
+        """The layers of the teacher pipeline: a text encoder layer (the captions, when they are not cached), then
+        the frozen copy's layers (its own state: no stream vector, never sampling). The copy is the starting model
+        (the snapshot load_diffusion_model took) or the transformer at `path`; on the CPU, where the engine moves
+        each stage's share to its GPU."""
+        model = self.teacher_snapshot if path is None else self.load_teacher_model(path)
+        if model is None:
+            raise RuntimeError('[teacher]: the starting model was not copied by load_diffusion_model')
+        self.teacher_snapshot = None
+        model.requires_grad_(False).eval()
+        state = LayerState(model.rope, self.compute_dtype, self.fp16_fold)
+        text_encoder = None if self.cache_text_embeddings else self.text_encoders[0]
+        return [TextEncoderLayer(text_encoder, self.dtype, self.text_dim, state), *teacher_chain(model, state)]
 
     def on_first_stage(self):
         """Whether this rank is on the first pipeline stage (DeepSpeed numbers ranks stage-major)."""
@@ -1451,7 +1480,11 @@ class MossImagePipeline(ComfyPipeline):
 
     def _loss_fn(self, flow_loss):
         def loss_fn(output, label):
-            # (target, mask), or (target, sigma, mask) when [teacher] is on.
+            # (target, mask), or (target, sigma, mask) when [teacher] is on; with the teacher pipeline a training
+            # batch's label also carries the teacher velocity after the mask (TeacherPipeline).
+            teacher_label = None
+            if len(label) == 4:
+                *label, teacher_label = label
             target, *rest, mask = label
             sigma = rest[0] if rest else None
             layout = self.layer_state.stream if self.layer_state is not None else None
@@ -1464,6 +1497,8 @@ class MossImagePipeline(ComfyPipeline):
                     stream = carried.pop(0)
                 if carried:
                     teacher = carried.pop(0)
+            if teacher is None:
+                teacher = teacher_label
             if sigma is not None and teacher is None and self.distill is not None and torch.is_grad_enabled():
                 raise RuntimeError('[teacher] is on and this is a training batch, but no teacher velocity reached the '
                                    'loss; distillation would silently be off. This is a bug in the layer tuple.')
@@ -1556,7 +1591,7 @@ class MossImagePipeline(ComfyPipeline):
         keeps this to one pipeline stage, which holds them all). A full fine-tune: a copy of the model as
         loaded, frozen, on the GPU of every rank of stage 0; the rest of the stages never run it.
         """
-        if self.distill is None or not self.on_first_stage():
+        if self.distill is None or not self.on_first_stage() or self.teacher_in_pipeline():
             return None
         model = self.diffusion_model
         # Its own state: no stream vector and never sampling, so the layers it builds are the plain forward.
@@ -1863,6 +1898,17 @@ def adapter_switched_off(lora_model):
                 p.requires_grad_(flag)
 
 
+def teacher_chain(model, state, offloader=None):
+    """InitialLayer, the blocks and FinalLayer of `model` (a frozen copy) with a state of their own."""
+    if offloader is None:
+        offloader = ModelOffloader('dummy', [], 0, 0, True,
+                                   torch.device('cuda' if torch.cuda.is_available() else 'cpu'), False, debug=False)
+    count = len(model.layers)
+    return [InitialLayer(model, state),
+            *[TransformerLayer(block, i, offloader, state, count) for i, block in enumerate(model.layers)],
+            FinalLayer(model, state)]
+
+
 class TeacherForward:
     """The velocity of the model the run started from, for [teacher]: the same layers as the student
     (InitialLayer, the blocks, FinalLayer), run under no_grad on the student's noisy latent, noise
@@ -1878,10 +1924,7 @@ class TeacherForward:
         self.state = state
         offloader = ModelOffloader('dummy', [], 0, 0, True, torch.device('cuda' if torch.cuda.is_available() else 'cpu'),
                                    False, debug=False)
-        count = len(model.layers)
-        self.layers = [InitialLayer(model, state)]
-        self.layers += [TransformerLayer(block, i, offloader, state, count) for i, block in enumerate(model.layers)]
-        self.layers.append(FinalLayer(model, state))
+        self.layers = teacher_chain(model, state, offloader)
 
     @torch.no_grad()
     def velocity(self, x, sigma, text, mask):

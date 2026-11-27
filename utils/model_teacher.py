@@ -211,9 +211,14 @@ class TeacherPipeline:
     ModelTeacher.run's output joins in the loader, so the loss function is the same.
     """
 
-    def __init__(self, teacher, engine):
+    def __init__(self, teacher, engine, label_targets=None, keep_float32=False):
+        """`label_targets`: how many leading entries of a label are targets the teacher's output stands in for
+        (default: all but the mask, the last); the output joins the label after its last entry. `keep_float32`:
+        leave the teacher's output in float32 instead of casting it to its target's dtype (MOSS-Image's loss)."""
         self.teacher = teacher
         self.engine = engine
+        self.label_targets = label_targets
+        self.keep_float32 = keep_float32
 
     def attach(self, items):
         """`items`: the step's micro batches [(features, label)] on the first and last stage, None on the others.
@@ -224,7 +229,7 @@ class TeacherPipeline:
         if teacher.finished():
             if not last:
                 return items
-            return [(features, (*label, *[torch.zeros_like(t) for t in label[:-1]]))
+            return [(features, (*label, *[torch.zeros_like(t) for t in label[:self._count(label)]]))
                     for features, label in items]
         engine.reset_activation_shape()
         with fp8_training.disabled():
@@ -237,7 +242,7 @@ class TeacherPipeline:
                                f'{len(items)} micro batches')
         attached = []
         for output, (features, label) in zip(outputs, items):
-            *targets, mask = label
+            targets = label[:self._count(label)]
             if not torch.is_tensor(output):
                 output = tuple(output)
             selected = teacher.select(output)
@@ -246,13 +251,17 @@ class TeacherPipeline:
                                    f'has {len(targets)} targets')
             teacher_targets = []
             for out, target in zip(selected, targets):
-                out = fit_trailing_dim(out.detach(), target).to(target.device, target.dtype)
+                out = fit_trailing_dim(out.detach(), target)
+                out = out.to(target.device, torch.float32 if self.keep_float32 else target.dtype)
                 if out.shape != target.shape:
                     raise RuntimeError(f'[teacher]: the teacher output {tuple(out.shape)} does not match the '
                                        f'target {tuple(target.shape)} it stands in for')
                 teacher_targets.append(out)
-            attached.append((features, (*targets, mask, *teacher_targets)))
+            attached.append((features, (*label, *teacher_targets)))
         return attached
+
+    def _count(self, label):
+        return len(label) - 1 if self.label_targets is None else self.label_targets
 
 
 def wrap_loss_fn(inner, teacher):

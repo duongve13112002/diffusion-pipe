@@ -75,10 +75,9 @@ def test_settings_distillation_cannot_run_with():
         parse_distill_config({'teacher': table, 'compile': True})
     with pytest.raises(ValueError, match='blocks_to_swap'):
         parse_distill_config({'teacher': table, 'blocks_to_swap': 4})
-    with pytest.raises(ValueError, match='pipeline_stages = 1'):
-        parse_distill_config({'teacher': table, 'adapter': {'type': 'lora'}, 'pipeline_stages': 2})
-    # An adapter on one stage, and a full fine-tune on several, are the supported shapes.
+    # An adapter or a full fine-tune, on one stage or several, are all supported (several: the teacher pipeline).
     assert parse_distill_config({'teacher': table, 'adapter': {'type': 'lora'}, 'pipeline_stages': 1})
+    assert parse_distill_config({'teacher': table, 'adapter': {'type': 'lora'}, 'pipeline_stages': 2})
     assert parse_distill_config({'teacher': table, 'pipeline_stages': 2})
 
 
@@ -160,7 +159,7 @@ def test_the_label_carries_sigma_only_when_distilling():
 
 # the teacher in the pipeline
 
-def distilling_pipeline(lora=False, distill=None, stream=None, reference=None):
+def distilling_pipeline(lora=False, distill=None, stream=None, reference=None, stages=1):
     """The tiny model with [teacher] on: layers built with the teacher, a Runner over them."""
     reference = reference or tiny_reference()
     pipe = trained_lora_pipeline(reference) if lora else loaded_pipeline(reference)
@@ -172,6 +171,7 @@ def distilling_pipeline(lora=False, distill=None, stream=None, reference=None):
         # what load_diffusion_model keeps for a full fine-tune
         pipe.teacher_snapshot = copy.deepcopy(pipe.diffusion_model)
     pipe.config = {'adapter': dict(LORA)} if lora else {}
+    pipe.config['pipeline_stages'] = stages
     pipe.training_step = 1
     if stream is not None:
         layout = StreamLayout(stream, len(pipe.diffusion_model.layers))
@@ -446,8 +446,8 @@ def test_path_is_a_known_key_and_loosens_the_adapter_rules():
     starting_adapter = {'adapter': {'type': 'lora', 'init_from_existing': '/a'}}
     with pytest.raises(ValueError, match='init_from_existing'):
         parse_distill_config({'teacher': teacher, **starting_adapter})
-    with pytest.raises(ValueError, match='pipeline_stages = 1'):
-        parse_distill_config({'teacher': teacher, 'adapter': {'type': 'lora'}, 'pipeline_stages': 2})
+    # An adapter on several stages is fine: the teacher is then a copy in the teacher pipeline.
+    assert parse_distill_config({'teacher': teacher, 'adapter': {'type': 'lora'}, 'pipeline_stages': 2}) is not None
     # With a path the teacher is a copy of its own, so neither applies.
     both = {**starting_adapter, 'pipeline_stages': 2}
     assert parse_distill_config({'teacher': {**teacher, 'path': '/m'}, **both}).path == '/m'
@@ -521,11 +521,14 @@ def test_only_a_full_fine_tune_without_path_copies_the_model_at_load(tmp_path, n
     assert pipe.teacher_snapshot is None
 
 
-def test_another_stage_does_not_copy_the_model(monkeypatch, tmp_path):
+@pytest.mark.parametrize('config', [{'pipeline_stages': 2}, {'pipeline_stages': 2, 'adapter': dict(LORA)}],
+                         ids=['full fine-tune', 'adapter'])
+def test_with_several_stages_every_rank_copies_the_model_for_the_teacher_pipeline(monkeypatch, tmp_path, config):
+    # The teacher pipeline builds its layers on every rank (also under an adapter: its blocks are a copy).
     monkeypatch.setattr(mi, 'rank_and_world_size', lambda: (1, 2))
-    pipe = loading_pipeline(tmp_path, config={'pipeline_stages': 2}, distill=cfg())
+    pipe = loading_pipeline(tmp_path, config=config, distill=cfg())
     pipe.load_diffusion_model()
-    assert pipe.teacher_snapshot is None
+    assert pipe.teacher_snapshot is not None
 
 
 def test_a_teacher_that_was_not_copied_at_load_is_an_error():

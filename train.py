@@ -756,7 +756,11 @@ if __name__ == '__main__':
     # student's modules; on the first pipeline stage only, which is where it runs.
     teacher = None
     teacher_stages = config.get('pipeline_stages', 1)
-    if teacher_config is not None:
+    # MOSS-Image reads its own [teacher]; with several stages that one also runs as the teacher pipeline.
+    pipeline_teacher_config = teacher_config
+    if pipeline_teacher_config is None and hasattr(model, 'own_teacher_config'):
+        pipeline_teacher_config = model.own_teacher_config()
+    if pipeline_teacher_config is not None:
         # With one stage the loader runs the teacher on the same GPU as the student. With several, every rank builds
         # the teacher's layers (on the CPU) and the second, forward-only pipeline engine below keeps its own
         # stage's share on the GPU. Building can fail on one rank alone (a missing file, a mismatching checkpoint):
@@ -764,17 +768,17 @@ if __name__ == '__main__':
         error = None
         try:
             teacher = model_teacher.build_teacher(
-                model, teacher_config, torch.device('cuda', torch.cuda.current_device()),
+                model, pipeline_teacher_config, torch.device('cuda', torch.cuda.current_device()),
                 place=teacher_stages == 1)
         except Exception as e:
             error = e
         all_ok(error)
         if is_main_process():
-            source = teacher_config.path or 'the model the run started from'
+            source = pipeline_teacher_config.path or 'the model the run started from'
             where = ('on the same GPU as the student' if teacher_stages == 1 else
                      f'as a second, forward-only pipeline split over the {teacher_stages} stages')
             print(f'[teacher] on: a frozen copy of {source} runs {where} '
-                  f'(lambda = {teacher_config.loss_weight} x decay {teacher_config.decay!r})')
+                  f'(lambda = {pipeline_teacher_config.loss_weight} x decay {pipeline_teacher_config.decay!r})')
     # Before the adapter, which then wraps the fp8 layers like any Linear.
     fp8_training.prepare_model(model)
 
@@ -884,7 +888,7 @@ if __name__ == '__main__':
         num_stages=num_stages,
         partition_method=partition_method,
         manual_partition_split=partition_split,
-        loss_fn=model_teacher.wrap_loss_fn(model.get_loss_fn(), teacher) if teacher is not None else model.get_loss_fn(),
+        loss_fn=model_teacher.wrap_loss_fn(model.get_loss_fn(), teacher) if teacher_config is not None else model.get_loss_fn(),
         dynamic_shape=True,
         **additional_pipeline_module_kwargs
     )
@@ -928,7 +932,9 @@ if __name__ == '__main__':
         teacher_module._layer_specs = []
         teacher.layers = None
         del teacher_module
-        teacher_pipeline = model_teacher.TeacherPipeline(teacher, teacher_engine)
+        teacher_pipeline = model_teacher.TeacherPipeline(
+            teacher, teacher_engine, label_targets=getattr(model, 'teacher_label_targets', None),
+            keep_float32=getattr(model, 'teacher_output_float32', False))
         gc.collect()
     # Read by the engine step in utils/patches.py.
     nonfinite_guard = None
@@ -1153,7 +1159,7 @@ if __name__ == '__main__':
         # (models with load_media_on_the_fly, e.g. iris); cached latents need only the default.
         num_dataloader_workers=config.get('dataloader_workers', 1),
         text_encoding=text_encoding,
-        teacher=teacher if teacher_pipeline is None else None,
+        teacher=teacher if teacher_pipeline is None and teacher_config is not None else None,
     )
     steps_per_epoch = len(train_dataloader) // model_engine.gradient_accumulation_steps()
     startup_timing.mark('batching (post_init) and dataloader')
