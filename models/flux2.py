@@ -190,7 +190,7 @@ class Flux2Pipeline(ComfyPipeline):
         extra_inputs = ()
         if 'control_latents' in inputs:
             control_latents = inputs['control_latents'].float()
-            control_latents = self.model_patcher.model.process_latent_in(control_latents)
+            control_latents = self.latent_format.process_in(control_latents)
             assert control_latents.shape == latents.shape, (
                 f"Control latents shape {control_latents.shape} doesn't match latents shape {latents.shape}"
             )

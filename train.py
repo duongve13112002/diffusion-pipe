@@ -68,7 +68,7 @@ parser.add_argument('--resume_from_checkpoint', nargs='?', const=True, default=N
 parser.add_argument('--reset_dataloader', action='store_true', help='Start dataloader from scratch when resuming from checkpoint, i.e. only load the optimizer states.')
 parser.add_argument('--reset_optimizer', action='store_true')
 parser.add_argument('--reset_optimizer_params', action='store_true')
-parser.add_argument('--regenerate_cache', action='store_true', help='Force regenerate cache.')
+parser.add_argument('--regenerate_cache', action='store_true', default=None, help='Force regenerate cache (or regenerate_cache = true in the config).')
 parser.add_argument('--cache_only', action='store_true', help='Cache model inputs then exit.')
 parser.add_argument('--metadata_only', action='store_true', help='Scan the datasets, group them into buckets and cache that metadata, print the files per bucket, then exit. No latents or text embeddings: neither the VAE nor a text encoder runs.')
 parser.add_argument('--cache_status', action='store_true', help='Print how many files of each dataset directory (and bucket) have their latents and text embeddings cached, then exit. Reads what is cached, also from a run that was interrupted or is still caching (rows it has not committed yet are not counted); encodes and writes no latents or text embeddings. Combine with --trust_cache to skip the metadata scan, e.g. while another run is caching.')
@@ -176,10 +176,8 @@ def set_config_defaults(config):
 
     # Distillation toward a frozen teacher for every model but MOSS-Image and anima_refiner, which read their own
     # [teacher] (utils/model_teacher.py).
-    teacher_config = model_teacher.parse_model_teacher_config(config)
-    if teacher_config is not None and is_main_process():
-        for message in model_teacher.warnings_for(teacher_config, config):
-            print('WARNING:', message)
+    # (parsed again in __main__, which prints its warnings once the process group exists.)
+    model_teacher.parse_model_teacher_config(config)
 
     # Skipping optimizer steps whose gradient is NaN or inf (utils/step_guard.py); off by default.
     apply_step_guard_config_defaults(config)
@@ -380,6 +378,7 @@ if __name__ == '__main__':
 
     set_config_defaults(config)
     teacher_config = model_teacher.parse_model_teacher_config(config)
+    teacher_warnings = model_teacher.warnings_for(teacher_config, config) if teacher_config is not None else []
     if args.nan_check and config.get('loss_scale') is not None:
         raise SystemExit("--nan_check stops at the first inf in a gradient, which with compute_dtype = 'float16' is "
                          "the loss scale's normal back-off signal, not an error. Debug in bfloat16 or float32.")
@@ -402,6 +401,9 @@ if __name__ == '__main__':
 
     common.set_rendezvous_env(args.master_port)
     deepspeed.init_distributed()
+    if is_main_process():
+        for message in teacher_warnings:
+            print('WARNING:', message)
     # After init_distributed, which sets LOCAL_RANK itself when it discovers an MPI launch.
     torch.cuda.set_device(common.resolve_local_rank(args.local_rank))
     if args.cache_only or args.cache_status or args.metadata_only:
@@ -702,13 +704,7 @@ if __name__ == '__main__':
             with torch.no_grad():
                 os.makedirs(args.dump_dataset, exist_ok=True)
                 vae = model.vae.to('cuda')
-                train_data.post_init(
-                    0,
-                    1,
-                    1,
-                    1,
-                    1,
-                )
+                train_data.post_init(0, 1, micro_batch_size_per_gpu, 1, image_micro_batch_size_per_gpu)
                 for i, item in enumerate(train_data):
                     latents = item['latents']
                     latents = latents / vae.config.scaling_factor
