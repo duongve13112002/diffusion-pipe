@@ -1314,10 +1314,11 @@ class MossImagePipeline(ComfyPipeline):
             comfy.model_management.load_models_gpu([te.patcher], force_full_load=True)
         # The starting model of a full fine-tune's [teacher], taken here: to_layers() runs after fp8_training has
         # swapped the student's Linears and attention for fp8 ones, which a later copy would carry along.
-        # With several pipeline stages every rank takes it (the teacher pipeline builds its layers on all of them,
-        # adapter or not: its blocks are a copy, not the student's with the adapter off).
+        # With several pipeline stages the teacher pipeline builds its layers on every rank (adapter or not: its
+        # blocks are a copy, not the student's with the adapter off), one rank at a time and before fp8 training
+        # (make_teacher_layers copies then), so the ranks do not all hold a copy from here on.
         if self.distill is not None and self.distill.path is None and (
-                self.teacher_in_pipeline() or ('adapter' not in self.config and self.on_first_stage())):
+                not self.teacher_in_pipeline() and 'adapter' not in self.config and self.on_first_stage()):
             self.teacher_snapshot = copy.deepcopy(self.diffusion_model)
 
     def teacher_in_pipeline(self):
@@ -1338,9 +1339,12 @@ class MossImagePipeline(ComfyPipeline):
         the frozen copy's layers (its own state: no stream vector, never sampling). The copy is the starting model
         (the snapshot load_diffusion_model took) or the transformer at `path`; on the CPU, where the engine moves
         each stage's share to its GPU."""
-        model = self.teacher_snapshot if path is None else self.load_teacher_model(path)
-        if model is None:
-            raise RuntimeError('[teacher]: the starting model was not copied by load_diffusion_model')
+        if path is None:
+            # train.py builds the teacher right after load_diffusion_model, before fp8 training and the adapter
+            # change the student's modules, so this is the starting model.
+            model = self.teacher_snapshot if self.teacher_snapshot is not None else copy.deepcopy(self.diffusion_model)
+        else:
+            model = self.load_teacher_model(path)
         self.teacher_snapshot = None
         model.requires_grad_(False).eval()
         state = LayerState(model.rope, self.compute_dtype, self.fp16_fold)

@@ -1212,7 +1212,7 @@ def test_train_py_shares_a_teacher_build_failure_with_every_rank():
     from pathlib import Path
     source = (Path(__file__).resolve().parent.parent / 'train.py').read_text()
     start = source.index('teacher = model_teacher.build_teacher(')
-    block = source[start - 300:start + 700]
+    block = source[start - 300:source.index('all_ok(error)', start) + 20]
     assert re.search(r'try:\s+teacher = model_teacher\.build_teacher\(', block)
     assert 'place=teacher_stages == 1' in block
     assert block.index('except Exception as e:') < block.index('all_ok(error)')

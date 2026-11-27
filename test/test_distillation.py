@@ -560,12 +560,20 @@ def test_only_a_full_fine_tune_without_path_copies_the_model_at_load(tmp_path, n
 
 @pytest.mark.parametrize('config', [{'pipeline_stages': 2}, {'pipeline_stages': 2, 'adapter': dict(LORA)}],
                          ids=['full fine-tune', 'adapter'])
-def test_with_several_stages_every_rank_copies_the_model_for_the_teacher_pipeline(monkeypatch, tmp_path, config):
-    # The teacher pipeline builds its layers on every rank (also under an adapter: its blocks are a copy).
+def test_with_several_stages_the_copy_is_made_when_the_teacher_is_built_not_at_load(monkeypatch, tmp_path, config):
+    # The teacher pipeline builds its layers on every rank (also under an adapter: its blocks are a copy), one rank
+    # at a time in train.py: a copy at load time would be held by all the ranks at once from there on.
     monkeypatch.setattr(mi, 'rank_and_world_size', lambda: (1, 2))
     pipe = loading_pipeline(tmp_path, config=config, distill=cfg())
     pipe.load_diffusion_model()
-    assert pipe.teacher_snapshot is not None
+    assert pipe.teacher_snapshot is None
+    before = {n: p.detach().clone() for n, p in pipe.diffusion_model.named_parameters()}
+    layers = pipe.make_teacher_layers()
+    assert pipe.teacher_snapshot is None
+    block = next(l for l in layers if hasattr(l, 'block')).block
+    assert not any(p is q for p in block.parameters() for q in pipe.diffusion_model.parameters())
+    for name, p in block.named_parameters():
+        assert torch.equal(before[f'layers.0.{name}'], p.detach().cpu()), name
 
 
 def test_a_teacher_that_was_not_copied_at_load_is_an_error():

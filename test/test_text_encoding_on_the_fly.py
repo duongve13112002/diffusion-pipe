@@ -424,6 +424,24 @@ def test_cosmos_and_iris_free_the_unused_text_encoder_unless_it_is_cached_or_nee
         assert (cached.text_encoder.decoder if pipeline is IrisPipeline else cached.text_encoder).weight.numel() == 16
 
 
+def test_wan_frees_its_t5_on_the_stages_that_never_run_it_unless_it_is_cached(monkeypatch):
+    # models/wan/t5.py reads torch.cuda.current_device() as a default argument when it is imported.
+    monkeypatch.setattr(torch.cuda, 'current_device', lambda: 0)
+    from models.wan.wan import WanPipeline
+
+    def make(cache):
+        return types.SimpleNamespace(cache_text_embeddings=cache,
+                                     text_encoder=types.SimpleNamespace(model=torch.nn.Linear(4, 4), tokenizer='kept'))
+
+    freed = make(False)
+    WanPipeline.free_unused_text_encoder(freed, _stage_engine(1, 2))
+    assert freed.text_encoder.model.weight.numel() == 0 and freed.text_encoder.tokenizer == 'kept'
+    for model, engine in ((make(False), _stage_engine(0, 2)), (make(False), _stage_engine(0, 1)),
+                          (make(True), _stage_engine(1, 2))):
+        WanPipeline.free_unused_text_encoder(model, engine)
+        assert model.text_encoder.model.weight.numel() == 16
+
+
 def _pipeline_engine(stage, stages):
     grid = types.SimpleNamespace(stage_to_global=lambda s: s)
     return types.SimpleNamespace(is_pipe_parallel=True, grid=grid, num_stages=stages,

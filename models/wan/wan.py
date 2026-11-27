@@ -14,6 +14,7 @@ from accelerate.utils import set_module_tensor_to_device
 from models.base import BasePipeline, PreprocessMediaFile, make_contiguous
 from utils.common import AUTOCAST_DTYPE, get_lin_function, time_shift, get_t_distribution, slice_t_distribution, sample_t, load_state_dict
 from utils.offloading import ModelOffloader
+from utils.text_encoding import free_text_encoder_off_first_stage
 from .t5 import T5EncoderModel
 from .vae2_1 import Wan2_1_VAE
 from .vae2_2 import Wan2_2_VAE
@@ -271,6 +272,12 @@ class WanPipeline(BasePipeline):
         vae = self.vae.model
         clip = self.clip.model if self.model_type in ('i2v', 'flf2v') else None
         return VaeAndClip(vae, clip)
+
+    def free_unused_text_encoder(self, engine):
+        # The T5 is read on every rank (it is part of the model), but only the first stage's layer runs it: the
+        # tokenizer, which the loader of the first and last stage uses, stays.
+        if not self.cache_text_embeddings:
+            free_text_encoder_off_first_stage(self.text_encoder.model, engine)
 
     def get_text_encoders(self):
         # Return the inner nn.Module
