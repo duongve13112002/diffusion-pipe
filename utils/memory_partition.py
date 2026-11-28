@@ -173,6 +173,21 @@ def report(weights, split, extra):
     return "partition_method = 'memory'" + note + ' -> ' + '; '.join(parts)
 
 
+PARTS_FILE = 'partition.json'
+
+
+def read_saved_parts(run_dir, tag):
+    """The stage boundaries a checkpoint was saved with (its partition.json), or None for one saved before they
+    were recorded or without a readable record."""
+    import json
+    try:
+        with open(os.path.join(run_dir, tag, PARTS_FILE)) as f:
+            parts = json.load(f)['parts']
+        return [int(b) for b in parts]
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
 def check_resumed_partition(saved, current, reset_optimizer=False):
     """The optimizer state of a checkpoint is per stage, so it fits only the stage boundaries it was saved with
     (the layers' weights are per layer and load under any split). `partition_method = 'memory'` moves them

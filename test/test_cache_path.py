@@ -71,3 +71,12 @@ def test_a_dataset_built_without_a_process_group_announces_the_cache_path(tmp_pa
     monkeypatch.setattr(dataset_util, 'is_main_process', no_backend)
     dataset_util.Dataset(config, Model(cache_text_embeddings=False))
     assert 'caches go to' in capsys.readouterr().out
+
+
+def test_a_symlinked_spelling_of_the_dataset_directory_shares_its_cache(tmp_path):
+    real = tmp_path / 'real' / 'imgs'
+    real.mkdir(parents=True)
+    (tmp_path / 'link').symlink_to(tmp_path / 'real')
+    config = {'cache_path': str(tmp_path / 'fast')}
+    assert (dataset_util.directory_cache_root(real, {}, config)
+            == dataset_util.directory_cache_root(tmp_path / 'link' / 'imgs', {}, config))

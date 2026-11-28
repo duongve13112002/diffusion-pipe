@@ -422,7 +422,9 @@ def test_the_checkpoint_records_the_stage_boundaries_for_the_resume_check(tmp_pa
     saver = saver_util.Saver(types.SimpleNamespace(config=str(config_file)), {}, False, tmp_path / 'run', _Model(),
                              types.SimpleNamespace(state_dict=lambda: {}), engine, module)
     saver.save_checkpoint(3, 24)
-    assert engine.client_state['partition_parts'] == [0, 3, 9]
+    assert 'partition_parts' not in engine.client_state
+    from utils import memory_partition
+    assert memory_partition.read_saved_parts(tmp_path / 'run', 'global_step12') == [0, 3, 9]
 
 
 def test_stochastic_rounding_is_unbiased():

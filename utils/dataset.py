@@ -2077,14 +2077,15 @@ def directory_cache_root(path, directory_config, dataset_config):
     """Where the caches of the dataset directory `path` live, before the model's name: `<path>/cache` by default.
 
     `cache_path` (top level of the dataset TOML, or in a [[directory]], which wins) puts them under that folder
-    instead, in a subfolder of its own per dataset directory (the directory's name and a hash of its absolute
+    instead, in a subfolder of its own per dataset directory (the directory's name and a hash of its real
     path, so two directories with the same name never share a cache)."""
     cache_path = directory_config.get('cache_path', dataset_config.get('cache_path'))
     if cache_path is None:
         return Path(path) / 'cache'
     if not isinstance(cache_path, str) or not cache_path.strip():
         raise ValueError(f'cache_path must be a folder path (a string), got {cache_path!r}')
-    absolute = os.path.abspath(os.path.expanduser(str(path)))
+    # realpath: the same directory reached through a symlink or another mount spelling keeps one cache.
+    absolute = os.path.realpath(os.path.expanduser(str(path)))
     key = hashlib.sha1(absolute.encode()).hexdigest()[:10]
     name = re.sub(r'[^A-Za-z0-9._-]+', '_', os.path.basename(absolute.rstrip('/')) or 'dataset')
     return Path(os.path.abspath(os.path.expanduser(cache_path))) / f'{name}_{key}'

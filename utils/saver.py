@@ -1,4 +1,5 @@
 from pathlib import Path
+import json
 import os
 import shutil
 import time
@@ -9,6 +10,7 @@ from deepspeed.runtime.checkpoint_engine.torch_checkpoint_engine import TorchChe
 from deepspeed.utils.logging import logger
 
 from utils.common import all_ok, fsync_dir, is_main_process, torch_save_atomic, write_atomic
+from utils import memory_partition
 from utils.dora import saved_key, saved_value
 from utils.ema import EMA_SUBDIR, save_ema_checkpoint
 
@@ -399,9 +401,6 @@ class Saver:
                     'step': step,
                     'examples': examples,
                     'custom_loader': self.train_dataloader.state_dict(),
-                    # The optimizer state is per stage: a resume under other boundaries must not load it.
-                    **({'partition_parts': [int(b) for b in parts]}
-                       if (parts := getattr(getattr(self.model_engine, 'module', None), 'parts', None)) is not None else {}),
                     **({'loss_average': self.loss_average.state_dict()} if self.loss_average is not None else {}),
                     **({'loss_scaler': scaler.state_dict()}
                        if (scaler := getattr(self.model_engine, 'loss_scaler', None)) is not None else {}),
@@ -418,6 +417,12 @@ class Saver:
         error = None
         if is_main_process():
             try:
+                # The optimizer state is per stage: a resume under other stage boundaries is refused before
+                # anything loads (utils/memory_partition.py), which needs them here and not inside DeepSpeed's files.
+                parts = getattr(getattr(self.model_engine, 'module', None), 'parts', None)
+                if parts is not None:
+                    write_atomic(save_root / tag / memory_partition.PARTS_FILE,
+                                 json.dumps({'parts': [int(b) for b in parts]}).encode())
                 write_atomic(save_root / 'latest', tag.encode())
             except Exception as e:
                 error = e

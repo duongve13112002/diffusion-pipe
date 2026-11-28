@@ -90,7 +90,7 @@ def test_the_loop_does_not_start_on_a_finished_checkpoint(train):
 
 def test_a_config_without_an_optimizer_table_is_refused_by_name(train):
     source = inspect.getsource(train)
-    assert source.index("if 'optimizer' not in config:") < source.index("config['optimizer'].get('gradient_release'")
+    assert source.index("if 'optimizer' not in config and not (args.cache_only") < source.index("config.get('optimizer', {}).get('gradient_release'")
 
 
 def test_parameters_of_a_model_without_original_names_are_grouped(train):

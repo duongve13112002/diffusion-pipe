@@ -1,4 +1,4 @@
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 import gc
 import time
 import math
@@ -35,11 +35,26 @@ def is_main_process():
     return get_rank() == 0
 
 
+_warned = set()
+
+
+def launcher_rank():
+    """This process's global rank before the process group exists, from the launcher's environment (deepspeed and
+    torchrun: RANK; Open MPI and PMI launchers: their own variables); 0 for a plain `python train.py`."""
+    for name in ('RANK', 'OMPI_COMM_WORLD_RANK', 'PMI_RANK', 'LOCAL_RANK'):
+        value = os.environ.get(name)
+        if value not in (None, ''):
+            return int(value)
+    return 0
+
+
 def warn_ignored(message):
     """Prints a warning once, from rank 0: for a setting that does not apply to this run (another switch is off,
     so nothing reads it), which is ignored rather than refused. Config checks run before the process group exists,
-    so the rank comes from the launcher's environment."""
-    if int(os.environ.get('RANK', os.environ.get('LOCAL_RANK', 0))) == 0:
+    so the rank comes from the launcher's environment. The same message is printed once even when the check that
+    raises it runs twice."""
+    if launcher_rank() == 0 and message not in _warned:
+        _warned.add(message)
         print('WARNING:', message, flush=True)
 
 
@@ -130,8 +145,10 @@ def resolve_local_rank(local_rank_arg=-1, environ=None):
     environ['LOCAL_RANK'] = str(local_rank)
     local_size = (environ.get('LOCAL_SIZE') or environ.get('LOCAL_WORLD_SIZE')
                   or environ.get('OMPI_COMM_WORLD_LOCAL_SIZE') or ('1' if world_size == 1 else None))
-    if local_size is not None:
-        environ['LOCAL_SIZE'] = local_size
+    if local_size is None:
+        # No launcher variable says: the GPUs this machine has, as train.py counts them.
+        local_size = str(max(1, torch.cuda.device_count()))
+    environ['LOCAL_SIZE'] = local_size
     return local_rank
 
 
@@ -150,15 +167,40 @@ def barriers_off():
         _barriers_off -= 1
 
 
+_serialized = 0
+
+
 @contextmanager
 def one_at_a_time():
-    if _barriers_off:
+    """The ranks of a node run the body one after the other, each on its turn, and meet at a barrier after every
+    turn. Nested inside another one_at_a_time the body just runs (it is already this rank's turn: a second set of
+    barriers would be reached by the ranks that wait in the outer one and not by this one). A body that fails still
+    lets the rank pass every barrier, so the others are not left waiting; the failure is raised after the last
+    one, for the caller to share with all_ok."""
+    global _serialized
+    if _barriers_off or _serialized:
         yield
         return
+    error = None
     for i in range(int(os.environ['LOCAL_SIZE'])):
         if i == int(os.environ['LOCAL_RANK']):
-            yield
+            _serialized += 1
+            try:
+                yield
+            except Exception as e:
+                error = e
+            finally:
+                _serialized -= 1
         dist.barrier()
+    if error is not None:
+        raise error
+
+
+def serialized_per_node():
+    """one_at_a_time() with several ranks in a process group; the plain body otherwise (one process, no group)."""
+    if dist.is_initialized() and dist.get_world_size() > 1:
+        return one_at_a_time()
+    return nullcontext()
 
 
 def empty_cuda_cache():

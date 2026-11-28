@@ -149,6 +149,11 @@ def validate_teacher_config(config, use_context_refiner, cache_text_embeddings):
         raise ValueError(f'[teacher] decay must be one of {DECAYS}, got {decay!r}')
 
     decay_steps = int(table.get('decay_steps', 0))
+    if decay == 'none' and decay_steps > 0:
+        from utils.common import warn_ignored
+        warn_ignored("[teacher] decay_steps is ignored with decay = 'none' (nothing falls): set decay = 'linear' "
+                     "or 'cosine' for it to apply.")
+        decay_steps = 0
     if decay != 'none' and decay_steps <= 0:
         # Deliberately not defaulted to "the run length": prepare_inputs cannot see the run
         # length, and a schedule that silently means something different per config is worse

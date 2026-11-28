@@ -201,7 +201,8 @@ with one GPU, several, several nodes and any `pipeline_stages`.
     Host memory while it is built: every rank reads and copies the whole teacher on the CPU, so with the default
     `parameters` or `uniform` partition they do it one at a time on a node and each frees the stages it does not
     run at once (peak: the node's ranks x the student, plus one teacher). With a `manual` `partition_split` the
-    split is only known once the student's layers exist, so all ranks build it together and free it afterwards.
+    split is only known once the student's layers exist, so each rank frees the stages it does not run later, after
+    the engine's partition is known (the build itself is still one rank at a time).
     The teacher is balanced by its own layers' parameter counts, not by the student's weights (`uniform` and a `manual` `partition_split` are the
     student's own; `memory` balances it by the bytes of its layers). Each rank builds the teacher's layers on the CPU first, then frees the other stages' weights:
     the CPU RAM peaks by about the size of the weights in `dtype` on every rank while loading. Neither the speed

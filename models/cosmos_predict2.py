@@ -38,7 +38,7 @@ from models.teacher_guidance import (
     teacher_warnings,
     validate_teacher_config,
 )
-from utils.common import load_state_dict, AUTOCAST_DTYPE, is_main_process, iterate_safetensors
+from utils.common import load_state_dict, AUTOCAST_DTYPE, is_main_process, iterate_safetensors, all_ok, serialized_per_node
 from utils.offloading import ModelOffloader
 from utils.text_encoding import free_text_encoder_off_first_stage
 from models.wan.vae2_1 import WanVAE_
@@ -758,7 +758,15 @@ class CosmosPredict2Pipeline(BasePipeline):
             p.original_name = name
 
         if self.teacher_cfg.enabled:
-            self.teacher = self._build_teacher(dtype)
+            # The state dict, the DiT or a copy of it, the llm_adapter and Qwen3-0.6B: one rank of a node at a time,
+            # as the teacher pipeline of the generic [teacher] is built, so the host memory is not ranks x all of it.
+            error = None
+            with serialized_per_node():
+                try:
+                    self.teacher = self._build_teacher(dtype)
+                except Exception as e:
+                    error = e
+            all_ok(error)
 
     def _load_teacher_llm(self, llm_path, dtype):
         """Qwen3-0.6B, the encoder Anima's llm_adapter was trained against.

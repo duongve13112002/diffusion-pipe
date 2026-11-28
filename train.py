@@ -1,5 +1,4 @@
 import argparse
-import contextlib
 import os
 import wandb
 from datetime import datetime, timezone
@@ -27,7 +26,7 @@ from utils import attention as attention_util
 from utils import fp8_training
 from utils import startup_timing
 from utils import common
-from utils.common import is_main_process, get_rank, DTYPE_MAP, empty_cuda_cache, all_ok, one_at_a_time
+from utils.common import is_main_process, get_rank, DTYPE_MAP, empty_cuda_cache, all_ok, serialized_per_node, warn_ignored
 import utils.saver
 from utils.isolate_rng import isolate_rng
 from utils.text_encoding import TextEncodingOnTheFly, encodes_text_in_loader
@@ -445,6 +444,11 @@ if __name__ == '__main__':
         args.regenerate_cache if args.regenerate_cache is not None
         else config.get('regenerate_cache', False)
     )
+    if not isinstance(regenerate_cache, bool):
+        raise ValueError(f'regenerate_cache must be true or false, got {regenerate_cache!r}')
+    if args.cache_status and regenerate_cache:
+        warn_ignored('regenerate_cache = true in the config is ignored by --cache_status, which only reads the caches.')
+        regenerate_cache = False
 
     # Determine run_dir (and the checkpoint to resume) on rank 0 and broadcast it, or its error.
     # Before the model loads and the datasets are scanned and cached, which can take hours: a
@@ -452,6 +456,10 @@ if __name__ == '__main__':
     # The runs that only cache or inspect the data never resume, so they skip it.
     run_dir = resume_tag = None
     if not (args.cache_only or args.cache_status or args.metadata_only or args.dump_dataset):
+        if dist.get_world_size() % int(config['pipeline_stages']):
+            raise ValueError(f'pipeline_stages = {config["pipeline_stages"]} does not divide the {dist.get_world_size()} '
+                             'GPUs: each pipeline takes pipeline_stages GPUs and the rest are data-parallel copies of it. '
+                             'Fix it now rather than after the datasets are cached and the model is loaded.')
         run_dir_container = [None]
         if is_main_process():
             try:
@@ -605,10 +613,10 @@ if __name__ == '__main__':
 
     default_micro_batch_size_per_gpu = list(micro_batch_size_per_gpu.values())[0]
 
-    if 'optimizer' not in config:
+    if 'optimizer' not in config and not (args.cache_only or args.cache_status or args.metadata_only or args.dump_dataset):
         raise ValueError('a training run needs an [optimizer] table (type, lr, ...); only the caching options '
                          '(--cache_only, --cache_status, --metadata_only) run without one')
-    gradient_release = config['optimizer'].get('gradient_release', False)
+    gradient_release = config.get('optimizer', {}).get('gradient_release', False)
     ds_config = {
         'train_micro_batch_size_per_gpu': default_micro_batch_size_per_gpu,
         'gradient_accumulation_steps': config.get('gradient_accumulation_steps', 1),
@@ -779,7 +787,7 @@ if __name__ == '__main__':
         # With several stages one rank at a time: every rank reads and copies the whole teacher, and all of them at
         # once is the host memory of ranks x (student + teacher). Each then frees the stages it does not run at once
         # (a manual split of the student's is only known once its layers exist, so that one is freed later).
-        with (one_at_a_time() if teacher_stages > 1 else contextlib.nullcontext()):
+        with serialized_per_node():
             try:
                 teacher = model_teacher.build_teacher(
                     model, pipeline_teacher_config, torch.device('cuda', torch.cuda.current_device()),
@@ -1277,6 +1285,10 @@ if __name__ == '__main__':
             restore = shift_checkpoint_layers(model_engine.module, layer_shift)
         param_groups = optimizer.param_groups.copy()
         names_before = group_names(optimizer.param_groups)
+        # Before the load, whose optimizer state of another split fails with an error that does not say why.
+        memory_partition.check_resumed_partition(
+            memory_partition.read_saved_parts(run_dir, resume_tag), getattr(model_engine.module, 'parts', None),
+            args.reset_optimizer)
         try:
             load_path, client_state = model_engine.load_checkpoint(
                 run_dir,
@@ -1298,8 +1310,6 @@ if __name__ == '__main__':
             train_dataloader.epoch = client_state['custom_loader']['epoch']
         else:
             train_dataloader.load_state_dict(client_state['custom_loader'])
-        memory_partition.check_resumed_partition(
-            client_state.get('partition_parts'), getattr(model_engine.module, 'parts', None), args.reset_optimizer)
         step = client_state['step'] + 1
         if 'examples' in client_state:
             examples = client_state['examples'] + global_batch_size
@@ -1364,8 +1374,16 @@ if __name__ == '__main__':
                 print(f'WARNING: stage {model_engine.grid.get_pipe_parallel_rank()}: checkpoint {tag} has no EMA for '
                       f'{len(missing)} of {len(ema)} parameters (EMA was off or the run changed); their average '
                       'starts from the current weights.')
-            if config.get('ema_init_path') and holds_ema:
-                print(f'Resuming: the EMA comes from checkpoint {tag}; ema_init_path is not used.')
+            if config.get('ema_init_path') and found:
+                if holds_ema:
+                    print(f'Resuming: the EMA comes from checkpoint {tag}; ema_init_path is not used.')
+            elif config.get('ema_init_path'):
+                # The checkpoint was saved without EMA (it was off): start the average from ema_init_path, as a new
+                # run would, rather than from the current weights.
+                loaded = load_ema_weights(ema, config['ema_init_path'])
+                if holds_ema:
+                    print(f'EMA (stage {model_engine.grid.get_pipe_parallel_rank()}): checkpoint {tag} has none; all '
+                          f'{loaded} tensors start from {config["ema_init_path"]}')
         elif config.get('ema_init_path'):
             loaded = load_ema_weights(ema, config['ema_init_path'])
             if holds_ema:

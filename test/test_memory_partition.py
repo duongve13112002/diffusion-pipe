@@ -141,9 +141,10 @@ def test_a_resume_under_other_stage_boundaries_is_refused_unless_the_optimizer_i
 def test_train_py_and_the_saver_record_and_check_the_boundaries():
     from pathlib import Path
     root = Path(__file__).resolve().parent.parent
-    assert "'partition_parts'" in (root / 'utils' / 'saver.py').read_text()
+    assert 'memory_partition.PARTS_FILE' in (root / 'utils' / 'saver.py').read_text()
     train = (root / 'train.py').read_text()
-    assert "memory_partition.check_resumed_partition(" in train and "loader_encoders=list(text_encoding.text_encoders)" in train
+    assert train.index('memory_partition.check_resumed_partition(') < train.index('load_checkpoint(')
+    assert 'memory_partition.read_saved_parts(run_dir, resume_tag)' in train and "loader_encoders=list(text_encoding.text_encoders)" in train
 
 
 @pytest.mark.parametrize('key, value', [('partition_extra_first_stage_gb', -1), ('partition_trainable_factor', 'x'),
@@ -241,3 +242,11 @@ def test_train_py_splits_the_student_by_the_plan_and_checks_the_keys_with_the_co
     assert 'partition_method=student_method' in source and 'manual_partition_split=student_split' in source
     # the teacher gets the configured method ('memory' too), not the student's manual one
     assert 'teacher.layers, num_stages, partition_method,' in source
+
+
+def test_ltx2_estimates_its_text_encoder_from_its_own_config_key(tmp_path):
+    from models.ltx2 import LTX2Pipeline
+    (tmp_path / 'te.safetensors').write_bytes(b'x' * 700)
+    pipe = types.SimpleNamespace(model_config={'text_encoder': str(tmp_path / 'te.safetensors'),
+                                               'diffusion_model': str(tmp_path / 'huge.safetensors')})
+    assert LTX2Pipeline.text_encoder_file_bytes(pipe) == 700

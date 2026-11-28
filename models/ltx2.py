@@ -228,6 +228,11 @@ class LTX2Pipeline(ComfyPipeline):
 
         self.offloader = ModelOffloader('dummy', [], 0, 0, True, torch.device('cuda'), False, debug=False)
 
+    def text_encoder_file_bytes(self):
+        # One encoder file ([model] text_encoder); the diffusion checkpoint it is read together with is not counted.
+        from utils.memory_partition import text_files_bytes
+        return text_files_bytes(self.model_config['text_encoder'])
+
     def load_vae(self, dtype):
         vae_sd = {}
         with safetensors.safe_open(self.model_config['diffusion_model'], framework='pt', device='cpu') as f:

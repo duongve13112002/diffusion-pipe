@@ -660,8 +660,8 @@ python -m tools.distill_refiner --config examples/anima_refiner/distill.toml
 
 An optional `[teacher]` table keeps a frozen stock Anima resident during ordinary training and
 mixes its velocity into the ground-truth target, weighted toward the teacher at high noise and
-decayed to nothing over the run. Off by default; it needs `cache_text_embeddings = false` and
-`pipeline_stages = 1`. See [docs/anima_refiner/teacher-guided-training.md](anima_refiner/teacher-guided-training.md)
+decayed to nothing over the run. Off by default; it needs `cache_text_embeddings = false`; with
+`pipeline_stages > 1` the teacher runs as a second, forward-only pipeline over the same stages. See [docs/anima_refiner/teacher-guided-training.md](anima_refiner/teacher-guided-training.md)
 and `examples/anima_refiner/teacher_guided.toml`.
 
 Sample either architecture with the same script — `tools/sample_anima_refiner.py` reads
@@ -859,7 +859,7 @@ See [examples/minimax_h3_image.toml](../examples/minimax_h3_image.toml) and its 
 - `save_dtype` leaves the output heads, the patch projection and the time embedder in float32 (the checkpoint's float32
   islands; rounding head 0 would move every head).
 - Per-component learning rates (`blocks_lr`, `token_refiner_lr`, and for a full fine-tune `text_projection_lr`,
-  `patch_embed_lr`, `head_lr`; 0 freezes). With an adapter the last three are refused.
+  `patch_embed_lr`, `head_lr`; 0 freezes). With an adapter the last three are ignored with a warning.
 - Refused: `frame_buckets` other than `[1]`, `audio_vae`, `cfg`, a text encoder other than one of type `minimax`, a
   VAE that is not the MiniMax-H3-Image one, an audio transformer (MiniMax H3: use `minimax_h3`), `pdd_heads` with a
   layout other than the official one, and caption dropout on an edit directory (see the P-H3-Image notes).

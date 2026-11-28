@@ -69,7 +69,7 @@ timestep_sample_method = 'pdd_grid'
 #merge_adapters = ['/data/models/minimax_h3_image_training_adapter_v1.safetensors']
 # cfg (CFG-augmented training) and audio_vae are refused.
 # Per-component learning rates (a LoRA leaves the heads and projections frozen: head_lr, patch_embed_lr and
-# text_projection_lr are refused with [adapter]; 0 freezes a component of a full fine-tune):
+# text_projection_lr are ignored with a warning under [adapter]; 0 freezes a component of a full fine-tune):
 #blocks_lr = 1e-5
 #token_refiner_lr = 1e-5
 

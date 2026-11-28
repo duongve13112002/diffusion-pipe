@@ -55,7 +55,11 @@ def compute_dtype_of(model_config):
 
 def computes_in_float16(model_config):
     """Whether [model] asks for float16 compute (compute_dtype, as a name or a torch dtype)."""
-    value = model_config.get('compute_dtype', '')
+    value = model_config.get('compute_dtype')
+    if value is None:
+        # MOSS-Image computes in the dtype of its weights unless compute_dtype says otherwise (an adapter over a
+        # float16 base is float16 compute with no compute_dtype at all).
+        value = model_config.get('dtype', '') if model_config.get('type') == 'moss_image' else ''
     return value == torch.float16 or str(value).lower() in FLOAT16_NAMES
 
 

@@ -435,8 +435,11 @@ def skip_finished_teacher(config, resume_tag):
     if not isinstance(table, dict) or match is None or not table.get('loss_weight'):
         return False
     decay_steps = table.get('decay_steps', 0)
-    if table.get('decay', 'none') == 'none' or not isinstance(decay_steps, int) or decay_steps <= 0:
+    # The stock-Anima table (it names an llm_path) defaults to a linear decay, the generic one to none.
+    decay = table.get('decay', 'linear' if 'llm_path' in table else 'none')
+    if isinstance(decay_steps, bool) or not isinstance(decay_steps, (int, float)) or decay == 'none' or decay_steps <= 0:
         return False
+    decay_steps = int(decay_steps)
     if int(match.group(1)) + 1 < decay_steps:
         return False
     table['loss_weight'] = 0
