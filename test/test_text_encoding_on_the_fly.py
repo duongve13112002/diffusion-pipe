@@ -469,3 +469,31 @@ def test_the_first_stage_loads_its_encoders_when_bound_not_at_the_first_batch():
     assert len(loads) == 2
     encoder.bind(_pipeline_engine(0, 3))
     assert len(loads) == 2
+
+
+def test_sdxl_frees_both_encoders_off_the_first_stage():
+    from models.sdxl import SDXLPipeline
+    for stage, freed in ((0, False), (1, True)):
+        model = types.SimpleNamespace(text_encoder=torch.nn.Linear(4, 4), text_encoder_2=torch.nn.Linear(4, 4))
+        SDXLPipeline.free_unused_text_encoder(model, _stage_engine(stage, 2))
+        assert (model.text_encoder.weight.numel() == 0) is freed
+        assert (model.text_encoder_2.weight.numel() == 0) is freed
+
+
+def test_hidream_frees_its_llama_off_the_first_stage():
+    # models/hidream.py needs flash_attn at import, which a CPU machine has not: read the source.
+    from pathlib import Path
+    source = (Path(__file__).resolve().parent.parent / 'models' / 'hidream.py').read_text()
+    body = source.split('def free_unused_text_encoder(self, engine):', 1)[1].split('\n    def ', 1)[0]
+    assert 'free_text_encoder_off_first_stage(self.text_encoder_4, engine)' in body
+    assert 'LlamaLayer(self.text_encoder_4)' in source
+
+
+@pytest.mark.parametrize('backend, cuda, device', [('nccl', True, 'cuda'), ('nccl', False, None),
+                                                   ('gloo', True, None), ('gloo', False, None)])
+def test_objects_travel_through_the_gpu_only_under_nccl(monkeypatch, backend, cuda, device):
+    monkeypatch.setattr(text_encoding.torch_dist, 'get_backend', lambda *a, **k: backend)
+    monkeypatch.setattr(text_encoding.torch.cuda, 'is_available', lambda: cuda)
+    monkeypatch.setattr(text_encoding.torch.cuda, 'current_device', lambda: 0)
+    found = TextEncodingOnTheFly._object_device()
+    assert (found.type if found is not None else None) == device

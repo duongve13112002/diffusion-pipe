@@ -15,6 +15,7 @@ import diffusers
 
 from models.base import BasePipeline, make_contiguous, shallow_clone
 from utils.common import AUTOCAST_DTYPE, empty_cuda_cache
+from utils.text_encoding import free_text_encoder_off_first_stage
 from utils.offloading import ModelOffloader
 from hi_diffusers import HiDreamImagePipeline, HiDreamImageTransformer2DModel
 from hi_diffusers.schedulers.fm_solvers_unipc import FlowUniPCMultistepScheduler
@@ -183,6 +184,10 @@ class HiDreamPipeline(BasePipeline):
 
     def get_text_encoders(self):
         return [self.text_encoder, self.text_encoder_2, self.text_encoder_3]
+
+    def free_unused_text_encoder(self, engine):
+        # Llama (text_encoder_4) is the first layer: the other stages never run it.
+        free_text_encoder_off_first_stage(self.text_encoder_4, engine)
 
     def save_adapter(self, save_dir, peft_state_dict):
         self.peft_config.save_pretrained(save_dir)

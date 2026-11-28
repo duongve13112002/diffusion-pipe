@@ -15,6 +15,7 @@ from safetensors.torch import save_file
 from models.base import BasePipeline, make_contiguous
 from utils.dora import DORA_SCALE, check_init_matches, has_dora_scale, kohya_module_name, saved_key
 from utils.common import AUTOCAST_DTYPE, is_main_process
+from utils.text_encoding import free_text_encoder_off_first_stage
 
 
 
@@ -480,6 +481,12 @@ class SDXLPipeline(BasePipeline):
     def get_text_encoders(self):
         # TODO: support training with cached text embeddings.
         return []
+
+    def free_unused_text_encoder(self, engine):
+        # Both encoders are part of the first layer (InitialLayer): the other stages never run them. Their configs and
+        # the tokenizers, which prepare_inputs reads, stay.
+        free_text_encoder_off_first_stage(self.text_encoder, engine)
+        free_text_encoder_off_first_stage(self.text_encoder_2, engine)
 
     def configure_adapter(self, adapter_config):
         if 'init_from_existing' in adapter_config:

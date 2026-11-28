@@ -104,7 +104,10 @@ class TextEncodingOnTheFly:
 
     @staticmethod
     def _object_device():
-        return torch.device('cuda', torch.cuda.current_device()) if torch.cuda.is_available() else None
+        # Only NCCL moves objects through the GPU; gloo (and a CPU run) keep them on the host.
+        if torch_dist.get_backend() == 'nccl' and torch.cuda.is_available():
+            return torch.device('cuda', torch.cuda.current_device())
+        return None
 
     def _send(self, value):
         torch_dist.send_object_list([value], dst=self.relay[1], device=self._object_device())
