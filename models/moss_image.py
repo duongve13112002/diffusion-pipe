@@ -1168,12 +1168,14 @@ class MossImagePipeline(ComfyPipeline):
         if space not in LAYOUT_BBOX_SPACES:
             raise ValueError(f'layout_bbox_space must be one of {", ".join(LAYOUT_BBOX_SPACES)}, got {space!r}')
         self.layout_caption_format = LAYOUT_BBOX_SPACES[space]
-        method = mc.get('timestep_sample_method', NOISE_DEFAULTS['timestep_sample_method'])
-        if method == 'uniform':
-            unused = [key for key in ('logit_mean', 'logit_std', 'sigma_cutoff', 'uniform_fraction', 'clean_end_share')
-                      if key in mc]
+        if mc.get('timestep_sample_method', NOISE_DEFAULTS['timestep_sample_method']) == 'uniform':
+            unused = [key for key in ('logit_mean', 'logit_std', 'sigma_cutoff', 'uniform_fraction', 'clean_end_share',
+                                      'clean_end_share_refresh_every') if key in mc]
             if unused:
-                raise ValueError(f"{', '.join(unused)} only apply to timestep_sample_method = 'logit_normal'")
+                warn_ignored(f"[model] {', '.join(unused)} are ignored: they only apply to timestep_sample_method = "
+                             "'logit_normal'.")
+                for key in unused:
+                    del mc[key]
         if 'clean_end_share' in mc:
             if 'logit_mean' in mc:
                 raise ValueError('clean_end_share sets logit_mean: remove one of them')

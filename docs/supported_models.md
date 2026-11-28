@@ -1017,8 +1017,9 @@ rather than loaded with layers' weights in their neighbours.
 - `clean_end_share = 30` sets the percent of training steps below sigma 0.5 (the clean end, where
   faces and fine detail are refined) by solving for `logit_mean`, with the rest of the sampler
   (`logit_std`, `sigma_cutoff`, `uniform_fraction`, `shift`, `min_t`, `max_t`) as configured; it
-  is refused together with `logit_mean` or `timestep_sample_method = 'uniform'`, and when the
-  other settings cannot reach the share. The reference distribution puts about 11% of steps
+  is refused together with `logit_mean` (two ways to set the same value) and when the other settings cannot reach
+  the share; with `timestep_sample_method = 'uniform'` it, `logit_mean`, `logit_std`, `sigma_cutoff` and
+  `uniform_fraction` are ignored with a warning. The reference distribution puts about 11% of steps
   there. [Fizgig](https://github.com/shootthesound/Fizgig) found likeness LoRAs on MOSS-Image
   converge much sooner with more ([v8.7.0 notes](https://github.com/shootthesound/Fizgig/blob/master/docs/RELEASE_NOTES_v8.7.0.md)),
   and that 30 (about where Krea 2 and Qwen-Image sit) beat 60 held for the whole run

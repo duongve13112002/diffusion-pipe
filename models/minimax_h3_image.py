@@ -155,8 +155,10 @@ class MiniMaxH3ImagePipeline(MinimaxH3Pipeline):
             raise ValueError(f'[model] timestep_sample_method must be one of {SAMPLE_METHODS}, got {method!r}')
         if method == 'pdd_grid':
             if keys := [k for k in CONTINUOUS_SAMPLING_KEYS if k in model_config]:
-                raise ValueError(f"[model] {', '.join(keys)} do not apply with timestep_sample_method = 'pdd_grid': it trains "
-                                 "on the sigmas of the checkpoint's sampling grid only. Remove them.")
+                warn_ignored(f"[model] {', '.join(keys)} are ignored with timestep_sample_method = 'pdd_grid': it trains "
+                             "on the sigmas of the checkpoint's sampling grid only.")
+                for key in keys:
+                    del model_config[key]
         # Without a method the grid is trained on when the checkpoint has one (refuse_unsupported_checkpoint decides, it
         # reads the checkpoint); a config that sets a continuous-sampling key chose the continuous sampling.
         self.grid_by_default = method is None and not any(k in model_config for k in CONTINUOUS_SAMPLING_KEYS)

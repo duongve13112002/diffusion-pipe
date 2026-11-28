@@ -1398,8 +1398,6 @@ def test_layout_bbox_space_selects_the_layout_caption_format():
     ({'text_encoder_fp8': True}, 'text_encoder_fp8'),
     ({'sigmoid_scale': 1.0}, 'sigmoid_scale'),
     ({'cache_text_embeddings': 'false'}, 'cache_text_embeddings'),
-    ({'timestep_sample_method': 'uniform', 'logit_mean': 0.0}, 'logit_mean'),
-    ({'timestep_sample_method': 'uniform', 'clean_end_share': 30}, 'clean_end_share'),
     ({'clean_end_share': 30, 'logit_mean': -1.09}, 'remove one of them'),
     ({'clean_end_share': 100}, 'percentage between 0 and 100'),
     ({'clean_end_share': '30'}, 'percentage between 0 and 100'),
@@ -1426,6 +1424,16 @@ def test_config_keys_that_do_not_apply_are_refused(model, match, tmp_path):
     root = diffusers_dir(tmp_path)
     with pytest.raises(ValueError, match=match):
         make_pipeline({'diffusers_path': str(root), **model})
+
+
+def test_logit_normal_keys_with_uniform_sampling_are_ignored_with_a_warning(tmp_path, capsys):
+    root = diffusers_dir(tmp_path)
+    pipe = make_pipeline({'diffusers_path': str(root), 'timestep_sample_method': 'uniform', 'logit_mean': 0.5,
+                          'clean_end_share': 30, 'clean_end_share_refresh_every': 2, 'shift': 2.0})
+    out = capsys.readouterr().out
+    assert 'logit_mean, clean_end_share, clean_end_share_refresh_every are ignored' in out
+    assert pipe.clean_end_schedule is None and 'logit_mean' not in pipe.model_config
+    assert pipe.noise_settings['shift'] == 2.0 and pipe.noise_settings['timestep_sample_method'] == 'uniform'
 
 
 def test_noise_settings_reach_the_sampler(tmp_path):

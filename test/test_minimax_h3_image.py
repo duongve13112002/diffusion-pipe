@@ -1280,11 +1280,15 @@ def test_pdd_grid_timesteps_are_the_samplers_sigmas():
     assert not set(other.sample_timesteps(50, 1, 4, 6, 'cpu').tolist()) <= set(t.tolist())
 
 
-def test_pdd_grid_replaces_the_continuous_sampling_keys(tmp_path):
+def test_pdd_grid_replaces_the_continuous_sampling_keys(tmp_path, capsys, monkeypatch):
     from models.minimax_h3_image import MiniMaxH3ImagePipeline
     text_encoders = [{'path': 'x', 'type': 'minimax'}]
-    with pytest.raises(ValueError, match="shift, sigmoid_scale do not apply with timestep_sample_method = 'pdd_grid'"):
-        MiniMaxH3ImagePipeline({'model': {'text_encoders': text_encoders, 'timestep_sample_method': 'pdd_grid', 'shift': 3, 'sigmoid_scale': 1.0}})
+    config = {'model': {'text_encoders': text_encoders, 'timestep_sample_method': 'pdd_grid', 'shift': 3, 'sigmoid_scale': 1.0}}
+    # The parent constructor loads CUDA objects; the keys are dealt with before it.
+    monkeypatch.setattr(MiniMaxH3ImagePipeline.__mro__[1], '__init__', lambda self, config: None)
+    MiniMaxH3ImagePipeline(config)
+    assert 'shift' not in config['model'] and 'sigmoid_scale' not in config['model']
+    assert "shift, sigmoid_scale are ignored with timestep_sample_method = 'pdd_grid'" in capsys.readouterr().out
     with pytest.raises(ValueError, match='timestep_sample_method must be one of'):
         MiniMaxH3ImagePipeline({'model': {'text_encoders': text_encoders, 'timestep_sample_method': 'sigmoid'}})
     model, _ = tiny_pair(1)
