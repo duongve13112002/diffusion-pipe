@@ -228,6 +228,8 @@ def test_attention_keys_of_a_feature_that_is_off_are_ignored_with_a_warning(caps
     for table, key in (({'attention': True, 'attention_min_tokens': 4096}, 'attention_min_tokens'),
                        ({'attention_min_tokens': 4096}, 'attention_min_tokens'),
                        ({'attention_amax_history': 8}, 'attention_amax_history')):
+        from utils import common
+        common._warned.clear()      # the same warning is printed once per process
         config = {'model': {'type': 'flux'}, 'fp8_training': dict(table)}
         assert fp8_training.apply_fp8_training_config_defaults(config) is not None
         assert f'{key} is ignored' in capsys.readouterr().out
