@@ -35,7 +35,8 @@ from utils.patches import apply_patches
 from utils.unsloth_utils import unsloth_checkpoint
 from utils.pipeline import ManualPipelineModule
 from utils import memory_partition
-from utils.placement import DEFAULT_PLACEMENT, check_placement, local_world_size, stage_of_rank, straddling_note
+from utils.placement import DEFAULT_PLACEMENT, check_placement, stage_of_rank, straddling_note
+from utils.placement import local_world_size as gpus_per_node
 from utils.dora import apply_dora_config_defaults, check_model_dtypes as check_dora_model_dtypes
 from utils.oplora import OPLoRAProjector, apply_oplora_config_defaults
 from utils.outlier_decay import OutlierDecay, apply_outlier_decay_config_defaults
@@ -903,7 +904,7 @@ if __name__ == '__main__':
     num_stages = config.get('pipeline_stages', 1)
     placement = check_placement(config.get('pipeline_placement', DEFAULT_PLACEMENT))
     if is_main_process():
-        note = straddling_note(num_stages, dist.get_world_size(), local_world_size()) if placement == 'node_local' else None
+        note = straddling_note(num_stages, dist.get_world_size(), gpus_per_node()) if placement == 'node_local' else None
         if note:
             print(f'WARNING: {note}')
     partition_method=config.get('partition_method', 'parameters')

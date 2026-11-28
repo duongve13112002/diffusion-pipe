@@ -209,3 +209,37 @@ def test_the_relay_pairs_each_replicas_first_and_last_stage_under_either_placeme
     # the replicas really had different captions, so a crossed pair would have shown
     assert next(r for r in results if r['replica'] == 0 and r['stage'] == 0)['features'] != \
         next(r for r in results if r['replica'] == 1 and r['stage'] == 0)['features']
+
+
+def _overwritten_imports(source):
+    import ast
+    tree = ast.parse(source)
+    imported = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and (node.module or '').split('.')[0] == 'utils':
+            imported.update(a.asname or a.name for a in node.names)
+    assigned = {}
+    for node in ast.walk(tree):
+        targets = []
+        if isinstance(node, ast.Assign):
+            targets = node.targets
+        elif isinstance(node, (ast.AugAssign, ast.AnnAssign, ast.For, ast.comprehension, ast.NamedExpr)):
+            targets = [node.target]
+        for target in targets:
+            for part in ([target] if isinstance(target, ast.Name) else getattr(target, 'elts', [])):
+                if isinstance(part, ast.Name) and part.id in imported:
+                    assigned.setdefault(part.id, []).append(part.lineno)
+    return imported, assigned
+
+
+def test_train_py_does_not_overwrite_a_name_it_imports_from_utils():
+    # train.py is a script, nothing runs it in the tests: a local variable called like an imported function
+    # (local_world_size, the GPUs per node) turned the call into "'int' object is not callable" on rank 0 at startup.
+    from pathlib import Path
+    source = (Path(__file__).resolve().parent.parent / 'train.py').read_text()
+    imported, assigned = _overwritten_imports(source)
+    assert {'gpus_per_node', 'check_placement', 'memory_partition'} <= imported
+    assert not assigned, assigned
+    # the check sees the mistake it was written for
+    broken = source.replace('gpus_per_node', 'local_world_size')
+    assert 'local_world_size' in _overwritten_imports(broken)[1]
