@@ -127,6 +127,16 @@ _limit_dataset_workers()
 import utils.common  # noqa: F401
 
 
+import pytest  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _fresh_warning_memory():
+    """warn_ignored prints a message once per process; a test that looks for it must not depend on which test ran first."""
+    utils.common._warned.clear()
+    yield
+
+
 class _StubLoader(importlib.abc.Loader):
     def create_module(self, spec):
         return _StubModule(spec.name)
