@@ -626,10 +626,10 @@ the last row, whose captions are encoded before the model (`utils/text_encoding.
 also reads every batch (it needs the label), so it used to load the text encoders and encode every
 caption a second time; now the first stage sends its encoded rows to the last stage, which holds no
 text encoder, and the stages between hold none either (they empty the weights the model loaded; a ComfyUI
-encoder is never loaded there). Wan, Cosmos-Predict2 / Anima, Iris and
-MOSS-Image encode in their first layer, so only the first stage's GPU holds the encoder; Wan, Cosmos-Predict2
-and Iris free its weights from the other stages' host memory once the pipeline is built (MOSS-Image never
-loads it there). MOSS-Image's `[teacher]` copy of a full fine-tune is made when the teacher pipeline is built, one
+encoder is never loaded there). Wan, Cosmos-Predict2 / Anima, Iris, SDXL and
+MOSS-Image encode in their first layer, so only the first stage's GPU holds the encoder; Wan, Cosmos-Predict2,
+Iris and SDXL (both encoders) free its weights from the other stages' host memory once the pipeline is built
+(MOSS-Image never loads it there). HiDream's Llama is its first layer too and is freed from the other stages the same way. MOSS-Image's `[teacher]` copy of a full fine-tune is made when the teacher pipeline is built, one
 rank at a time, not when the model loads. The `parameters` partition counts parameters by number (frozen ones too, dtype ignored) and does not see an encoder
 that is not one of the layers' parameters (the data loader's, Iris's and MOSS-Image's own), so the first stage has
 as many blocks as the others plus that encoder. Two ways to move blocks off stage 0: `partition_method = 'manual'` with
